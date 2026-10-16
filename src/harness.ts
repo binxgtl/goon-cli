@@ -53,7 +53,6 @@ export class Harness {
         });
         let stepText = '';
         const projection = new AnswerProjection(this.config.inlineReasoning);
-        let sawReasoning = false;
         const present = (parts: AnswerPart[]) => {
           for (const part of parts) {
             if (part.type === 'text') { stepText += part.text; this.emit({ type: 'text', text: part.text }); }
@@ -65,7 +64,6 @@ export class Harness {
           if (event.type === 'abort') throw new Error('Model request cancelled or timed out.');
           if (event.type === 'text-delta') present(projection.push(event.text));
           if (event.type === 'reasoning-delta') {
-            sawReasoning = true;
             if (this.config.showReasoning) this.emit({ type: 'reasoning', text: event.text, source: 'provider' });
           }
         }
@@ -86,7 +84,9 @@ export class Harness {
         session.messages.push(...response.messages);
         text += stepText;
         await this.store.save(); // Persist tool declarations before any side effect.
-        if (!calls.length && !stepText.trim() && (sawReasoning || projection.sawReasoning)) throw new Error('Model returned reasoning without a visible answer.');
+        // A successful terminal step needs its own answer. Reasoning may be
+        // opaque to the adapter, and earlier tool narration is not completion.
+        if (!calls.length && !stepText.trim()) throw new Error('Model finished without a visible answer.');
         if (!calls.length) return text;
         const outcome = await this.executeBatch(calls, signal);
         if (outcome.denied) { this.emit({ type: 'stopped', reason: 'Permission denied.' }); return text; }

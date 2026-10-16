@@ -53,10 +53,34 @@ Goon does not implement either upstream's complete durable token event journal.
 `--show-reasoning` opts into separate `reasoning` NDJSON events or labeled
 stderr/TUI output. The default emits neither native nor extracted reasoning.
 Child reasoning is never mirrored into parent progress, including with this
-option. Reasoning-only responses fail with an explicit missing-answer error;
+option. Terminal responses without a non-whitespace projected answer fail with
+an explicit missing-answer error;
 truncated/cancelled streams cannot execute tool calls or flush hidden text as an
 answer. Summary generation also rejects a reasoning-only summary before replacing
 active history.
+
+## Terminal-answer correction in 0.2.2
+
+The 0.2.1 implementation enforced its missing-answer error only after observing
+a reasoning delta or a recognized inline think block. That did not implement the
+full intended contract. Empty/whitespace responses, opaque gateway fields ignored
+by the compatible adapter, and Anthropic redacted thinking without text deltas
+could finish successfully with an empty answer. A parent could do so after
+successful child completion as well.
+
+0.2.2 validates the terminal step's projected answer directly, without requiring
+any evidence of reasoning. Tool-only intermediate steps are valid; prior tool
+narration does not substitute for a final answer. Missing-answer failures retain
+usage and completed tool history, release locks, and do not trigger automatic
+model retries or replay side effects. Permission denial remains an explicit
+stopped/denied outcome (exit 2), not successful completion.
+
+The new tests reproduce these response shapes through the real SDK and CLI,
+including redacted thinking that emits reasoning start/end but no delta. The
+redacted payload remains in SDK response metadata; unsupported gateway fields
+are not reconstructed or claimed to be durably preserved. These controlled
+fixtures establish a guard defect; without the user's raw gateway trace they
+do not identify the exact payload of the reported claude-sonnet-5-5 run.
 
 ## NDJSON migration from 0.2.0
 

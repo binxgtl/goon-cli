@@ -120,6 +120,11 @@ quy tắc tương thích định dạng, không nhận diện mọi kiểu reaso
 khỏi transcript. `--inline-reasoning off` tắt nhận diện; có thể lưu
 `inlineReasoning` trong config hoặc đặt `GOON_INLINE_REASONING`.
 
+Response cuối không gọi tool phải có answer không rỗng sau projection. Không có
+answer thì báo lỗi và exit 1, kể cả adapter không nhận diện được reasoning hoặc
+các bước trước đã có lời dẫn/tool thành công. Không tự gọi lại model hay chạy lại
+side effect; usage và những thay đổi đã hoàn tất vẫn được lưu để kiểm tra/resume.
+
 ## MCP
 
 Goon dùng MCP SDK chính thức, hỗ trợ **tools qua stdio và Streamable HTTP**.

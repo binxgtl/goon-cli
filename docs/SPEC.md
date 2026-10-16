@@ -51,6 +51,12 @@ tools and persistence. No ZCode runtime source is copied or loaded.
   is incremental across chunk boundaries, ends once visible answer text starts,
   and can be disabled. Reasoning is opt-in on a separate event/display channel.
   Compaction uses the visible summary and refuses reasoning-only output.
+- Every terminal model step without tool calls requires non-whitespace projected
+  answer text, independent of observed reasoning events. Earlier tool narration
+  and successful child reports cannot stand in for the parent's final answer.
+  Missing answers checkpoint usage/history and fail without automatic retries or
+  replaying completed tools. Tool-only intermediate steps remain valid; explicit
+  permission denial retains its stopped/denied outcome and exit code 2.
 - Child start/progress/terminal events form a discriminated union. Only start
   includes task; progress excludes text/reasoning. Child reports select the last
   non-empty visible assistant answer. Terminal publication follows session close,
