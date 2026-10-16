@@ -48,7 +48,7 @@ test('noninteractive mutations fail closed and end the run', async t => {
 test('read-only omits bash, edit and write from the model tool surface', async t => {
   const f = await fixture(t);
   const p = await provider(t, (body, response) => {
-    assert.deepEqual(body.tools.map(t => t.function.name).sort(), ['list_files', 'read_file', 'search']);
+    assert.deepEqual(body.tools.map(t => t.function.name).sort(), ['delegate_task', 'list_files', 'read_file', 'search']);
     return sse(response, { text: 'Read-only ready.' });
   });
   const result = await cli(f, p.url, ['--read-only', '-p', 'inspect']).done;

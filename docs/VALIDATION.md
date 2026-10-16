@@ -1,45 +1,85 @@
-# Validation — 0.1.0
+# Validation — 0.2.0
 
-Executed on Linux x64, Node.js 24.19.0.
+Executed on Linux x64, Node.js 24.19.0, 2026-10-16.
 
-- `npm test`: **29 passed, 0 failed**. Tests use local mock HTTP servers and
-  the real CLI, AI SDK adapters, filesystem, process scheduler and session store.
-- `npm run typecheck`: passed, TypeScript strict mode.
-- `npm run lint`: passed without warnings.
-- Installed the packed npm archive in a separate prefix with development
-  dependencies omitted and lifecycle scripts disabled. Its executable, help,
-  version and a real harness → mock HTTP → write_file → final response cycle
-  passed. Installed runtime tree contained **zero `.node` native addons**.
-- One local `goon --help` sample: 0.124 seconds and 51,864 KiB peak child RSS.
-  This is a Linux development-machine observation, not a Termux benchmark or a
-  measurement of memory use during a long agent run.
+The earlier 29/29 result for 0.1.0 was obtained with the default umask only.
+It missed a real bug: open(mode) and writeFile({mode}) both apply umask. Under
+007 the original file-mode test failed (28/29 overall), and an edit could change
+0755 to 0750. That earlier result did not establish restrictive-umask behavior.
 
-Coverage includes OpenAI-compatible streamed tool arguments and reasoning
-roundtrip, Anthropic Messages streaming, OpenAI Responses streaming,
-write/read/edit across a resumed session, offline init/doctor, invalid config,
-credential redaction, denied mutations, read-only tool surfaces, SIGINT during
-HTTP, incomplete streams, bounded parallel reads and mutation barriers,
-cancellation result pairing, compaction/archive, oversized input, stale file
-revisions, exact edits, symlink/path escapes, fallback search, output truncation,
-process-group cancellation, command timeouts, exclusive session locks, stale
-owner recovery and workspace-bound resume.
+## Current checks
 
-Release validation adds initial-version selection, automatic patch increments,
-lockfile synchronization, installed CLI version reporting, and an end-to-end
-publishing simulation using a local bare Git remote and mocked GitHub release
-commands. The simulation publishes v0.1.0, pushes a source update, verifies the
-bot commit and v0.1.1 tag, then retries from the previous source commit and
-confirms that it repairs v0.1.1 without creating v0.1.2. No remote release is
-created by the test itself. The real GitHub Actions workflow additionally runs
-the suite on Node 22.16 and 24; consult Actions for its execution results.
+| Command / environment | Result |
+|---|---|
+| `npm test` | 46 passed, 0 failed, 0 skipped |
+| `(umask 027; node --test tests/*.test.mjs)` | 46 passed, 0 failed, 0 skipped |
+| `(umask 007; node --test tests/*.test.mjs)` | 46 passed, 0 failed, 0 skipped |
+| `npm run typecheck` | Passed, strict TypeScript |
+| `npm run lint` | Passed, no warnings |
+| `npm run release:pack` | Built, packed, installed in isolated prefix, executable/help/version passed |
+| Runtime/MCP/subagent/TUI tests with CLI entrypoint from the installed archive | 26 passed, 0 failed, 0 skipped |
 
-No paid API request was made. No Android/Termux device, ARM64, macOS or Windows
-was available for execution. Termux support is an implementation target, not a
-device-tested claim. OS-level shell sandboxing is not implemented. File path
-validation is intended to prevent ordinary traversal/symlink mistakes; it is
-not a security boundary against another hostile process sharing the OS account.
+File tests now establish 0755 with an explicit chmod after fixture creation.
+A regression test launches separate Node processes with umasks 027, 007 and 077,
+edits existing files at modes 0755, 0640 and 0444, and checks exact permissions.
+It separately checks that new files obey the process umask. Runtime writes
+chmod the temporary file for existing files before fsync/rename.
 
-Runtime package tree contains JavaScript dependencies; platform-specific lint
-binaries are development dependencies only. The installable npm archive
-includes compiled `dist/`, so Termux installation does not need TypeScript or
-native builds.
+## Integration coverage
+
+Tests use local mock model HTTP endpoints and real AI SDK adapters, filesystem,
+subprocesses and session stores. No paid model request was made.
+
+- OpenAI-compatible streamed tool arguments and reasoning roundtrip; Anthropic
+  Messages and OpenAI Responses; write/read/edit across resume; offline
+  init/doctor; invalid config; key redaction; noninteractive approval denial;
+  read-only tool surfaces; incomplete stream rejection and HTTP cancellation.
+- Scheduler order, two concurrent reads and serial mutation barriers;
+  cancellation result pairing; compaction/archive; oversized input; stale file
+  revisions; exact edits; symlink/path escapes; fallback search; output bounds;
+  process groups/timeouts; session locks, dead-owner recovery and workspace resume.
+- MCP uses real SDK servers over both stdio and Streamable HTTP, including
+  paginated discovery, local argument validation, bearer/env mapping, refusal
+  to inherit the provider key, explicit read-only allowlists, ignoring remote
+  readOnlyHint for permissions, isError propagation, cancellation, timeout,
+  credential redaction, unregister/close and CLI startup-failure lock cleanup and SIGTERM during MCP initialization
+  preserving exit code 143 while killing the server and releasing the session.
+- Subagents run through the real provider/harness loop: isolated context,
+  read-only child tool surfaces, maximum two concurrent research workers,
+  sequential editing workers, no recursive delegation, inherited approvals,
+  denial stopping the parent, shared budget accounting, persistent child
+  sessions, SIGINT draining children and releasing every session lock.
+- TUI tests keyboard editing/history, Unicode/wide-character wrapping,
+  cancellation, narrow resize and escape-sequence removal. A real POSIX
+  pseudo-terminal drives the CLI through /status, resize, a task, a write
+  approval and /exit; it verifies alternate-screen exit, canonical-mode
+  restoration, written file contents and absence of session locks. The PTY
+  test uses Python 3 during development/CI; the installed CLI does not.
+- Release tests cover stable-version selection, patch increments, lockfile
+  synchronization, installed version reporting, and a local bare-Git/mocked
+  GitHub publishing simulation including retry without another version bump.
+
+The GitHub workflow now runs the full suite at default, 027 and 007 umasks on
+Node 22.16 and 24. Consult the repository's Actions runs for remote results.
+
+## Scope
+
+No Android/Termux device, ARM64, macOS or Windows was available for execution.
+Termux is an implementation target, not a device-tested claim. POSIX PTY coverage
+is skipped on Windows. Emoji grapheme rendering can vary between terminals;
+--no-tui retains plain readline. MCP integration covers tools over stdio and
+Streamable HTTP; resources, prompts, OAuth and legacy SSE are not implemented.
+Children have separate transcripts and tool policies, not OS isolation. They do
+not load MCP or spawn further agents. Shared budgets are checked between model
+requests, so concurrent in-flight requests may exceed the threshold.
+
+Shell/MCP processes run as the current user, without an OS sandbox. File path
+checks prevent ordinary traversal/symlink mistakes and are not a boundary
+against a hostile process sharing that account. Transcript data is not globally
+secret-scrubbed. Reported key-redaction tests cover error output, not all possible
+model or tool content.
+
+The installable archive includes compiled dist/ and installs with development
+dependencies omitted and lifecycle scripts disabled. The inspected installed
+runtime tree contains zero `.node` native addons. Platform-specific lint binaries
+are development dependencies only. Runtime dependencies still download from npm.

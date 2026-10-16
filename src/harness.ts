@@ -1,7 +1,7 @@
 import { streamText, type LanguageModel, type ToolResultPart } from 'ai';
 import type { RuntimeConfig } from './config.js';
 import { SessionStore, repairInterrupted } from './session.js';
-import { ToolRegistry, type ToolCall } from './tools.js';
+import { ToolRegistry, type ToolCall, type RunBudget } from './tools.js';
 import { createModel } from './provider.js';
 import { safeError } from './errors.js';
 import { compactIfNeeded, estimatedTokens, systemPrompt } from './context.js';
@@ -20,10 +20,14 @@ export class Harness {
     readonly emit: (event: HarnessEvent) => void = () => {}, model?: LanguageModel) {
     this.model = model ?? createModel(config);
   }
-  async run(prompt: string, signal: AbortSignal): Promise<string> {
+  async run(prompt: string, signal: AbortSignal, sharedBudget?: RunBudget): Promise<string> {
     if (this.running) throw new Error('This harness already has an active run.');
     this.running = true;
     let text = '', spent = 0, measuredInput = 0;
+    const budget = sharedBudget ?? { spent: 0, limit: this.config.runTokenBudget };
+    this.tools.budget = budget;
+    const account = (tokens: number) => { spent += tokens; budget.spent += tokens; };
+    const exhausted = () => (this.config.runTokenBudget > 0 && spent >= this.config.runTokenBudget) || (budget.limit > 0 && budget.spent >= budget.limit);
     const session = this.store.session;
     try {
       signal.throwIfAborted();
@@ -32,11 +36,11 @@ export class Harness {
       await this.store.save();
       for (;;) {
         signal.throwIfAborted();
-        if (this.config.runTokenBudget && spent >= this.config.runTokenBudget) throw new Error('Run token budget reached. Resume with a new prompt or increase --run-token-budget.');
+        if (exhausted()) throw new Error('Run token budget reached. Resume with a new prompt or increase --run-token-budget.');
         const oldCount = session.compactions;
-        spent += await compactIfNeeded(this.store, this.config, this.model, system, signal, measuredInput);
+        account(await compactIfNeeded(this.store, this.config, this.model, system, signal, measuredInput));
         if (session.compactions !== oldCount) { measuredInput = 0; this.emit({ type: 'compaction', count: session.compactions }); }
-        if (this.config.runTokenBudget && spent >= this.config.runTokenBudget) throw new Error('Run token budget reached during compaction. Original history is archived; resume to continue.');
+        if (exhausted()) throw new Error('Run token budget reached during compaction. Original history is archived; resume to continue.');
         const result = streamText({
           model: this.model, system, messages: session.messages, tools: this.tools.schemas(),
           maxOutputTokens: this.config.maxOutputTokens, maxRetries: 2,
@@ -62,7 +66,7 @@ export class Harness {
         const input = usage.inputTokens ?? estimatedTokens(session.messages, system);
         const output = usage.outputTokens ?? Math.ceil(JSON.stringify(response.messages).length / 2);
         const tokens = usage.totalTokens ?? input + output;
-        spent += tokens; session.tokens += tokens; measuredInput = input;
+        account(tokens); session.tokens += tokens; measuredInput = input;
         this.emit({ type: 'usage', input, output, total: tokens });
         session.messages.push(...response.messages);
         text += stepText;
@@ -77,7 +81,7 @@ export class Harness {
       repairInterrupted(session.messages);
       await this.store.save();
       throw error;
-    } finally { this.running = false; }
+    } finally { this.running = false; this.tools.budget = undefined; }
   }
   private async executeBatch(calls: ToolCall[], signal: AbortSignal): Promise<{ denied: boolean }> {
     const content: ToolResultPart[] = [];

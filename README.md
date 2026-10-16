@@ -73,8 +73,11 @@ những yêu cầu này bị từ chối; dùng `--yes` khi chủ động cho ph
 loại bỏ write/edit/bash khỏi bộ tool. File tools chỉ truy cập workspace đã chọn;
 shell chạy với quyền tài khoản hiện tại, **không có sandbox hệ điều hành**.
 
-Trong chế độ tương tác: `/help`, `/exit`, Ctrl+C để huỷ tác vụ đang chạy.
-`--json` xuất NDJSON gồm session, text, tool, usage, compaction, done/error.
+Khi chạy `goon` trong terminal, TUI toàn màn hình hiện trạng thái tool/agent,
+token và ô nhập. Có `/help`, `/tools`, `/status`, `/exit`; phím lên/xuống gọi lại
+prompt, PgUp/PgDn cuộn, Ctrl+C huỷ lượt đang chạy, Ctrl+D thoát khi ô nhập trống.
+Dùng `--no-tui` để về readline; pipe, `-p`, `--json` và `TERM=dumb` dùng đầu ra thường.
+`--json` xuất NDJSON gồm session, text, tool, usage, compaction, subagent, done/error.
 Mã thoát: 0 thành công, 1 lỗi, 2 từ chối quyền, 130 Ctrl+C, 143 SIGTERM.
 
 ## Harness có gì
@@ -87,7 +90,8 @@ Mã thoát: 0 thành công, 1 lỗi, 2 từ chối quyền, 130 Ctrl+C, 143 SIGT
 - Lưu phiên atomic, lock tiến trình, resume theo workspace. Lượt tool dở dang
   được đánh dấu kết quả chưa rõ; không tự lặp lại side effect sau crash.
 - Edit/overwrite phải đọc file trước và kiểm tra revision để tránh ghi đè thay
-  đổi mới. Ghi file theo temporary file + rename, giữ mode của file cũ.
+  đổi mới. Ghi file theo temporary file + chmod + rename, giữ đúng mode file cũ dù
+  umask là `027`/`007`; file mới vẫn theo umask.
 - Compact context có archive đầy đủ trước khi thay lịch sử đang hoạt động.
   Đọc `AGENTS.md` tại gốc workspace, tối đa 24.000 ký tự.
 - Output tool giới hạn; shell có timeout, huỷ process group trên POSIX. Search
@@ -96,8 +100,63 @@ Mã thoát: 0 thành công, 1 lỗi, 2 từ chối quyền, 130 Ctrl+C, 143 SIGT
   prompt, ngữ cảnh và kết quả tool tới API bạn chọn. Transcript lưu những dữ liệu
   đó trên máy; không coi transcript là đã được rà soát toàn bộ bí mật.
 
-Đây là v0.1 dùng terminal readline, chưa phải bộ tính năng ngang ZCode/DSH.
-Chưa có MCP, subagent hoặc giao diện TUI toàn màn hình.
+## MCP
+
+Goon dùng MCP SDK chính thức, hỗ trợ **tools qua stdio và Streamable HTTP**.
+Tạo `~/.config/goon/mcp.json` (hoặc `$XDG_CONFIG_HOME/goon/mcp.json`):
+
+```json
+{
+  "servers": {
+    "remote": {
+      "transport": "http",
+      "url": "https://YOUR_MCP_HOST/mcp",
+      "bearerEnv": "MY_MCP_TOKEN",
+      "readOnlyTools": []
+    }
+  }
+}
+```
+
+Đặt token trong biến `MY_MCP_TOKEN`, rồi chạy:
+
+```bash
+goon mcp list    # xem cấu hình, không kết nối
+goon mcp check   # kết nối và in tên tool gốc/tên namespaced
+goon            # tự nạp các server đã bật
+goon --no-mcp    # bỏ qua MCP trong lượt này
+```
+
+Mỗi tool MCP mặc định cần duyệt quyền. Chỉ đưa tên tool gốc mà bạn tin là chỉ đọc
+vào `readOnlyTools` để bỏ bước duyệt và cho phép trong `--read-only`. Không tự tin
+`readOnlyHint` của server. Tên tool có namespace và hash để tránh trùng.
+Xem [docs/MCP.md](docs/MCP.md) cho stdio, biến môi trường, giới hạn và cấu hình mẫu.
+MCP hiện chỉ tích hợp tools; chưa có resources, prompts, OAuth hay SSE cũ.
+
+## Subagent
+
+Hai tool mới được bật mặc định:
+
+- `delegate_task`: chia tối đa bốn việc đọc/review, tối đa hai agent chạy đồng thời.
+- `delegate_edit`: chia tối đa bốn việc sửa, chạy tuần tự; duyệt cả yêu cầu giao
+  việc và từng thao tác ghi/shell của agent con. `--yes` cũng áp dụng cho agent con.
+
+```bash
+goon --read-only -p 'Dùng delegate_task để xem cấu trúc repo và tìm rủi ro trong test, rồi tổng hợp'
+goon -p 'Dùng delegate_edit để sửa lỗi trong src/files.ts và bổ sung regression test'
+goon --no-subagents -p 'Đọc repo và làm trực tiếp'
+```
+
+Agent con có context và transcript riêng, cùng model/workspace, không nhận toàn
+bộ hội thoại cha, không có MCP và không sinh thêm agent. Công cụ giao việc phải
+truyền đủ ngữ cảnh. Mỗi con có budget tối đa 30.000 token và cùng tiêu budget
+lượt chạy của cha; Ctrl+C huỷ và chờ tất cả agent đang chạy dọn phiên.
+Transcript nằm ở `$XDG_DATA_HOME/goon/subagents/PARENT_UUID/CHILD_UUID.json`.
+`--resume` hiện dùng cho phiên chính; transcript con giữ lại để kiểm tra bằng
+file hoặc mở qua `SessionStore` API. Token trong phiên chính chỉ tính request của
+cha; token của con nằm trong phiên con, còn budget lượt chạy và TUI tính cả hai.
+
+Đây là triển khai độc lập còn nhỏ, chưa tương đương toàn bộ ZCode/DSH.
 
 ## Cấu hình và dữ liệu
 
@@ -131,10 +190,13 @@ npm ci
 npm run typecheck
 npm run lint
 npm test
+(umask 027; node --test tests/*.test.mjs)
+(umask 007; node --test tests/*.test.mjs)
 npm run build
 npm install -g . --omit=dev
 ```
 
+Test pseudo-terminal cần Python 3 trên POSIX; bản cài Goon không cần Python.
 Không cần build monorepo tham khảo. Mã nguồn chia theo trách nhiệm:
 
 | File | Trách nhiệm |
@@ -145,11 +207,13 @@ Không cần build monorepo tham khảo. Mã nguồn chia theo trách nhiệm:
 | `src/files.ts`, `src/process.ts` | File và subprocess I/O |
 | `src/session.ts` | Lock, checkpoint, resume và sửa lịch sử bị ngắt |
 | `src/context.ts` | System prompt, AGENTS.md và compaction |
-| `src/cli.ts` | Flags, readline, NDJSON, vòng đời terminal |
+| `src/cli.ts`, `src/tui.ts` | Flags, TUI/readline, NDJSON, vòng đời terminal |
+| `src/mcp.ts` | MCP client, transport, schema, lifecycle |
+| `src/subagents.ts` | Context con, concurrency, budget và approval |
 
 Public API xuất `Harness`, `ToolRegistry`, `SessionStore` và kiểu liên quan.
 `ToolRegistry.register()` nhận schema Zod, cờ `readOnly` và hàm execute; trả về
-hàm gỡ đăng ký. Chưa có cơ chế tự tải plugin ngoài từ config.
+hàm gỡ đăng ký. MCP nạp theo config người dùng; không tự đọc cấu hình MCP từ repo.
 
 Xem [NOTICE.md](NOTICE.md) để biết nguồn tham khảo và commit đã đọc;
 [docs/VALIDATION.md](docs/VALIDATION.md) ghi kết quả và phạm vi đã kiểm chứng.
@@ -164,7 +228,8 @@ Repo vẫn giữ gói bootstrap `release/goon-cli-0.1.0.tgz`; dùng Releases đ�
 
 Mỗi lần push lên `main`, workflow `Check and release` sẽ:
 
-1. Chạy typecheck, lint và toàn bộ test trên Node 22.16 và 24.
+1. Chạy typecheck, lint và toàn bộ test trên Node 22.16 và 24, gồm umask
+   mặc định, `027` và `007`.
 2. Build gói npm, cài thử trong prefix riêng và kiểm tra phiên bản thực tế.
 3. Tạo tag `vX.Y.Z` và GitHub Release với gói `.tgz` cùng `SHA256SUMS.txt`.
 

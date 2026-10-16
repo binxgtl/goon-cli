@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { writeFile, readFile, symlink, stat } from 'node:fs/promises';
+import { writeFile, readFile, symlink, stat, chmod } from 'node:fs/promises';
 import { join } from 'node:path';
 import { WorkspaceFiles } from '../dist/files.js';
 import { runCommand } from '../dist/process.js';
@@ -10,6 +10,8 @@ test('existing files require a fresh read; edits preserve file mode', async t =>
   const f = await fixture(t), files = new WorkspaceFiles(f.cwd);
   const path = join(f.cwd, 'script.sh');
   await writeFile(path, 'first\n', { mode: 0o755 });
+  await chmod(path, 0o755);
+  assert.equal((await stat(path)).mode & 0o777, 0o755);
   await assert.rejects(files.write('script.sh', 'second'), /Read the current file/);
   await files.read('script.sh');
   await writeFile(path, 'changed elsewhere\n');
@@ -18,6 +20,32 @@ test('existing files require a fresh read; edits preserve file mode', async t =>
   await files.edit('script.sh', 'changed elsewhere', 'edited');
   assert.equal(await readFile(path, 'utf8'), 'edited\n');
   assert.equal((await stat(path)).mode & 0o777, 0o755);
+});
+
+test('edits preserve exact permissions under restrictive umasks; new files obey umask', async t => {
+  const f = await fixture(t);
+  for (const mask of [0o027, 0o007, 0o077]) {
+    const source = `
+      import { writeFile, chmod, stat } from 'node:fs/promises';
+      import { WorkspaceFiles } from ${JSON.stringify(new URL('../dist/files.js', import.meta.url).href)};
+      process.umask(${mask});
+      const files = new WorkspaceFiles(process.cwd());
+      for (const mode of [0o755, 0o640, 0o444]) {
+        await writeFile('existing', 'before');
+        await chmod('existing', mode);
+        await files.read('existing');
+        await files.edit('existing', 'before', 'after');
+        if (((await stat('existing')).mode & 0o777) !== mode) throw Error('mode lost');
+        await chmod('existing', 0o600);
+      }
+      await files.write('new-${mask}', 'new');
+      if (((await stat('new-${mask}')).mode & 0o777) !== (0o644 & ~${mask})) throw Error('new file ignores umask');
+    `;
+    const result = await runCommand(process.execPath, ['--input-type=module', '-e', source], {
+      cwd: f.cwd, signal: new AbortController().signal, timeoutMs: 5000,
+    });
+    assert.equal(result.code, 0, result.output);
+  }
 });
 
 test('workspace containment rejects ../ and symlink escapes including missing leaves', async t => {

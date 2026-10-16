@@ -52,10 +52,12 @@ export class WorkspaceFiles {
     const file = await this.path(path);
     if (Buffer.byteLength(content) > MAX_FILE_BYTES) throw new Error('Write exceeds 2 MiB.');
     let mode = 0o644;
+    let existing = false;
     try {
       const current = await this.text(file);
       if (this.revisions.get(file) !== this.digest(current)) throw new Error('Read the current file before overwriting; it is unread or has changed.');
       mode = (await stat(file)).mode & 0o777;
+      existing = true;
     } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
     await mkdir(dirname(file), { recursive: true });
     // Re-resolve after creating parents to reject a pre-existing symlink escape.
@@ -64,6 +66,9 @@ export class WorkspaceFiles {
     const handle = await open(temporary, 'wx', mode);
     try {
       await handle.writeFile(content, 'utf8');
+      // open(mode) is filtered by umask. Restore existing permissions exactly;
+      // new files should still obey the caller's umask.
+      if (existing) await handle.chmod(mode);
       await handle.sync();
       await handle.close();
       await rename(temporary, file);

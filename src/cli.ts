@@ -6,12 +6,16 @@ import { loadConfig, resolveRuntime, saveConfig, configPath, dataDir } from './c
 import { safeError } from './errors.js';
 import { VERSION } from './version.js';
 import type { HarnessEvent } from './harness.js';
+import type { SubagentEvent } from './subagents.js';
+import { terminalText as cleanTerminal, TerminalUI } from './tui.js';
+import type { McpManager } from './mcp.js';
 
 const HELP = `goon cli ${VERSION} — independent coding harness
 
 Usage: goon [options] [prompt]
        goon init --provider openai-compatible --base-url URL --model MODEL
        goon doctor | sessions
+       goon mcp list | check
 
 Options:
   -p, --prompt TEXT          Run one task (or pipe a prompt on stdin)
@@ -22,8 +26,11 @@ Options:
       --key-env NAME         Credential variable (default GOON_API_KEY)
       --resume ID|latest     Resume a saved session in this workspace
       --yes                 Approve file changes and shell commands automatically
-      --read-only           Expose only read/list/search tools
+      --read-only           Read tools and research agents; no writes or shell
       --json                Emit NDJSON events instead of terminal output
+      --no-tui              Use plain readline instead of the full-screen UI
+      --no-mcp              Disable configured MCP servers for this run
+      --no-subagents        Disable delegation tools for this run
       --context-window N    Actual model context window (default 128000)
       --max-output-tokens N  Per-request output limit (default 8192)
       --run-token-budget N   Run token budget (default 100000; 0 disables)
@@ -31,14 +38,10 @@ Options:
   -h, --help                Show help
   -v, --version             Show version
 
-Interactive commands: /help, /exit. Ctrl+C cancels the active run.
+Interactive commands: /help, /status, /tools, /exit. Ctrl+C cancels the active run.
 No Claude/Z.ai account login. API keys are read from environment variables.
 Shell commands run as your OS user; approvals are not an OS sandbox.
 `;
-// Terminal control bytes are data, never commands for the user's terminal.
-// oxlint-disable-next-line eslint/no-control-regex
-const cleanTerminal = (text: string) => text.replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, '');
-
 export async function main(argv = process.argv.slice(2)): Promise<void> {
   let apiKey: string | undefined;
   let jsonOutput = false;
@@ -49,6 +52,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       provider: { type: 'string' }, 'base-url': { type: 'string' }, model: { type: 'string' },
       'key-env': { type: 'string' }, resume: { type: 'string' }, yes: { type: 'boolean' },
       'read-only': { type: 'boolean' }, json: { type: 'boolean' },
+      'no-tui': { type: 'boolean' }, 'no-mcp': { type: 'boolean' }, 'no-subagents': { type: 'boolean' },
       'context-window': { type: 'string' }, 'max-output-tokens': { type: 'string' },
       'run-token-budget': { type: 'string' }, 'timeout-ms': { type: 'string' },
     } });
@@ -62,6 +66,23 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       if (typeof value === 'string') overrides[key] = ['contextWindow', 'maxOutputTokens', 'runTokenBudget', 'timeoutMs'].includes(key) ? Number(value) : value;
     }
     const config = await loadConfig(overrides);
+    if (positionals[0] === 'mcp') {
+      const { loadMcpConfig, mcpConfigPath, McpManager } = await import('./mcp.js');
+      const mcpConfig = await loadMcpConfig();
+      if (positionals[1] === 'list') {
+        stdout.write(JSON.stringify({ path: mcpConfigPath(), servers: Object.entries(mcpConfig.servers).map(([name, server]) =>
+          ({ name, transport: server.transport, disabled: server.disabled, readOnlyTools: server.readOnlyTools })) }, null, 2) + '\n');
+        return;
+      }
+      if (positionals[1] !== 'check') throw new Error('Usage: goon mcp list | check');
+      const manager = new McpManager(mcpConfig, resolve(values.cwd ?? '.'));
+      const controller = new AbortController();
+      const cancel = (signal: NodeJS.Signals) => { process.exitCode = signal === 'SIGTERM' ? 143 : 130; controller.abort(); };
+      process.on('SIGINT', cancel); process.on('SIGTERM', cancel);
+      try { stdout.write(JSON.stringify(await manager.connect(undefined, controller.signal), null, 2) + '\n'); }
+      finally { process.removeListener('SIGINT', cancel); process.removeListener('SIGTERM', cancel); await manager.close(); }
+      return;
+    }
     if (positionals[0] === 'init') {
       if (!config.model) throw new Error('Specify --model and optionally --base-url/--provider.');
       await saveConfig(config);
@@ -104,81 +125,110 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     apiKey = runtime.apiKey;
     const store = await SessionStore.open(join(runtime.dataDir, 'sessions'), runtime, values.resume);
     let rl: ReturnType<typeof createInterface> | undefined;
+    let tui: TerminalUI | undefined;
+    let manager: McpManager | undefined;
     let controller: AbortController | undefined;
-    let denied = false, exiting = false, terminating = false;
+    let denied = false, exiting = false, terminating = false, starting = true;
     const interactive = !prompt;
-    if (stdin.isTTY) rl = createInterface({ input: stdin, output: stderr, terminal: true });
-    const emit = (event: HarnessEvent) => {
-      if (event.type === 'stopped') denied = true;
-      if (jsonOutput) { stdout.write(JSON.stringify(event) + '\n'); return; }
-      if (event.type === 'text') stdout.write(cleanTerminal(event.text));
-      else if (event.type === 'tool' && event.state === 'start') stderr.write(`\n[${event.name}]\n`);
-      else if (event.type === 'compaction') stderr.write('\n[Context compacted; original history archived.]\n');
-      else if (event.type === 'stopped') stderr.write(`\n${event.reason}\n`);
-    };
-    const { ToolRegistry } = await import('./tools.js');
-    const tools = new ToolRegistry(runtime.cwd, async request => {
-      if (values.yes) return true;
-      if (!rl) return false;
-      const preview = cleanTerminal(JSON.stringify(request.input, null, 2).split(runtime.apiKey).join('[REDACTED]').slice(0, 1600));
-      const reply = await rl.question(`\nAllow ${request.tool}?\n${preview}\n[y/N] `, { signal: request.signal });
-      return /^(y|yes)$/i.test(reply.trim());
-    }, values['read-only'] === true);
-    const { Harness } = await import('./harness.js');
-    const harness = new Harness(runtime, store, tools, emit);
     const stop = () => {
+      if (starting) process.exitCode = 130;
       if (controller && !controller.signal.aborted) controller.abort(new Error('Cancelled by user.'));
-      else { exiting = true; rl?.close(); }
+      else { exiting = true; rl?.close(); tui?.close(); }
     };
     const terminate = () => {
       terminating = true; exiting = true;
       controller?.abort(new Error('Terminated.'));
-      rl?.close(); process.exitCode = 143;
+      rl?.close(); tui?.close(); process.exitCode = 143;
     };
-    process.on('SIGINT', stop);
-    process.on('SIGTERM', terminate);
-    rl?.on('SIGINT', stop);
-    if (jsonOutput) stdout.write(JSON.stringify({ type: 'session', id: store.session.id, cwd: runtime.cwd }) + '\n');
-    else stderr.write(`goon · ${runtime.model} · session ${store.session.id}\n`);
-    const run = async (input: string) => {
-      if (Buffer.byteLength(input) > 1024 * 1024) throw new Error('Prompt exceeds 1 MiB.');
-      denied = false;
-      controller = new AbortController();
-      try {
-        const text = await harness.run(input, controller.signal);
-        if (jsonOutput) stdout.write(JSON.stringify({ type: 'done', text, denied, sessionId: store.session.id }) + '\n');
-        else stdout.write('\n');
-        if (denied && !interactive) process.exitCode = 2;
-      } catch (error) {
-        if (!interactive) process.exitCode = controller.signal.aborted ? terminating ? 143 : 130 : 1;
-        const message = safeError(error, apiKey);
-        if (jsonOutput) stdout.write(JSON.stringify({ type: 'error', message }) + '\n');
-        else stderr.write(`\n${cleanTerminal(message)}\n`);
-      } finally { controller = undefined; }
-    };
+    process.on('SIGINT', stop); process.on('SIGTERM', terminate);
     try {
+      if (interactive && stdin.isTTY && stdout.isTTY && !jsonOutput && !values['no-tui'] && process.env.TERM !== 'dumb') {
+        tui = new TerminalUI(`${runtime.model} · ${store.session.id.slice(0, 8)}`, stop);
+      } else if (stdin.isTTY) rl = createInterface({ input: stdin, output: stderr, terminal: true });
+      rl?.on('SIGINT', stop);
+      const display = (text: string) => tui ? tui.write(text) : stderr.write(cleanTerminal(text));
+      const question = (label: string, signal?: AbortSignal, remember = false) => tui ? tui.question(label, signal, remember)
+        : rl ? rl.question(label, { signal }) : Promise.reject(new Error('Input requires a TTY.'));
+      const emit = (event: HarnessEvent | SubagentEvent) => {
+        if (event.type === 'stopped') denied = true;
+        if (jsonOutput) { stdout.write(JSON.stringify(event) + '\n'); return; }
+        if (tui) { tui.event(event); return; }
+        if (event.type === 'text') stdout.write(cleanTerminal(event.text));
+        else if (event.type === 'subagent' && !event.event) stderr.write(`\n[agent ${event.id.slice(0, 8)}: ${event.state}]\n`);
+        else if (event.type === 'tool' && event.state === 'start') stderr.write(`\n[${event.name}]\n`);
+        else if (event.type === 'compaction') stderr.write('\n[Context compacted; original history archived.]\n');
+        else if (event.type === 'stopped') stderr.write(`\n${event.reason}\n`);
+      };
+      const { ToolRegistry } = await import('./tools.js');
+      const tools = new ToolRegistry(runtime.cwd, async request => {
+        if (values.yes) return true;
+        if (!rl && !tui) return false;
+        const preview = cleanTerminal(JSON.stringify(request.input, null, 2).split(runtime.apiKey).join('[REDACTED]').slice(0, 1600));
+        display(`\nAllow ${request.tool}?\n${preview}\n`);
+        const reply = await question('[y/N] ', request.signal);
+        return /^(y|yes)$/i.test(reply.trim());
+      }, values['read-only'] === true);
+      if (!values['no-mcp']) {
+        const { loadMcpConfig, McpManager } = await import('./mcp.js');
+        controller = new AbortController();
+        tui?.setStatus('Connecting MCP');
+        manager = new McpManager(await loadMcpConfig(), runtime.cwd);
+        await manager.connect(tools, controller.signal);
+        controller = undefined;
+      }
+      if (!values['no-subagents']) {
+        const { Subagents } = await import('./subagents.js');
+        new Subagents(runtime, store, tools, emit).register();
+      }
+      const { Harness } = await import('./harness.js');
+      const harness = new Harness(runtime, store, tools, emit);
+      starting = false;
+      if (jsonOutput) stdout.write(JSON.stringify({ type: 'session', id: store.session.id, cwd: runtime.cwd }) + '\n');
+      else display(`goon · ${runtime.model} · session ${store.session.id}\n`);
+      const run = async (input: string) => {
+        if (Buffer.byteLength(input) > 1024 * 1024) throw new Error('Prompt exceeds 1 MiB.');
+        denied = false;
+        controller = new AbortController();
+        tui?.setStatus('Running');
+        if (tui) tui.write(`\n> ${input}\n`);
+        try {
+          const text = await harness.run(input, controller.signal);
+          if (jsonOutput) stdout.write(JSON.stringify({ type: 'done', text, denied, sessionId: store.session.id }) + '\n');
+          else if (tui) tui.write('\n'); else stdout.write('\n');
+          if (denied && !interactive) process.exitCode = 2;
+        } catch (error) {
+          if (!interactive) process.exitCode = controller.signal.aborted ? terminating ? 143 : 130 : 1;
+          const message = safeError(error, apiKey);
+          if (jsonOutput) stdout.write(JSON.stringify({ type: 'error', message }) + '\n');
+          else display(`\n${message}\n`);
+        } finally { controller = undefined; tui?.setStatus('Ready'); }
+      };
       if (prompt) await run(prompt);
       else {
-        if (!rl) throw new Error('Interactive mode requires a TTY.');
-        stderr.write('Type /help for commands.\n');
+        if (!rl && !tui) throw new Error('Interactive mode requires a TTY.');
+        display('Type /help for commands.\n');
+        tui?.setStatus('Ready');
         while (!exiting) {
           let input: string;
-          try { input = (await rl.question('\ngoon> ')).trim(); }
+          try { input = (await question(tui ? 'goon> ' : '\ngoon> ', undefined, true)).trim(); }
           catch { break; }
           if (!input) continue;
           if (['/exit', '/quit'].includes(input)) break;
-          if (input === '/help') { stderr.write('Enter a task. /exit quits. Ctrl+C cancels a run.\n'); continue; }
+          if (input === '/help') { display('Enter a task. /tools lists tools. /status shows session. /exit quits. Ctrl+C cancels; PgUp/PgDn scroll the TUI.\n'); continue; }
+          if (input === '/tools') { display(Object.keys(tools.schemas()).join('\n') + '\n'); continue; }
+          if (input === '/status') { display(`Session ${store.session.id}\nModel ${runtime.model}\nWorkspace ${runtime.cwd}\nSession tokens ${store.session.tokens}\nMCP tools ${manager?.tools.length ?? 0}\n`); continue; }
           await run(input);
         }
       }
     } finally {
       process.removeListener('SIGINT', stop); process.removeListener('SIGTERM', terminate);
-      rl?.close(); await store.close();
+      try { tui?.close(); rl?.close(); await manager?.close(); }
+      finally { await store.close(); }
     }
   } catch (error) {
     const message = cleanTerminal(safeError(error, apiKey));
     if (jsonOutput) stdout.write(JSON.stringify({ type: 'error', message }) + '\n');
     else stderr.write(`goon: ${message}\n`);
-    process.exitCode = 1;
+    if (process.exitCode !== 130 && process.exitCode !== 143) process.exitCode = 1;
   }
 }

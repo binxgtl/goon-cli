@@ -1,4 +1,5 @@
-import { tool, type ToolSet } from 'ai';
+import { tool, jsonSchema, type FlexibleSchema, type ToolSet } from 'ai';
+import { Ajv } from 'ajv';
 import { z } from 'zod';
 import { WorkspaceFiles, limitText } from './files.js';
 import { runCommand } from './process.js';
@@ -10,9 +11,17 @@ export interface ToolDefinition<Input = unknown> {
   description: string; schema: z.ZodType<Input>; readOnly: boolean;
   execute: (input: Input, signal: AbortSignal) => Promise<string>;
 }
+export interface RunBudget { spent: number; limit: number }
+export class PermissionDeniedError extends Error {}
+interface RegisteredTool {
+  description: string; schema: FlexibleSchema<unknown>; readOnly: boolean;
+  parse: (input: unknown) => unknown;
+  execute: (input: unknown, signal: AbortSignal) => Promise<string>;
+}
 export class ToolRegistry {
   readonly files: WorkspaceFiles;
-  private definitions = new Map<string, ToolDefinition>();
+  budget?: RunBudget;
+  private definitions = new Map<string, RegisteredTool>();
   constructor(readonly cwd: string, readonly approve: Approve, readonly readOnly = false) {
     this.files = new WorkspaceFiles(cwd);
     this.register('read_file', {
@@ -61,10 +70,21 @@ export class ToolRegistry {
     });
   }
   register<Input>(name: string, definition: ToolDefinition<Input>) {
+    return this.add(name, { ...definition, parse: input => definition.schema.parse(input),
+      execute: (input, signal) => definition.execute(definition.schema.parse(input), signal) });
+  }
+  registerJson(name: string, definition: Omit<ToolDefinition, 'schema'> & { schema: Record<string, unknown> }) {
+    const ajv = new Ajv({ strict: false, validateFormats: false });
+    const validate = ajv.compile(definition.schema);
+    const parse = (input: unknown) => {
+      if (!validate(input)) throw new Error(`Invalid arguments for ${name}: ${ajv.errorsText(validate.errors)}`);
+      return input;
+    };
+    return this.add(name, { ...definition, schema: jsonSchema(definition.schema), parse });
+  }
+  private add(name: string, definition: RegisteredTool) {
     if (!/^[a-z][a-z0-9_]*$/.test(name) || this.definitions.has(name)) throw new Error(`Invalid or duplicate tool: ${name}`);
-    this.definitions.set(name, { ...definition,
-      execute: (input, signal) => definition.execute(definition.schema.parse(input), signal),
-    });
+    this.definitions.set(name, definition);
     return () => this.definitions.delete(name);
   }
   schemas(): ToolSet {
@@ -76,11 +96,15 @@ export class ToolRegistry {
     signal.throwIfAborted();
     const definition = this.definitions.get(call.toolName);
     if (!definition || (this.readOnly && !definition.readOnly)) throw new Error(`Tool is not available: ${call.toolName}`);
-    const input = definition.schema.parse(call.input);
+    const input = definition.parse(call.input);
     if (!definition.readOnly && !await this.approve({ tool: call.toolName, input, signal })) {
       return { text: 'Permission denied by the user. Stop this run.', denied: true };
     }
     signal.throwIfAborted();
-    return { text: await definition.execute(input, signal) };
+    try { return { text: await definition.execute(input, signal) }; }
+    catch (error) {
+      if (error instanceof PermissionDeniedError) return { text: error.message, denied: true };
+      throw error;
+    }
   }
 }
