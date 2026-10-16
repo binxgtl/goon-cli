@@ -10,5 +10,7 @@ export type { Config, RuntimeConfig } from './config.js';
 export { McpManager, loadMcpConfig, mcpConfigSchema, mcpConfigPath, mcpToolName } from './mcp.js';
 export type { McpConfig } from './mcp.js';
 export { Subagents } from './subagents.js';
-export type { SubagentEvent } from './subagents.js';
+export type { SubagentEvent, SubagentProgress } from './subagents.js';
+export { AnswerProjection, visibleAnswer, lastAssistantAnswer } from './reasoning.js';
+export type { AnswerPart, InlineReasoning } from './reasoning.js';
 export { TerminalUI } from './tui.js';

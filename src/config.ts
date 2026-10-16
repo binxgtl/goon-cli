@@ -13,6 +13,8 @@ export const configSchema = z.object({
   maxOutputTokens: z.number().int().min(128).max(128_000).default(8192),
   timeoutMs: z.number().int().min(1000).max(1_800_000).default(300_000),
   runTokenBudget: z.number().int().min(0).default(100_000),
+  inlineReasoning: z.enum(['leading-think', 'off']).default('leading-think'),
+  showReasoning: z.boolean().default(false),
 }).strict();
 export type Config = z.infer<typeof configSchema>;
 export interface RuntimeConfig extends Config { cwd: string; apiKey: string; dataDir: string; baseUrl: string; model: string }
@@ -30,6 +32,7 @@ export async function loadConfig(overrides: Record<string, unknown> = {}): Promi
     provider: 'GOON_PROVIDER', baseUrl: 'GOON_BASE_URL', model: 'GOON_MODEL', keyEnv: 'GOON_KEY_ENV',
     contextWindow: 'GOON_CONTEXT_WINDOW', maxOutputTokens: 'GOON_MAX_OUTPUT_TOKENS',
     timeoutMs: 'GOON_TIMEOUT_MS', runTokenBudget: 'GOON_RUN_TOKEN_BUDGET',
+    inlineReasoning: 'GOON_INLINE_REASONING',
   })) {
     if (process.env[name] !== undefined) env[key] = ['contextWindow', 'maxOutputTokens', 'timeoutMs', 'runTokenBudget'].includes(key)
       ? Number(process.env[name]) : process.env[name];

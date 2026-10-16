@@ -31,6 +31,8 @@ Options:
       --no-tui              Use plain readline instead of the full-screen UI
       --no-mcp              Disable configured MCP servers for this run
       --no-subagents        Disable delegation tools for this run
+      --inline-reasoning MODE leading-think (default) | off
+      --show-reasoning      Separate reasoning events / labeled stderr output
       --context-window N    Actual model context window (default 128000)
       --max-output-tokens N  Per-request output limit (default 8192)
       --run-token-budget N   Run token budget (default 100000; 0 disables)
@@ -53,6 +55,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       'key-env': { type: 'string' }, resume: { type: 'string' }, yes: { type: 'boolean' },
       'read-only': { type: 'boolean' }, json: { type: 'boolean' },
       'no-tui': { type: 'boolean' }, 'no-mcp': { type: 'boolean' }, 'no-subagents': { type: 'boolean' },
+      'inline-reasoning': { type: 'string' }, 'show-reasoning': { type: 'boolean' },
       'context-window': { type: 'string' }, 'max-output-tokens': { type: 'string' },
       'run-token-budget': { type: 'string' }, 'timeout-ms': { type: 'string' },
     } });
@@ -61,10 +64,11 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     if (values.version) { stdout.write(`goon cli ${VERSION}\n`); return; }
     const overrides: Record<string, unknown> = {};
     for (const [flag, key] of Object.entries({ provider: 'provider', 'base-url': 'baseUrl', model: 'model', 'key-env': 'keyEnv',
-      'context-window': 'contextWindow', 'max-output-tokens': 'maxOutputTokens', 'run-token-budget': 'runTokenBudget', 'timeout-ms': 'timeoutMs' })) {
+      'context-window': 'contextWindow', 'max-output-tokens': 'maxOutputTokens', 'run-token-budget': 'runTokenBudget', 'timeout-ms': 'timeoutMs', 'inline-reasoning': 'inlineReasoning' })) {
       const value = values[flag as keyof typeof values];
       if (typeof value === 'string') overrides[key] = ['contextWindow', 'maxOutputTokens', 'runTokenBudget', 'timeoutMs'].includes(key) ? Number(value) : value;
     }
+    if (values['show-reasoning'] !== undefined) overrides.showReasoning = values['show-reasoning'];
     const config = await loadConfig(overrides);
     if (positionals[0] === 'mcp') {
       const { loadMcpConfig, mcpConfigPath, McpManager } = await import('./mcp.js');
@@ -149,12 +153,18 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       const display = (text: string) => tui ? tui.write(text) : stderr.write(cleanTerminal(text));
       const question = (label: string, signal?: AbortSignal, remember = false) => tui ? tui.question(label, signal, remember)
         : rl ? rl.question(label, { signal }) : Promise.reject(new Error('Input requires a TTY.'));
+      let reasoningSource: 'inline' | 'provider' | undefined;
       const emit = (event: HarnessEvent | SubagentEvent) => {
         if (event.type === 'stopped') denied = true;
         if (jsonOutput) { stdout.write(JSON.stringify(event) + '\n'); return; }
         if (tui) { tui.event(event); return; }
+        if (event.type === 'reasoning') {
+          if (reasoningSource !== event.source) stderr.write(`\n[reasoning · ${event.source}]\n`);
+          stderr.write(cleanTerminal(event.text)); reasoningSource = event.source; return;
+        }
+        if (reasoningSource) { stderr.write('\n'); reasoningSource = undefined; }
         if (event.type === 'text') stdout.write(cleanTerminal(event.text));
-        else if (event.type === 'subagent' && !event.event) stderr.write(`\n[agent ${event.id.slice(0, 8)}: ${event.state}]\n`);
+        else if (event.type === 'subagent' && event.state !== 'progress') stderr.write(`\n[agent ${event.id.slice(0, 8)}: ${event.state}]\n`);
         else if (event.type === 'tool' && event.state === 'start') stderr.write(`\n[${event.name}]\n`);
         else if (event.type === 'compaction') stderr.write('\n[Context compacted; original history archived.]\n');
         else if (event.type === 'stopped') stderr.write(`\n${event.reason}\n`);

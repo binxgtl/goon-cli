@@ -29,7 +29,7 @@ export async function provider(t, handler) {
   t.after(() => { server.closeAllConnections(); return new Promise(resolve => server.close(resolve)); });
   return { url: `http://127.0.0.1:${server.address().port}/v1`, requests, server };
 }
-export function sse(response, { text = '', calls = [], reasoning = '' } = {}) {
+export function sse(response, { text = '', calls = [], reasoning = '', textChunks, finishReason } = {}) {
   response.writeHead(200, { 'content-type': 'text/event-stream' });
   const chunk = delta => response.write(`data: ${JSON.stringify({ id: 'chatcmpl-test', object: 'chat.completion.chunk', created: 1, model: 'test-model', choices: [{ index: 0, delta, finish_reason: null }] })}\n\n`);
   chunk({ role: 'assistant' });
@@ -39,8 +39,8 @@ export function sse(response, { text = '', calls = [], reasoning = '' } = {}) {
     chunk({ tool_calls: [{ index, id: call.id, type: 'function', function: { name: call.name, arguments: args.slice(0, 3) } }] });
     chunk({ tool_calls: [{ index, function: { arguments: args.slice(3) } }] });
   }
-  if (text) { chunk({ content: text.slice(0, 2) }); chunk({ content: text.slice(2) }); }
-  response.write(`data: ${JSON.stringify({ id: 'chatcmpl-test', object: 'chat.completion.chunk', choices: [{ index: 0, delta: {}, finish_reason: calls.length ? 'tool_calls' : 'stop' }], usage: { prompt_tokens: 100, completion_tokens: 10, total_tokens: 110 } })}\n\n`);
+  for (const content of textChunks ?? (text ? [text.slice(0, 2), text.slice(2)] : [])) chunk({ content });
+  response.write(`data: ${JSON.stringify({ id: 'chatcmpl-test', object: 'chat.completion.chunk', choices: [{ index: 0, delta: {}, finish_reason: finishReason ?? (calls.length ? 'tool_calls' : 'stop') }], usage: { prompt_tokens: 100, completion_tokens: 10, total_tokens: 110 } })}\n\n`);
   response.end('data: [DONE]\n\n');
 }
 export function cli(f, url, args = [], options = {}) {

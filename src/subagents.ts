@@ -6,8 +6,13 @@ import { ToolRegistry, PermissionDeniedError, type RunBudget } from './tools.js'
 import type { RuntimeConfig } from './config.js';
 import { limitText } from './files.js';
 import { safeError } from './errors.js';
+import { lastAssistantAnswer } from './reasoning.js';
 
-export interface SubagentEvent { type: 'subagent'; id: string; task: string; state: 'start' | 'done' | 'error'; event?: HarnessEvent }
+export type SubagentProgress = Exclude<HarnessEvent, { type: 'text' | 'reasoning' }>;
+export type SubagentEvent =
+  | { type: 'subagent'; id: string; state: 'start'; task: string }
+  | { type: 'subagent'; id: string; state: 'progress'; event: SubagentProgress }
+  | { type: 'subagent'; id: string; state: 'done' | 'error' };
 const tasksSchema = z.object({ tasks: z.array(z.string().trim().min(1).max(16_000)).min(1).max(4) });
 // A single manager bounds concurrency across multiple model tool calls.
 export class Subagents {
@@ -42,12 +47,13 @@ export class Subagents {
   private async child(task: string, readOnly: boolean, signal: AbortSignal, budget: RunBudget): Promise<string> {
     await this.acquire(signal);
     let store: SessionStore | undefined, denied = false;
+    let report = '';
+    let failure: { error: unknown } | undefined;
     try {
       if (budget.limit && budget.spent >= budget.limit) throw new Error('Shared run token budget reached.');
       store = await SessionStore.open(join(this.config.dataDir, 'subagents', this.parent.session.id), this.config);
       const id = store.session.id;
-      const emit = (event?: HarnessEvent, state: SubagentEvent['state'] = 'start') => this.emit({ type: 'subagent', id, task, state, event });
-      emit();
+      this.emit({ type: 'subagent', id, task, state: 'start' });
       const tools = new ToolRegistry(this.config.cwd, async request => {
         const allowed = await this.registry.approve(request);
         denied ||= !allowed;
@@ -55,14 +61,25 @@ export class Subagents {
       }, readOnly || this.registry.readOnly);
       // No delegation tools are registered in children: depth is exactly one.
       const config = { ...this.config, runTokenBudget: Math.min(this.config.runTokenBudget || 30_000, 30_000) };
-      try {
-        const report = await new Harness(config, store, tools, event => emit(event)).run(
-          `You are a delegated agent. Complete this task and return a concise report with evidence. Do not ask other agents.\n\n${task}`, signal, budget);
-        if (denied) throw new PermissionDeniedError('Permission denied in a subagent. Stop this run.');
-        emit(undefined, 'done');
-        return `Session ${id}\nTask: ${task}\n${limitText(report, 12_000)}`;
-      } catch (error) { emit(undefined, 'error'); throw error; }
-    } finally { await store?.close(); this.release(); }
+      await new Harness(config, store, tools, event => {
+        // Parent progress is a control channel. The complete text/reasoning
+        // belongs to the child transcript, never a per-token parent mirror.
+        if (event.type !== 'text' && event.type !== 'reasoning') this.emit({ type: 'subagent', id, state: 'progress', event });
+      }).run(
+        `You are a delegated agent. Complete this task and return a concise report with evidence. Do not ask other agents.\n\n${task}`, signal, budget);
+      if (denied) throw new PermissionDeniedError('Permission denied in a subagent. Stop this run.');
+      report = `Session ${id}\nTask: ${task}\n${limitText(lastAssistantAnswer(store.session.messages, config.inlineReasoning), 12_000)}`;
+    } catch (error) { failure = { error }; }
+    try { await store?.close(); }
+    // Preserve a primary run/denial error if cleanup also fails; a successful
+    // run with failed cleanup must never announce done or return success.
+    catch (error) { failure ??= { error }; }
+    finally {
+      this.release();
+      if (store) this.emit({ type: 'subagent', id: store.session.id, state: failure ? 'error' : 'done' });
+    }
+    if (failure) throw failure.error;
+    return report;
   }
   private async run(tasks: string[], readOnly: boolean, signal: AbortSignal) {
     if (!readOnly && this.registry.readOnly) throw new Error('Writable subagents unavailable in read-only mode.');

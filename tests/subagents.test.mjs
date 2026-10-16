@@ -125,3 +125,69 @@ test('--no-subagents removes both delegation tools', async t => {
   const result = await cli(f, p.url, ['--no-subagents', '--read-only', '-p', 'inspect']).done;
   assert.equal(result.code, 0, result.stderr);
 });
+
+test('JSON child progress is independent of text token count and carries task only once', async t => {
+  const f = await fixture(t);
+  const tasks = ['alpha', 'beta'].map(name => `Inspect ${name}: ${'context '.repeat(150)}`.trim());
+  const p = await provider(t, (body, response) => {
+    if (isChild(body)) {
+      if (!body.messages.some(m => m.role === 'tool')) return sse(response, {
+        reasoning: 'native child reasoning', textChunks: [...'PREAMBLE'.repeat(100)],
+        calls: [{ id: 'child-list', name: 'list_files', input: {} }],
+      });
+      return sse(response, { reasoning: 'more native reasoning', textChunks: [...'<think>child private</think>FINAL_REPORT'] });
+    }
+    if (!body.messages.some(m => m.role === 'tool')) return sse(response, { calls: [{ id: 'delegate-many', name: 'delegate_task', input: { tasks } }] });
+    assert(!body.messages.at(-1).content.includes('PREAMBLE'));
+    assert(!body.messages.at(-1).content.includes('child private'));
+    assert.equal(body.messages.at(-1).content.split('FINAL_REPORT').length - 1, 2);
+    return sse(response, { text: 'Reports combined.' });
+  });
+  const result = await cli(f, p.url, ['--show-reasoning', '--read-only', '--json', '-p', 'delegate']).done;
+  assert.equal(result.code, 0, result.stdout + result.stderr);
+  const events = result.stdout.trim().split('\n').map(JSON.parse);
+  const children = events.filter(e => e.type === 'subagent');
+  assert.equal(children.length, 12, 'two children: start, two usages, two tool states, terminal; no token mirrors');
+  assert(!JSON.stringify(children).includes('PREAMBLE'));
+  assert(!JSON.stringify(children).includes('child private'));
+  const ids = [...new Set(children.map(e => e.id))]; assert.equal(ids.length, 2);
+  for (const id of ids) {
+    const own = children.filter(e => e.id === id);
+    assert.deepEqual(own.map(e => e.state), ['start', 'progress', 'progress', 'progress', 'progress', 'done']);
+    assert(tasks.includes(own[0].task));
+    assert(own.slice(1).every(e => !('task' in e)));
+    assert.deepEqual(own.filter(e => e.state === 'progress').map(e => e.event.type), ['usage', 'tool', 'tool', 'usage']);
+    const root = join(f.data, 'goon/subagents', events[0].id);
+    const transcript = await readFile(join(root, `${id}.json`), 'utf8');
+    assert(transcript.includes('PREAMBLE')); assert(transcript.includes('child private'));
+  }
+});
+
+test('terminal child event follows lock release, including cleanup failures; capacity is reclaimed', async t => {
+  const { existsSync } = await import('node:fs');
+  const f = await fixture(t), events = [];
+  const p = await provider(t, (body, response) => {
+    if (isChild(body)) return sse(response, { text: 'child report' });
+    if (!body.messages.some(m => m.role === 'tool')) return sse(response, { calls: [{ id: 'four', name: 'delegate_task', input: { tasks: ['one', 'two', 'three', 'four'] } }] });
+    return sse(response, { text: 'handled child failures' });
+  });
+  const config = configFor(f, p), store = await SessionStore.open(join(f.data, 'sessions'), config);
+  t.after(() => store.close());
+  const originalClose = SessionStore.prototype.close;
+  let failures = 0;
+  SessionStore.prototype.close = async function () {
+    await originalClose.call(this);
+    if (this.root.includes('/subagents/') && failures++ < 2) throw new Error('injected close failure');
+  };
+  t.after(() => { SessionStore.prototype.close = originalClose; });
+  const tools = new ToolRegistry(f.cwd, async () => true);
+  new Subagents(config, store, tools, event => {
+    events.push(event);
+    if (event.state === 'done' || event.state === 'error') assert(!existsSync(join(config.dataDir, 'subagents', store.session.id, `${event.id}.lock`)));
+  }).register();
+  const result = await new Harness(config, store, tools).run('four tasks', AbortSignal.timeout(3000));
+  assert.equal(result, 'handled child failures');
+  assert.equal(events.filter(e => e.state === 'start').length, 4);
+  assert.equal(events.filter(e => e.state === 'error').length, 2);
+  assert.equal(events.filter(e => e.state === 'done').length, 2);
+});

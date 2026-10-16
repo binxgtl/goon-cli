@@ -1,4 +1,4 @@
-# Validation — 0.2.0
+# Validation — 0.2.1
 
 Executed on Linux x64, Node.js 24.19.0, 2026-10-16.
 
@@ -11,19 +11,39 @@ It missed a real bug: open(mode) and writeFile({mode}) both apply umask. Under
 
 | Command / environment | Result |
 |---|---|
-| `npm test` | 46 passed, 0 failed, 0 skipped |
-| `(umask 027; node --test tests/*.test.mjs)` | 46 passed, 0 failed, 0 skipped |
-| `(umask 007; node --test tests/*.test.mjs)` | 46 passed, 0 failed, 0 skipped |
+| `npm test` | 67 passed, 0 failed, 0 skipped |
+| `(umask 027; node --test tests/*.test.mjs)` | 67 passed, 0 failed, 0 skipped |
+| `(umask 007; node --test tests/*.test.mjs)` | 67 passed, 0 failed, 0 skipped |
 | `npm run typecheck` | Passed, strict TypeScript |
 | `npm run lint` | Passed, no warnings |
 | `npm run release:pack` | Built, packed, installed in isolated prefix, executable/help/version passed |
-| Runtime/MCP/subagent/TUI tests with CLI entrypoint from the installed archive | 26 passed, 0 failed, 0 skipped |
+| Runtime/MCP/subagent/TUI/reasoning tests with CLI entrypoint from the installed archive | 46 passed, 0 failed, 0 skipped |
 
 File tests now establish 0755 with an explicit chmod after fixture creation.
 A regression test launches separate Node processes with umasks 027, 007 and 077,
 edits existing files at modes 0755, 0640 and 0444, and checks exact permissions.
 It separately checks that new files obey the process umask. Runtime writes
 chmod the temporary file for existing files before fsync/rename.
+
+## Stream/subagent dogfood regressions
+
+The user's 0.2.0 dogfood report found child event spam and inline think text
+being shown as an answer. A before/after comparison of the released executable
+and the fix (two children, 256 one-character text deltas each, 150-word contexts)
+measured **518 → 6** parent subagent events, **689109 → 3037** NDJSON bytes and
+**518 → 2** copies of task. This is a controlled mock-provider fixture.
+
+A separate tool-bearing regression asserts exactly twelve child events for two
+children, regardless of narration length, with final-report-only delivery and
+complete original child messages retained. Cleanup fault injection verifies
+error terminals, lock-release ordering and slot reuse. The reasoning suite tests
+every marker split position, nested/multiple/unclosed blocks, code literals,
+explicit extraction-off and opt-in rendering, unchanged tool/resume history,
+Anthropic signature replay, reasoning-only failure, truncation and cancellation.
+Compaction tests accept only the visible summary before replacing history.
+
+See [REFERENCE_REVIEW.md](REFERENCE_REVIEW.md) for pinned upstream sources,
+adopted contracts, NDJSON migration and remaining implementation boundaries.
 
 ## Integration coverage
 
@@ -42,7 +62,8 @@ subprocesses and session stores. No paid model request was made.
   paginated discovery, local argument validation, bearer/env mapping, refusal
   to inherit the provider key, explicit read-only allowlists, ignoring remote
   readOnlyHint for permissions, isError propagation, cancellation, timeout,
-  credential redaction, unregister/close and CLI startup-failure lock cleanup and SIGTERM during MCP initialization
+  credential redaction, unregister/close and CLI startup-failure lock cleanup and
+  SIGTERM during MCP initialization
   preserving exit code 143 while killing the server and releasing the session.
 - Subagents run through the real provider/harness loop: isolated context,
   read-only child tool surfaces, maximum two concurrent research workers,

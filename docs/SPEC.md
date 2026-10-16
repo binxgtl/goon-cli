@@ -46,6 +46,16 @@ tools and persistence. No ZCode runtime source is copied or loaded.
   cleanup. It is enabled only for interactive TTYs; --no-tui, TERM=dumb, prompt
   mode and JSON retain plain output. Terminal controls in model/tool data are
   stripped. No native UI dependency is required.
+- AnswerProjection owns display compatibility for leading think blocks. It never
+  mutates SDK response messages or signed provider replay metadata. Extraction
+  is incremental across chunk boundaries, ends once visible answer text starts,
+  and can be disabled. Reasoning is opt-in on a separate event/display channel.
+  Compaction uses the visible summary and refuses reasoning-only output.
+- Child start/progress/terminal events form a discriminated union. Only start
+  includes task; progress excludes text/reasoning. Child reports select the last
+  non-empty visible assistant answer. Terminal publication follows session close,
+  and capacity is released on cleanup failures as well as successful runs.
+  See REFERENCE_REVIEW.md for exact source references and NDJSON migration.
 
 ## Acceptance
 

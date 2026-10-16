@@ -37,6 +37,8 @@ export class TerminalUI {
   private historyIndex = 0;
   private remember = false;
   private toolStates = new Map<string, string>();
+  private outputChannel?: 'text' | 'reasoning';
+  private reasoningSource?: 'inline' | 'provider';
   constructor(readonly title: string, readonly cancel: () => void,
     readonly source: ReadStream = process.stdin, readonly target: WriteStream = process.stdout) {
     this.oldRaw = source.isRaw;
@@ -50,11 +52,17 @@ export class TerminalUI {
   }
   event(event: HarnessEvent | SubagentEvent) {
     if (event.type === 'subagent') {
-      if (event.event?.type === 'usage') this.tokens += event.event.total;
+      if (event.state === 'progress' && event.event.type === 'usage') this.tokens += event.event.total;
       const key = `agent:${event.id}`;
-      this.toolStates.set(key, `agent ${event.id.slice(0, 8)}: ${event.state}`);
-      if (event.state === 'start' && !event.event) this.write(`\n[agent ${event.id.slice(0, 8)}] ${event.task.slice(0, 160)}\n`);
-    } else if (event.type === 'text') this.write(event.text);
+      const state = event.state === 'progress' ? event.event.type === 'tool' ? `${event.event.name}: ${event.event.state}` : 'running' : event.state;
+      this.toolStates.set(key, `agent ${event.id.slice(0, 8)}: ${state}`);
+      if (event.state === 'start') this.write(`\n[agent ${event.id.slice(0, 8)}] ${event.task.slice(0, 160)}\n`);
+    } else if (event.type === 'text' || event.type === 'reasoning') {
+      if (event.type === 'reasoning' && (this.outputChannel !== 'reasoning' || this.reasoningSource !== event.source)) this.write(`\n[reasoning · ${event.source}]\n`);
+      else if (event.type === 'text' && this.outputChannel === 'reasoning') this.write('\n[answer]\n');
+      if (event.type === 'reasoning') this.reasoningSource = event.source;
+      this.outputChannel = event.type; this.write(event.text);
+    }
     else if (event.type === 'tool') {
       this.toolStates.set(event.id, `${event.name}: ${event.state}`);
     } else if (event.type === 'usage') this.tokens += event.total;
@@ -63,7 +71,7 @@ export class TerminalUI {
     while (this.toolStates.size > 6) this.toolStates.delete(this.toolStates.keys().next().value!);
     this.schedule();
   }
-  setStatus(status: string) { this.status = status; this.schedule(); }
+  setStatus(status: string) { this.status = status; if (status === 'Running') this.outputChannel = undefined; this.schedule(); }
   question(label = 'goon> ', signal?: AbortSignal, remember = false): Promise<string> {
     if (this.closed) return Promise.reject(new Error('Terminal closed.'));
     if (this.pending) return Promise.reject(new Error('A terminal question is already active.'));

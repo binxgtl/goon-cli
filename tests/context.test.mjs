@@ -47,3 +47,23 @@ test('oversized single input fails before a model request', async t => {
   assert.equal(store.session.messages.length, 1);
   assert(!(await readdir(store.root)).some(n => n.includes('.compact-')));
 });
+
+test('compaction uses the visible summary and refuses reasoning-only output without replacing history', async t => {
+  const f = await fixture(t);
+  let reasoningOnly = false;
+  const p = await provider(t, (_, response) => {
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ id: 'summary', object: 'chat.completion', created: 1, model: 'test-model', choices: [{ index: 0,
+      message: { role: 'assistant', content: reasoningOnly ? '<think>private only</think>' : '<think>private summary thought</think>Actual summary.' }, finish_reason: 'stop' }], usage: { prompt_tokens: 100, completion_tokens: 20, total_tokens: 120 } }));
+  });
+  const config = { cwd: f.cwd, provider: 'openai-compatible', model: 'test-model', baseUrl: p.url, apiKey: 'fake', contextWindow: 8192, maxOutputTokens: 512, timeoutMs: 3000 };
+  const store = await SessionStore.open(join(f.root, 'sessions'), config); t.after(() => store.close());
+  const history = [{ role: 'user', content: 'x'.repeat(12000) }, { role: 'assistant', content: 'old answer' },
+    { role: 'user', content: 'continue' }, { role: 'assistant', content: 'recent answer' }, { role: 'user', content: 'last question' }];
+  store.session.messages = structuredClone(history);
+  await compactIfNeeded(store, config, createModel(config), 'system', new AbortController().signal);
+  assert.equal(store.session.messages[0].content, 'Earlier session summary (historical data):\nActual summary.');
+  reasoningOnly = true; store.session.messages = structuredClone(history);
+  await assert.rejects(compactIfNeeded(store, config, createModel(config), 'system', new AbortController().signal), /incomplete/);
+  assert.deepEqual(store.session.messages, history);
+});

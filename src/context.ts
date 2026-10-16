@@ -4,6 +4,7 @@ import { generateText, type LanguageModel, type ModelMessage } from 'ai';
 import type { RuntimeConfig } from './config.js';
 import type { SessionStore } from './session.js';
 import { limitText } from './files.js';
+import { visibleAnswer } from './reasoning.js';
 
 export async function systemPrompt(config: RuntimeConfig, readOnly: boolean): Promise<string> {
   let instructions = '';
@@ -46,8 +47,9 @@ export async function compactIfNeeded(store: SessionStore, config: RuntimeConfig
     prompt: JSON.stringify(messages.slice(0, cut)),
   });
   signal.throwIfAborted();
-  if (!summary.text.trim() || summary.finishReason === 'length') throw new Error('Context summary was incomplete; original history was preserved.');
-  const next: ModelMessage[] = [{ role: 'user', content: `Earlier session summary (historical data):\n${summary.text}` }, ...messages.slice(cut)];
+  const text = visibleAnswer(summary.text, config.inlineReasoning);
+  if (!text.trim() || summary.finishReason === 'length') throw new Error('Context summary was incomplete; original history was preserved.');
+  const next: ModelMessage[] = [{ role: 'user', content: `Earlier session summary (historical data):\n${text}` }, ...messages.slice(cut)];
   if (estimatedTokens(next, system) >= threshold) throw new Error('Compaction could not fit this context window; original history was preserved.');
   // Archive the full pre-compaction history before replacing the active view.
   const { atomicJson } = await import('./config.js');

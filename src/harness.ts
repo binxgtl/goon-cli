@@ -5,9 +5,11 @@ import { ToolRegistry, type ToolCall, type RunBudget } from './tools.js';
 import { createModel } from './provider.js';
 import { safeError } from './errors.js';
 import { compactIfNeeded, estimatedTokens, systemPrompt } from './context.js';
+import { AnswerProjection, type AnswerPart } from './reasoning.js';
 
 export type HarnessEvent =
   | { type: 'text'; text: string }
+  | { type: 'reasoning'; text: string; source: 'inline' | 'provider' }
   | { type: 'tool'; name: string; id: string; state: 'start' | 'done' | 'error' }
   | { type: 'usage'; input: number; output: number; total: number }
   | { type: 'compaction'; count: number }
@@ -50,15 +52,28 @@ export class Harness {
           onError: () => {},
         });
         let stepText = '';
+        const projection = new AnswerProjection(this.config.inlineReasoning);
+        let sawReasoning = false;
+        const present = (parts: AnswerPart[]) => {
+          for (const part of parts) {
+            if (part.type === 'text') { stepText += part.text; this.emit({ type: 'text', text: part.text }); }
+            else if (this.config.showReasoning) this.emit({ ...part, type: 'reasoning', source: 'inline' });
+          }
+        };
         for await (const event of result.fullStream) {
           if (event.type === 'error') throw event.error;
           if (event.type === 'abort') throw new Error('Model request cancelled or timed out.');
-          if (event.type === 'text-delta') { stepText += event.text; this.emit({ type: 'text', text: event.text }); }
+          if (event.type === 'text-delta') present(projection.push(event.text));
+          if (event.type === 'reasoning-delta') {
+            sawReasoning = true;
+            if (this.config.showReasoning) this.emit({ type: 'reasoning', text: event.text, source: 'provider' });
+          }
         }
         signal.throwIfAborted();
         const finish = await result.finishReason;
         if (finish === 'length') throw new Error('Model response hit the output limit. No tools from this response were executed; increase --max-output-tokens.');
         if (['error', 'content-filter', 'other', 'unknown'].includes(finish)) throw new Error(`Model stopped unexpectedly (${finish}).`);
+        present(projection.finish());
         const response = await result.response;
         const calls: ToolCall[] = (await result.toolCalls).map(c => ({ toolCallId: c.toolCallId, toolName: c.toolName, input: c.input }));
         if (calls.length > 32 || new Set(calls.map(c => c.toolCallId)).size !== calls.length) throw new Error('Invalid or excessive tool call batch. No tools executed.');
@@ -71,6 +86,7 @@ export class Harness {
         session.messages.push(...response.messages);
         text += stepText;
         await this.store.save(); // Persist tool declarations before any side effect.
+        if (!calls.length && !stepText.trim() && (sawReasoning || projection.sawReasoning)) throw new Error('Model returned reasoning without a visible answer.');
         if (!calls.length) return text;
         const outcome = await this.executeBatch(calls, signal);
         if (outcome.denied) { this.emit({ type: 'stopped', reason: 'Permission denied.' }); return text; }

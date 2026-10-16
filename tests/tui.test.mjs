@@ -38,7 +38,8 @@ test('TUI cancels approvals, handles Ctrl+C and redraws at narrow terminal sizes
   tty.key('', 'c', { ctrl: true }); assert.equal(tty.cancelled, 1);
   tty.ui.event({ type: 'text', text: 'hello\nworld\x1b[2J' });
   tty.ui.event({ type: 'tool', name: 'read_file', id: 'one', state: 'start' });
-  tty.ui.event({ type: 'subagent', id: 'child', task: 'Inspect', state: 'start', event: { type: 'usage', total: 15 } });
+  tty.ui.event({ type: 'subagent', id: 'child', task: 'Inspect', state: 'start' });
+  tty.ui.event({ type: 'subagent', id: 'child', state: 'progress', event: { type: 'usage', total: 15 } });
   tty.output.columns = 4; tty.output.rows = 8; tty.output.emit('resize');
   const prompt = tty.ui.question(); tty.key('abc', undefined);
   await new Promise(resolve => setTimeout(resolve, 40));
@@ -74,4 +75,23 @@ test('real TUI pseudo-terminal handles status, resize, approval and clean exit',
   assert.deepEqual(JSON.parse(stdout), { code: 0, entered: true, restored: true, canonical: true });
   assert.equal(await readFile(join(f.cwd, 'ui.txt'), 'utf8'), 'approved from TUI');
   assert(!(await readdir(join(f.data, 'goon/sessions'))).some(n => n.endsWith('.lock')));
+});
+
+test('TUI separates opt-in reasoning from answers and consumes compact child progress', async t => {
+  const tty = terminal(t); tty.output.columns = 100; tty.output.rows = 24;
+  tty.ui.event({ type: 'reasoning', source: 'provider', text: 'native detail' });
+  tty.ui.event({ type: 'reasoning', source: 'inline', text: 'thinking ' });
+  tty.ui.event({ type: 'reasoning', source: 'inline', text: 'detail' });
+  tty.ui.event({ type: 'text', text: 'Visible answer.' });
+  tty.ui.event({ type: 'subagent', id: 'child123', state: 'start', task: 'Inspect one file' });
+  tty.ui.event({ type: 'subagent', id: 'child123', state: 'progress', event: { type: 'usage', input: 10, output: 5, total: 15 } });
+  tty.ui.event({ type: 'subagent', id: 'child123', state: 'progress', event: { type: 'tool', name: 'read_file', id: 'r1', state: 'done' } });
+  tty.ui.event({ type: 'subagent', id: 'child123', state: 'done' });
+  await new Promise(resolve => setTimeout(resolve, 40));
+  const frame = tty.written.split('\x1b[H\x1b[2J').at(-1);
+  assert.equal(frame.split('[reasoning · inline]').length - 1, 1);
+  assert.equal(frame.split('[reasoning · provider]').length - 1, 1);
+  assert.match(frame, /\[answer\]/); assert.match(frame, /Visible answer/);
+  assert.match(frame, /agent child123: done/); assert.match(frame, /15 tokens/);
+  assert.equal(frame.split('Inspect one file').length - 1, 1);
 });

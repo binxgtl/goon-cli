@@ -78,6 +78,7 @@ token và ô nhập. Có `/help`, `/tools`, `/status`, `/exit`; phím lên/xuố
 prompt, PgUp/PgDn cuộn, Ctrl+C huỷ lượt đang chạy, Ctrl+D thoát khi ô nhập trống.
 Dùng `--no-tui` để về readline; pipe, `-p`, `--json` và `TERM=dumb` dùng đầu ra thường.
 `--json` xuất NDJSON gồm session, text, tool, usage, compaction, subagent, done/error.
+Reasoning chỉ xuất qua event riêng khi bật `--show-reasoning`.
 Mã thoát: 0 thành công, 1 lỗi, 2 từ chối quyền, 130 Ctrl+C, 143 SIGTERM.
 
 ## Harness có gì
@@ -99,6 +100,25 @@ Mã thoát: 0 thành công, 1 lỗi, 2 từ chối quyền, 130 Ctrl+C, 143 SIGT
 - Không có telemetry hoặc tự cập nhật do Goon triển khai. Request model vẫn gửi
   prompt, ngữ cảnh và kết quả tool tới API bạn chọn. Transcript lưu những dữ liệu
   đó trên máy; không coi transcript là đã được rà soát toàn bộ bí mật.
+
+## Reasoning và gateway inline think
+
+Mặc định ẩn reasoning khỏi câu trả lời. Gateway trả `<think>...</think>` ở đầu
+content được xử lý ngay khi stream, kể cả thẻ bị cắt giữa nhiều chunk. Chỉ phần
+answer đi vào text/done và report của agent con. Native reasoning, signature và
+provider metadata trong transcript gốc vẫn giữ nguyên để tool roundtrip/resume.
+
+```bash
+goon --show-reasoning --json -p 'Kiểm tra dự án'  # event reasoning riêng
+goon --show-reasoning -p 'Kiểm tra dự án'         # stderr/TUI có nhãn reasoning
+goon --inline-reasoning off -p 'Trả tài liệu XML bắt đầu bằng <think>'
+```
+
+Chính sách `leading-think` chỉ nhận các block liên tiếp ở đầu câu trả lời; sau
+khi answer bắt đầu, thẻ xuất hiện trong văn bản/code được giữ nguyên. Đây là
+quy tắc tương thích định dạng, không nhận diện mọi kiểu reasoning hay xoá bí mật
+khỏi transcript. `--inline-reasoning off` tắt nhận diện; có thể lưu
+`inlineReasoning` trong config hoặc đặt `GOON_INLINE_REASONING`.
 
 ## MCP
 
@@ -155,6 +175,11 @@ Transcript nằm ở `$XDG_DATA_HOME/goon/subagents/PARENT_UUID/CHILD_UUID.json`
 `--resume` hiện dùng cho phiên chính; transcript con giữ lại để kiểm tra bằng
 file hoặc mở qua `SessionStore` API. Token trong phiên chính chỉ tính request của
 cha; token của con nằm trong phiên con, còn budget lượt chạy và TUI tính cả hai.
+Report lấy câu trả lời assistant có nội dung cuối cùng, không gom lời dẫn trước
+tool. NDJSON tách `start` (có task), `progress` (tool/usage/compaction/stopped) và
+`done/error` (sau bước dọn phiên; lỗi dọn phiên không được báo done). Không mirror
+token text/reasoning của con sang
+cha. [Hợp đồng event và phần tham khảo sâu](docs/REFERENCE_REVIEW.md).
 
 Đây là triển khai độc lập còn nhỏ, chưa tương đương toàn bộ ZCode/DSH.
 
@@ -168,7 +193,7 @@ cha; token của con nằm trong phiên con, còn budget lượt chạy và TUI 
 
 Các biến: `GOON_PROVIDER`, `GOON_BASE_URL`, `GOON_MODEL`, `GOON_KEY_ENV`,
 `GOON_CONTEXT_WINDOW`, `GOON_MAX_OUTPUT_TOKENS`, `GOON_TIMEOUT_MS`,
-`GOON_RUN_TOKEN_BUDGET`.
+`GOON_RUN_TOKEN_BUDGET`, `GOON_INLINE_REASONING`.
 
 Context mặc định 128.000 token, output 8.192, thời hạn request 300.000 ms,
 budget mỗi tác vụ 100.000 token. Đặt context/output theo model thực tế:
@@ -210,6 +235,7 @@ Không cần build monorepo tham khảo. Mã nguồn chia theo trách nhiệm:
 | `src/cli.ts`, `src/tui.ts` | Flags, TUI/readline, NDJSON, vòng đời terminal |
 | `src/mcp.ts` | MCP client, transport, schema, lifecycle |
 | `src/subagents.ts` | Context con, concurrency, budget và approval |
+| `src/reasoning.ts` | Projection answer/reasoning, giữ transcript gốc |
 
 Public API xuất `Harness`, `ToolRegistry`, `SessionStore` và kiểu liên quan.
 `ToolRegistry.register()` nhận schema Zod, cờ `readOnly` và hàm execute; trả về

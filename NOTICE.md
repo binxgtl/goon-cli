@@ -18,3 +18,8 @@ Design references inspected for version 0.1.0:
 Goon uses the Vercel AI SDK and its provider adapters for protocol handling.
 Dependencies retain their own licenses in their installed package directories.
 The implementation and build process use no official Claude Code binary.
+
+A deeper stream/subagent review for 0.2.1 rechecked ZCode at the same commit
+and DeepSeek Harness at `1517a4dbca0a2789ff1d41ba439600f8547d23fa`.
+See [docs/REFERENCE_REVIEW.md](docs/REFERENCE_REVIEW.md) for exact source links,
+contracts adopted, independent compatibility choices and remaining scope.
