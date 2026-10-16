@@ -1,0 +1,164 @@
+# goon cli
+
+CLI coding agent độc lập, ưu tiên Termux, dùng API của bạn. Tham khảo kiến trúc
+ZCode và DeepSeek Harness; **không fork base và không dùng runtime của hai dự án**.
+
+## Cài trên Termux
+
+Clone repo và cài gói npm đã build sẵn:
+
+```bash
+pkg install nodejs-lts git bash ripgrep
+node --version
+git clone https://github.com/binxgtl/goon-cli.git
+cd goon-cli
+npm install -g ./release/goon-cli-0.1.0.tgz --omit=dev
+goon --version
+```
+
+Cần Node **22.16 trở lên**; Node 24 cũng được. Nếu `nodejs-lts` của môi trường
+hiện tại thấp hơn, dùng gói `nodejs` đáp ứng phiên bản này. Bản npm đã chứa JS
+biên dịch sẵn; không cần compiler, pnpm, proot, glibc hay addon native. Thiếu
+`ripgrep` vẫn có search JavaScript dự phòng giới hạn kích thước.
+
+Runtime dependencies được tải từ npm khi cài; gói này không kèm `node_modules`.
+Hãy làm việc trong `$HOME` của Termux để có đầy đủ quyền file và executable bit.
+
+## API ngoài, không đăng nhập tài khoản
+
+Ví dụ dưới dùng placeholder; thay URL và model theo dịch vụ bạn đang có:
+
+```bash
+goon init \
+  --provider openai-compatible \
+  --base-url 'https://YOUR_PROVIDER/v1' \
+  --model 'YOUR_MODEL_ID'
+
+# Nhập key ẩn, tránh ghi key vào lịch sử lệnh bash:
+read -rsp 'API key: ' GOON_API_KEY; echo
+export GOON_API_KEY
+
+cd "$HOME/your-project"
+goon doctor
+goon
+```
+
+Key được đọc từ biến môi trường; `init` chỉ lưu tên biến, không lưu giá trị key.
+Muốn dùng biến khác, thêm `--key-env TEN_BIEN`.
+
+| Provider | `--provider` | Base URL |
+|---|---|---|
+| Dịch vụ OpenAI-compatible | `openai-compatible` | API root trước `/chat/completions`, thường kết thúc `/v1` |
+| OpenAI Responses-compatible | `openai-responses` | API root trước `/responses` |
+| Anthropic Messages-compatible | `anthropic` | API root trước `/messages`, thường kết thúc `/v1` |
+
+Không tự thêm `/v1` cho URL của bạn: một số gateway dùng đường dẫn riêng.
+Nếu không đặt URL, provider Anthropic dùng `https://api.anthropic.com/v1`, hai
+provider còn lại dùng `https://api.openai.com/v1`. Không cần acc Claude/Z.ai;
+bạn cần key hợp lệ cho endpoint đã cấu hình. Endpoint phải hỗ trợ tool calling.
+
+## Dùng
+
+```bash
+goon -p 'Đọc repo, tìm nguyên nhân lỗi và sửa; chạy kiểm tra phù hợp'
+goon --read-only -p 'Đọc và giải thích kiến trúc repo'
+goon --resume latest
+goon --resume SESSION_UUID -p 'Tiếp tục phần đang làm'
+goon --yes -p 'Sửa lỗi và chạy test'
+goon --json -p 'Kiểm tra dự án'
+printf '%s' 'Giải thích các file chính' | goon --read-only
+goon sessions
+```
+
+Mặc định yêu cầu chấp thuận khi sửa/ghi file hoặc chạy shell. Không có TTY thì
+những yêu cầu này bị từ chối; dùng `--yes` khi chủ động cho phép. `--read-only`
+loại bỏ write/edit/bash khỏi bộ tool. File tools chỉ truy cập workspace đã chọn;
+shell chạy với quyền tài khoản hiện tại, **không có sandbox hệ điều hành**.
+
+Trong chế độ tương tác: `/help`, `/exit`, Ctrl+C để huỷ tác vụ đang chạy.
+`--json` xuất NDJSON gồm session, text, tool, usage, compaction, done/error.
+Mã thoát: 0 thành công, 1 lỗi, 2 từ chối quyền, 130 Ctrl+C, 143 SIGTERM.
+
+## Harness có gì
+
+- Vòng lặp model → tool → result → model, giữ reasoning và provider metadata
+  thông qua AI SDK; xử lý stream xong mới chạy tool.
+- Sáu tool: `read_file`, `list_files`, `search`, `write_file`, `edit_file`, `bash`.
+- Hai tool đọc liên tiếp có thể chạy song song. Ghi file và shell là hàng rào
+  tuần tự; kết quả giữ thứ tự model, kể cả khi bị huỷ.
+- Lưu phiên atomic, lock tiến trình, resume theo workspace. Lượt tool dở dang
+  được đánh dấu kết quả chưa rõ; không tự lặp lại side effect sau crash.
+- Edit/overwrite phải đọc file trước và kiểm tra revision để tránh ghi đè thay
+  đổi mới. Ghi file theo temporary file + rename, giữ mode của file cũ.
+- Compact context có archive đầy đủ trước khi thay lịch sử đang hoạt động.
+  Đọc `AGENTS.md` tại gốc workspace, tối đa 24.000 ký tự.
+- Output tool giới hạn; shell có timeout, huỷ process group trên POSIX. Search
+  JavaScript dự phòng bỏ `.git`, `node_modules`, symlink và giới hạn quét.
+- Không có telemetry hoặc tự cập nhật do Goon triển khai. Request model vẫn gửi
+  prompt, ngữ cảnh và kết quả tool tới API bạn chọn. Transcript lưu những dữ liệu
+  đó trên máy; không coi transcript là đã được rà soát toàn bộ bí mật.
+
+Đây là v0.1 dùng terminal readline, chưa phải bộ tính năng ngang ZCode/DSH.
+Chưa có MCP, subagent hoặc giao diện TUI toàn màn hình.
+
+## Cấu hình và dữ liệu
+
+- Config: `$XDG_CONFIG_HOME/goon/config.json`, mặc định `~/.config/goon/config.json`.
+- Sessions: `$XDG_DATA_HOME/goon/sessions/`, mặc định `~/.local/share/goon/sessions/`.
+- Archives: `SESSION_UUID.compact-N.json` trong cùng thư mục session.
+- Ưu tiên: cờ CLI > biến `GOON_*` > config người dùng > mặc định. Không tự đọc
+  `.env` hoặc config provider của dự án.
+
+Các biến: `GOON_PROVIDER`, `GOON_BASE_URL`, `GOON_MODEL`, `GOON_KEY_ENV`,
+`GOON_CONTEXT_WINDOW`, `GOON_MAX_OUTPUT_TOKENS`, `GOON_TIMEOUT_MS`,
+`GOON_RUN_TOKEN_BUDGET`.
+
+Context mặc định 128.000 token, output 8.192, thời hạn request 300.000 ms,
+budget mỗi tác vụ 100.000 token. Đặt context/output theo model thực tế:
+
+```bash
+goon --context-window 64000 --max-output-tokens 4096
+goon --run-token-budget 0  # tắt budget cho tác vụ dài
+```
+
+Budget kiểm tra tại ranh giới request, không phải trần chi phí thanh toán cứng.
+Khi endpoint không trả usage, Goon dùng ước lượng ký tự để tránh chạy vô hạn.
+Compact cũng gọi model và có tính token. Thông báo chạm output limit nghĩa là
+tool của response chưa hoàn tất đó chưa được thực thi.
+
+## Phát triển
+
+```bash
+npm ci
+npm run typecheck
+npm run lint
+npm test
+npm run build
+npm install -g . --omit=dev
+```
+
+Không cần build monorepo tham khảo. Mã nguồn chia theo trách nhiệm:
+
+| File | Trách nhiệm |
+|---|---|
+| `src/harness.ts` | Agent loop, điều phối tool, usage, cancellation |
+| `src/provider.ts` | Chọn adapter API |
+| `src/tools.ts` | Registry, schema và approval |
+| `src/files.ts`, `src/process.ts` | File và subprocess I/O |
+| `src/session.ts` | Lock, checkpoint, resume và sửa lịch sử bị ngắt |
+| `src/context.ts` | System prompt, AGENTS.md và compaction |
+| `src/cli.ts` | Flags, readline, NDJSON, vòng đời terminal |
+
+Public API xuất `Harness`, `ToolRegistry`, `SessionStore` và kiểu liên quan.
+`ToolRegistry.register()` nhận schema Zod, cờ `readOnly` và hàm execute; trả về
+hàm gỡ đăng ký. Chưa có cơ chế tự tải plugin ngoài từ config.
+
+Xem [NOTICE.md](NOTICE.md) để biết nguồn tham khảo và commit đã đọc;
+[docs/VALIDATION.md](docs/VALIDATION.md) ghi kết quả và phạm vi đã kiểm chứng.
+
+## Repository
+
+Source: [binxgtl/goon-cli](https://github.com/binxgtl/goon-cli).
+Gói npm dựng sẵn nằm tại `release/goon-cli-0.1.0.tgz`; checksum SHA-256 ở
+`release/SHA256SUMS.txt`. Muốn kiểm tra trước khi cài, chạy
+`(cd release && sha256sum -c SHA256SUMS.txt)`.
