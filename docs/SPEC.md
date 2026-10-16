@@ -38,3 +38,21 @@ calls, read/write/edit, denied approval, cancellation, authentication failure,
 resume and crash repair. Unit tests cover config validation, locks, symlink
 escapes, stale revisions, output limits and subprocess cleanup. Linux tests do
 not establish Android device compatibility.
+
+## Automated GitHub releases
+
+Pushes to main and manual workflow dispatch run checks on Node 22.16 and 24.
+Pull requests run read-only checks without release permissions. After checks,
+the newest main commit is packed and installed in an isolated prefix. The first
+release uses package.json's stable version. Later changed commits auto-increment
+the latest patch, unless package.json declares a higher stable version. Version
+changes update package.json and npm-shrinkwrap.json in a bot commit before the
+annotated tag is pushed. CLI version output reads its installed manifest.
+
+Publishing owns tag/release state. Existing tags are never moved. A rerun at the
+same tagged commit repairs the same release instead of bumping again. Superseded
+source commits are skipped. Release jobs are serialized, use contents:write only
+in their publishing job, upload npm archives plus SHA-256 checksums to a draft,
+and publish the release only after uploads complete. The repository GITHUB_TOKEN
+does not trigger recursive push workflows. No npm registry publishing or
+automatic updating of installed clients is enabled by this workflow.

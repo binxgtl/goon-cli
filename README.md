@@ -5,14 +5,12 @@ ZCode và DeepSeek Harness; **không fork base và không dùng runtime của ha
 
 ## Cài trên Termux
 
-Clone repo và cài gói npm đã build sẵn:
+Cài bản GitHub Release mới nhất:
 
 ```bash
 pkg install nodejs-lts git bash ripgrep
 node --version
-git clone https://github.com/binxgtl/goon-cli.git
-cd goon-cli
-npm install -g ./release/goon-cli-0.1.0.tgz --omit=dev
+npm install -g https://github.com/binxgtl/goon-cli/releases/latest/download/goon-cli.tgz --omit=dev
 goon --version
 ```
 
@@ -159,6 +157,30 @@ Xem [NOTICE.md](NOTICE.md) để biết nguồn tham khảo và commit đã đ�
 ## Repository
 
 Source: [binxgtl/goon-cli](https://github.com/binxgtl/goon-cli).
-Gói npm dựng sẵn nằm tại `release/goon-cli-0.1.0.tgz`; checksum SHA-256 ở
-`release/SHA256SUMS.txt`. Muốn kiểm tra trước khi cài, chạy
-`(cd release && sha256sum -c SHA256SUMS.txt)`.
+Các bản cài và checksum nằm trong [GitHub Releases](https://github.com/binxgtl/goon-cli/releases).
+Repo vẫn giữ gói bootstrap `release/goon-cli-0.1.0.tgz`; dùng Releases để lấy bản mới.
+
+## Tự động build và release
+
+Mỗi lần push lên `main`, workflow `Check and release` sẽ:
+
+1. Chạy typecheck, lint và toàn bộ test trên Node 22.16 và 24.
+2. Build gói npm, cài thử trong prefix riêng và kiểm tra phiên bản thực tế.
+3. Tạo tag `vX.Y.Z` và GitHub Release với gói `.tgz` cùng `SHA256SUMS.txt`.
+
+Bản đầu dùng `v0.1.0`. Sau đó mỗi commit mới trên main tự tăng patch. Có thể
+đặt một phiên bản stable cao hơn trong `package.json` **và** `npm-shrinkwrap.json`
+để chủ động phát hành minor/major. Bot đồng bộ và commit tăng version trước khi
+tạo tag; không đổi tag cũ. Commit của bot dùng `GITHUB_TOKEN`, không lặp workflow.
+Rerun tại cùng commit đã có tag sẽ dùng lại phiên bản đó để phục hồi release.
+Commit bị một cập nhật mới hơn vượt qua sẽ được bỏ qua khi publish.
+
+Pull request chỉ chạy kiểm tra. Có thể chọn Actions → Check and release → Run
+workflow trên main để chạy thủ công. Không cần thêm PAT hay npm token; job dùng
+quyền `contents: write` của `GITHUB_TOKEN`. Nếu sau này bật branch protection chặn
+bot ghi main, cần điều chỉnh quyền/rule của chính repo.
+
+Assets được upload vào draft trước khi công khai. Lệnh `npm run release:pack`
+cho phép kiểm tra build, gói npm và cài thử ở local mà không publish. Workflow
+không publish lên npm registry và không tự đổi bản Goon đã cài trên điện thoại.
+Để cập nhật bản đang dùng, chạy lại lệnh `npm install -g` từ Releases ở trên.

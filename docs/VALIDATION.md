@@ -2,7 +2,7 @@
 
 Executed on Linux x64, Node.js 24.19.0.
 
-- `npm test`: **24 passed, 0 failed**. Tests use local mock HTTP servers and
+- `npm test`: **29 passed, 0 failed**. Tests use local mock HTTP servers and
   the real CLI, AI SDK adapters, filesystem, process scheduler and session store.
 - `npm run typecheck`: passed, TypeScript strict mode.
 - `npm run lint`: passed without warnings.
@@ -23,6 +23,15 @@ cancellation result pairing, compaction/archive, oversized input, stale file
 revisions, exact edits, symlink/path escapes, fallback search, output truncation,
 process-group cancellation, command timeouts, exclusive session locks, stale
 owner recovery and workspace-bound resume.
+
+Release validation adds initial-version selection, automatic patch increments,
+lockfile synchronization, installed CLI version reporting, and an end-to-end
+publishing simulation using a local bare Git remote and mocked GitHub release
+commands. The simulation publishes v0.1.0, pushes a source update, verifies the
+bot commit and v0.1.1 tag, then retries from the previous source commit and
+confirms that it repairs v0.1.1 without creating v0.1.2. No remote release is
+created by the test itself. The real GitHub Actions workflow additionally runs
+the suite on Node 22.16 and 24; consult Actions for its execution results.
 
 No paid API request was made. No Android/Termux device, ARM64, macOS or Windows
 was available for execution. Termux support is an implementation target, not a

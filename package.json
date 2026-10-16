@@ -12,9 +12,10 @@
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",
-    "lint": "oxlint src tests bin",
+    "lint": "oxlint src tests bin scripts",
     "test": "npm run build && node --test tests/*.test.mjs",
-    "prepack": "npm run build"
+    "prepack": "npm run build",
+    "release:pack": "node scripts/pack-release.mjs"
   },
   "dependencies": {
     "@ai-sdk/anthropic": "3.0.81",

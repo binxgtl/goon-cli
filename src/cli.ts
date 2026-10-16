@@ -4,9 +4,10 @@ import { stdin, stdout, stderr } from 'node:process';
 import { join, resolve } from 'node:path';
 import { loadConfig, resolveRuntime, saveConfig, configPath, dataDir } from './config.js';
 import { safeError } from './errors.js';
+import { VERSION } from './version.js';
 import type { HarnessEvent } from './harness.js';
 
-const HELP = `goon cli 0.1.0 — independent coding harness
+const HELP = `goon cli ${VERSION} — independent coding harness
 
 Usage: goon [options] [prompt]
        goon init --provider openai-compatible --base-url URL --model MODEL
@@ -53,7 +54,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     } });
     jsonOutput = values.json === true;
     if (values.help) { stdout.write(HELP); return; }
-    if (values.version) { stdout.write('goon cli 0.1.0\n'); return; }
+    if (values.version) { stdout.write(`goon cli ${VERSION}\n`); return; }
     const overrides: Record<string, unknown> = {};
     for (const [flag, key] of Object.entries({ provider: 'provider', 'base-url': 'baseUrl', model: 'model', 'key-env': 'keyEnv',
       'context-window': 'contextWindow', 'max-output-tokens': 'maxOutputTokens', 'run-token-budget': 'runTokenBudget', 'timeout-ms': 'timeoutMs' })) {
@@ -74,7 +75,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         catch { return false; }
       };
       const [bash, rg] = await Promise.all([executable('bash'), executable('rg')]);
-      stdout.write(JSON.stringify({ version: '0.1.0', node: process.version, platform: process.platform, arch: process.arch,
+      stdout.write(JSON.stringify({ version: VERSION, node: process.version, platform: process.platform, arch: process.arch,
         config: configPath(), provider: config.provider, model: config.model ?? null, baseUrl: config.baseUrl ?? 'provider default',
         credentialVariable: config.keyEnv, credentialPresent: Boolean(process.env[config.keyEnv]), bash, ripgrep: rg,
         searchFallback: !rg, data: dataDir(), networkTested: false }, null, 2) + '\n');
