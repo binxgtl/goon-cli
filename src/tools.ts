@@ -3,6 +3,7 @@ import { Ajv } from 'ajv';
 import { z } from 'zod';
 import { WorkspaceFiles, limitText } from './files.js';
 import { runCommand } from './process.js';
+import { todoItemSchema, type TodoItem } from './session.js';
 
 export interface Approval { tool: string; input: unknown; signal: AbortSignal }
 export type Approve = (request: Approval) => Promise<boolean>;
@@ -18,11 +19,28 @@ interface RegisteredTool {
   parse: (input: unknown) => unknown;
   execute: (input: unknown, signal: AbortSignal) => Promise<string>;
 }
+
+export function formatTodos(todos: TodoItem[]): string {
+  if (!todos.length) return 'Todo list is empty.';
+  const pending = todos.filter(t => t.status === 'pending').length;
+  const inProgress = todos.filter(t => t.status === 'in_progress').length;
+  const completed = todos.filter(t => t.status === 'completed').length;
+  const lines = todos.map((t, i) => {
+    const icon = t.status === 'completed' ? '[x]' : t.status === 'in_progress' ? '[>]' : '[ ]';
+    return `${i + 1}. ${icon} (${t.priority}) ${t.content}`;
+  });
+  return `Todos (${completed}/${todos.length} completed, ${inProgress} in progress, ${pending} pending):\n${lines.join('\n')}`;
+}
+
 export class ToolRegistry {
   readonly files: WorkspaceFiles;
   budget?: RunBudget;
+  planMode = false;
+  todos: TodoItem[] = [];
+  onTodoUpdate?: (todos: TodoItem[]) => void;
+  onPlanExit?: (plan: string) => void;
   private definitions = new Map<string, RegisteredTool>();
-  constructor(readonly cwd: string, readonly approve: Approve, readonly readOnly = false) {
+  constructor(readonly cwd: string, readonly approve: Approve, public readOnly = false) {
     this.files = new WorkspaceFiles(cwd);
     this.register('read_file', {
       description: 'Read a workspace text file with line numbers. Read an existing file before editing or overwriting it.',
@@ -50,6 +68,36 @@ export class ToolRegistry {
         }
       },
     });
+    this.register('todo_write', {
+      description: 'Record and update the complete task checklist to track multi-step implementation progress. Pass the full updated list of todos.',
+      schema: z.object({ todos: z.array(todoItemSchema) }), readOnly: true,
+      execute: async input => {
+        this.todos = input.todos;
+        this.onTodoUpdate?.(this.todos);
+        return `Updated todo list.\n${formatTodos(this.todos)}`;
+      },
+    });
+    this.register('todo_read', {
+      description: 'Read the current session task checklist.',
+      schema: z.object({}), readOnly: true,
+      execute: async () => formatTodos(this.todos),
+    });
+    this.register('exit_plan_mode', {
+      description: 'Use in plan mode when your implementation plan is complete. Presents the Markdown plan for user approval and exits plan mode upon approval so you can begin coding.',
+      schema: z.object({ plan: z.string().min(1) }), readOnly: true,
+      execute: async (input, signal) => {
+        if (!this.planMode) {
+          return 'Session is not in plan mode; you can already edit files and run tools directly.';
+        }
+        const ok = await this.approve({ tool: 'exit_plan_mode', input, signal });
+        if (!ok) {
+          return 'User chose to stay in plan mode and revise the plan. Incorporate any feedback and call exit_plan_mode again when ready.';
+        }
+        this.planMode = false;
+        this.onPlanExit?.(input.plan);
+        return `Plan approved — exited plan mode. You can now use write_file, edit_file, apply_patch, todo_write, and bash to implement the plan step by step.\n\n## Approved Plan:\n${input.plan}`;
+      },
+    });
     this.register('write_file', {
       description: 'Create or overwrite a workspace UTF-8 file. Existing files must first be read. Use edit_file for small changes.',
       schema: z.object({ path: z.string(), content: z.string() }), readOnly: false,
@@ -60,14 +108,27 @@ export class ToolRegistry {
       schema: z.object({ path: z.string(), oldText: z.string().min(1), newText: z.string(), replaceAll: z.boolean().default(false) }),
       readOnly: false, execute: input => this.files.edit(input.path, input.oldText, input.newText, input.replaceAll),
     });
+    this.register('apply_patch', {
+      description: 'Apply a multi-hunk or multi-file patch ("*** Begin Patch" ... "*** Update File: <path>" / "*** Add File: <path>" / "*** Delete File: <path>" ... "*** End Patch").',
+      schema: z.object({ patch: z.string().min(1) }), readOnly: false,
+      execute: input => this.files.applyPatch(input.patch),
+    });
     this.register('bash', {
       description: 'Execute a shell command in the workspace as the current OS user. No OS sandbox. Use for git, builds and tests. Output is bounded; do not start persistent background servers.',
       schema: z.object({ command: z.string().min(1), timeoutMs: z.number().int().min(1000).max(600_000).default(120_000) }),
       readOnly: false, execute: async (input, signal) => {
-        const result = await runCommand('bash', ['-c', input.command], { cwd, signal, timeoutMs: input.timeoutMs });
-        return `Exit code: ${result.code}\n${result.output}`;
+        const beforeSnap = await this.files.snapshotWorkspace();
+        try {
+          const result = await runCommand('bash', ['-c', input.command], { cwd, signal, timeoutMs: input.timeoutMs });
+          return `Exit code: ${result.code}\n${result.output}`;
+        } finally {
+          await this.files.captureWorkspaceDiff(beforeSnap).catch(() => {});
+        }
       },
     });
+  }
+  get effectiveReadOnly(): boolean {
+    return this.readOnly || this.planMode;
   }
   register<Input>(name: string, definition: ToolDefinition<Input>) {
     return this.add(name, { ...definition, parse: input => definition.schema.parse(input),
@@ -88,14 +149,20 @@ export class ToolRegistry {
     return () => this.definitions.delete(name);
   }
   schemas(): ToolSet {
-    return Object.fromEntries([...this.definitions].filter(([, d]) => !this.readOnly || d.readOnly)
-      .map(([name, d]) => [name, tool({ description: d.description, inputSchema: d.schema })]));
+    return Object.fromEntries([...this.definitions].filter(([name, d]) => {
+      if (name === 'exit_plan_mode' && !this.planMode) return false;
+      if ((name === 'todo_write' || name === 'todo_read') && this.readOnly && !this.planMode) return false;
+      return !this.effectiveReadOnly || d.readOnly;
+    }).map(([name, d]) => [name, tool({ description: d.description, inputSchema: d.schema })]));
   }
-  isReadOnly(name: string) { return this.definitions.get(name)?.readOnly === true; }
+  isReadOnly(name: string) {
+    if (name === 'exit_plan_mode' || name === 'todo_write') return false; // serialize state transitions
+    return this.definitions.get(name)?.readOnly === true;
+  }
   async execute(call: ToolCall, signal: AbortSignal): Promise<{ text: string; denied?: boolean }> {
     signal.throwIfAborted();
     const definition = this.definitions.get(call.toolName);
-    if (!definition || (this.readOnly && !definition.readOnly)) throw new Error(`Tool is not available: ${call.toolName}`);
+    if (!definition || (this.effectiveReadOnly && !definition.readOnly)) throw new Error(`Tool is not available in ${this.planMode ? 'plan' : 'read-only'} mode: ${call.toolName}`);
     const input = definition.parse(call.input);
     if (!definition.readOnly && !await this.approve({ tool: call.toolName, input, signal })) {
       return { text: 'Permission denied by the user. Stop this run.', denied: true };
@@ -108,3 +175,4 @@ export class ToolRegistry {
     }
   }
 }
+

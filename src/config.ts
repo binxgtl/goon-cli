@@ -4,10 +4,14 @@ import { readFile, mkdir, writeFile, rename, realpath } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 
+export const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
+export type EffortLevel = (typeof EFFORT_LEVELS)[number];
+
 export const configSchema = z.object({
   provider: z.enum(['openai-compatible', 'openai-responses', 'anthropic']).default('openai-compatible'),
   baseUrl: z.string().url().optional(),
   model: z.string().trim().min(1).optional(),
+  effort: z.enum(EFFORT_LEVELS).optional(),
   keyEnv: z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/).default('GOON_API_KEY'),
   contextWindow: z.number().int().min(8192).max(2_000_000).default(128_000),
   maxOutputTokens: z.number().int().min(128).max(128_000).default(8192),
@@ -20,7 +24,36 @@ export type Config = z.infer<typeof configSchema>;
 export interface RuntimeConfig extends Config { cwd: string; apiKey: string; dataDir: string; baseUrl: string; model: string }
 export const configDir = () => join(process.env.XDG_CONFIG_HOME || join(homedir(), '.config'), 'goon');
 export const configPath = () => join(configDir(), 'config.json');
+export const credentialsPath = () => join(configDir(), 'credentials.json');
 export const dataDir = () => join(process.env.XDG_DATA_HOME || join(homedir(), '.local', 'share'), 'goon');
+
+const credentialsSchema = z.record(z.string(), z.string());
+
+export async function loadCredentials(): Promise<Record<string, string>> {
+  try {
+    const raw = JSON.parse(await readFile(credentialsPath(), 'utf8'));
+    return credentialsSchema.parse(raw);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return {};
+    return {};
+  }
+}
+
+export async function saveCredential(keyEnv: string, apiKey: string): Promise<void> {
+  await mkdir(configDir(), { recursive: true, mode: 0o700 });
+  const existing = await loadCredentials();
+  const trimmed = apiKey.trim();
+  if (trimmed) existing[keyEnv] = trimmed;
+  await atomicJson(credentialsPath(), existing);
+}
+
+export async function resolveApiKey(config: Config): Promise<string | undefined> {
+  const fromEnv = process.env[config.keyEnv]?.trim();
+  if (fromEnv) return fromEnv;
+  const stored = await loadCredentials();
+  const fromStore = stored[config.keyEnv]?.trim();
+  return fromStore || undefined;
+}
 
 export async function loadConfig(overrides: Record<string, unknown> = {}): Promise<Config> {
   let stored: unknown = {};
@@ -29,8 +62,8 @@ export async function loadConfig(overrides: Record<string, unknown> = {}): Promi
   const validated = configSchema.parse(stored);
   const env: Record<string, unknown> = {};
   for (const [key, name] of Object.entries({
-    provider: 'GOON_PROVIDER', baseUrl: 'GOON_BASE_URL', model: 'GOON_MODEL', keyEnv: 'GOON_KEY_ENV',
-    contextWindow: 'GOON_CONTEXT_WINDOW', maxOutputTokens: 'GOON_MAX_OUTPUT_TOKENS',
+    provider: 'GOON_PROVIDER', baseUrl: 'GOON_BASE_URL', model: 'GOON_MODEL', effort: 'GOON_EFFORT',
+    keyEnv: 'GOON_KEY_ENV', contextWindow: 'GOON_CONTEXT_WINDOW', maxOutputTokens: 'GOON_MAX_OUTPUT_TOKENS',
     timeoutMs: 'GOON_TIMEOUT_MS', runTokenBudget: 'GOON_RUN_TOKEN_BUDGET',
     inlineReasoning: 'GOON_INLINE_REASONING',
   })) {
@@ -49,9 +82,9 @@ export async function loadConfig(overrides: Record<string, unknown> = {}): Promi
 }
 
 export async function resolveRuntime(config: Config, cwd: string): Promise<RuntimeConfig> {
-  if (!config.model) throw new Error('Missing model. Run goon init --model MODEL --base-url URL.');
-  const apiKey = process.env[config.keyEnv];
-  if (!apiKey) throw new Error(`Missing ${config.keyEnv}. Set it in your shell; no account login is needed.`);
+  if (!config.model) throw new Error('Missing model. Run "goon setup" or "goon init --model MODEL --base-url URL".');
+  const apiKey = await resolveApiKey(config);
+  if (!apiKey) throw new Error(`Missing ${config.keyEnv}. Run "goon setup" or set ${config.keyEnv} in your shell.`);
   const baseUrl = config.baseUrl ?? (config.provider === 'anthropic' ? 'https://api.anthropic.com/v1' : 'https://api.openai.com/v1');
   return { ...config, model: config.model, baseUrl, apiKey, cwd: await realpath(resolve(cwd)), dataDir: dataDir() };
 }

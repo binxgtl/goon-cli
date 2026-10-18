@@ -95,3 +95,71 @@ test('cancellation kills a child process group and timeout ends runaway commands
     cwd: f.cwd, signal: new AbortController().signal, timeoutMs: 100,
   }), /timed out/);
 });
+
+test('edit normalizes CRLF/LF line endings, supports line-trimmed fallback, and generates unified diff previews', async t => {
+  const f = await fixture(t), files = new WorkspaceFiles(f.cwd);
+  const crlfFile = join(f.cwd, 'win.ts');
+  await writeFile(crlfFile, 'const a = 1;\r\nconst b = 2;\r\nconst c = 3;\r\n', 'utf8');
+  await files.read('win.ts');
+
+  const diffPreview = await files.previewDiff('edit_file', {
+    path: 'win.ts',
+    oldText: 'const b = 2;\n',
+    newText: 'const b = 42;\n',
+  });
+  assert.match(diffPreview, /--- a\/win\.ts/);
+  assert.match(diffPreview, /-const b = 2;/);
+  assert.match(diffPreview, /\+const b = 42;/);
+
+  await files.edit('win.ts', 'const b = 2;\n', 'const b = 42;\n');
+  const afterCrlf = await readFile(crlfFile, 'utf8');
+  assert.equal(afterCrlf, 'const a = 1;\r\nconst b = 42;\r\nconst c = 3;\r\n');
+
+  // Line-trimmed fallback when indentation drifts slightly
+  await files.read('win.ts');
+  await files.edit('win.ts', '  const a = 1;\n  const b = 42;', 'const a = 10;\nconst b = 20;');
+  assert.equal(await readFile(crlfFile, 'utf8'), 'const a = 10;\r\nconst b = 20;\r\nconst c = 3;\r\n');
+});
+
+test('applyPatch supports Add/Update/Delete and restoreBackups reverts modified, added, and deleted files', async t => {
+  const f = await fixture(t), files = new WorkspaceFiles(f.cwd);
+  await writeFile(join(f.cwd, 'keep.txt'), 'line1\nline2\nline3\n', 'utf8');
+  await writeFile(join(f.cwd, 'remove-me.txt'), 'goodbye\n', 'utf8');
+
+  files.beginTurn();
+  const patch = [
+    '*** Begin Patch',
+    '*** Update File: keep.txt',
+    '@@',
+    ' line1',
+    '-line2',
+    '+line2_patched',
+    ' line3',
+    '*** Add File: added.txt',
+    '+hello world',
+    '*** Delete File: remove-me.txt',
+    '*** End Patch',
+  ].join('\n');
+
+  const preview = await files.previewDiff('apply_patch', { patch });
+  assert.match(preview, /\+line2_patched/);
+  assert.match(preview, /\+hello world/);
+
+  await files.applyPatch(patch);
+  assert.equal(await readFile(join(f.cwd, 'keep.txt'), 'utf8'), 'line1\nline2_patched\nline3\n');
+  assert.equal(await readFile(join(f.cwd, 'added.txt'), 'utf8'), 'hello world');
+  await assert.rejects(readFile(join(f.cwd, 'remove-me.txt'), 'utf8'));
+
+  const backups = files.takeTurnBackups();
+  assert.equal(backups.length, 3);
+
+  const restored = await files.restoreBackups(backups);
+  assert.deepEqual(restored.restored.sort(), ['keep.txt', 'remove-me.txt']);
+  assert.deepEqual(restored.deleted, ['added.txt']);
+
+  assert.equal(await readFile(join(f.cwd, 'keep.txt'), 'utf8'), 'line1\nline2\nline3\n');
+  assert.equal(await readFile(join(f.cwd, 'remove-me.txt'), 'utf8'), 'goodbye\n');
+  await assert.rejects(readFile(join(f.cwd, 'added.txt'), 'utf8'));
+});
+
+

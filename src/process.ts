@@ -1,15 +1,32 @@
 import { spawn } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
 
 export interface CommandResult { code: number; output: string; truncated: boolean }
 const OUTPUT_LIMIT = 64 * 1024;
 const HARD_OUTPUT_LIMIT = 4 * 1024 * 1024;
 
+export function resolveExecutable(command: string): string {
+  if (command !== 'bash' || process.platform !== 'win32') return command;
+  const candidates = [
+    process.env.GOON_BASH,
+    'C:\\Program Files\\Git\\bin\\bash.exe',
+    'C:\\Program Files (x86)\\Git\\bin\\bash.exe',
+    process.env.LOCALAPPDATA ? join(process.env.LOCALAPPDATA, 'Programs', 'Git', 'bin', 'bash.exe') : undefined,
+  ];
+  for (const candidate of candidates) {
+    if (candidate && existsSync(candidate)) return candidate;
+  }
+  return command;
+}
+
 export async function runCommand(command: string, args: string[], options: {
   cwd: string; signal: AbortSignal; timeoutMs: number;
 }): Promise<CommandResult> {
   options.signal.throwIfAborted();
+  const resolvedCommand = resolveExecutable(command);
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, {
+    const child = spawn(resolvedCommand, args, {
       cwd: options.cwd, env: process.env, stdio: ['ignore', 'pipe', 'pipe'],
       detached: process.platform !== 'win32', windowsHide: true,
     });
@@ -21,6 +38,9 @@ export async function runCommand(command: string, args: string[], options: {
       if (process.platform === 'win32') {
         const taskkill = spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
         taskkill.on('error', () => child.kill(signal));
+        child.kill(signal);
+        child.stdout.destroy();
+        child.stderr.destroy();
       } else {
         try { process.kill(-child.pid, signal); } catch (error) {
           if ((error as NodeJS.ErrnoException).code !== 'ESRCH') child.kill(signal);

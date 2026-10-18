@@ -5,14 +5,44 @@ import { modelMessageSchema, type ModelMessage, type ToolResultPart } from 'ai';
 import { z } from 'zod';
 import { atomicJson } from './config.js';
 
+export const fileBackupSchema = z.object({
+  path: z.string(),
+  existed: z.boolean(),
+  content: z.string().optional(),
+  mode: z.number().int().optional(),
+  afterHash: z.string().optional(),
+});
+export type FileBackup = z.infer<typeof fileBackupSchema>;
+
+export const turnCheckpointSchema = z.object({
+  id: z.number().int().positive(),
+  createdAt: z.string().datetime(),
+  prompt: z.string(),
+  messageIndex: z.number().int().nonnegative(),
+  tokensBefore: z.number().nonnegative(),
+  files: z.array(fileBackupSchema),
+});
+export type TurnCheckpoint = z.infer<typeof turnCheckpointSchema>;
+
+export const todoItemSchema = z.object({
+  content: z.string().min(1),
+  status: z.enum(['pending', 'in_progress', 'completed']),
+  priority: z.enum(['high', 'medium', 'low']).default('medium'),
+});
+export type TodoItem = z.infer<typeof todoItemSchema>;
+
 const sessionSchema = z.object({
   version: z.literal(1), id: z.string().uuid(), cwd: z.string(),
+  title: z.string().optional(),
   createdAt: z.string().datetime(), updatedAt: z.string().datetime(),
   provider: z.string(), model: z.string(), baseUrl: z.string(),
   messages: z.array(modelMessageSchema), tokens: z.number().nonnegative(), compactions: z.number().int().nonnegative(),
+  checkpoints: z.array(turnCheckpointSchema).optional(),
+  todos: z.array(todoItemSchema).optional(),
 });
 export type Session = z.infer<typeof sessionSchema>;
-export type SessionSummary = Pick<Session, 'id' | 'cwd' | 'updatedAt' | 'model'>;
+export type SessionSummary = Pick<Session, 'id' | 'cwd' | 'updatedAt' | 'model' | 'title'>;
+
 
 export function repairInterrupted(messages: ModelMessage[]): boolean {
   const pending = new Map<string, string>();
@@ -96,10 +126,23 @@ export class SessionStore {
     for (const name of names.filter(n => /^[0-9a-f-]{36}\.json$/.test(n))) {
       try {
         const s = sessionSchema.parse(JSON.parse(await readFile(join(root, name), 'utf8')));
-        results.push({ id: s.id, cwd: s.cwd, updatedAt: s.updatedAt, model: s.model });
+        results.push({ id: s.id, cwd: s.cwd, updatedAt: s.updatedAt, model: s.model, ...(s.title ? { title: s.title } : {}) });
       } catch { /* Invalid/incomplete entries never become resumable sessions. */ }
     }
     return results.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  }
+  async forkToNewFile(title?: string): Promise<string> {
+    const forkedId = randomUUID();
+    const now = new Date().toISOString();
+    const forked: Session = {
+      ...structuredClone(this.session),
+      id: forkedId,
+      createdAt: now,
+      updatedAt: now,
+      ...(title ? { title } : this.session.title ? { title: `${this.session.title} (fork)` } : {}),
+    };
+    await atomicJson(join(this.root, `${forkedId}.json`), forked);
+    return forkedId;
   }
   async save() {
     this.session.updatedAt = new Date().toISOString();
@@ -112,3 +155,4 @@ export class SessionStore {
     catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
   }
 }
+

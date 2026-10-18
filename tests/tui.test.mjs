@@ -95,3 +95,65 @@ test('TUI separates opt-in reasoning from answers and consumes compact child pro
   assert.match(frame, /agent child123: done/); assert.match(frame, /15 tokens/);
   assert.equal(frame.split('Inspect one file').length - 1, 1);
 });
+
+test('TUI supports slash-command Tab completion, Shift+Tab mode toggle, Alt+. effort cycling, and dynamic setup wizard with zero hardcoded models', async t => {
+  const tty = terminal(t);
+  let modeToggles = 0;
+  const efforts = [];
+  tty.ui.onToggleMode = () => { modeToggles++; tty.ui.setMode('auto'); };
+  tty.ui.onCycleEffort = dir => { efforts.push(dir); tty.ui.setEffort('xhigh'); };
+  const q = tty.ui.question('goon> ', undefined, true);
+  tty.key('', 'tab', { shift: true });
+  assert.equal(modeToggles, 1);
+  tty.key('.', '.', { meta: true });
+  assert.deepEqual(efforts, [1]);
+  tty.key('/eff', undefined);
+  tty.key('', 'tab');
+  tty.key('', 'return');
+  assert.equal((await q).trim(), '/effort');
+
+  const { fixture } = await import('./helpers.mjs');
+  const { readFile } = await import('node:fs/promises');
+  const { join } = await import('node:path');
+  const { runSetupWizard, resolveRuntime, PROVIDER_PRESETS, EFFORT_LEVELS } = await import('../dist/index.js');
+  assert.deepEqual(EFFORT_LEVELS, ['low', 'medium', 'high', 'xhigh', 'max']);
+  for (const preset of PROVIDER_PRESETS) {
+    assert(!('models' in preset), `Preset ${preset.id} must not hardcode models`);
+  }
+
+  const f = await fixture(t);
+  const oldConfigHome = process.env.XDG_CONFIG_HOME;
+  const oldKey = process.env.GOON_API_KEY;
+  process.env.XDG_CONFIG_HOME = f.config;
+  delete process.env.GOON_API_KEY;
+  t.after(() => {
+    if (oldConfigHome === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = oldConfigHome;
+    if (oldKey !== undefined) process.env.GOON_API_KEY = oldKey;
+  });
+
+  // Step 1: provider=4 (OpenRouter), Step 2: URL, Step 3: API Key, Step 4: pick discovered model #1, Step 5: effort=xhigh
+  const answers = ['4', 'https://openrouter.ai/api/v1', 'sk-or-wizard-secret-key', '1', 'xhigh'];
+  let outputLog = '';
+  const updated = await runSetupWizard(undefined, {
+    write: text => { outputLog += text; },
+    ask: async () => answers.shift() ?? '',
+    discover: async (url, key) => {
+      assert.equal(url, 'https://openrouter.ai/api/v1');
+      assert.equal(key, 'sk-or-wizard-secret-key');
+      return [{ id: 'dynamic/discovered-model-v1', contextWindow: 200_000 }];
+    },
+  });
+  assert.equal(updated.provider, 'openai-compatible');
+  assert.equal(updated.baseUrl, 'https://openrouter.ai/api/v1');
+  assert.equal(updated.model, 'dynamic/discovered-model-v1');
+  assert.equal(updated.effort, 'xhigh');
+  assert.match(outputLog, /Setup Saved/);
+
+  const rawConfig = await readFile(join(f.config, 'goon', 'config.json'), 'utf8');
+  assert(!rawConfig.includes('sk-or-wizard-secret-key'));
+  const runtime = await resolveRuntime(updated, f.cwd);
+  assert.equal(runtime.apiKey, 'sk-or-wizard-secret-key');
+  assert.equal(runtime.effort, 'xhigh');
+});
+

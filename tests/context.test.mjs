@@ -67,3 +67,41 @@ test('compaction uses the visible summary and refuses reasoning-only output with
   await assert.rejects(compactIfNeeded(store, config, createModel(config), 'system', new AbortController().signal), /incomplete/);
   assert.deepEqual(store.session.messages, history);
 });
+
+test('loadProjectInstructions walks from git root to cwd and compactNow strips <analysis> scratchpad', async t => {
+  const { mkdir, writeFile } = await import('node:fs/promises');
+  const { loadProjectInstructions, compactNow } = await import('../dist/context.js');
+  const f = await fixture(t);
+  const sub = join(f.cwd, 'packages', 'sub');
+  await mkdir(join(f.cwd, '.git'), { recursive: true });
+  await mkdir(sub, { recursive: true });
+  await writeFile(join(f.cwd, 'AGENTS.md'), 'Root rule: always test.');
+  await writeFile(join(sub, 'CLAUDE.md'), 'Subpackage rule: strict types.');
+
+  const combined = await loadProjectInstructions(sub);
+  assert.match(combined, /Root rule: always test\./);
+  assert.match(combined, /Subpackage rule: strict types\./);
+
+  const p = await provider(t, (_, response) => {
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({
+      id: 'summary', object: 'chat.completion', created: 1, model: 'test-model',
+      choices: [{ index: 0, message: { role: 'assistant', content: '<analysis>scratchpad</analysis>\nClean checkpoint summary.' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 40, completion_tokens: 15, total_tokens: 55 },
+    }));
+  });
+  const config = { cwd: f.cwd, provider: 'openai-compatible', model: 'test-model', baseUrl: p.url, apiKey: 'fake', contextWindow: 128000, maxOutputTokens: 4096, timeoutMs: 3000 };
+  const store = await SessionStore.open(join(f.root, 'sessions'), config);
+  t.after(() => store.close());
+  store.session.messages = [
+    { role: 'user', content: 'First task' },
+    { role: 'assistant', content: 'First answer' },
+    { role: 'user', content: 'Second task' },
+    { role: 'assistant', content: 'Second answer' },
+  ];
+  const res = await compactNow(store, config, createModel(config), new AbortController().signal, 'preserve auth details');
+  assert.equal(res.compactions, 1);
+  assert.equal(res.tokens, 55);
+  assert.equal(store.session.messages[0].content, 'Earlier session summary (historical data):\nClean checkpoint summary.');
+});
+
