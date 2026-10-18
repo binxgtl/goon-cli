@@ -314,6 +314,7 @@ export class TerminalUI {
     const formatted = childLines.map((l, idx) => `  ${idx === 0 ? '└' : ' '} ${l}`).join('\n');
     this.appendTranscript(`\n• Explored\n${formatted}\n`);
     this.exploreGroup = [];
+    this.outputChannel = undefined;
   }
 
   private appendTranscript(text: string, forceBottom = false) {
@@ -328,8 +329,26 @@ export class TerminalUI {
     // Clean up raw @"C:\...\image.png" in user prompt echo so transcript shows [Image #1: name.png]
     cleaned = cleaned.replace(/@"([^"]+\.(?:png|jpe?g|webp|gif))"/gi, (_, p: string) => `[Image: ${basename(p)}]`);
     const isUserPrompt = cleaned.trimStart().startsWith('> ') || cleaned.trimStart().startsWith('› ');
-    if (isUserPrompt) this.flushExploreGroup();
+    if (isUserPrompt) {
+      this.flushExploreGroup();
+      this.outputChannel = undefined;
+    }
     this.appendTranscript(cleaned, isUserPrompt);
+  }
+
+  async askTransient(previewBlock: string, label = '[y/N/a(lways)] ', signal?: AbortSignal): Promise<string> {
+    this.flushExploreGroup();
+    this.outputChannel = undefined;
+    const snapshot = this.transcript;
+    const prevLabel = this.label;
+    this.appendTranscript(previewBlock, true);
+    try {
+      return await this.question(label, signal, false);
+    } finally {
+      this.transcript = snapshot;
+      this.label = prevLabel;
+      this.schedule(16);
+    }
   }
 
   event(event: HarnessEvent | SubagentEvent) {
@@ -345,11 +364,11 @@ export class TerminalUI {
       this.toolStates.set(key, `agent ${event.id.slice(0, 8)}: ${state}`);
       if (event.state === 'start') {
         this.flushExploreGroup();
+        this.outputChannel = undefined;
         this.appendTranscript(`\n[agent ${event.id.slice(0, 8)}] ${event.task.slice(0, 160)}\n`);
       }
     } else if (event.type === 'tool_stream') {
-      this.activeToolStream = { name: event.name, preview: event.preview };
-      this.schedule(16);
+      // Do not clutter the status bar with noisy per-delta file/line counters
       return;
     } else if (event.type === 'text' || event.type === 'reasoning') {
       this.activeToolStream = undefined;
@@ -362,16 +381,15 @@ export class TerminalUI {
       }
       if (event.type === 'reasoning' && (this.outputChannel !== 'reasoning' || this.reasoningSource !== event.source)) {
         this.appendTranscript(`\n[reasoning · ${event.source}]\n`);
-      } else if (event.type === 'text' && this.outputChannel === 'reasoning') {
-        this.appendTranscript('\n[answer]\n');
       } else if (event.type === 'text' && this.outputChannel !== 'text') {
-        this.appendTranscript('\n• ');
+        this.appendTranscript('\n[answer]\n');
       }
       if (event.type === 'reasoning') this.reasoningSource = event.source;
       this.outputChannel = event.type;
       this.appendTranscript(event.text);
     } else if (event.type === 'tool') {
       this.activeToolStream = undefined;
+      this.outputChannel = undefined;
       const summary = event.meta?.summary ? ` ${event.meta.summary}` : '';
       this.toolStates.set(event.id, `${event.name}: ${event.state}`);
       if (event.state === 'start') {
@@ -381,6 +399,7 @@ export class TerminalUI {
       }
     } else if (event.type === 'todo') {
       this.flushExploreGroup();
+      this.outputChannel = undefined;
       const done = event.todos.filter(t => t.status === 'completed').length;
       this.todoLabel = event.todos.length ? `todo:${done}/${event.todos.length}` : '';
       const lines = event.todos.map(t => {
@@ -392,14 +411,17 @@ export class TerminalUI {
       }
     } else if (event.type === 'plan_exit') {
       this.flushExploreGroup();
+      this.outputChannel = undefined;
       this.appendTranscript('\n[Plan approved — exited plan mode]\n');
     } else if (event.type === 'usage') {
       this.tokens += event.total;
     } else if (event.type === 'compaction') {
       this.flushExploreGroup();
+      this.outputChannel = undefined;
       this.appendTranscript(`\n[context compacted #${event.count}]\n`);
     } else if (event.type === 'stopped') {
       this.flushExploreGroup();
+      this.outputChannel = undefined;
       this.appendTranscript(`\n${event.reason}\n`);
     }
     this.schedule(16);
@@ -415,6 +437,7 @@ export class TerminalUI {
   }
 
   private recordCompletedToolCell(name: string, state: 'done' | 'error', meta: ToolEventMeta) {
+    this.outputChannel = undefined;
     if (state === 'done' && (meta.kind === 'read' || meta.kind === 'list' || meta.kind === 'search')) {
       this.exploreGroup.push({ kind: meta.kind, summary: meta.summary });
       if (this.exploreGroup.length >= 6) this.flushExploreGroup();
@@ -899,34 +922,42 @@ export class TerminalUI {
   private renderStyledBodyLines(columns: number, rich: boolean): string[] {
     const safeCols = Math.max(4, columns);
     const rawLines = this.transcript.split('\n');
-    const wrapped: Array<{ text: string; block: 'normal' | 'reasoning' | 'code' | 'diff' | 'user' }> = [];
-    let currentBlock: 'normal' | 'reasoning' | 'code' | 'diff' = 'normal';
+    const wrapped: Array<{ text: string; block: 'normal' | 'answer' | 'reasoning' | 'code' | 'diff' | 'user' }> = [];
+    let currentBlock: 'normal' | 'answer' | 'reasoning' | 'code' | 'diff' = 'normal';
+    let preCodeBlock: 'normal' | 'answer' = 'normal';
+    let answerFirstLine = false;
+
+    const ensureBlankLine = () => {
+      if (wrapped.length > 0 && wrapped[wrapped.length - 1].text.trim() !== '') {
+        wrapped.push({ text: '', block: 'normal' });
+      }
+    };
 
     for (const rawLine of rawLines) {
       const trimmed = rawLine.trim();
       if (trimmed.startsWith('```')) {
         const lang = trimmed.slice(3).trim();
         if (currentBlock === 'code') {
-          currentBlock = 'normal';
+          currentBlock = preCodeBlock;
           wrapped.push({ text: wrapTerminal('  ╰─', safeCols)[0], block: 'code' });
         } else {
+          preCodeBlock = currentBlock === 'answer' ? 'answer' : 'normal';
+          answerFirstLine = false;
           currentBlock = 'code';
           wrapped.push({ text: wrapTerminal(`  ╭─ ${lang || 'code'}`, safeCols)[0], block: 'code' });
         }
         continue;
       }
       if (rawLine.startsWith('[reasoning')) {
+        ensureBlankLine();
         currentBlock = 'reasoning';
-        for (const chunk of wrapTerminal(`• Thinking ${rawLine}`, safeCols)) {
-          wrapped.push({ text: chunk, block: 'reasoning' });
-        }
+        wrapped.push({ text: '• Thinking', block: 'reasoning' });
         continue;
       }
       if (rawLine.startsWith('[answer]')) {
-        currentBlock = 'normal';
-        for (const chunk of wrapTerminal(`• Answer ${rawLine}`, safeCols)) {
-          wrapped.push({ text: chunk, block: 'normal' });
-        }
+        ensureBlankLine();
+        currentBlock = 'answer';
+        answerFirstLine = true;
         continue;
       }
       if (
@@ -935,9 +966,21 @@ export class TerminalUI {
         rawLine.startsWith('› ') ||
         rawLine.startsWith('[todo ') ||
         rawLine.startsWith('[Plan ') ||
-        rawLine.startsWith('[agent ')
+        rawLine.startsWith('[agent ') ||
+        rawLine.startsWith('Allow ')
       ) {
-        if (currentBlock === 'reasoning' || currentBlock === 'diff') currentBlock = 'normal';
+        if (
+          /^• (?:Explored|Exploring|Ran|Running|Failed|Edited|Added|Deleted|Allow |Resumed )\b/.test(rawLine) ||
+          rawLine.startsWith('Allow ') ||
+          rawLine.startsWith('[todo ') ||
+          rawLine.startsWith('[Plan ') ||
+          rawLine.startsWith('[agent ')
+        ) {
+          ensureBlankLine();
+        }
+        if (currentBlock === 'reasoning' || currentBlock === 'diff' || currentBlock === 'answer') {
+          currentBlock = 'normal';
+        }
       }
       if (
         rawLine.startsWith('--- a/') ||
@@ -959,30 +1002,58 @@ export class TerminalUI {
       }
 
       const isUser = rawLine.startsWith('> ') || rawLine.startsWith('› ');
-      const lineBlock = isUser ? 'user' : currentBlock;
-
-      if (lineBlock === 'user') {
+      if (isUser) {
+        ensureBlankLine();
+        currentBlock = 'normal';
         const cleanUser = rawLine.replace(/^>\s/, '› ');
         for (const chunk of wrapWithIndent(cleanUser, safeCols, ' ', '   ')) {
           wrapped.push({ text: chunk, block: 'user' });
         }
+        ensureBlankLine();
         continue;
       }
 
-      if (lineBlock === 'reasoning' || lineBlock === 'code') {
-        for (const chunk of wrapWithIndent(rawLine, safeCols, '  │ ', '  │ ')) {
-          wrapped.push({ text: chunk, block: lineBlock });
+      if (!trimmed) {
+        if (currentBlock === 'reasoning') continue;
+        if (currentBlock === 'answer' && answerFirstLine) continue;
+        ensureBlankLine();
+        continue;
+      }
+
+      const lineBlock = currentBlock;
+
+      if (lineBlock === 'reasoning') {
+        for (const chunk of wrapWithIndent(rawLine, safeCols, '  ', '  ')) {
+          wrapped.push({ text: chunk, block: 'reasoning' });
         }
         continue;
       }
 
-      if (lineBlock === 'normal') {
+      if (lineBlock === 'code') {
+        for (const chunk of wrapWithIndent(rawLine, safeCols, '    ', '    ')) {
+          wrapped.push({ text: chunk, block: 'code' });
+        }
+        continue;
+      }
+
+      if (lineBlock === 'answer' || lineBlock === 'normal') {
         const bulletMatch = /^(\s*)[-*]\s+(.*)$/.exec(rawLine);
         if (bulletMatch) {
           const indent = bulletMatch[1];
           const content = bulletMatch[2];
+          if (lineBlock === 'answer' && answerFirstLine) {
+            answerFirstLine = false;
+          }
           for (const chunk of wrapWithIndent(content, safeCols, `${indent}  • `, `${indent}    `)) {
-            wrapped.push({ text: chunk, block: 'normal' });
+            wrapped.push({ text: chunk, block: lineBlock });
+          }
+          continue;
+        }
+        if (lineBlock === 'answer') {
+          const firstPrefix = answerFirstLine ? '• ' : '  ';
+          answerFirstLine = false;
+          for (const chunk of wrapWithIndent(rawLine, safeCols, firstPrefix, '  ')) {
+            wrapped.push({ text: chunk, block: 'answer' });
           }
           continue;
         }
@@ -999,7 +1070,7 @@ export class TerminalUI {
 
   private styleLine(
     line: string,
-    block: 'normal' | 'reasoning' | 'code' | 'diff' | 'user',
+    block: 'normal' | 'answer' | 'reasoning' | 'code' | 'diff' | 'user',
     columns: number,
   ): string {
     if (line.startsWith('╭') || line.startsWith('╰') || line.startsWith('│') || line.startsWith('  >_ ')) {
@@ -1008,21 +1079,18 @@ export class TerminalUI {
     if (block === 'user') {
       return padRightAnsi(`\x1b[1;97m${formatInlineMarkdown(line, '\x1b[1;97m\x1b[48;5;236m')}`, columns, '\x1b[48;5;236m');
     }
-    if (line.startsWith('• Thinking [reasoning')) {
+    if (line === '• Thinking') {
       return `\x1b[2;35m${line}\x1b[0m`;
     }
     if (block === 'reasoning') {
-      return `\x1b[2;3m${line}\x1b[0m`;
-    }
-    if (line.startsWith('• Answer [answer]')) {
-      return `\x1b[1;32m${line}\x1b[0m`;
+      return `\x1b[2;3m${formatInlineMarkdown(line, '\x1b[2;3m')}\x1b[0m`;
     }
     if (block === 'code') {
       if (line.startsWith('  ╭─') || line.startsWith('  ╰─')) return `\x1b[2;36m${line}\x1b[0m`;
       return `\x1b[38;2;180;210;255m${line}\x1b[0m`;
     }
     // Codex Explored / Ran / Edited cells
-    if (/^• (?:Explored|Exploring)\b/.test(line)) {
+    if (/^• (?:Explored|Exploring|Resumed)\b/.test(line)) {
       return `\x1b[2m•\x1b[0m \x1b[1m${line.slice(2)}\x1b[0m`;
     }
     if (/^• (?:Ran|Running)\b/.test(line)) {
@@ -1036,6 +1104,15 @@ export class TerminalUI {
         .replace(/\(\+(\d+)/, '(\x1b[32m+$1\x1b[0m')
         .replace(/-(\d+)\)/, '\x1b[31m-$1\x1b[0m)');
       return `\x1b[2m•\x1b[0m \x1b[1m${coloredStats.slice(2)}\x1b[0m`;
+    }
+    if (line.startsWith('• Allow ') || line.startsWith('Allow ')) {
+      return `\x1b[1;33m${line}\x1b[0m`;
+    }
+    if (line.startsWith('  $ ')) {
+      return `  \x1b[2m$\x1b[0m \x1b[1;38;2;99;168;248m${line.slice(4)}\x1b[0m`;
+    }
+    if (block === 'answer' && line.startsWith('• ')) {
+      return `\x1b[2m•\x1b[0m ${formatInlineMarkdown(line.slice(2))}`;
     }
     if (/^\s*(?:└| )\s+(?:Read|List|Search)\b/.test(line)) {
       return line
@@ -1066,7 +1143,6 @@ export class TerminalUI {
     if (line.startsWith('  [ ] ')) return `\x1b[2m  □ ${line.slice(6)}\x1b[0m`;
     if (line.startsWith('↺ Reverted')) return `\x1b[1;33m${line}\x1b[0m`;
     if (line.startsWith('[agent ')) return `\x1b[33m${line}\x1b[0m`;
-    if (line.startsWith('Allow ')) return `\x1b[1;33m${line}\x1b[0m`;
 
     // Markdown headings
     const headingMatch = /^(#{1,4})\s+(.*)$/.exec(line.trimStart());
@@ -1115,7 +1191,8 @@ export class TerminalUI {
 
     // Body lines with strict width bound
     const all = this.renderStyledBodyLines(safeCols, rich);
-    const height = rows - 5;
+    const chromeRows = rich ? 6 : 4;
+    const height = Math.max(2, rows - chromeRows);
     this.maxScroll = Math.max(0, all.length - height);
     this.scroll = Math.min(this.scroll, this.maxScroll);
     const end = all.length - this.scroll;
@@ -1124,11 +1201,9 @@ export class TerminalUI {
 
     // Codex Live Status Indicator / Slash Command / Attached Images / Scroll Indicator Bar
     const elapsedStr = this.turnStartedAt ? `${formatCompactDuration(Date.now() - this.turnStartedAt)} • ` : '';
-    const liveActivity = this.activeToolStream
-      ? `Streaming ${this.activeToolStream.name}${this.activeToolStream.preview ? `: ${this.activeToolStream.preview}` : '…'}`
-      : this.reasoningHeader
-        ? `${this.reasoningHeader}${this.reasoningDetail ? ` — ${this.reasoningDetail}` : ''}`
-        : [...this.toolStates.values()].slice(-2).join(' | ');
+    const liveActivity = this.reasoningHeader
+      ? `${this.reasoningHeader}${this.reasoningDetail ? ` — ${this.reasoningDetail}` : ''}`
+      : [...this.toolStates.values()].slice(-2).join(' | ');
 
     let toolsText = '';
     if (this.scroll > 0) {
@@ -1140,9 +1215,9 @@ export class TerminalUI {
     } else if (this.attachedImages.size > 0 && !busy) {
       const items = [...this.attachedImages.entries()].map(([k, p]) => `${k}: ${basename(p)}`).join(' · ');
       toolsText = `📎 Attached ${items} (Enter to send · Backspace to remove)`;
-    } else if (busy || this.activeToolStream) {
-      const statusTitle = liveActivity || this.status;
-      toolsText = `• ${statusTitle} (${elapsedStr}esc / ctrl+c to interrupt)`;
+    } else if (busy) {
+      const statusTitle = liveActivity || 'Working';
+      toolsText = `• ${statusTitle} (${elapsedStr}esc to interrupt)`;
     } else {
       toolsText = [...this.toolStates.values()].slice(-2).join(' | ');
     }
@@ -1150,42 +1225,75 @@ export class TerminalUI {
     const toolsLine = rich && toolsText
       ? this.scroll > 0
         ? `\x1b[1;36m${clip(toolsText)}\x1b[0m`
-        : busy || this.activeToolStream
+        : busy
           ? `\x1b[1;38;2;99;168;248m${indicator}\x1b[0m \x1b[1m${clip(toolsText.slice(2))}\x1b[0m`
           : `\x1b[33m${clip(toolsText)}\x1b[0m`
       : clip(toolsText);
 
-    const footerRaw = clip(
-      `${indicator} ${this.status} · ${this.modeLabel} · effort:${this.effortLabel}${todoBadge} · ${this.tokens} tokens · ↑↓/Wheel scroll · Shift+Tab mode · Alt+V paste img`,
-    );
-    const footer = rich
-      ? `\x1b[2m${footerRaw}\x1b[0m`
-      : clip(`${this.status} · ${this.tokens} tokens · Ctrl+C cancel · PgUp/PgDn scroll`);
+    if (rich) {
+      // Rounded Composer Text Box with guaranteed spacer gap above
+      const gapLine = '';
+      const boxPromptLabel = this.label === 'goon> ' ? '› ' : clip(this.label);
+      const boxLabelCols = visibleLength(boxPromptLabel);
+      const boxInnerCols = Math.max(1, safeCols - 4 - boxLabelCols);
 
-    // Composer prompt with strict width math so `label + input` NEVER exceeds `safeCols`
+      let visibleBeforeCursor = this.input.slice(0, this.cursor).join('');
+      while (visibleBeforeCursor && visibleLength(visibleBeforeCursor) >= boxInnerCols) {
+        visibleBeforeCursor = [...visibleBeforeCursor].slice(1).join('');
+      }
+      const afterCursor = this.input.slice(this.cursor).join('');
+      const shownInput = wrapTerminal(visibleBeforeCursor + afterCursor, boxInnerCols)[0];
+      const isEmptyInput = this.input.length === 0 && this.label === 'goon> ';
+      const placeholder = isEmptyInput
+        ? wrapTerminal('Ask anything… (Type /help, @ files, Ctrl+V paste image)', boxInnerCols)[0]
+        : '';
+      const innerContent = placeholder
+        ? `\x1b[2m${placeholder}\x1b[0m`
+        : formatInlineMarkdown(shownInput);
+      const innerPadSpaces = ' '.repeat(Math.max(0, boxInnerCols - visibleLength(placeholder || shownInput)));
+
+      const borderColor = busy ? '\x1b[2m' : '\x1b[38;2;99;168;248m';
+      const topMeta = clip(` ${this.modeLabel} · effort:${this.effortLabel}${todoBadge} `);
+      const topDashes = '─'.repeat(Math.max(1, safeCols - 3 - visibleLength(topMeta)));
+      const boxTop = `${borderColor}╭─\x1b[0m\x1b[1;36m${topMeta}\x1b[0m${borderColor}${topDashes}╮\x1b[0m`;
+
+      const boxMid =
+        `${borderColor}│\x1b[0m \x1b[1;38;2;99;168;248m${boxPromptLabel}\x1b[0m` +
+        `${innerContent}${innerPadSpaces} ${borderColor}│\x1b[0m`;
+
+      const botMeta = clip(
+        ` ${this.status} · ${this.tokens} tokens · ↑↓/Wheel scroll · Shift+Tab mode · Ctrl+V paste img `,
+      );
+      const botDashes = '─'.repeat(Math.max(1, safeCols - 3 - visibleLength(botMeta)));
+      const boxBot = `${borderColor}╰─\x1b[0m\x1b[2m${botMeta}\x1b[0m${borderColor}${botDashes}╯\x1b[0m`;
+
+      const boxCursorCol = Math.min(safeCols - 1, 2 + boxLabelCols + visibleLength(visibleBeforeCursor) + 1);
+      const frame =
+        `\x1b[?2026h\x1b[?25l\x1b[H\x1b[2J${[header, ...body, gapLine, toolsLine, boxTop, boxMid, boxBot].join('\r\n')}` +
+        (this.pending ? `\x1b[1A\r\x1b[${boxCursorCol}G\x1b[?25h` : '') +
+        `\x1b[?2026l`;
+
+      if (frame !== this.lastRenderedFrame) {
+        this.lastRenderedFrame = frame;
+        this.target.write(frame);
+      }
+      return;
+    }
+
+    // Compact fallback for tiny (<48x12) terminals
+    const footer = clip(`${this.status} · ${this.tokens} tokens · Ctrl+C cancel · PgUp/PgDn scroll`);
     const label = clip(this.label);
     const labelCols = visibleLength(label);
     const inputAvailCols = Math.max(1, safeCols - labelCols);
-
     let visibleBeforeCursor = this.input.slice(0, this.cursor).join('');
     while (visibleBeforeCursor && visibleLength(visibleBeforeCursor) >= inputAvailCols) {
       visibleBeforeCursor = [...visibleBeforeCursor].slice(1).join('');
     }
     const afterCursor = this.input.slice(this.cursor).join('');
     const shownInput = wrapTerminal(visibleBeforeCursor + afterCursor, inputAvailCols)[0];
-    const isEmptyInput = this.input.length === 0 && this.label === 'goon> ';
-    const placeholder = isEmptyInput && rich
-      ? wrapTerminal('Ask anything… (/ commands, @ files, Ctrl+V / Alt+V paste image)', inputAvailCols)[0]
-      : '';
-    const styledShownInput = formatInlineMarkdown(shownInput);
-    const prompt = rich
-      ? `\x1b[1;38;2;99;168;248m${label}\x1b[0m${placeholder ? `\x1b[2m${placeholder}\x1b[0m` : styledShownInput}`
-      : wrapTerminal(label + shownInput, safeCols)[0];
-
+    const prompt = wrapTerminal(label + shownInput, safeCols)[0];
     const cursorColumn = Math.min(columns, labelCols + visibleLength(visibleBeforeCursor) + 1);
 
-    // Position cursor directly on the current (`prompt`) line via \r\x1b[${cursorColumn}G
-    // so it is mathematically impossible for the cursor to land on the wrong row.
     const frame =
       `\x1b[?2026h\x1b[?25l\x1b[H\x1b[2J${[header, ...body, toolsLine, footer, prompt].join('\r\n')}` +
       (this.pending ? `\r\x1b[${cursorColumn}G\x1b[?25h` : '') +

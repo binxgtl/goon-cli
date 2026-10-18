@@ -89,6 +89,20 @@ function welcomeBanner(
   ].join('\n');
 }
 
+function formatRelativeTime(isoDate: string): string {
+  const ts = Date.parse(isoDate);
+  if (!Number.isFinite(ts)) return isoDate.slice(0, 16).replace('T', ' ');
+  const diffSec = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+  if (diffSec < 60) return 'just now';
+  const mins = Math.floor(diffSec / 60);
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs}h ago`;
+  const days = Math.floor(hrs / 24);
+  if (days < 30) return `${days}d ago`;
+  return isoDate.slice(0, 10);
+}
+
 export async function main(argv = process.argv.slice(2)): Promise<void> {
   let apiKey: string | undefined;
   let jsonOutput = false;
@@ -264,15 +278,27 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
           if (!rl && !tui) return false;
           if (request.tool === 'exit_plan_mode' && request.input && typeof request.input === 'object' && 'plan' in request.input) {
             const planStr = String((request.input as { plan: unknown }).plan);
-            display(`\n╭─── Proposed Implementation Plan ────────────────────────────────╮\n${planStr}\n╰─────────────────────────────────────────────────────────────────╯\nApprove plan and exit plan mode?\n`);
-            const reply = (await question('[y/N] ', request.signal)).trim().toLowerCase();
+            const planPrompt = `\n╭─── Proposed Implementation Plan ────────────────────────────────╮\n${planStr}\n╰─────────────────────────────────────────────────────────────────╯\nApprove plan and exit plan mode?\n`;
+            const reply = tui
+              ? (await tui.askTransient(planPrompt, '[y/N] ', request.signal)).trim().toLowerCase()
+              : (display(planPrompt), (await question('[y/N] ', request.signal)).trim().toLowerCase());
             return reply === 'y' || reply === 'yes';
           }
           const diff = await reg.files.previewDiff(request.tool, request.input);
-          const rawPreview = diff ?? JSON.stringify(request.input, null, 2);
+          let rawPreview: string;
+          if (diff) {
+            rawPreview = diff;
+          } else if (request.tool === 'bash' && request.input && typeof request.input === 'object' && 'command' in request.input) {
+            const cmd = String((request.input as { command: unknown }).command ?? '').trim();
+            rawPreview = `  $ ${cmd}`;
+          } else {
+            rawPreview = JSON.stringify(request.input, null, 2);
+          }
           const preview = cleanTerminal(rawPreview.split(runtime.apiKey).join('[REDACTED]').slice(0, 2000));
-          display(`\nAllow ${request.tool}?\n${preview}\n`);
-          const reply = (await question('[y/N/a(lways)] ', request.signal)).trim().toLowerCase();
+          const approvalBlock = `\n• Allow ${request.tool}?\n${preview}\n`;
+          const reply = tui
+            ? (await tui.askTransient(approvalBlock, '[y/N/a(lways)] ', request.signal)).trim().toLowerCase()
+            : (display(approvalBlock), (await question('[y/N/a(lways)] ', request.signal)).trim().toLowerCase());
           if (reply === 'a' || reply === 'always') {
             sessionAllowedTools.add(request.tool);
             return true;
@@ -330,6 +356,46 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       const renderResumedHistory = () => {
         const msgs = store.session.messages;
         if (!msgs.length) return;
+        if (tui) {
+          const blocks: string[] = [];
+          const tail = msgs.slice(-30);
+          for (const m of tail) {
+            if (m.role === 'user') {
+              const rawText = typeof m.content === 'string'
+                ? m.content
+                : Array.isArray(m.content)
+                  ? m.content.map(p => ('text' in p && typeof p.text === 'string' ? p.text : p.type === 'image' ? '[Image]' : '')).filter(Boolean).join(' ')
+                  : '';
+              const cleaned = rawText
+                .replace(/<referenced_file\s+path="([^"]+)"[\s\S]*?<\/referenced_file>/g, '[@$1]')
+                .replace(/\r?\n/g, ' ')
+                .trim();
+              if (cleaned) blocks.push(`\n> ${cleaned}\n`);
+            } else if (m.role === 'assistant') {
+              if (typeof m.content === 'string') {
+                const txt = m.content.trim();
+                if (txt) blocks.push(`\n[answer]\n${txt}\n`);
+              } else if (Array.isArray(m.content)) {
+                for (const part of m.content) {
+                  if (part.type === 'reasoning' && 'text' in part && typeof part.text === 'string' && part.text.trim()) {
+                    blocks.push(`\n[reasoning]\n${part.text.trim()}\n`);
+                  } else if (part.type === 'text' && 'text' in part && typeof part.text === 'string' && part.text.trim()) {
+                    blocks.push(`\n[answer]\n${part.text.trim()}\n`);
+                  }
+                }
+              }
+            }
+          }
+          const titleSuffix = store.session.title ? ` (${store.session.title})` : '';
+          blocks.push(
+            `\n• Resumed session ${store.session.id.slice(0, 8)}${titleSuffix} · ${msgs.length} messages · ${store.session.checkpoints?.length ?? 0} checkpoints\n`,
+          );
+          display(blocks.join(''));
+          if (store.session.todos?.length) {
+            tui.event({ type: 'todo', todos: store.session.todos });
+          }
+          return;
+        }
         const lines: string[] = [
           `\n╭─── Resumed Session ${store.session.id.slice(0, 8)}${store.session.title ? ` (${store.session.title})` : ''} · ${msgs.length} messages · ${store.session.checkpoints?.length ?? 0} checkpoints ───╮`,
         ];
@@ -347,9 +413,6 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         }
         lines.push('╰──────────────────────────────────────────────────────────────────────────────────╯\n');
         display(lines.join('\n'));
-        if (store.session.todos?.length) {
-          tui?.event({ type: 'todo', todos: store.session.todos });
-        }
       };
 
       starting = false;
@@ -703,13 +766,19 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
                 continue;
               }
               const rows = candidates.slice(0, 15).map((s, idx) => {
-                const currentTag = s.id === store.session.id ? ' [current]' : '';
+                const numStr = String(idx + 1).padStart(2, ' ');
+                const currentTag = s.id === store.session.id ? ' • current' : '';
                 const msgTag = `${s.messagesCount ?? 0} msgs`;
-                const label = s.title ? `[${s.title}]` : s.preview ? `"${s.preview}"` : '(empty)';
-                return `  ${idx + 1}. ${s.id.slice(0, 8)}${currentTag} · ${msgTag} · ${s.updatedAt.slice(0, 19).replace('T', ' ')} · ${label}`;
+                const ageTag = formatRelativeTime(s.updatedAt);
+                const rawLabel = s.title ? `[${s.title}] ${s.preview ?? ''}`.trim() : s.preview ? s.preview : '(empty session)';
+                const label = rawLabel.replace(/\s+/g, ' ').slice(0, 68);
+                return `  ${numStr}. ${s.id.slice(0, 8)} · ${ageTag.padEnd(8)} · ${msgTag.padEnd(8)} · ${label}${currentTag}`;
               });
-              display(`\nSaved sessions in workspace (${candidates.length}):\n${rows.join('\n')}\n`);
-              const choice = (await question(`Resume session [1-${Math.min(15, candidates.length)}, latest, ID prefix, or Enter to cancel]: `)).trim();
+              const pickerBlock = `\n╭─── Resume Saved Session (${candidates.length} in workspace) ───────────────────────────╮\n${rows.join('\n')}\n╰──────────────────────────────────────────────────────────────────────────╯\n`;
+              const promptText = `Resume [1-${Math.min(15, candidates.length)}, latest, ID prefix, or Enter to cancel]: `;
+              const choice = tui
+                ? (await tui.askTransient(pickerBlock, promptText)).trim()
+                : (display(pickerBlock), (await question(promptText)).trim());
               if (!choice) {
                 display('Cancelled /resume.\n');
                 continue;
@@ -736,6 +805,10 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
               const built = await buildHarness(mode);
               tools = built.tools;
               harness = built.harness;
+              if (tui) {
+                tui.clear();
+                display(welcomeBanner(runtime.model, runtime.provider, runtime.baseUrl, runtime.effort, runtime.cwd, store.session.id, mode));
+              }
               tui?.setTitle(store.session.title ? `${runtime.model} · ${store.session.title}` : `${runtime.model} · ${store.session.id.slice(0, 8)}`);
               tui?.setTokens(store.session.tokens);
               tui?.event({ type: 'todo', todos: store.session.todos ?? [] });

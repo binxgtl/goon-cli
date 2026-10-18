@@ -89,9 +89,10 @@ test('TUI separates opt-in reasoning from answers and consumes compact child pro
   tty.ui.event({ type: 'subagent', id: 'child123', state: 'done' });
   await new Promise(resolve => setTimeout(resolve, 40));
   const frame = tty.written.split('\x1b[H\x1b[2J').at(-1);
-  assert.equal(frame.split('[reasoning · inline]').length - 1, 1);
-  assert.equal(frame.split('[reasoning · provider]').length - 1, 1);
-  assert.match(frame, /\[answer\]/); assert.match(frame, /Visible answer/);
+  assert.equal(frame.split('• Thinking').length - 1, 2);
+  assert(!frame.includes('[reasoning'), 'Must not render raw [reasoning] tags');
+  assert(!frame.includes('[answer]'), 'Must not render raw [answer] header');
+  assert.match(frame, /Visible answer\./);
   assert.match(frame, /agent child123: done/); assert.match(frame, /15 tokens/);
   assert.equal(frame.split('Inspect one file').length - 1, 1);
 });
@@ -157,17 +158,18 @@ test('TUI supports slash-command Tab completion, Shift+Tab mode toggle, Alt+. ef
   assert.equal(runtime.effort, 'xhigh');
 });
 
-test('Codex TUI renders Markdown bullets without false-positive red diff coloring, coalesces Explored cells, and streams tool_stream status', async t => {
+test('Codex TUI renders Markdown bullets without false-positive red diff coloring, coalesces Explored cells, and suppresses noisy tool_stream status', async t => {
   const tty = terminal(t);
   tty.output.columns = 100;
   tty.output.rows = 30;
   tty.ui.setStatus('Running');
 
-  // 1. Live tool_stream event updates status bar immediately
+  // 1. Live tool_stream event is suppressed from status bar (only clean Working status shown)
   tty.ui.event({ type: 'tool_stream', id: 'tc1', name: 'write_file', state: 'delta', preview: 'src/app.ts' });
   await new Promise(resolve => setTimeout(resolve, 25));
   assert(tty.written.includes('\x1b[?2026h'), 'Should wrap frames in DEC Mode 2026 synchronized output');
-  assert(tty.written.includes('Streaming write_file: src/app.ts'), 'Should display live tool_stream progress');
+  assert(!tty.written.includes('Streaming write_file:'), 'Must NOT display noisy Streaming write_file status');
+  assert(tty.written.includes('Working'), 'Should display clean Working status indicator');
 
   // 2. Coalesced Explored cell for consecutive read/list/search tools
   tty.ui.event({
@@ -329,6 +331,39 @@ test('Codex TUI collapses pasted ScreenClip image paths into [Image #1], prevent
   assert.equal(fromBarePaste.imageParts[0].mediaType, 'image/png');
   assert.match(fromBarePaste.text, /\[Image #1: \{25D1BD96-7B57-4392-BBF0-17E774BEEFF2\}\.png\]/);
 });
+
+test('Codex TUI renders rounded composer text box with spacer gap, pipe-free thinking cells, and cleans up askTransient prompts', async t => {
+  const { stripVTControlCharacters } = await import('node:util');
+  const tty = terminal(t);
+  tty.output.columns = 90;
+  tty.output.rows = 20;
+
+  tty.ui.event({ type: 'reasoning', source: 'provider', text: 'Checking files without vertical bars\n' });
+  tty.ui.event({ type: 'text', text: 'Direct bullet answer without [answer] tag.\n' });
+  await new Promise(resolve => setTimeout(resolve, 25));
+
+  // Verify transient approval prompt appears while waiting and is removed once answered
+  const approvalPromise = tty.ui.askTransient('\n• Allow bash?\n  $ npm test\n', '[y/N/a(lways)] ');
+  await new Promise(resolve => setTimeout(resolve, 25));
+  let frame = stripVTControlCharacters(tty.written.split('\x1b[H\x1b[2J').at(-1));
+  assert.match(frame, /• Allow bash\?/);
+  assert.match(frame, /\$ npm test/);
+
+  tty.key('y', 'y');
+  tty.key('', 'return');
+  assert.equal(await approvalPromise, 'y');
+  await new Promise(resolve => setTimeout(resolve, 25));
+
+  frame = stripVTControlCharacters(tty.written.split('\x1b[H\x1b[2J').at(-1));
+  assert(!frame.includes('Allow bash?'), 'Transient approval prompt should be removed from transcript after answer');
+  assert.match(frame, /• Thinking/);
+  assert.match(frame, /  Checking files without vertical bars/);
+  assert.match(frame, /• Direct bullet answer without \[answer\] tag\./);
+  assert.match(frame, /╭─/);
+  assert.match(frame, /│ › /);
+  assert.match(frame, /╰─/);
+});
+
 
 
 
