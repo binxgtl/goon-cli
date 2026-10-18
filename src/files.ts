@@ -318,7 +318,6 @@ export class WorkspaceFiles {
     }
   }
   private assertNotWindowsReserved(file: string) {
-    if (process.platform !== 'win32') return;
     const rel = relative(this.root, file);
     for (const seg of rel.split(/[\\/]/)) {
       if (WINDOWS_RESERVED_DEVICE_RE.test(seg)) {
