@@ -28,7 +28,49 @@ export type HarnessEvent =
   | { type: 'compaction'; count: number }
   | { type: 'todo'; todos: TodoItem[] }
   | { type: 'plan_exit'; plan: string }
+  | { type: 'retry'; attempt: number; maxRetries: number; message: string }
   | { type: 'stopped'; reason: string };
+
+export const MAX_API_RETRIES = 3;
+
+function isNonRetryableApiError(error: unknown, userSignal: AbortSignal): boolean {
+  if (userSignal.aborted) return true;
+  const errObj = error && typeof error === 'object' ? (error as Record<string, unknown>) : {};
+  const status = typeof errObj.statusCode === 'number'
+    ? errObj.statusCode
+    : typeof errObj.status === 'number'
+      ? errObj.status
+      : undefined;
+  if (status === 400 || status === 401 || status === 403 || status === 404 || status === 422) {
+    return true;
+  }
+  const msg = error instanceof Error ? error.message : String(error);
+  if (
+    /\b(?:401|403|authentication_error|invalid_api_key|unauthorized)\b/i.test(msg) ||
+    msg.startsWith('Model response hit the output limit') ||
+    msg.startsWith('Invalid or excessive tool call batch') ||
+    msg.startsWith('Model stopped unexpectedly (content-filter)')
+  ) {
+    return true;
+  }
+  return false;
+}
+
+async function sleepWithAbort(ms: number, signal: AbortSignal): Promise<void> {
+  if (ms <= 0) return;
+  signal.throwIfAborted();
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal.reason ?? new Error('Cancelled by user.'));
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
 
 export interface RevertResult {
   turnsReverted: number;
@@ -239,73 +281,93 @@ export class Harness {
         account(await compactIfNeeded(this.store, this.config, this.model, system, signal, measuredInput));
         if (session.compactions !== oldCount) { measuredInput = 0; this.emit({ type: 'compaction', count: session.compactions }); }
         if (exhausted()) throw new Error('Run token budget reached during compaction. Original history is archived; resume to continue.');
-        const result = streamText({
-          model: this.model, system, messages: session.messages, tools: this.tools.schemas(),
-          maxOutputTokens: this.config.maxOutputTokens, maxRetries: 2,
-          ...(providerOptions ? { providerOptions } : {}),
-          abortSignal: AbortSignal.any([signal, AbortSignal.timeout(this.config.timeoutMs)]),
-          // The SDK's default handler logs the raw upstream error. CLI owns
-          // error presentation so credentials can be redacted before output.
-          onError: () => {},
-        });
         let stepText = '';
-        const projection = new AnswerProjection(this.config.inlineReasoning);
-        const present = (parts: AnswerPart[]) => {
-          for (const part of parts) {
-            if (part.type === 'text') { stepText += part.text; this.emit({ type: 'text', text: part.text }); }
-            else if (this.config.showReasoning) this.emit({ ...part, type: 'reasoning', source: 'inline' });
-          }
-        };
-        const streamingTools = new Map<string, { name: string; raw: string; lastEmitLen: number }>();
-        for await (const event of result.fullStream) {
-          if (event.type === 'error') throw event.error;
-          if (event.type === 'abort') throw new Error('Model request cancelled or timed out.');
-          if (event.type === 'text-delta') present(projection.push(event.text));
-          if (event.type === 'reasoning-delta') {
-            if (this.config.showReasoning) this.emit({ type: 'reasoning', text: event.text, source: 'provider' });
-          }
-          if (event.type === 'tool-input-start') {
-            const name = normalizeToolName(event.toolName);
-            streamingTools.set(event.id, { name, raw: '', lastEmitLen: 0 });
-            this.emit({ type: 'tool_stream', name, id: event.id, state: 'start', preview: '' });
-          }
-          if (event.type === 'tool-input-delta') {
-            const entry = streamingTools.get(event.id);
-            if (entry) {
-              entry.raw += event.delta;
-              if (entry.raw.length - entry.lastEmitLen >= 48 || event.delta.includes('\n') || entry.lastEmitLen === 0) {
-                entry.lastEmitLen = entry.raw.length;
-                this.emit({
-                  type: 'tool_stream',
-                  name: entry.name,
-                  id: event.id,
-                  state: 'delta',
-                  preview: extractStreamPreview(entry.raw),
-                });
+        let calls: ToolCall[] = [];
+        for (let attempt = 0; ; attempt++) {
+          stepText = '';
+          calls = [];
+          try {
+            const result = streamText({
+              model: this.model, system, messages: session.messages, tools: this.tools.schemas(),
+              maxOutputTokens: this.config.maxOutputTokens, maxRetries: 0,
+              ...(providerOptions ? { providerOptions } : {}),
+              abortSignal: AbortSignal.any([signal, AbortSignal.timeout(this.config.timeoutMs)]),
+              // The SDK's default handler logs the raw upstream error. CLI owns
+              // error presentation so credentials can be redacted before output.
+              onError: () => {},
+            });
+            const projection = new AnswerProjection(this.config.inlineReasoning);
+            const present = (parts: AnswerPart[]) => {
+              for (const part of parts) {
+                if (part.type === 'text') { stepText += part.text; this.emit({ type: 'text', text: part.text }); }
+                else if (this.config.showReasoning) this.emit({ ...part, type: 'reasoning', source: 'inline' });
+              }
+            };
+            const streamingTools = new Map<string, { name: string; raw: string; lastEmitLen: number }>();
+            for await (const event of result.fullStream) {
+              if (event.type === 'error') throw event.error;
+              if (event.type === 'abort') throw new Error('Model request cancelled or timed out.');
+              if (event.type === 'text-delta') present(projection.push(event.text));
+              if (event.type === 'reasoning-delta') {
+                if (this.config.showReasoning) this.emit({ type: 'reasoning', text: event.text, source: 'provider' });
+              }
+              if (event.type === 'tool-input-start') {
+                const name = normalizeToolName(event.toolName);
+                streamingTools.set(event.id, { name, raw: '', lastEmitLen: 0 });
+                this.emit({ type: 'tool_stream', name, id: event.id, state: 'start', preview: '' });
+              }
+              if (event.type === 'tool-input-delta') {
+                const entry = streamingTools.get(event.id);
+                if (entry) {
+                  entry.raw += event.delta;
+                  if (entry.raw.length - entry.lastEmitLen >= 48 || event.delta.includes('\n') || entry.lastEmitLen === 0) {
+                    entry.lastEmitLen = entry.raw.length;
+                    this.emit({
+                      type: 'tool_stream',
+                      name: entry.name,
+                      id: event.id,
+                      state: 'delta',
+                      preview: extractStreamPreview(entry.raw),
+                    });
+                  }
+                }
               }
             }
+            signal.throwIfAborted();
+            const finish = await result.finishReason;
+            if (finish === 'length') throw new Error('Model response hit the output limit. No tools from this response were executed; increase --max-output-tokens.');
+            if (['error', 'content-filter', 'other', 'unknown'].includes(finish)) throw new Error(`Model stopped unexpectedly (${finish}).`);
+            present(projection.finish());
+            const response = await result.response;
+            calls = (await result.toolCalls).map(c => ({ toolCallId: c.toolCallId, toolName: c.toolName, input: c.input }));
+            if (calls.length > 32 || new Set(calls.map(c => c.toolCallId)).size !== calls.length) throw new Error('Invalid or excessive tool call batch. No tools executed.');
+            // A successful terminal step needs its own answer. Reasoning may be
+            // opaque to the adapter, and earlier tool narration is not completion.
+            if (!calls.length && !stepText.trim()) throw new Error('Model finished without a visible answer.');
+            const usage = await result.usage;
+            const input = usage.inputTokens ?? estimatedTokens(session.messages, system);
+            const output = usage.outputTokens ?? Math.ceil(JSON.stringify(response.messages).length / 2);
+            const tokens = usage.totalTokens ?? input + output;
+            account(tokens); session.tokens += tokens; measuredInput = input;
+            this.emit({ type: 'usage', input, output, total: tokens });
+            session.messages.push(...response.messages);
+            text += stepText;
+            await this.store.save(); // Persist tool declarations before any side effect.
+            break;
+          } catch (stepErr) {
+            if (attempt >= MAX_API_RETRIES || isNonRetryableApiError(stepErr, signal)) {
+              throw stepErr;
+            }
+            const nextRetry = attempt + 1;
+            this.emit({
+              type: 'retry',
+              attempt: nextRetry,
+              maxRetries: MAX_API_RETRIES,
+              message: safeError(stepErr, this.config.apiKey),
+            });
+            await sleepWithAbort(Math.min(1500, 150 * 2 ** attempt), signal);
           }
         }
-        signal.throwIfAborted();
-        const finish = await result.finishReason;
-        if (finish === 'length') throw new Error('Model response hit the output limit. No tools from this response were executed; increase --max-output-tokens.');
-        if (['error', 'content-filter', 'other', 'unknown'].includes(finish)) throw new Error(`Model stopped unexpectedly (${finish}).`);
-        present(projection.finish());
-        const response = await result.response;
-        const calls: ToolCall[] = (await result.toolCalls).map(c => ({ toolCallId: c.toolCallId, toolName: c.toolName, input: c.input }));
-        if (calls.length > 32 || new Set(calls.map(c => c.toolCallId)).size !== calls.length) throw new Error('Invalid or excessive tool call batch. No tools executed.');
-        const usage = await result.usage;
-        const input = usage.inputTokens ?? estimatedTokens(session.messages, system);
-        const output = usage.outputTokens ?? Math.ceil(JSON.stringify(response.messages).length / 2);
-        const tokens = usage.totalTokens ?? input + output;
-        account(tokens); session.tokens += tokens; measuredInput = input;
-        this.emit({ type: 'usage', input, output, total: tokens });
-        session.messages.push(...response.messages);
-        text += stepText;
-        await this.store.save(); // Persist tool declarations before any side effect.
-        // A successful terminal step needs its own answer. Reasoning may be
-        // opaque to the adapter, and earlier tool narration is not completion.
-        if (!calls.length && !stepText.trim()) throw new Error('Model finished without a visible answer.');
         if (!calls.length) return text;
         const outcome = await this.executeBatch(calls, signal);
         if (outcome.denied) { this.emit({ type: 'stopped', reason: 'Permission denied.' }); return text; }

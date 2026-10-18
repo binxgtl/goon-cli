@@ -8,7 +8,7 @@ import type { SubagentEvent } from './subagents.js';
 
 const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 export const SLASH_COMMANDS = [
-  '/help', '/setup', '/model', '/effort', '/mode', '/plan', '/revert', '/undo',
+  '/help', '/setup', '/model', '/effort', '/mode', '/view', '/plan', '/revert', '/undo',
   '/checkpoints', '/todo', '/resume', '/new', '/compact', '/diff', '/review', '/fork', '/rename',
   '/export', '/init', '/status', '/tools', '/sessions', '/doctor', '/clear', '/exit',
 ];
@@ -17,6 +17,7 @@ const SLASH_DESCRIPTIONS: Record<string, string> = {
   '/help': 'show commands & shortcuts',
   '/model': 'switch model & auto-sync limits',
   '/effort': 'set reasoning effort (low..max)',
+  '/view': 'switch view mode: normal (hide thinking) | verbose (show all)',
   '/plan': 'toggle read-only Plan Mode',
   '/mode': 'cycle ask / plan / auto / readonly',
   '/revert': 'rewind turn(s) & restore prompt to composer (or Esc Esc)',
@@ -32,10 +33,12 @@ const SLASH_DESCRIPTIONS: Record<string, string> = {
   '/exit': 'quit goon cli',
 };
 
-// Strip whole escape sequences before removing remaining control bytes.
+// Strip whole escape sequences before removing remaining control bytes, normalizing combining accents to NFC.
 export function terminalText(value: string): string {
   // oxlint-disable-next-line eslint/no-control-regex
-  return stripVTControlCharacters(value).replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, '');
+  return stripVTControlCharacters(value)
+    .normalize('NFC')
+    .replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, '');
 }
 
 const width = (c: string) =>
@@ -101,10 +104,29 @@ function wrapWithIndent(text: string, columns: number, firstPrefix: string, cont
   return out.length ? out : [firstPrefix];
 }
 
-function visibleLength(str: string): number {
+export function visibleLength(str: string): number {
   let total = 0;
   for (const c of stripVTControlCharacters(str)) total += width(c);
   return total;
+}
+
+export function sliceVisible(str: string, maxCols: number): string {
+  const normalized = str.normalize('NFC');
+  let out = '';
+  let used = 0;
+  for (const c of normalized) {
+    const w = width(c);
+    if (used + w > maxCols) break;
+    out += c;
+    used += w;
+  }
+  return out;
+}
+
+export function padEndVisible(str: string, cols: number): string {
+  const sliced = sliceVisible(str, cols);
+  const vis = visibleLength(sliced);
+  return `${sliced}${' '.repeat(Math.max(0, cols - vis))}`;
 }
 
 function padRightAnsi(str: string, cols: number, bgAnsi = ''): string {
@@ -256,6 +278,7 @@ export class TerminalUI {
   private escPrimed?: 'backtrack' | 'clear';
   private escPrimeTimer?: NodeJS.Timeout;
   private statusNotice?: string;
+  private viewMode: 'normal' | 'verbose' = 'verbose';
   onToggleMode?: () => void;
   onCycleEffort?: (direction: 1 | -1) => void;
 
@@ -369,6 +392,16 @@ export class TerminalUI {
     this.schedule();
   }
 
+  setViewMode(mode: 'normal' | 'verbose') {
+    this.viewMode = mode;
+    this.scroll = 0;
+    this.schedule(0);
+  }
+
+  getViewMode(): 'normal' | 'verbose' {
+    return this.viewMode;
+  }
+
   setEffort(effort: string | undefined) {
     this.effortLabel = terminalText(effort || 'default');
     this.schedule();
@@ -410,10 +443,15 @@ export class TerminalUI {
     let cleaned = text;
     // Clean up raw @"C:\...\image.png" in user prompt echo so transcript shows [Image #1: name.png]
     cleaned = cleaned.replace(/@"([^"]+\.(?:png|jpe?g|webp|gif))"/gi, (_, p: string) => `[Image: ${basename(p)}]`);
-    const isUserPrompt = cleaned.trimStart().startsWith('> ') || cleaned.trimStart().startsWith('› ');
+    const trimmedStart = cleaned.trimStart();
+    const isUserPrompt = trimmedStart.startsWith('> ') || trimmedStart.startsWith('› ');
+    const isTaggedBlock = trimmedStart.startsWith('[reasoning') || trimmedStart.startsWith('[answer]');
     if (isUserPrompt) {
       this.flushExploreGroup();
       this.outputChannel = undefined;
+    } else if (this.outputChannel && !isTaggedBlock && trimmedStart.length > 0) {
+      this.outputChannel = undefined;
+      cleaned = `\n[normal]\n${cleaned}`;
     }
     this.appendTranscript(cleaned, isUserPrompt);
   }
@@ -870,6 +908,16 @@ export class TerminalUI {
             this.schedule(0);
             return;
           }
+        } else if (this.pending && !this.remember) {
+          const pending = this.pending;
+          this.pending = undefined;
+          pending.cleanup();
+          this.input = [];
+          this.cursor = 0;
+          this.attachedImages.clear();
+          pending.resolve('');
+          this.schedule(0);
+          return;
         }
       }
       if (key.ctrl && key.name === 'l') {
@@ -1133,7 +1181,26 @@ export class TerminalUI {
 
     for (const rawLine of rawLines) {
       const trimmed = rawLine.trim();
+      if (rawLine === '[normal]') {
+        currentBlock = 'normal';
+        answerFirstLine = false;
+        continue;
+      }
+      if (rawLine.startsWith('[reasoning')) {
+        currentBlock = 'reasoning';
+        if (this.viewMode === 'normal') continue;
+        ensureBlankLine();
+        wrapped.push({ text: '• Thinking', block: 'reasoning' });
+        continue;
+      }
+      if (rawLine.startsWith('[answer]')) {
+        ensureBlankLine();
+        currentBlock = 'answer';
+        answerFirstLine = true;
+        continue;
+      }
       if (trimmed.startsWith('```')) {
+        if (currentBlock === 'reasoning' && this.viewMode === 'normal') continue;
         const lang = trimmed.slice(3).trim();
         if (currentBlock === 'code') {
           currentBlock = preCodeBlock;
@@ -1146,18 +1213,6 @@ export class TerminalUI {
         }
         continue;
       }
-      if (rawLine.startsWith('[reasoning')) {
-        ensureBlankLine();
-        currentBlock = 'reasoning';
-        wrapped.push({ text: '• Thinking', block: 'reasoning' });
-        continue;
-      }
-      if (rawLine.startsWith('[answer]')) {
-        ensureBlankLine();
-        currentBlock = 'answer';
-        answerFirstLine = true;
-        continue;
-      }
       if (
         rawLine.startsWith('• ') ||
         rawLine.startsWith('> ') ||
@@ -1168,7 +1223,7 @@ export class TerminalUI {
         rawLine.startsWith('Allow ')
       ) {
         if (
-          /^• (?:Explored|Exploring|Ran|Running|Failed|Edited|Added|Deleted|Allow |Resumed )\b/.test(rawLine) ||
+          /^• (?:Explored|Exploring|Ran|Running|Failed|Edited|Added|Deleted|Allow |Resumed |Reverted )\b/.test(rawLine) ||
           rawLine.startsWith('Allow ') ||
           rawLine.startsWith('[todo ') ||
           rawLine.startsWith('[Plan ') ||
@@ -1221,6 +1276,7 @@ export class TerminalUI {
       const lineBlock = currentBlock;
 
       if (lineBlock === 'reasoning') {
+        if (this.viewMode === 'normal') continue;
         for (const chunk of wrapWithIndent(rawLine, safeCols, '  ', '  ')) {
           wrapped.push({ text: chunk, block: 'reasoning' });
         }

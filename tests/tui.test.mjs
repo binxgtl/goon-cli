@@ -451,3 +451,44 @@ test('Codex TUI backtrack/revert removes reverted turns from screen, restores pr
   tty.key('', 'escape');
   assert.equal(await q2, '/revert');
 });
+
+test('welcomeBanner aligns all box borders to 69 visible columns with NFD Vietnamese paths and /view toggles normal vs verbose thinking', async t => {
+  const { stripVTControlCharacters } = await import('node:util');
+  const { welcomeBanner, visibleLength } = await import('../dist/index.js');
+
+  // NFD decomposed path: "D:\Thư mục mới (2)" ("u" + \u0323, "ơ" + \u0301)
+  const nfdWorkspace = 'D:\\Th\u01B0 mu\u0323c m\u01A1\u0301i (2)';
+  const banner = welcomeBanner('gpt-5.4', 'openai', 'https://api.ezaiapi.com/v1', 'max', nfdWorkspace, '0f40f011-0000-4000-8000-000000000000', 'ask');
+  const lines = banner.trim().split('\n');
+  assert.equal(lines.length, 6);
+  for (const line of lines) {
+    assert.equal(visibleLength(line), 69, `Expected 69 visible columns for line: ${line}`);
+  }
+
+  // Test /view mode: normal hides thinking blocks, verbose shows all thinking blocks
+  const tty = terminal(t);
+  tty.output.columns = 90;
+  tty.output.rows = 20;
+
+  tty.ui.setViewMode('normal');
+  assert.equal(tty.ui.getViewMode(), 'normal');
+  tty.ui.event({ type: 'reasoning', source: 'provider', text: 'Internal chain of thought step 1.\n' });
+  tty.ui.event({ type: 'text', text: 'Final visible answer.\n' });
+  await new Promise(resolve => setTimeout(resolve, 25));
+
+  let frame = stripVTControlCharacters(tty.ui.renderedFrame());
+  assert(!frame.includes('• Thinking'), 'In normal view mode, thinking blocks must be hidden');
+  assert(!frame.includes('Internal chain of thought step 1.'), 'In normal view mode, reasoning text must be hidden');
+  assert.match(frame, /• Final visible answer\./);
+
+  // Switch to verbose view mode -> thinking block immediately appears
+  tty.ui.setViewMode('verbose');
+  assert.equal(tty.ui.getViewMode(), 'verbose');
+  await new Promise(resolve => setTimeout(resolve, 25));
+
+  frame = stripVTControlCharacters(tty.ui.renderedFrame());
+  assert.match(frame, /• Thinking/);
+  assert.match(frame, /Internal chain of thought step 1\./);
+  assert.match(frame, /• Final visible answer\./);
+});
+

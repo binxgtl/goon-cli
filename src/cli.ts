@@ -19,7 +19,7 @@ import { safeError } from './errors.js';
 import { VERSION } from './version.js';
 import type { HarnessEvent } from './harness.js';
 import type { SubagentEvent } from './subagents.js';
-import { terminalText as cleanTerminal, TerminalUI } from './tui.js';
+import { padEndVisible, terminalText as cleanTerminal, TerminalUI, visibleLength } from './tui.js';
 import type { McpManager } from './mcp.js';
 import { EFFORT_DESCRIPTIONS, parseEffortInput, runSetupWizard } from './setup.js';
 import { discoverModels, formatModelBadge, resolveModelCapabilities, type DiscoveredModel } from './provider.js';
@@ -27,6 +27,7 @@ import { discoverModels, formatModelBadge, resolveModelCapabilities, type Discov
 const HELP = `goon cli ${VERSION} — independent coding harness
 
 Usage: goon [options] [prompt]
+       goon resume [ID|latest|number]
        goon setup
        goon init --provider openai-compatible --base-url URL --model MODEL [--effort LEVEL]
        goon doctor | sessions
@@ -57,17 +58,17 @@ Options:
   -v, --version             Show version
 
 Interactive commands:
-  /help, /setup, /model, /effort, /mode, /plan, /revert, /undo, /checkpoints,
+  /help, /setup, /model, /effort, /mode, /view, /plan, /revert, /undo, /checkpoints,
   /todo, /compact, /diff, /review, /fork, /rename, /export, /init, /status,
   /tools, /sessions, /doctor, /clear, /exit, or !<cmd> for shell.
-Shortcuts: Shift+Tab mode, Alt+. / Alt+, effort, Tab autocomplete (@file & /cmd), Ctrl+C cancel.
+Shortcuts: Shift+Tab mode, Alt+. / Alt+, effort, Tab autocomplete (@file & /cmd), Esc Esc rewind, Ctrl+C cancel.
 API keys are read from environment variables or ~/.config/goon/credentials.json.
 Shell commands run as your OS user; approvals are not an OS sandbox.
 `;
 
 type PermissionMode = 'ask' | 'plan' | 'auto' | 'readonly';
 
-function welcomeBanner(
+export function welcomeBanner(
   model: string,
   provider: string,
   baseUrl: string,
@@ -76,14 +77,18 @@ function welcomeBanner(
   sessionId: string,
   mode: PermissionMode,
 ): string {
-  const row = (label: string, val: string) => `│  ${label.padEnd(10)}: ${val.slice(0, 52).padEnd(52)} │`;
+  const innerWidth = 67;
+  const row = (label: string, val: string) =>
+    `│  ${padEndVisible(label, 10)}: ${padEndVisible(val, 52)} │`;
+  const titlePrefix = `╭─── >_ goon cli (v${VERSION}) `;
+  const topDashes = '─'.repeat(Math.max(1, innerWidth + 1 - visibleLength(titlePrefix)));
   return [
-    `╭─── >_ goon cli (v${VERSION}) ──────────────────────────────────────────╮`,
+    `${titlePrefix}${topDashes}╮`,
     row('gateway', `${baseUrl} (${provider})`),
     row('directory', cwd),
     row('session', `${sessionId.slice(0, 8)} · mode: ${mode} (Shift+Tab or /mode)`),
-    row('commands', 'Type /help · /plan · /revert · /resume · /diff'),
-    `╰───────────────────────────────────────────────────────────────────╯`,
+    row('commands', 'Type /help · /view · /plan · /revert · /resume'),
+    `╰${'─'.repeat(innerWidth)}╯`,
     '',
   ].join('\n');
 }
@@ -180,14 +185,27 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       if (!bash || !config.model || !resolvedKey) process.exitCode = 1;
       return;
     }
-    const { SessionStore } = await import('./session.js');
+    const { SessionStore, sameWorkspace } = await import('./session.js');
     if (positionals[0] === 'sessions') {
       const list = await SessionStore.list(join(dataDir(), 'sessions'));
       stdout.write(values.json ? JSON.stringify(list) + '\n' : list.map(s => `${s.id}  ${s.updatedAt}  ${s.model}${s.title ? `  [${s.title}]` : ''}  ${s.cwd}`).join('\n') + '\n');
       return;
     }
-    if (values.prompt && positionals.length) throw new Error('Use either --prompt or positional prompt text.');
-    let prompt = values.prompt ?? (positionals.length ? positionals.join(' ') : undefined);
+    let resumeTarget = values.resume;
+    let launchResumePicker = false;
+    let promptPositionals = positionals;
+    if (positionals[0] === 'resume') {
+      const subTarget = positionals[1]?.trim();
+      if (subTarget) {
+        resumeTarget = subTarget;
+        promptPositionals = positionals.slice(2);
+      } else {
+        launchResumePicker = true;
+        promptPositionals = [];
+      }
+    }
+    if (values.prompt && promptPositionals.length) throw new Error('Use either --prompt or positional prompt text.');
+    let prompt = values.prompt ?? (promptPositionals.length ? promptPositionals.join(' ') : undefined);
     if (!prompt && !stdin.isTTY) {
       let bytes = 0; const chunks: Buffer[] = [];
       for await (const chunk of stdin) {
@@ -203,12 +221,24 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       config = await runSetupWizard(config);
     }
     const interactive = !prompt;
-    if (interactive && !jsonOutput && values['show-reasoning'] === undefined) {
+    let viewMode: 'normal' | 'verbose' = config.showReasoning ? 'verbose' : 'normal';
+    if (interactive && !jsonOutput) {
       config.showReasoning = true;
     }
     let runtime = await resolveRuntime(config, values.cwd ?? process.cwd());
     apiKey = runtime.apiKey;
-    let store = await SessionStore.open(join(runtime.dataDir, 'sessions'), runtime, values.resume);
+    const sessionsRootDir = join(runtime.dataDir, 'sessions');
+    if (launchResumePicker && !resumeTarget) {
+      const existingList = await SessionStore.list(sessionsRootDir);
+      const wsNonEmpty = existingList.filter(s => sameWorkspace(s.cwd, runtime.cwd) && (s.messagesCount ?? 0) > 0);
+      const anyNonEmpty = existingList.filter(s => (s.messagesCount ?? 0) > 0);
+      const best = wsNonEmpty[0] ?? anyNonEmpty[0] ?? existingList.find(s => sameWorkspace(s.cwd, runtime.cwd));
+      if (best) {
+        resumeTarget = best.id;
+        if ((wsNonEmpty.length || anyNonEmpty.length) <= 1) launchResumePicker = false;
+      }
+    }
+    let store = await SessionStore.open(sessionsRootDir, runtime, resumeTarget);
     let rl: ReturnType<typeof createInterface> | undefined;
     let tui: TerminalUI | undefined;
     let manager: McpManager | undefined;
@@ -234,6 +264,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         const titleLabel = store.session.title ? `${runtime.model} · ${store.session.title}` : `${runtime.model} · ${store.session.id.slice(0, 8)}`;
         tui = new TerminalUI(titleLabel, stop);
         tui.setMode(mode);
+        tui.setViewMode(viewMode);
         tui.setEffort(runtime.effort);
         tui.setTokens(store.session.tokens);
       } else if (stdin.isTTY) rl = createInterface({ input: stdin, output: stderr, terminal: true });
@@ -248,6 +279,11 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
           mode = prePlanMode;
           tui?.setMode(mode);
         }
+        if (event.type === 'retry') {
+          if (tui) tui.setNotice(`↻ API error (${event.message.slice(0, 64)}) — retrying (${event.attempt}/${event.maxRetries})...`);
+          else if (!jsonOutput) stderr.write(`\n[Retry ${event.attempt}/${event.maxRetries}: ${cleanTerminal(event.message)}]\n`);
+          return;
+        }
         if (event.type === 'tool_stream') {
           if (tui) tui.event(event);
           return;
@@ -255,6 +291,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         if (jsonOutput) { stdout.write(JSON.stringify(event) + '\n'); return; }
         if (tui) { tui.event(event); return; }
         if (event.type === 'reasoning') {
+          if (viewMode === 'normal') return;
           if (reasoningSource !== event.source) stderr.write(`\n[reasoning · ${event.source}]\n`);
           stderr.write(cleanTerminal(event.text)); reasoningSource = event.source; return;
         }
@@ -454,10 +491,16 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         if (!rl && !tui) throw new Error('Interactive mode requires a TTY.');
         display('Type /help for commands, @file to attach files, !<cmd> for shell, or enter a task.\n');
         tui?.setStatus('Ready');
+        let initialAutoCommand: string | undefined = launchResumePicker ? '/resume' : undefined;
         while (!exiting) {
           let input: string;
-          try { input = (await question(tui ? 'goon> ' : '\ngoon> ', undefined, true)).trim(); }
-          catch { break; }
+          if (initialAutoCommand) {
+            input = initialAutoCommand;
+            initialAutoCommand = undefined;
+          } else {
+            try { input = (await question(tui ? 'goon> ' : '\ngoon> ', undefined, true)).trim(); }
+            catch { break; }
+          }
           if (!input) continue;
           if (['/exit', '/quit'].includes(input)) break;
           if (input === '/clear') {
@@ -472,6 +515,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
               '  /model [id] [--effort=<level>]    Discover/pick model from /models or set model ID\n' +
               '  /effort [low|medium|high|xhigh|max|default] Switch reasoning effort (or Alt+./Alt+,)\n' +
               '  /mode [ask|plan|auto|readonly]    Switch mode (or press Shift+Tab)\n' +
+              '  /view [normal|verbose]            Switch view mode: normal (hide thinking) | verbose (show all)\n' +
               '  /plan [off|execute|<prompt>]      Enter/exit Plan Mode or execute approved plan\n' +
               '  /revert, /undo [code|msg|both] [N] Rewind last N turns & restore prompt to composer (or press Esc Esc)\n' +
               '  /checkpoints                      Interactive picker to rewind to any earlier turn checkpoint\n' +
@@ -502,7 +546,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
               write: text => display(text),
               ask: label => question(label),
             });
-            if (interactive && !jsonOutput && values['show-reasoning'] === undefined) {
+            if (interactive && !jsonOutput) {
               config.showReasoning = true;
             }
             runtime = await resolveRuntime(config, runtime.cwd);
@@ -628,6 +672,26 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             display(`Mode set to: ${mode}\n`);
             continue;
           }
+          if (input === '/view' || input.startsWith('/view ')) {
+            const arg = input.slice(5).trim().toLowerCase();
+            if (!arg) {
+              viewMode = viewMode === 'verbose' ? 'normal' : 'verbose';
+            } else if (arg === 'normal' || arg === 'compact' || arg === 'default' || arg === 'hide') {
+              viewMode = 'normal';
+            } else if (arg === 'verbose' || arg === 'all' || arg === 'full' || arg === 'show') {
+              viewMode = 'verbose';
+            } else {
+              display('Usage: /view [normal | verbose]\n');
+              continue;
+            }
+            config.showReasoning = viewMode === 'verbose';
+            await saveConfig(config);
+            tui?.setViewMode(viewMode);
+            const desc = viewMode === 'verbose' ? 'verbose (show thinking & all details)' : 'normal (hide thinking blocks)';
+            if (tui) tui.setNotice(`View mode: ${desc}`);
+            else display(`View mode set to: ${desc}\n`);
+            continue;
+          }
           if (input === '/plan' || input.startsWith('/plan ')) {
             const arg = input.slice(5).trim();
             const lower = arg.toLowerCase();
@@ -691,7 +755,11 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
                 const promptPreview = cp.prompt.replace(/\s+/g, ' ').slice(0, 54);
                 return `  ${numStr}. #${cp.id} [${cp.createdAt.slice(11, 19)}] "${promptPreview}" (${fileDesc})`;
               });
-              const pickerBlock = `\n╭─── Rewind to Turn Checkpoint (${cps.length} available) ──────────────────────────╮\n${rows.join('\n')}\n╰──────────────────────────────────────────────────────────────────────────╯\n`;
+              const cpTitle = `─── Rewind to Turn Checkpoint (${cps.length} available) `;
+              const cpInner = Math.max(74, visibleLength(cpTitle) + 4, ...rows.map(r => visibleLength(r) + 2));
+              const cpTop = `╭${cpTitle}${'─'.repeat(Math.max(1, cpInner - visibleLength(cpTitle)))}╮`;
+              const cpBot = `╰${'─'.repeat(cpInner)}╯`;
+              const pickerBlock = `\n${cpTop}\n${rows.join('\n')}\n${cpBot}\n`;
               const choice = (await tui.askTransient(pickerBlock, `Rewind [1-${Math.min(15, reversed.length)}, or Enter to cancel]: `)).trim();
               const pickedNum = Number(choice);
               if (!choice || !Number.isInteger(pickedNum) || pickedNum < 1 || pickedNum > reversed.length) {
@@ -799,6 +867,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             }
             const oldStore = store;
             store = newStore;
+            await oldStore.discardIfEmpty();
             await oldStore.close();
             const built = await buildHarness(mode);
             tools = built.tools;
@@ -814,8 +883,10 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
           if (input === '/resume' || input.startsWith('/resume ')) {
             const sessionsRoot = join(runtime.dataDir, 'sessions');
             const allList = await SessionStore.list(sessionsRoot);
-            const wsList = allList.filter(s => s.cwd === runtime.cwd);
-            const candidates = wsList.length ? wsList : allList;
+            const wsList = allList.filter(s => sameWorkspace(s.cwd, runtime.cwd));
+            const rawPool = wsList.length ? wsList : allList;
+            const nonEmptyPool = rawPool.filter(s => (s.messagesCount ?? 0) > 0 || Boolean(s.title));
+            const candidates = nonEmptyPool.length ? nonEmptyPool : rawPool;
             let arg = input.slice(7).trim();
             if (!arg) {
               if (!candidates.length) {
@@ -828,16 +899,21 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
                 const msgTag = `${s.messagesCount ?? 0} msgs`;
                 const ageTag = formatRelativeTime(s.updatedAt);
                 const rawLabel = s.title ? `[${s.title}] ${s.preview ?? ''}`.trim() : s.preview ? s.preview : '(empty session)';
-                const label = rawLabel.replace(/\s+/g, ' ').slice(0, 68);
+                const label = rawLabel.replace(/\s+/g, ' ').slice(0, 64);
                 return `  ${numStr}. ${s.id.slice(0, 8)} · ${ageTag.padEnd(8)} · ${msgTag.padEnd(8)} · ${label}${currentTag}`;
               });
-              const pickerBlock = `\n╭─── Resume Saved Session (${candidates.length} in workspace) ───────────────────────────╮\n${rows.join('\n')}\n╰──────────────────────────────────────────────────────────────────────────╯\n`;
-              const promptText = `Resume [1-${Math.min(15, candidates.length)}, latest, ID prefix, or Enter to cancel]: `;
+              const resTitle = `─── Resume Saved Session (${candidates.length} in workspace) `;
+              const resInner = Math.max(74, visibleLength(resTitle) + 4, ...rows.map(r => visibleLength(r) + 2));
+              const resTop = `╭${resTitle}${'─'.repeat(Math.max(1, resInner - visibleLength(resTitle)))}╮`;
+              const resBot = `╰${'─'.repeat(resInner)}╯`;
+              const pickerBlock = `\n${resTop}\n${rows.join('\n')}\n${resBot}\n`;
+              const promptText = `Resume [1-${Math.min(15, candidates.length)}, latest, ID prefix, or Esc/q to cancel]: `;
               const choice = tui
                 ? (await tui.askTransient(pickerBlock, promptText)).trim()
                 : (display(pickerBlock), (await question(promptText)).trim());
-              if (!choice) {
-                display('Cancelled /resume.\n');
+              if (!choice || choice.toLowerCase() === 'q' || choice.toLowerCase() === 'cancel' || choice === '0') {
+                if (tui) tui.setNotice('Cancelled /resume.');
+                else display('Cancelled /resume.\n');
                 continue;
               }
               arg = choice;
@@ -848,8 +924,12 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             }
             try {
               const targetMatch = arg === 'latest'
-                ? candidates.find(s => s.id !== store.session.id)?.id ?? candidates[0]?.id
-                : candidates.find(s => s.id === arg || s.id.toLowerCase().startsWith(arg.toLowerCase()))?.id ?? arg;
+                ? candidates.find(s => s.id !== store.session.id && (s.messagesCount ?? 0) > 0)?.id
+                  ?? candidates.find(s => s.id !== store.session.id)?.id
+                  ?? candidates[0]?.id
+                : candidates.find(s => s.id === arg || s.id.toLowerCase().startsWith(arg.toLowerCase()))?.id
+                  ?? allList.find(s => s.id === arg || s.id.toLowerCase().startsWith(arg.toLowerCase()))?.id
+                  ?? arg;
               if (targetMatch === store.session.id) {
                 display(`Already in session ${store.session.id.slice(0, 8)}.\n`);
                 renderResumedHistory();
@@ -858,6 +938,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
               const newStore = await SessionStore.open(sessionsRoot, runtime, targetMatch, store.session.id);
               const oldStore = store;
               store = newStore;
+              await oldStore.discardIfEmpty();
               await oldStore.close();
               const built = await buildHarness(mode);
               tools = built.tools;
@@ -1024,6 +1105,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
               `Model          ${runtime.model}\n` +
               `Effort         ${runtime.effort ?? 'default'}\n` +
               `Mode           ${mode}\n` +
+              `View           ${viewMode}\n` +
               `Workspace      ${runtime.cwd}\n` +
               `Checkpoints    ${store.session.checkpoints?.length ?? 0} turn(s)\n` +
               `Context usage  ~${usedEst} / ${runtime.contextWindow} tokens (${pct}%)\n` +

@@ -1,8 +1,8 @@
-export { Harness } from './harness.js';
+export { Harness, MAX_API_RETRIES } from './harness.js';
 export type { HarnessEvent, RevertResult, ToolEventMeta } from './harness.js';
 export { ToolRegistry, formatTodos, normalizeToolName, normalizeToolInput, TOOL_NAME_ALIASES } from './tools.js';
 export type { ToolDefinition, ToolCall, Approve, Approval, RunBudget } from './tools.js';
-export { SessionStore, repairInterrupted, fileBackupSchema, turnCheckpointSchema, todoItemSchema } from './session.js';
+export { SessionStore, sameWorkspace, repairInterrupted, fileBackupSchema, turnCheckpointSchema, todoItemSchema } from './session.js';
 export type { Session, SessionSummary, FileBackup, TurnCheckpoint, TodoItem } from './session.js';
 export { createModel, buildProviderOptions, discoverModels, KNOWN_GATEWAY_MODELS, resolveModelCapabilities, formatModelBadge } from './provider.js';
 export type { DiscoveredModel, ProviderOptionsMap } from './provider.js';
@@ -19,6 +19,8 @@ export { Subagents } from './subagents.js';
 export type { SubagentEvent, SubagentProgress } from './subagents.js';
 export { AnswerProjection, visibleAnswer, lastAssistantAnswer } from './reasoning.js';
 export type { AnswerPart, InlineReasoning } from './reasoning.js';
-export { TerminalUI, SLASH_COMMANDS, formatInlineMarkdown } from './tui.js';
+export { TerminalUI, SLASH_COMMANDS, formatInlineMarkdown, visibleLength, padEndVisible } from './tui.js';
+export { welcomeBanner } from './cli.js';
+
 
 

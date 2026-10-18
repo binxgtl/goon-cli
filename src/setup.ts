@@ -20,6 +20,7 @@ import {
   type DiscoveredModel,
 } from './provider.js';
 import { VERSION } from './version.js';
+import { padEndVisible, visibleLength } from './tui.js';
 
 export interface ProviderPreset {
   id: string;
@@ -113,8 +114,10 @@ export async function runSetupWizard(initialConfig?: Config, io?: SetupIO): Prom
   const discover = io?.discover ?? ((url, key, prov) => discoverModels(url, key, prov));
 
   try {
+    const setupTitle = `╭─── ✻ goon cli v${VERSION} · Interactive Setup `;
+    const setupTopDashes = '─'.repeat(Math.max(1, 70 - visibleLength(setupTitle)));
     write(
-      `\n╭─── ✻ goon cli v${VERSION} · Interactive Setup ─────────────────────────╮\n` +
+      `\n${setupTitle}${setupTopDashes}╮\n` +
       `│  Configure provider, endpoint, API key, model & reasoning effort    │\n` +
       `╰─────────────────────────────────────────────────────────────────────╯\n\n` +
       `Step 1/5 · Choose AI Provider Dialect / Endpoint Preset:\n`
@@ -206,13 +209,13 @@ export async function runSetupWizard(initialConfig?: Config, io?: SetupIO): Prom
     const finalKey = await resolveApiKey(updated);
     write(
       `\n╭─── ✓ Setup Saved ───────────────────────────────────────────────────╮\n` +
-      `│  Provider : ${updated.provider.padEnd(54)}│\n` +
-      `│  Base URL : ${(updated.baseUrl ?? 'default').slice(0, 54).padEnd(54)}│\n` +
-      `│  Model    : ${(updated.model ?? '').slice(0, 54).padEnd(54)}│\n` +
-      `│  Effort   : ${(updated.effort ?? 'default').padEnd(54)}│\n` +
-      `│  Context  : ${`${updated.contextWindow} tokens (out: ${updated.maxOutputTokens})`.slice(0, 54).padEnd(54)}│\n` +
-      `│  API Key  : ${(finalKey ? 'Configured ✓' : `Missing (set ${updated.keyEnv})`).padEnd(54)}│\n` +
-      `│  Config   : ${configPath().slice(0, 54).padEnd(54)}│\n` +
+      `│  Provider : ${padEndVisible(updated.provider, 54)}│\n` +
+      `│  Base URL : ${padEndVisible(updated.baseUrl ?? 'default', 54)}│\n` +
+      `│  Model    : ${padEndVisible(updated.model ?? '', 54)}│\n` +
+      `│  Effort   : ${padEndVisible(updated.effort ?? 'default', 54)}│\n` +
+      `│  Context  : ${padEndVisible(`${updated.contextWindow} tokens (out: ${updated.maxOutputTokens})`, 54)}│\n` +
+      `│  API Key  : ${padEndVisible(finalKey ? 'Configured ✓' : `Missing (set ${updated.keyEnv})`, 54)}│\n` +
+      `│  Config   : ${padEndVisible(configPath(), 54)}│\n` +
       `╰─────────────────────────────────────────────────────────────────────╯\n\n`
     );
     return updated;

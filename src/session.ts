@@ -78,6 +78,12 @@ export function repairInterrupted(messages: ModelMessage[]): boolean {
   return true;
 }
 
+export function sameWorkspace(a: string, b: string): boolean {
+  const na = a.normalize('NFC').replace(/[\\/]+$/, '');
+  const nb = b.normalize('NFC').replace(/[\\/]+$/, '');
+  return process.platform === 'win32' ? na.toLowerCase() === nb.toLowerCase() : na === nb;
+}
+
 export class SessionStore {
   private closed = false;
   private constructor(readonly root: string, readonly session: Session, private readonly lock: string) {}
@@ -86,11 +92,22 @@ export class SessionStore {
     let id = resume?.trim();
     if (id === 'latest') {
       const list = await SessionStore.list(root);
-      id = list.find(s => s.cwd === input.cwd && s.id !== excludeId)?.id ?? list.find(s => s.cwd === input.cwd)?.id;
+      const wsList = list.filter(s => sameWorkspace(s.cwd, input.cwd) && s.id !== excludeId);
+      id = wsList.find(s => (s.messagesCount ?? 0) > 0)?.id
+        ?? wsList[0]?.id
+        ?? list.find(s => sameWorkspace(s.cwd, input.cwd) && (s.messagesCount ?? 0) > 0)?.id
+        ?? list.find(s => sameWorkspace(s.cwd, input.cwd))?.id;
+    } else if (id && /^\d+$/.test(id)) {
+      const idx = Number(id) - 1;
+      const list = await SessionStore.list(root);
+      const wsNonEmpty = list.filter(s => sameWorkspace(s.cwd, input.cwd) && (s.messagesCount ?? 0) > 0 && s.id !== excludeId);
+      const wsAll = list.filter(s => sameWorkspace(s.cwd, input.cwd) && s.id !== excludeId);
+      const candidates = wsNonEmpty.length ? wsNonEmpty : wsAll;
+      id = candidates[idx]?.id ?? id;
     } else if (id && !z.string().uuid().safeParse(id).success && /^[0-9a-f-]{4,35}$/i.test(id)) {
       const prefix = id.toLowerCase();
       const list = await SessionStore.list(root);
-      id = list.find(s => s.cwd === input.cwd && s.id.toLowerCase().startsWith(prefix))?.id
+      id = list.find(s => sameWorkspace(s.cwd, input.cwd) && s.id.toLowerCase().startsWith(prefix))?.id
         ?? list.find(s => s.id.toLowerCase().startsWith(prefix))?.id
         ?? id;
     }
@@ -135,7 +152,7 @@ export class SessionStore {
       const session: Session = resume ? sessionSchema.parse(JSON.parse(await readFile(join(root, `${id}.json`), 'utf8'))) : {
         version: 1, id, ...route, createdAt: now, updatedAt: now, messages: [], tokens: 0, compactions: 0,
       };
-      if (session.id !== id || await realpath(session.cwd) !== input.cwd) throw new Error('Session belongs to a different workspace.');
+      if (session.id !== id || !sameWorkspace(await realpath(session.cwd), input.cwd)) throw new Error('Session belongs to a different workspace.');
       const store = new SessionStore(root, session, lock);
       repairInterrupted(session.messages);
       // Provider changes are explicit CLI/config choices, not restored secrets.
@@ -182,6 +199,12 @@ export class SessionStore {
     this.session.updatedAt = new Date().toISOString();
     await atomicJson(join(this.root, `${this.session.id}.json`), this.session);
   }
+  async discardIfEmpty() {
+    if (this.session.messages.length === 0 && !this.session.title) {
+      try { await unlink(join(this.root, `${this.session.id}.json`)); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+    }
+  }
   async close() {
     if (this.closed) return;
     this.closed = true;
@@ -189,4 +212,5 @@ export class SessionStore {
     catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
   }
 }
+
 

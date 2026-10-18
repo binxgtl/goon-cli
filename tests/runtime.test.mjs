@@ -514,5 +514,78 @@ test('AI Gateway ultra-compatibility: session affinity headers, 4 gateway models
   assert.equal(observedEfforts[3], 'low');
 });
 
+test('Harness retries transient HTTP 500 API errors up to 3 times and SessionStore.open ignores 0-message empty sessions on resume', async t => {
+  const { join } = await import('node:path');
+  const { Harness, SessionStore, ToolRegistry } = await import('../dist/index.js');
+  const f = await fixture(t);
+  let attempts = 0;
+  const p = await provider(t, (_, response) => {
+    attempts++;
+    if (attempts <= 3) {
+      response.writeHead(500, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ error: { message: `Transient upstream 500 on attempt #${attempts}` } }));
+      return;
+    }
+    return sse(response, { text: 'Recovered on retry #3 (attempt #4).' });
+  });
+
+  const config = {
+    provider: 'openai-compatible',
+    baseUrl: p.url,
+    model: 'test-model',
+    keyEnv: 'GOON_API_KEY',
+    apiKey: 'test-secret-never-echo',
+    cwd: f.cwd,
+    contextWindow: 32000,
+    maxOutputTokens: 1024,
+    runTokenBudget: 100000,
+    timeoutMs: 10000,
+    maxTurns: 4,
+    inlineReasoning: 'leading-think',
+    showReasoning: false,
+  };
+
+  const sessionsRoot = join(f.data, 'sessions');
+  const s1 = await SessionStore.open(sessionsRoot, config);
+  const retryEvents = [];
+  const tools = new ToolRegistry(f.cwd, async () => true, false);
+  const harness = new Harness(config, s1, tools, ev => {
+    if (ev.type === 'retry') retryEvents.push(ev);
+  });
+
+  const answer = await harness.run('Test API retry', new AbortController().signal);
+  assert.equal(answer, 'Recovered on retry #3 (attempt #4).');
+  assert.equal(attempts, 4);
+  assert.equal(retryEvents.length, 3);
+  assert.deepEqual(retryEvents.map(r => r.attempt), [1, 2, 3]);
+  assert.equal(retryEvents[0].maxRetries, 3);
+  await s1.close();
+
+  // Create a newer 0-message empty session (simulating starting `goon` before running `/resume` or `goon resume`)
+  await new Promise(resolve => setTimeout(resolve, 15));
+  const emptySession = await SessionStore.open(sessionsRoot, config);
+  assert.equal(emptySession.session.messages.length, 0);
+  await emptySession.close();
+
+  // Resuming 'latest' or '1' must pick s1 (which has messages), NOT emptySession!
+  const resumedLatest = await SessionStore.open(sessionsRoot, config, 'latest');
+  assert.equal(resumedLatest.session.id, s1.session.id);
+  assert.equal(resumedLatest.session.messages.length, 2);
+  await resumedLatest.close();
+
+  const resumedOne = await SessionStore.open(sessionsRoot, config, '1');
+  assert.equal(resumedOne.session.id, s1.session.id);
+  await resumedOne.close();
+
+  // And discardIfEmpty deletes the 0-message empty session file from disk
+  const reOpenedEmpty = await SessionStore.open(sessionsRoot, config, emptySession.session.id);
+  await reOpenedEmpty.discardIfEmpty();
+  await reOpenedEmpty.close();
+  const remaining = await SessionStore.list(sessionsRoot);
+  assert.equal(remaining.length, 1);
+  assert.equal(remaining[0].id, s1.session.id);
+});
+
+
 
 
