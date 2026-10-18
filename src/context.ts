@@ -173,14 +173,20 @@ export async function systemPrompt(config: RuntimeConfig, readOnly: boolean, pla
   const modeGuidance = planMode
     ? [
         'PLAN MODE ACTIVE: You are currently in read-only planning mode.',
-        '1. Explore first using read-only tools (read_file, list_files, search) to ground your plan in the actual repository.',
+        '1. Explore first using read-only tools (read_file, list_files, search, spawn_agent with agent_type="explorer" + wait_agent, or delegate_task) to ground your plan in the actual repository.',
         '2. Do NOT modify files or run mutating commands while in plan mode.',
         '3. Formulate a complete, structured Markdown plan (# Title, Summary, Key Changes & Files, Verification Steps, Risks).',
         '4. When ready, call exit_plan_mode({ plan }) to present the plan for approval and transition to implementation (or wrap your plan in <proposed_plan>...</proposed_plan>).',
       ].join('\n')
     : readOnly
-      ? 'READ-ONLY MODE: inspect and explain only. Do not modify files or execute shell commands.'
-      : 'ACTIVE MODE: Standard Execution Mode (you are NOT in Plan Mode or Read-Only Mode; read_file, list_files, search, write_file, edit_file, apply_patch, bash, todo_read, todo_write are available).';
+      ? 'READ-ONLY MODE: inspect and explain only. Do not modify files or execute shell commands. When delegate_task is available, use delegate_task({ tasks: [...] }) to parallelize independent codebase research.'
+      : [
+          'ACTIVE MODE: Standard Execution Mode (you are NOT in Plan Mode or Read-Only Mode; read_file, list_files, search, write_file, edit_file, apply_patch, bash, todo_read, todo_write, spawn_agent, wait_agent, send_input, close_agent, list_agents, delegate_task, delegate_edit are available).',
+          'Multi-agent / Subagents (Codex workflow): When subagent tools are available in your tool list, proactively use them whenever a request asks for subagents/agents or involves multiple independent codebase questions, broad exploration, or parallelizable tasks:',
+          '  • Background / interactive sub-agents: Call `spawn_agent({ message: "<self-contained task>", agent_type: "explorer" | "worker" })` (you may spawn multiple agents in parallel), then call `wait_agent({ targets: [agent_id, ...] })` to collect their final reports. Use `send_input` for follow-ups and `close_agent` when done.',
+          '  • Synchronous batch delegation: Call `delegate_task({ tasks: ["<task 1>", "<task 2>"] })` for parallel read-only exploration, or `delegate_edit({ tasks: ["<task 1>", ...] })` for sequential coding subtasks.',
+          '  • Always give each sub-agent a concrete, self-contained prompt (and explicit file ownership for `worker` / `delegate_edit`).',
+        ].join('\n');
   const winGuidance = process.platform === 'win32'
     ? '\nOn Windows (win32), the bash tool runs POSIX bash (Git Bash / MSYS), NOT cmd.exe. Always use POSIX syntax and redirect to /dev/null (NEVER use >nul or 2>nul, which creates a literal undeletable "nul" file, and do not pass cmd.exe switches like dir /a /b directly to bash).'
     : '';

@@ -123,6 +123,27 @@ function buildToolMeta(toolName: string, rawInput: unknown): ToolEventMeta {
     }
     return { kind: 'edit', summary: pathStr };
   }
+  if (canonical === 'spawn_agent') {
+    const role = typeof rec.agent_type === 'string' ? rec.agent_type : typeof rec.role === 'string' ? rec.role : 'default';
+    const msg = typeof rec.message === 'string' ? rec.message : typeof rec.prompt === 'string' ? rec.prompt : typeof rec.task === 'string' ? rec.task : '';
+    return { kind: 'other', summary: `[${role}] ${msg.trim().replace(/\s+/g, ' ').slice(0, 100)}`.trim() };
+  }
+  if (canonical === 'wait_agent') {
+    const targets = Array.isArray(rec.targets) ? rec.targets.join(', ') : Array.isArray(rec.ids) ? rec.ids.join(', ') : typeof rec.target === 'string' ? rec.target : 'agents';
+    return { kind: 'other', summary: `waiting for ${targets}` };
+  }
+  if (canonical === 'send_input') {
+    const target = typeof rec.target === 'string' ? rec.target : typeof rec.id === 'string' ? rec.id : 'agent';
+    return { kind: 'other', summary: `to ${target}` };
+  }
+  if (canonical === 'close_agent') {
+    const target = typeof rec.target === 'string' ? rec.target : typeof rec.id === 'string' ? rec.id : 'agent';
+    return { kind: 'other', summary: target };
+  }
+  if (canonical === 'delegate_task' || canonical === 'delegate_edit') {
+    const count = Array.isArray(rec.tasks) ? rec.tasks.length : 1;
+    return { kind: 'other', summary: `${count} subagent task(s)` };
+  }
   return { kind: 'other', summary: canonical };
 }
 
@@ -345,15 +366,24 @@ export class Harness {
             if (['error', 'content-filter', 'other', 'unknown'].includes(finish)) throw new Error(`Model stopped unexpectedly (${finish}).`);
             present(projection.finish());
             const response = await result.response;
+            const assistantMessages = response.messages.filter(m => m.role === 'assistant');
             calls = (await result.toolCalls).map(c => ({ toolCallId: c.toolCallId, toolName: c.toolName, input: c.input }));
+            for (const m of assistantMessages) {
+              if (!Array.isArray(m.content)) continue;
+              for (const part of m.content) {
+                if (part.type === 'tool-call' && !calls.some(c => c.toolCallId === part.toolCallId)) {
+                  calls.push({ toolCallId: part.toolCallId, toolName: part.toolName, input: part.input });
+                }
+              }
+            }
             if (calls.length > 32 || new Set(calls.map(c => c.toolCallId)).size !== calls.length) throw new Error('Invalid or excessive tool call batch. No tools executed.');
             const usage = await result.usage;
             const input = usage.inputTokens ?? estimatedTokens(session.messages, system);
-            const output = usage.outputTokens ?? Math.ceil(JSON.stringify(response.messages).length / 2);
+            const output = usage.outputTokens ?? Math.ceil(JSON.stringify(assistantMessages).length / 2);
             const tokens = usage.totalTokens ?? input + output;
             account(tokens); session.tokens += tokens; measuredInput = input;
             this.emit({ type: 'usage', input, output, total: tokens });
-            session.messages.push(...response.messages);
+            session.messages.push(...assistantMessages);
             text += stepText;
             await this.store.save(); // Persist tool declarations before any side effect.
             break;

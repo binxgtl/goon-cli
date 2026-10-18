@@ -45,15 +45,28 @@ export const TOOL_NAME_ALIASES: Record<string, string> = {
   grep: 'search',
   edit: 'edit_file',
   write: 'write_file',
+  wait: 'wait_agent',
+  send_message: 'send_input',
+  followup_task: 'send_input',
+  interrupt_agent: 'close_agent',
+  subagent: 'spawn_agent',
+  task: 'spawn_agent',
 };
 
 export function normalizeToolName(name: string, hasExact?: (n: string) => boolean): string {
-  const clean = name.trim();
+  const clean = name.trim().replace(/^(?:multi_agent_v1|multi_agent|functions)\./i, '');
   if (hasExact?.(clean)) return clean;
-  return TOOL_NAME_ALIASES[clean] ?? clean;
+  return TOOL_NAME_ALIASES[clean] ?? TOOL_NAME_ALIASES[clean.toLowerCase()] ?? clean;
 }
 
 export function normalizeToolInput(toolName: string, input: unknown): unknown {
+  if (typeof input === 'string') {
+    if (toolName === 'delegate_task' || toolName === 'delegate_edit') return { tasks: [input] };
+    if (toolName === 'spawn_agent') return { message: input };
+    if (toolName === 'wait_agent') return { targets: [input] };
+    if (toolName === 'close_agent' || toolName === 'resume_agent') return { target: input };
+    return input;
+  }
   if (!input || typeof input !== 'object' || Array.isArray(input)) return input;
   const obj = { ...(input as Record<string, unknown>) };
   if (['read_file', 'write_file', 'edit_file', 'list_files', 'search'].includes(toolName)) {
@@ -93,6 +106,114 @@ export function normalizeToolInput(toolName: string, input: unknown): unknown {
     if (typeof obj.command === 'string') {
       obj.command = sanitizeBashCommand(obj.command);
     }
+  }
+  if (toolName === 'delegate_task' || toolName === 'delegate_edit') {
+    if (obj.tasks === undefined) {
+      const single = obj.task ?? obj.prompt ?? obj.message ?? obj.instructions;
+      if (typeof single === 'string') obj.tasks = [single];
+      else if (Array.isArray(single)) obj.tasks = single;
+    } else if (typeof obj.tasks === 'string') {
+      obj.tasks = [obj.tasks];
+    } else if (Array.isArray(obj.tasks)) {
+      obj.tasks = obj.tasks.map(item => {
+        if (typeof item === 'string') return item;
+        if (item && typeof item === 'object') {
+          const rec = item as Record<string, unknown>;
+          const text = rec.task ?? rec.prompt ?? rec.message ?? rec.description;
+          if (typeof text === 'string') return text;
+        }
+        return item;
+      });
+    }
+    delete obj.task;
+    delete obj.prompt;
+    delete obj.message;
+    delete obj.instructions;
+  }
+  if (toolName === 'spawn_agent') {
+    if (obj.message === undefined) {
+      const msg = obj.prompt ?? obj.task ?? obj.instruction ?? obj.instructions;
+      if (typeof msg === 'string') obj.message = msg;
+      else if (Array.isArray(obj.items)) {
+        const parts = (obj.items as Array<Record<string, unknown>>)
+          .map(it => (typeof it?.text === 'string' ? it.text : ''))
+          .filter(Boolean);
+        if (parts.length) obj.message = parts.join('\n');
+      }
+    }
+    if (obj.agent_type === undefined) {
+      const role = obj.role ?? obj.subagent_type ?? obj.type;
+      if (typeof role === 'string') obj.agent_type = role;
+    }
+    if (obj.nickname === undefined && typeof obj.task_name === 'string') {
+      obj.nickname = obj.task_name;
+    }
+    if (obj.fork_context === undefined && obj.fork_turns !== undefined) {
+      obj.fork_context = obj.fork_turns === 'all' || obj.fork_turns === true;
+    }
+    if (obj.reasoning_effort === 'minimal') {
+      obj.reasoning_effort = 'low';
+    }
+    delete obj.prompt;
+    delete obj.task;
+    delete obj.instruction;
+    delete obj.instructions;
+    delete obj.items;
+    delete obj.role;
+    delete obj.subagent_type;
+    delete obj.type;
+    delete obj.task_name;
+    delete obj.fork_turns;
+  }
+  if (toolName === 'wait_agent') {
+    const rawTargets = obj.targets ?? obj.ids ?? obj.target ?? obj.id ?? obj.agent_ids ?? obj.agent_id;
+    if (typeof rawTargets === 'string') {
+      obj.targets = [rawTargets];
+    } else if (Array.isArray(rawTargets)) {
+      obj.targets = rawTargets.map(String).filter(Boolean);
+    }
+    if (typeof obj.timeoutMs === 'number' && obj.timeout_ms === undefined) {
+      obj.timeout_ms = obj.timeoutMs;
+    }
+    delete obj.ids;
+    delete obj.target;
+    delete obj.id;
+    delete obj.agent_ids;
+    delete obj.agent_id;
+    delete obj.timeoutMs;
+  }
+  if (toolName === 'send_input') {
+    if (obj.target === undefined) {
+      const t = obj.id ?? obj.agent_id ?? obj.task_name ?? obj.recipient;
+      if (typeof t === 'string') obj.target = t;
+    }
+    if (obj.message === undefined) {
+      const m = obj.prompt ?? obj.task ?? obj.input;
+      if (typeof m === 'string') obj.message = m;
+      else if (Array.isArray(obj.items)) {
+        const parts = (obj.items as Array<Record<string, unknown>>)
+          .map(it => (typeof it?.text === 'string' ? it.text : ''))
+          .filter(Boolean);
+        if (parts.length) obj.message = parts.join('\n');
+      }
+    }
+    delete obj.id;
+    delete obj.agent_id;
+    delete obj.task_name;
+    delete obj.recipient;
+    delete obj.prompt;
+    delete obj.task;
+    delete obj.input;
+    delete obj.items;
+  }
+  if (toolName === 'close_agent' || toolName === 'resume_agent') {
+    if (obj.target === undefined) {
+      const t = obj.id ?? obj.agent_id ?? obj.task_name;
+      if (typeof t === 'string') obj.target = t;
+    }
+    delete obj.id;
+    delete obj.agent_id;
+    delete obj.task_name;
   }
   return obj;
 }
@@ -199,18 +320,31 @@ export class ToolRegistry {
   get effectiveReadOnly(): boolean {
     return this.readOnly || this.planMode;
   }
+  private ajv = new Ajv({ strict: false, validateFormats: false, allowUnionTypes: true });
   register<Input>(name: string, definition: ToolDefinition<Input>) {
     return this.add(name, { ...definition, parse: input => definition.schema.parse(input),
       execute: (input, signal) => definition.execute(definition.schema.parse(input), signal) });
   }
   registerJson(name: string, definition: Omit<ToolDefinition, 'schema'> & { schema: Record<string, unknown> }) {
-    const ajv = new Ajv({ strict: false, validateFormats: false });
-    const validate = ajv.compile(definition.schema);
-    const parse = (input: unknown) => {
-      if (!validate(input)) throw new Error(`Invalid arguments for ${name}: ${ajv.errorsText(validate.errors)}`);
-      return input;
-    };
-    return this.add(name, { ...definition, schema: jsonSchema(definition.schema), parse });
+    const cleanSchema = { ...definition.schema };
+    delete cleanSchema.$schema;
+    delete cleanSchema.$id;
+    let parse: (input: unknown) => unknown;
+    try {
+      const validate = this.ajv.compile(cleanSchema);
+      parse = (input: unknown) => {
+        if (!validate(input)) throw new Error(`Invalid arguments for ${name}: ${this.ajv.errorsText(validate.errors)}`);
+        return input;
+      };
+    } catch {
+      parse = (input: unknown) => {
+        if (input === null || typeof input !== 'object' || Array.isArray(input)) {
+          throw new Error(`Invalid arguments for ${name}: expected an object.`);
+        }
+        return input;
+      };
+    }
+    return this.add(name, { ...definition, schema: jsonSchema(cleanSchema), parse });
   }
   private add(name: string, definition: RegisteredTool) {
     if (!/^[a-z][a-z0-9_]*$/.test(name) || this.definitions.has(name)) throw new Error(`Invalid or duplicate tool: ${name}`);
@@ -221,15 +355,25 @@ export class ToolRegistry {
     return normalizeToolName(name, n => this.definitions.has(n));
   }
   schemas(): ToolSet {
+    const collabTools = new Set(['spawn_agent', 'wait_agent', 'send_input', 'close_agent', 'resume_agent', 'list_agents']);
     return Object.fromEntries([...this.definitions].filter(([name, d]) => {
       if (name === 'exit_plan_mode' && !this.planMode) return false;
-      if ((name === 'todo_write' || name === 'todo_read') && this.readOnly && !this.planMode) return false;
+      if ((name === 'todo_write' || name === 'todo_read' || collabTools.has(name)) && this.readOnly && !this.planMode) return false;
       return !this.effectiveReadOnly || d.readOnly;
     }).map(([name, d]) => [name, tool({ description: d.description, inputSchema: d.schema })]));
   }
   isReadOnly(name: string) {
     const canonical = this.resolveToolName(name);
-    if (canonical === 'exit_plan_mode' || canonical === 'todo_write') return false; // serialize state transitions
+    if (
+      canonical === 'exit_plan_mode' ||
+      canonical === 'todo_write' ||
+      canonical === 'wait_agent' ||
+      canonical === 'send_input' ||
+      canonical === 'close_agent' ||
+      canonical === 'resume_agent'
+    ) {
+      return false; // serialize state transitions
+    }
     return this.definitions.get(canonical)?.readOnly === true;
   }
   async execute(call: ToolCall, signal: AbortSignal): Promise<{ text: string; denied?: boolean }> {

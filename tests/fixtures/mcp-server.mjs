@@ -22,4 +22,37 @@ export function mockMcpServer() {
   });
   return server;
 }
+export function mockReaScaleServer(count = 207) {
+  const server = new Server({ name: 'rea-scale-test-server', version: '6.7.0' }, { capabilities: { tools: {} } });
+  const bigDesc = 'X'.repeat(13_000);
+  const tools = Array.from({ length: count }, (_, idx) => ({
+    name: `rea_tool_${idx + 1}`,
+    description: `REA tool #${idx + 1} ${bigDesc}`,
+    inputSchema: {
+      $schema: 'https://json-schema.org/draft/2020-12/schema',
+      $id: `https://rea.example/schemas/tool_${idx + 1}.json`,
+      type: 'object',
+      properties: {
+        query: {
+          type: 'string',
+          description: idx === 0 ? 'Y'.repeat(22_000) : 'Query parameter',
+        },
+        mode: {
+          const: 'fast',
+        },
+      },
+      required: ['query'],
+    },
+  }));
+  server.setRequestHandler(ListToolsRequestSchema, () => ({ tools }));
+  server.setRequestHandler(CallToolRequestSchema, async request => ({
+    content: [{ type: 'text', text: `called:${request.params.name}:${request.params.arguments?.query ?? ''}` }],
+  }));
+  return server;
+}
+if (process.argv.includes('--stdio') || process.argv.includes('--rea-scale')) {
+  process.stdin.on('end', () => process.exit(0));
+  process.stdin.on('close', () => process.exit(0));
+}
 if (process.argv.includes('--stdio')) await mockMcpServer().connect(new StdioServerTransport());
+if (process.argv.includes('--rea-scale')) await mockReaScaleServer().connect(new StdioServerTransport());

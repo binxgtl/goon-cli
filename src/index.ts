@@ -13,8 +13,22 @@ export type { ProviderPreset, SetupIO } from './setup.js';
 export { computeUnifiedDiff, parsePatchText, applyHunksToContent, WorkspaceFiles, limitText, WINDOWS_RESERVED_DEVICE_RE, toWinExtendedPath, unlinkSafe } from './files.js';
 export type { PatchHunk, PatchOperation } from './files.js';
 export { compactIfNeeded, compactNow, expandFileMentions, loadProjectInstructions, systemPrompt, estimatedTokens } from './context.js';
-export { McpManager, loadMcpConfig, mcpConfigSchema, mcpConfigPath, mcpToolName } from './mcp.js';
-export type { McpConfig } from './mcp.js';
+export {
+  McpManager,
+  loadMcpConfig,
+  saveMcpConfig,
+  mcpConfigSchema,
+  mcpServerSchema,
+  mcpConfigPath,
+  mcpToolName,
+  sanitizeAndCompactToolSchema,
+  parseCodexMcpServers,
+  importCodexMcpServers,
+  resolveMcpCommand,
+  DEFAULT_MCP_MAX_BUFFER_SIZE,
+  DEFAULT_MAX_MCP_TOOLS,
+} from './mcp.js';
+export type { McpConfig, McpServerConfig } from './mcp.js';
 export { Subagents } from './subagents.js';
 export type { SubagentEvent, SubagentProgress } from './subagents.js';
 export { AnswerProjection, visibleAnswer, lastAssistantAnswer } from './reasoning.js';

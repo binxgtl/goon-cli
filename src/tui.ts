@@ -8,7 +8,7 @@ import type { SubagentEvent } from './subagents.js';
 
 const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 export const SLASH_COMMANDS = [
-  '/help', '/setup', '/model', '/effort', '/mode', '/auto', '/yolo', '/view', '/transcript', '/plan', '/revert', '/undo',
+  '/help', '/setup', '/model', '/effort', '/mode', '/auto', '/yolo', '/view', '/transcript', '/mcp', '/subagents', '/agent', '/plan', '/revert', '/undo',
   '/checkpoints', '/todo', '/resume', '/new', '/compact', '/diff', '/review', '/fork', '/rename',
   '/export', '/init', '/status', '/tools', '/sessions', '/doctor', '/clear', '/exit',
 ];
@@ -20,7 +20,10 @@ const SLASH_DESCRIPTIONS: Record<string, string> = {
   '/auto': 'toggle auto-approve mode for writes & shell (or /mode auto)',
   '/yolo': 'enable auto-approve mode for all tools',
   '/view': 'switch view mode: normal | verbose | transcript',
-  '/transcript': 'toggle full transcript mode (or Ctrl+O)',
+  '/transcript': 'toggle full transcript mode (or Ctrl+T)',
+  '/mcp': 'list, check, add, remove, reload, or import-codex MCP servers',
+  '/subagents': 'list spawned subagents, inspect transcripts, or run a subagent task',
+  '/agent': 'spawn a subagent task or inspect subagents (/subagents)',
   '/plan': 'toggle read-only Plan Mode',
   '/mode': 'cycle ask / auto / plan / readonly (or Shift+Tab)',
   '/revert': 'rewind turn(s) & restore prompt to composer (or Esc Esc)',
@@ -529,6 +532,10 @@ export class TerminalUI {
         this.flushExploreGroup();
         this.outputChannel = undefined;
         this.appendTranscript(`\n[agent ${event.id.slice(0, 8)}] ${event.task.slice(0, 160)}\n`);
+      } else if (event.state === 'done' || event.state === 'error') {
+        this.flushExploreGroup();
+        this.outputChannel = undefined;
+        this.appendTranscript(`\n• Subagent ${event.id.slice(0, 8)}: ${event.state}\n`);
       }
     } else if (event.type === 'tool_stream') {
       // Do not clutter the status bar with noisy per-delta file/line counters

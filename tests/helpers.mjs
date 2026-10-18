@@ -8,7 +8,7 @@ export async function fixture(t) {
   const root = await mkdtemp(join(tmpdir(), 'goon-test-'));
   const cwd = join(root, 'workspace');
   await mkdir(cwd);
-  t.after(() => rm(root, { recursive: true, force: true }));
+  t.after(() => rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }));
   return { root, cwd, config: join(root, 'config'), data: join(root, 'data') };
 }
 export async function provider(t, handler) {
@@ -46,12 +46,24 @@ export function sse(response, { text = '', calls = [], reasoning = '', textChunk
 export function cli(f, url, args = [], options = {}) {
   const child = spawn(process.execPath, [resolve(process.env.GOON_TEST_BIN ?? 'bin/goon.mjs'), '--cwd', f.cwd, '--base-url', url, '--model', 'test-model', ...args], {
     env: { ...process.env, XDG_CONFIG_HOME: f.config, XDG_DATA_HOME: f.data, GOON_API_KEY: 'test-secret-never-echo', ...options.env },
-    stdio: ['pipe', 'pipe', 'pipe'],
+    stdio: ['pipe', 'pipe', 'pipe', 'ipc'],
   });
+  const origKill = child.kill.bind(child);
+  child.kill = (sig = 'SIGTERM') => {
+    if (process.platform === 'win32' && (sig === 'SIGINT' || sig === 'SIGTERM') && child.connected) {
+      try {
+        child.send({ type: 'goon:signal', signal: sig });
+        return true;
+      } catch {
+        // fall through
+      }
+    }
+    return origKill(sig);
+  };
   let stdout = '', stderr = '';
   child.stdout.on('data', chunk => { stdout += chunk; });
   child.stderr.on('data', chunk => { stderr += chunk; });
-  const timeout = setTimeout(() => child.kill('SIGKILL'), 15_000);
+  const timeout = setTimeout(() => origKill('SIGKILL'), 15_000);
   const done = new Promise((resolve, reject) => {
     child.once('error', reject);
     child.once('close', (code, signal) => { clearTimeout(timeout); resolve({ code, signal, stdout, stderr }); });

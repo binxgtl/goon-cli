@@ -191,3 +191,70 @@ test('terminal child event follows lock release, including cleanup failures; cap
   assert.equal(events.filter(e => e.state === 'error').length, 2);
   assert.equal(events.filter(e => e.state === 'done').length, 2);
 });
+
+test('model autonomously invokes Codex multi-agent tools (spawn_agent, wait_agent, send_input, close_agent) and flexible delegate_task inputs', async t => {
+  const f = await fixture(t), events = [];
+  let childTurns = 0;
+  const p = await provider(t, (body, response) => {
+    if (isChild(body)) {
+      childTurns++;
+      return sse(response, { text: `Child turn ${childTurns} report` });
+    }
+    const toolMsgs = body.messages.filter(m => m.role === 'tool');
+    if (toolMsgs.length === 0) {
+      // Verify the LLM receives full JSON schemas for spawn_agent, wait_agent, delegate_task
+      const toolNames = body.tools.map(tl => tl.function.name);
+      assert(toolNames.includes('spawn_agent'));
+      assert(toolNames.includes('wait_agent'));
+      assert(toolNames.includes('send_input'));
+      assert(toolNames.includes('close_agent'));
+      const spawnTool = body.tools.find(tl => tl.function.name === 'spawn_agent');
+      assert(spawnTool.function.parameters.properties.message, 'spawn_agent schema must expose message property to LLM');
+      return sse(response, {
+        calls: [
+          { id: 'spawn-1', name: 'spawn_agent', input: { prompt: 'Explore module A', role: 'explorer' } },
+          { id: 'del-single', name: 'delegate_task', input: { task: 'Single string task' } },
+        ],
+      });
+    }
+    if (toolMsgs.length === 2) {
+      const spawnOut = JSON.parse(toolMsgs[0].content);
+      assert.equal(spawnOut.nickname, 'Euclid');
+      assert.equal(spawnOut.agent_type, 'explorer');
+      assert.match(toolMsgs[1].content, /Child turn/);
+      return sse(response, {
+        calls: [{ id: 'wait-1', name: 'wait', input: { id: spawnOut.agent_id } }],
+      });
+    }
+    if (toolMsgs.length === 3) {
+      const waitOut = JSON.parse(toolMsgs[2].content);
+      assert.equal(waitOut.timed_out, false);
+      const agentId = Object.keys(waitOut.status)[0];
+      assert.match(waitOut.status[agentId].completed, /Child turn/);
+      return sse(response, {
+        calls: [
+          { id: 'send-1', name: 'send_message', input: { id: 'Euclid', prompt: 'Follow-up question', wait: true } },
+          { id: 'close-1', name: 'close_agent', input: { id: 'Euclid' } },
+        ],
+      });
+    }
+    if (toolMsgs.length >= 4) {
+      const sendOut = toolMsgs[3].content;
+      assert.match(sendOut, /Child turn 3 report/, `Unexpected send_message output: ${sendOut}`);
+    }
+    return sse(response, { text: 'All multi-agent steps complete.' });
+  });
+  const config = configFor(f, p);
+  const store = await SessionStore.open(join(f.data, 'sessions'), config);
+  t.after(() => store.close());
+  const tools = new ToolRegistry(f.cwd, async () => true);
+  const subagents = new Subagents(config, store, tools, e => events.push(e));
+  subagents.register();
+  t.after(() => subagents.closeAll());
+  const out = await new Harness(config, store, tools).run('use subagents', AbortSignal.timeout(5000));
+  assert.equal(out, 'All multi-agent steps complete.');
+  assert.equal(childTurns, 3);
+  const summaries = await subagents.listSubagentSummaries();
+  assert(summaries.some(s => s.nickname === 'Euclid' && s.status === 'shutdown'));
+});
+

@@ -31,7 +31,7 @@ Usage: goon [options] [prompt]
        goon setup
        goon init --provider openai-compatible --base-url URL --model MODEL [--effort LEVEL]
        goon doctor | sessions
-       goon mcp list | check
+       goon mcp list | check [name] | get <name> | add <name> ... | remove <name> | import-codex [name...]
 
 Options:
   -p, --prompt TEXT          Run one task (or pipe a prompt on stdin)
@@ -58,10 +58,10 @@ Options:
   -v, --version             Show version
 
 Interactive commands:
-  /help, /setup, /model, /effort, /mode, /view, /plan, /revert, /undo, /checkpoints,
-  /todo, /compact, /diff, /review, /fork, /rename, /export, /init, /status,
-  /tools, /sessions, /doctor, /clear, /exit, or !<cmd> for shell.
-Shortcuts: Shift+Tab mode, Alt+. / Alt+, effort, Tab autocomplete (@file & /cmd), Esc Esc rewind, Ctrl+C cancel.
+  /help, /setup, /model, /effort, /mode, /auto, /view, /transcript, /mcp, /plan,
+  /revert, /undo, /checkpoints, /todo, /compact, /diff, /review, /fork, /rename,
+  /export, /init, /status, /tools, /sessions, /doctor, /clear, /exit, or !<cmd>.
+Shortcuts: Shift+Tab mode, Ctrl+T transcript, Alt+. / Alt+, effort, Tab autocomplete, Esc Esc rewind, Ctrl+C cancel.
 API keys are read from environment variables or ~/.config/goon/credentials.json.
 Shell commands run as your OS user; approvals are not an OS sandbox.
 `;
@@ -111,6 +111,69 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   let apiKey: string | undefined;
   let jsonOutput = false;
   try {
+    if (argv[0] === 'mcp' && argv[1] === 'add') {
+      const { loadMcpConfig, saveMcpConfig, mcpServerSchema } = await import('./mcp.js');
+      const rest = argv.slice(2);
+      const dashDashIdx = rest.indexOf('--');
+      const flagPart = dashDashIdx >= 0 ? rest.slice(0, dashDashIdx) : rest;
+      const cmdPart = dashDashIdx >= 0 ? rest.slice(dashDashIdx + 1) : [];
+      const addParsed = parseArgs({
+        args: flagPart,
+        allowPositionals: true,
+        strict: false,
+        options: {
+          url: { type: 'string' },
+          'bearer-env': { type: 'string' },
+          'bearer-token-env-var': { type: 'string' },
+          env: { type: 'string', multiple: true },
+          trust: { type: 'boolean' },
+          'timeout-ms': { type: 'string' },
+        },
+      });
+      const name = addParsed.positionals[0];
+      if (!name) {
+        throw new Error('Usage: goon mcp add <name> (--url <URL> [--bearer-env ENV] | -- <command> [args...])');
+      }
+      const envMap: Record<string, string> = {};
+      for (const pair of (addParsed.values.env as string[] | undefined) ?? []) {
+        const eq = pair.indexOf('=');
+        if (eq > 0) envMap[pair.slice(0, eq).trim()] = pair.slice(eq + 1);
+      }
+      const urlVal = typeof addParsed.values.url === 'string' ? addParsed.values.url : undefined;
+      const commandTokens = cmdPart.length ? cmdPart : addParsed.positionals.slice(1);
+      if (!urlVal && !commandTokens.length) {
+        throw new Error('Specify either --url <URL> or -- <command> [args...] when adding an MCP server.');
+      }
+      const bearerEnv =
+        (typeof addParsed.values['bearer-env'] === 'string' ? addParsed.values['bearer-env'] : undefined) ??
+        (typeof addParsed.values['bearer-token-env-var'] === 'string' ? addParsed.values['bearer-token-env-var'] : undefined);
+      const timeoutMs =
+        typeof addParsed.values['timeout-ms'] === 'string' ? Number(addParsed.values['timeout-ms']) : undefined;
+      const serverEntry = mcpServerSchema.parse(
+        urlVal
+          ? {
+              transport: 'http',
+              url: urlVal,
+              ...(bearerEnv ? { bearerEnv } : {}),
+              ...(addParsed.values.trust === true ? { trust: true } : {}),
+              ...(timeoutMs ? { timeoutMs } : {}),
+            }
+          : {
+              transport: 'stdio',
+              command: commandTokens[0],
+              args: commandTokens.slice(1),
+              ...(Object.keys(envMap).length ? { env: envMap } : {}),
+              ...(addParsed.values.trust === true ? { trust: true } : {}),
+              ...(timeoutMs ? { timeoutMs } : {}),
+            },
+      );
+      const mcpConfig = await loadMcpConfig();
+      mcpConfig.servers[name] = serverEntry;
+      await saveMcpConfig(mcpConfig);
+      stdout.write(`Added MCP server "${name}" (${serverEntry.transport}).\n`);
+      return;
+    }
+
     const { values, positionals } = parseArgs({ args: argv, allowPositionals: true, strict: true, options: {
       help: { type: 'boolean', short: 'h' }, version: { type: 'boolean', short: 'v' },
       prompt: { type: 'string', short: 'p' }, cwd: { type: 'string', short: 'C' },
@@ -136,15 +199,46 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     if (values['show-reasoning'] !== undefined) overrides.showReasoning = values['show-reasoning'];
     let config: Config = await loadConfig(overrides);
     if (positionals[0] === 'mcp') {
-      const { loadMcpConfig, mcpConfigPath, McpManager } = await import('./mcp.js');
+      const { loadMcpConfig, saveMcpConfig, mcpConfigPath, McpManager, importCodexMcpServers } = await import('./mcp.js');
       const mcpConfig = await loadMcpConfig();
-      if (positionals[1] === 'list') {
+      const sub = positionals[1];
+      if (sub === 'list') {
         stdout.write(JSON.stringify({ path: mcpConfigPath(), servers: Object.entries(mcpConfig.servers).map(([name, server]) =>
-          ({ name, transport: server.transport, disabled: server.disabled, readOnlyTools: server.readOnlyTools })) }, null, 2) + '\n');
+          ({ name, transport: server.transport, disabled: server.disabled, trust: server.trust, readOnlyTools: server.readOnlyTools })) }, null, 2) + '\n');
         return;
       }
-      if (positionals[1] !== 'check') throw new Error('Usage: goon mcp list | check');
-      const manager = new McpManager(mcpConfig, resolve(values.cwd ?? '.'));
+      if (sub === 'get') {
+        const target = positionals[2];
+        if (!target || !mcpConfig.servers[target]) throw new Error(`MCP server "${target ?? ''}" not found.`);
+        stdout.write(JSON.stringify({ name: target, ...mcpConfig.servers[target] }, null, 2) + '\n');
+        return;
+      }
+      if (sub === 'remove' || sub === 'rm') {
+        const target = positionals[2];
+        if (!target || !mcpConfig.servers[target]) throw new Error(`MCP server "${target ?? ''}" not found.`);
+        delete mcpConfig.servers[target];
+        await saveMcpConfig(mcpConfig);
+        stdout.write(`Removed MCP server "${target}".\n`);
+        return;
+      }
+      if (sub === 'import-codex') {
+        const filterNames = positionals.slice(2);
+        const res = await importCodexMcpServers(undefined, filterNames.length ? filterNames : undefined);
+        stdout.write(JSON.stringify(res, null, 2) + '\n');
+        return;
+      }
+      if (sub !== 'check') {
+        throw new Error('Usage: goon mcp list | check [name] | get <name> | add <name> ... | remove <name> | import-codex [name...]');
+      }
+      const targetFilter = positionals[2];
+      const filteredConfig = targetFilter
+        ? {
+            servers: Object.fromEntries(
+              Object.entries(mcpConfig.servers).filter(([k]) => k === targetFilter),
+            ),
+          }
+        : mcpConfig;
+      const manager = new McpManager(filteredConfig, resolve(values.cwd ?? '.'));
       const controller = new AbortController();
       const cancel = (signal: NodeJS.Signals) => { process.exitCode = signal === 'SIGTERM' ? 143 : 130; controller.abort(); };
       process.on('SIGINT', cancel); process.on('SIGTERM', cancel);
@@ -243,6 +337,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     let rl: ReturnType<typeof createInterface> | undefined;
     let tui: TerminalUI | undefined;
     let manager: McpManager | undefined;
+    let subagents: import('./subagents.js').Subagents | undefined;
     let controller: AbortController | undefined;
     let denied = false, exiting = false, terminating = false, starting = true;
     let mode: PermissionMode = values['read-only']
@@ -265,7 +360,14 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       controller?.abort(new Error('Terminated.'));
       rl?.close(); tui?.close(); process.exitCode = 143;
     };
-    process.on('SIGINT', stop); process.on('SIGTERM', terminate);
+    const onIpcSignal = (msg: unknown) => {
+      if (msg && typeof msg === 'object' && (msg as { type?: string }).type === 'goon:signal') {
+        const sig = (msg as { signal?: string }).signal;
+        if (sig === 'SIGINT') stop();
+        else if (sig === 'SIGTERM') terminate();
+      }
+    };
+    process.on('SIGINT', stop); process.on('SIGTERM', terminate); process.on('message', onIpcSignal);
     try {
       if (interactive && stdin.isTTY && stdout.isTTY && !jsonOutput && !values['no-tui'] && process.env.TERM !== 'dumb') {
         const titleLabel = store.session.title ? `${runtime.model} · ${store.session.title}` : `${runtime.model} · ${store.session.id.slice(0, 8)}`;
@@ -360,12 +462,31 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
           const { loadMcpConfig, McpManager } = await import('./mcp.js');
           controller = new AbortController();
           tui?.setStatus('Connecting MCP');
-          manager = new McpManager(await loadMcpConfig(), runtime.cwd);
-          await manager.connect(reg, controller.signal);
-          controller = undefined;
+          try {
+            manager = new McpManager(await loadMcpConfig(), runtime.cwd);
+            await manager.connect(reg, controller.signal);
+            for (const st of manager.statuses) {
+              if (st.status === 'error') {
+                display(`[MCP warning: server "${st.name}" failed to start: ${st.error ?? 'unknown error'}]\n`);
+              }
+            }
+          } catch (error) {
+            if (!interactive || controller.signal.aborted) {
+              controller = undefined;
+              throw error;
+            }
+            display(`[MCP warning: ${safeError(error, apiKey)}]\n`);
+          } finally {
+            controller = undefined;
+          }
+        }
+        if (subagents) {
+          await subagents.closeAll();
+          subagents = undefined;
         }
         if (!values['no-subagents']) {
-          new Subagents(runtime, store, reg, emit).register();
+          subagents = new Subagents(runtime, store, reg, emit);
+          subagents.register();
         }
         return { tools: reg, harness: new Harness(runtime, store, reg, emit) };
       };
@@ -544,6 +665,8 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             '  /export [filename.md]             Export session transcript to a Markdown file\n' +
             '  /init                             Generate or update AGENTS.md for this project\n' +
             '  /status                           Show session, model, effort & context window stats\n' +
+            '  /mcp [list|check|import-codex|reload] Inspect, check, reload, or import Codex MCP servers\n' +
+            '  /subagents [list|show <id>|<task>] List spawned subagents, view transcript, or run a subagent\n' +
             '  /tools                            List active tools in current mode\n' +
             '  /sessions                         List saved workspace sessions\n' +
             '  /doctor                           Check environment health\n' +
@@ -700,6 +823,51 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             display(`Failed to run git diff: ${safeError(error, apiKey)}\n`);
           }
           return true;
+        }
+        if (cmdInput === '/mcp' || cmdInput === '/mcp list') {
+          const { loadMcpConfig, mcpConfigPath } = await import('./mcp.js');
+          const cfg = await loadMcpConfig();
+          const entries = Object.entries(cfg.servers);
+          const statusMap = new Map((manager?.statuses ?? []).map(s => [s.name, s]));
+          if (!entries.length) {
+            display(`No MCP servers configured in ${mcpConfigPath()}.\nTip: Run "/mcp import-codex" or "goon mcp add <name> -- <cmd> [args...]"\n`);
+          } else {
+            const lines = entries.map(([name, s]) => {
+              const target = s.transport === 'stdio' ? `${s.command}${s.args.length ? ' ' + s.args.join(' ') : ''}` : s.url;
+              const st = statusMap.get(name);
+              const badge = s.disabled
+                ? 'disabled'
+                : st?.status === 'ok'
+                  ? `connected (${st.toolCount} tools)`
+                  : st?.status === 'error'
+                    ? `error: ${st.error}`
+                    : 'configured';
+              return `  ${name}  [${s.transport}]  (${badge})  ${target}`;
+            });
+            display(`MCP Servers (${entries.length}):\n${lines.join('\n')}\nActive MCP tools: ${manager?.tools.length ?? 0}\n`);
+          }
+          return true;
+        }
+        if (cmdInput === '/subagents' || cmdInput === '/agents' || cmdInput === '/subagents list' || cmdInput.startsWith('/subagents show ') || cmdInput.startsWith('/agent show ')) {
+          const rest = cmdInput.replace(/^\/(?:subagents|agents|agent)\s*/, '').trim();
+          if (!rest || rest === 'list') {
+            const list = await (subagents?.listSubagentSummaries() ?? Promise.resolve([]));
+            if (!list.length) {
+              display('  No subagents spawned in this session yet.\n  Tip: Use "/agent <task>" or ask the agent to spawn subagents (spawn_agent / delegate_task).\n');
+            } else {
+              const lines = list.map((s) =>
+                `  ${s.nickname} (${s.id})  [${s.role}]  ${s.status}  (${s.messagesCount} msgs)  ${s.updatedAt}\n    Task: ${s.task}${s.summary ? `\n    Summary: ${s.summary}` : ''}`,
+              );
+              display(`Subagents (${list.length}):\n${lines.join('\n')}\n`);
+            }
+            return true;
+          }
+          if (rest.startsWith('show ')) {
+            const target = rest.slice(5).trim();
+            const transcript = await subagents?.readSubagentTranscript(target);
+            display((transcript ?? `Subagent "${target}" not found.`) + '\n');
+            return true;
+          }
         }
         if (cmdInput === '/tools') {
           const names = Object.keys(tools.schemas());
@@ -1329,6 +1497,88 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             );
             continue;
           }
+          if (input.startsWith('/mcp ')) {
+            const subArgs = input.slice(5).trim().split(/\s+/);
+            const sub = (subArgs[0] ?? 'list').toLowerCase();
+            const { loadMcpConfig, saveMcpConfig, importCodexMcpServers } = await import('./mcp.js');
+            if (sub === 'reload' || sub === 'reconnect') {
+              const built = await buildHarness(mode);
+              tools = built.tools;
+              harness = built.harness;
+              display(`Reloaded MCP servers (${manager?.tools.length ?? 0} MCP tools active).\n`);
+              continue;
+            }
+            if (sub === 'import-codex' || sub === 'sync-codex') {
+              try {
+                const res = await importCodexMcpServers(undefined, subArgs.slice(1).length ? subArgs.slice(1) : undefined);
+                if (!res.imported.length) {
+                  display(`No matching MCP servers found in ~/.codex/config.toml (target: ${res.path}).\n`);
+                } else {
+                  display(`Imported ${res.imported.length} MCP server(s) into ${res.path}: ${res.imported.join(', ')}\n`);
+                  const built = await buildHarness(mode);
+                  tools = built.tools;
+                  harness = built.harness;
+                  display(`Active MCP tools: ${manager?.tools.length ?? 0}\n`);
+                }
+              } catch (error) {
+                display(`MCP import failed: ${safeError(error, apiKey)}\n`);
+              }
+              continue;
+            }
+            if (sub === 'remove' || sub === 'rm') {
+              const target = subArgs[1];
+              if (!target) {
+                display('Usage: /mcp remove <name>\n');
+                continue;
+              }
+              const cfg = await loadMcpConfig();
+              if (!cfg.servers[target]) {
+                display(`MCP server "${target}" not found.\n`);
+                continue;
+              }
+              delete cfg.servers[target];
+              await saveMcpConfig(cfg);
+              const built = await buildHarness(mode);
+              tools = built.tools;
+              harness = built.harness;
+              display(`Removed MCP server "${target}" (${manager?.tools.length ?? 0} MCP tools active).\n`);
+              continue;
+            }
+            if (sub === 'check') {
+              const built = await buildHarness(mode);
+              tools = built.tools;
+              harness = built.harness;
+              for (const st of manager?.statuses ?? []) {
+                display(`  ${st.name}: ${st.status}${st.status === 'ok' ? ` (${st.toolCount} tools)` : st.error ? ` — ${st.error}` : ''}\n`);
+              }
+              continue;
+            }
+            display('Usage: /mcp [list | check | reload | import-codex [names...] | remove <name>]\n');
+            continue;
+          }
+          if (input === '/subagents' || input === '/agents' || input === '/agent' || input.startsWith('/subagents ') || input.startsWith('/agents ') || input.startsWith('/agent ')) {
+            const rest = input.replace(/^\/(?:subagents|agents|agent)\s*/, '').trim();
+            if (!rest || rest === 'list') {
+              const list = await (subagents?.listSubagentSummaries() ?? Promise.resolve([]));
+              if (!list.length) {
+                display('  No subagents spawned in this session yet.\n  Tip: Use "/agent <task>" or ask the agent to spawn subagents (spawn_agent / delegate_task).\n');
+              } else {
+                const lines = list.map((s) =>
+                  `  ${s.nickname} (${s.id})  [${s.role}]  ${s.status}  (${s.messagesCount} msgs)  ${s.updatedAt}\n    Task: ${s.task}${s.summary ? `\n    Summary: ${s.summary}` : ''}`,
+                );
+                display(`Subagents (${list.length}):\n${lines.join('\n')}\n`);
+              }
+              continue;
+            }
+            if (rest.startsWith('show ')) {
+              const target = rest.slice(5).trim();
+              const transcript = await subagents?.readSubagentTranscript(target);
+              display((transcript ?? `Subagent "${target}" not found.`) + '\n');
+              continue;
+            }
+            await run(`Use a subagent (spawn_agent + wait_agent, or delegate_task / delegate_edit as appropriate) to execute the following task and report the result:\n\n${rest}`);
+            continue;
+          }
           if (input === '/tools') {
             const names = Object.keys(tools.schemas());
             display(names.map(n => `  ${tools.isReadOnly(n) ? '● [read]' : '◆ [exec]'} ${n}`).join('\n') + '\n');
@@ -1390,9 +1640,14 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       }
 
     } finally {
-      process.removeListener('SIGINT', stop); process.removeListener('SIGTERM', terminate);
-      try { tui?.close(); rl?.close(); await manager?.close(); }
-      finally { await store.close(); }
+      process.removeListener('SIGINT', stop); process.removeListener('SIGTERM', terminate); process.removeListener('message', onIpcSignal);
+      try { tui?.close(); rl?.close(); await subagents?.closeAll(); await manager?.close(); }
+      finally {
+        await store.close();
+        if (process.connected) {
+          try { process.disconnect(); } catch { /* ignore */ }
+        }
+      }
     }
   } catch (error) {
     const message = cleanTerminal(safeError(error, apiKey));

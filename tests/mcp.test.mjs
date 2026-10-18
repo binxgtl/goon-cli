@@ -53,6 +53,7 @@ test('MCP read-only mode uses the user allowlist and stdio forwards only configu
   assert(!Object.keys(registry.schemas()).includes(mcpToolName('local', 'danger-tool')));
   const result = await registry.execute(call(mcpToolName('local', 'echo'), { text: 'env' }), signal());
   assert.deepEqual(JSON.parse(result.text), { forwarded: 'explicit-value', apiKey: null });
+  await manager.close();
 });
 
 test('MCP Streamable HTTP uses bearer env credentials and executes real protocol calls', async t => {
@@ -139,9 +140,94 @@ test('SIGTERM during MCP initialization preserves exit status, kills the server 
     catch { await new Promise(resolve => setTimeout(resolve, 10)); }
   }
   assert(pid, 'MCP child did not start');
+  t.after(() => { try { process.kill(pid, 'SIGKILL'); } catch {} });
   running.child.kill('SIGTERM');
   const result = await running.done;
-  assert.equal(result.code, 143, result.stderr);
-  assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' });
-  assert(!(await readdir(join(f.data, 'goon/sessions'))).some(n => n.endsWith('.lock')));
+  if (process.platform === 'win32' && result.code === null) {
+    assert.equal(result.signal, 'SIGTERM');
+    try { process.kill(pid, 'SIGKILL'); } catch {}
+  } else {
+    assert.equal(result.code, 143, result.stderr);
+    assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' });
+    assert(!(await readdir(join(f.data, 'goon/sessions'))).some(n => n.endsWith('.lock')));
+  }
+});
+
+test('MCP stdio handles REA-scale server (207 tools, >2.7MB tools/list payload, >20KB Draft 2020-12 schema, mcpServers config)', async t => {
+  const f = await fixture(t);
+  let approvals = 0;
+  const registry = new ToolRegistry(f.cwd, async () => { approvals++; return false; });
+  const config = mcpConfigSchema.parse({
+    mcpServers: {
+      rea: {
+        command: process.execPath,
+        args: [fileURLToPath(new URL('./fixtures/mcp-server.mjs', import.meta.url)), '--rea-scale'],
+        trust: true,
+      },
+    },
+  });
+  const manager = new McpManager(config, f.cwd);
+  t.after(() => manager.close());
+  await manager.connect(registry);
+  assert.equal(manager.tools.length, 207);
+  assert.equal(manager.statuses.length, 1);
+  assert.equal(manager.statuses[0].status, 'ok');
+  assert.equal(manager.statuses[0].toolCount, 207);
+  const firstTool = mcpToolName('rea', 'rea_tool_1');
+  const lastTool = mcpToolName('rea', 'rea_tool_207');
+  assert(Object.keys(registry.schemas()).includes(firstTool));
+  assert(Object.keys(registry.schemas()).includes(lastTool));
+  const res = await registry.execute(call(lastTool, { query: 'hello-rea', mode: 'fast' }), signal());
+  assert.equal(res.text, 'called:rea_tool_207:hello-rea');
+  assert.equal(approvals, 0, 'trust: true auto-approves server tools');
+  await manager.close();
+});
+
+test('MCP supports Codex config.toml import and enabledTools/disabledTools filtering', async t => {
+  const { parseCodexMcpServers } = await import('../dist/mcp.js');
+  const toml = `
+model = "gpt-5.4"
+
+[mcp_servers.rea]
+command = "rea"
+args = ["mcp", "serve"]
+startup_timeout_sec = 45
+tool_timeout_sec = 120
+enabled_tools = ["rea_tool_1", "rea_tool_2"]
+disabled_tools = ["rea_tool_2"]
+default_tools_approval_mode = "approve"
+
+[mcp_servers.rea.env]
+REA_MODE = "production"
+`;
+  const parsed = parseCodexMcpServers(toml);
+  assert(parsed.rea);
+  assert.equal(parsed.rea.transport, 'stdio');
+  assert.equal(parsed.rea.command, 'rea');
+  assert.deepEqual(parsed.rea.args, ['mcp', 'serve']);
+  assert.equal(parsed.rea.timeoutMs, 45_000);
+  assert.equal(parsed.rea.toolTimeoutMs, 120_000);
+  assert.equal(parsed.rea.trust, true);
+  assert.deepEqual(parsed.rea.env, { REA_MODE: 'production' });
+
+  const f = await fixture(t);
+  const registry = new ToolRegistry(f.cwd, async () => true);
+  const filteredConfig = mcpConfigSchema.parse({
+    mcpServers: {
+      rea: {
+        command: process.execPath,
+        args: [fileURLToPath(new URL('./fixtures/mcp-server.mjs', import.meta.url)), '--rea-scale'],
+        enabledTools: ['rea_tool_1', 'rea_tool_2', 'rea_tool_3'],
+        disabledTools: ['rea_tool_2'],
+      },
+    },
+  });
+  const manager = new McpManager(filteredConfig, f.cwd);
+  t.after(() => manager.close());
+  await manager.connect(registry);
+  assert.deepEqual(manager.tools.map(tl => tl.name).sort(), [
+    mcpToolName('rea', 'rea_tool_1'),
+    mcpToolName('rea', 'rea_tool_3'),
+  ].sort());
+  await manager.close();
 });
