@@ -13,8 +13,17 @@ export const limitText = (text: string, limit = 32_000): string => {
 };
 
 export function computeUnifiedDiff(path: string, before: string, after: string, contextLines = 3): string {
-  const oldLines = before === '' ? [] : before.replace(/\r\n/g, '\n').split('\n');
-  const newLines = after === '' ? [] : after.replace(/\r\n/g, '\n').split('\n');
+  const splitLines = (text: string): string[] => {
+    if (text === '') return [];
+    const normalized = text.replace(/\r\n/g, '\n');
+    return normalized.endsWith('\n') ? normalized.slice(0, -1).split('\n') : normalized.split('\n');
+  };
+  let oldLines = splitLines(before);
+  let newLines = splitLines(after);
+  if (before !== after && oldLines.length === newLines.length && oldLines.every((l, i) => l === newLines[i])) {
+    oldLines = before === '' ? [] : before.replace(/\r\n/g, '\n').split('\n');
+    newLines = after === '' ? [] : after.replace(/\r\n/g, '\n').split('\n');
+  }
   let prefix = 0;
   while (prefix < oldLines.length && prefix < newLines.length && oldLines[prefix] === newLines[prefix]) {
     prefix++;
@@ -37,20 +46,22 @@ export function computeUnifiedDiff(path: string, before: string, after: string, 
   const beforeCtx = oldLines.slice(ctxStart, prefix);
   const afterCtx = oldLines.slice(oldLines.length - suffix, ctxEndOld);
 
-  const oldStart = ctxStart + 1;
+  const oldStart = oldLines.length === 0 ? 0 : ctxStart + 1;
   const oldCount = beforeCtx.length + oldChanged.length + afterCtx.length;
-  const newStart = ctxStart + 1;
+  const newStart = newLines.length === 0 ? 0 : ctxStart + 1;
   const newCount = beforeCtx.length + newChanged.length + afterCtx.length;
+  const maxDiffLines = 5000;
+  const kindPrefix = before === '' && after !== '' ? 'new ' : after === '' && before !== '' ? 'deleted ' : '';
 
   const out: string[] = [
-    `--- a/${path} (+${newChanged.length} -${oldChanged.length})`,
+    `--- a/${path} (${kindPrefix}+${newChanged.length} -${oldChanged.length})`,
     `+++ b/${path}`,
     `@@ -${oldStart},${oldCount} +${newStart},${newCount} @@`,
     ...beforeCtx.map(l => ` ${l}`),
-    ...oldChanged.slice(0, 60).map(l => `-${l}`),
-    ...(oldChanged.length > 60 ? [`... (-${oldChanged.length - 60} more removed lines)`] : []),
-    ...newChanged.slice(0, 60).map(l => `+${l}`),
-    ...(newChanged.length > 60 ? [`... (+${newChanged.length - 60} more added lines)`] : []),
+    ...oldChanged.slice(0, maxDiffLines).map(l => `-${l}`),
+    ...(oldChanged.length > maxDiffLines ? [`... (-${oldChanged.length - maxDiffLines} more removed lines)`] : []),
+    ...newChanged.slice(0, maxDiffLines).map(l => `+${l}`),
+    ...(newChanged.length > maxDiffLines ? [`... (+${newChanged.length - maxDiffLines} more added lines)`] : []),
     ...afterCtx.map(l => ` ${l}`),
   ];
   return out.join('\n');

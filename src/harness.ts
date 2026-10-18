@@ -133,10 +133,16 @@ function summarizeDiffCounts(diffText: string | undefined): { added: number; rem
   let isNew = false;
   let isDeleted = false;
   for (const line of diffText.split('\n')) {
-    if (line.startsWith('--- /dev/null')) isNew = true;
-    else if (line.startsWith('+++ /dev/null')) isDeleted = true;
+    if (line.startsWith('--- /dev/null') || /^--- a\/.+ \(new \+\d+ -\d+\)$/.test(line)) isNew = true;
+    else if (line.startsWith('+++ /dev/null') || /^--- a\/.+ \(deleted \+\d+ -\d+\)$/.test(line)) isDeleted = true;
     else if (line.startsWith('+') && !line.startsWith('+++')) added++;
     else if (line.startsWith('-') && !line.startsWith('---')) removed++;
+    else {
+      const moreAdded = /^\.\.\. \(\+(\d+) more added lines\)$/.exec(line);
+      if (moreAdded) added += Number(moreAdded[1]);
+      const moreRemoved = /^\.\.\. \(-(\d+) more removed lines\)$/.exec(line);
+      if (moreRemoved) removed += Number(moreRemoved[1]);
+    }
   }
   const verb = isDeleted ? 'Deleted' : isNew ? 'Added' : 'Edited';
   return { added, removed, verb };

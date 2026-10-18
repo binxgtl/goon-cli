@@ -323,14 +323,17 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
           const diff = await reg.files.previewDiff(request.tool, request.input);
           let rawPreview: string;
           if (diff) {
-            rawPreview = diff;
+            const diffLines = diff.split('\n');
+            rawPreview = diffLines.length > 80
+              ? `${diffLines.slice(0, 80).join('\n')}\n... (+${diffLines.length - 80} more diff lines)`
+              : diff;
           } else if (request.tool === 'bash' && request.input && typeof request.input === 'object' && 'command' in request.input) {
             const cmd = String((request.input as { command: unknown }).command ?? '').trim();
             rawPreview = `  $ ${cmd}`;
           } else {
             rawPreview = JSON.stringify(request.input, null, 2);
           }
-          const preview = cleanTerminal(rawPreview.split(runtime.apiKey).join('[REDACTED]').slice(0, 2000));
+          const preview = cleanTerminal(rawPreview.split(runtime.apiKey).join('[REDACTED]').slice(0, 8000));
           const approvalBlock = `\n• Allow ${request.tool}?\n${preview}\n`;
           const reply = tui
             ? (await tui.askTransient(approvalBlock, '[y/N/a(lways)] ', request.signal)).trim().toLowerCase()

@@ -490,5 +490,14 @@ test('welcomeBanner aligns all box borders to 69 visible columns with NFD Vietna
   assert.match(frame, /• Thinking/);
   assert.match(frame, /Internal chain of thought step 1\./);
   assert.match(frame, /• Final visible answer\./);
+
+  // Verify computeUnifiedDiff and TUI do NOT cap >60 line writes at +60
+  const { computeUnifiedDiff } = await import('../dist/index.js');
+  const longContent = Array.from({ length: 250 }, (_, i) => `const line_${i + 1} = ${i + 1};`).join('\n') + '\n';
+  const diff250 = computeUnifiedDiff('src/big.ts', '', longContent);
+  assert.match(diff250, /--- a\/src\/big\.ts \(new \+250 -0\)/);
+  const plusLines = diff250.split('\n').filter(l => l.startsWith('+') && !l.startsWith('+++'));
+  assert.equal(plusLines.length, 250, 'computeUnifiedDiff must include all 250 added lines, not cap at 60');
 });
+
 

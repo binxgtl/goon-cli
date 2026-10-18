@@ -178,7 +178,7 @@ function formatCompactDuration(ms: number): string {
   return `${m}m ${String(s).padStart(2, '0')}s`;
 }
 
-function formatCompactDiff(diffText: string, maxLines = 14): string[] {
+function formatCompactDiff(diffText: string, maxLines = 20): string[] {
   const rawLines = diffText.split(/\r?\n/);
   const out: string[] = [];
   let oldLine = 1;
@@ -190,8 +190,13 @@ function formatCompactDiff(diffText: string, maxLines = 14): string[] {
     const hunkMatch = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
     if (hunkMatch) {
       if (shown > 0 && shown < maxLines) out.push('      ⋮');
-      oldLine = Number(hunkMatch[1]);
-      newLine = Number(hunkMatch[2]);
+      oldLine = Math.max(1, Number(hunkMatch[1]));
+      newLine = Math.max(1, Number(hunkMatch[2]));
+      continue;
+    }
+    const moreMatch = /^\.\.\. \([+-](\d+) more (?:added|removed) lines\)$/.exec(line);
+    if (moreMatch) {
+      omitted += Number(moreMatch[1]);
       continue;
     }
     if (line.startsWith('+')) {
@@ -596,7 +601,7 @@ export class TerminalUI {
         meta.added !== undefined || meta.removed !== undefined
           ? ` (+${meta.added ?? 0} -${meta.removed ?? 0})`
           : '';
-      const diffLines = meta.diff ? formatCompactDiff(meta.diff) : [];
+      const diffLines = meta.diff ? formatCompactDiff(meta.diff, this.viewMode === 'verbose' ? 120 : 30) : [];
       const diffBlock = diffLines.length ? `\n${diffLines.join('\n')}` : '';
       this.appendTranscript(`\n• ${verb} ${meta.summary}${stats}${diffBlock}\n`);
       return;
