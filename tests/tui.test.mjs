@@ -550,8 +550,8 @@ test('TerminalUI Ctrl+T toggles Codex Transcript Mode, auto-approve mode, and im
   assert.match(frame, /• Thinking/);
   assert.match(frame, /Hidden reasoning visible in Ctrl\+T\./);
 
-  // Press Esc (\x1b) -> exits Transcript Mode back to normal Composer view
-  tty.input.write('\x1b');
+  // Press q (or Ctrl+T / Esc) -> exits Transcript Mode back to normal Composer view immediately
+  tty.input.write('q');
   await new Promise(resolve => setTimeout(resolve, 25));
   assert.equal(tty.ui.isTranscriptOverlay(), false);
 
