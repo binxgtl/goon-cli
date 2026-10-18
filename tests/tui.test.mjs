@@ -88,7 +88,7 @@ test('TUI separates opt-in reasoning from answers and consumes compact child pro
   tty.ui.event({ type: 'subagent', id: 'child123', state: 'progress', event: { type: 'tool', name: 'read_file', id: 'r1', state: 'done' } });
   tty.ui.event({ type: 'subagent', id: 'child123', state: 'done' });
   await new Promise(resolve => setTimeout(resolve, 40));
-  const frame = tty.written.split('\x1b[H\x1b[2J').at(-1);
+  const frame = tty.ui.renderedFrame();
   assert.equal(frame.split('• Thinking').length - 1, 2);
   assert(!frame.includes('[reasoning'), 'Must not render raw [reasoning] tags');
   assert(!frame.includes('[answer]'), 'Must not render raw [answer] header');
@@ -217,7 +217,7 @@ test('Codex TUI renders Markdown bullets without false-positive red diff colorin
   });
   await new Promise(resolve => setTimeout(resolve, 30));
 
-  const lastFrame = tty.written.split('\x1b[H\x1b[2J').at(-1);
+  const lastFrame = tty.ui.renderedFrame();
   assert.match(lastFrame, /Explored/);
   assert.match(lastFrame, /Read.*src\/index\.ts/);
   assert.match(lastFrame, /Search.*createModel in src/);
@@ -269,11 +269,7 @@ test('Codex TUI collapses pasted ScreenClip image paths into [Image #1], prevent
   await new Promise(resolve => setTimeout(resolve, 25));
 
   // Verify NO rendered line in the frame exceeds columns - 1 (79 visible chars)
-  const rawLastFrame = tty.written.split('\x1b[H\x1b[2J').at(-1);
-  const frameAfterStream = rawLastFrame.endsWith('\x1b[?2026l')
-    ? rawLastFrame.slice(0, -'\x1b[?2026l'.length)
-    : rawLastFrame;
-  for (const rawLine of frameAfterStream.split('\r\n')) {
+  for (const rawLine of tty.ui.renderedFrame().split('\r\n')) {
     const cleanLine = stripVTControlCharacters(rawLine.split('\r')[0]);
     assert(
       cleanLine.length <= 79,
@@ -288,7 +284,7 @@ test('Codex TUI collapses pasted ScreenClip image paths into [Image #1], prevent
   // Press Up arrow on empty input -> scrolls up in transcript and displays "↑ Scrolled up" banner
   tty.key('', 'up');
   await new Promise(resolve => setTimeout(resolve, 25));
-  let latestFrame = tty.written.split('\x1b[H\x1b[2J').at(-1);
+  let latestFrame = tty.ui.renderedFrame();
   assert.match(latestFrame, /↑ Scrolled up/);
 
   // SGR mouse wheel up (\x1b[<64;10;10M) scrolls further up without leaking "64;10;10M" into input
@@ -299,7 +295,7 @@ test('Codex TUI collapses pasted ScreenClip image paths into [Image #1], prevent
   // Press Escape while scrolled up -> returns to bottom (scroll = 0)
   tty.key('', 'escape');
   await new Promise(resolve => setTimeout(resolve, 25));
-  latestFrame = tty.written.split('\x1b[H\x1b[2J').at(-1);
+  latestFrame = tty.ui.renderedFrame();
   assert(!latestFrame.includes('↑ Scrolled up'), 'Escape should return scroll position to bottom');
 
   // 3. Simulate pasting the external ScreenClip image path via bracketed paste
@@ -308,12 +304,11 @@ test('Codex TUI collapses pasted ScreenClip image paths into [Image #1], prevent
   tty.key(undefined, 'paste-end', { sequence: '\x1b[201~' });
   await new Promise(resolve => setTimeout(resolve, 25));
 
-  latestFrame = tty.written.split('\x1b[H\x1b[2J').at(-1);
+  latestFrame = tty.ui.renderedFrame();
   // Composer shows [Image #1] pill and Attached status bar instead of raw 100+ char path
   assert.match(latestFrame, /\[Image #1\]/);
   assert.match(latestFrame, /📎 Attached \[Image #1\]/);
-  // Cursor is positioned on the prompt line itself via \r\x1b[<col>G\x1b[?25h
-  assert(latestFrame.includes('\r\x1b[') && latestFrame.includes('G\x1b[?25h'));
+  assert(tty.written.includes('H\x1b[?25h'), 'Cursor should be positioned on boxMid row');
 
   // Submit the pasted image
   tty.key('', 'return');
@@ -332,20 +327,24 @@ test('Codex TUI collapses pasted ScreenClip image paths into [Image #1], prevent
   assert.match(fromBarePaste.text, /\[Image #1: \{25D1BD96-7B57-4392-BBF0-17E774BEEFF2\}\.png\]/);
 });
 
-test('Codex TUI renders rounded composer text box with spacer gap, pipe-free thinking cells, and cleans up askTransient prompts', async t => {
+test('Codex TUI renders rounded composer text box with spacer gap, pipe-free thinking cells, differential row rendering, and cleans up askTransient prompts', async t => {
   const { stripVTControlCharacters } = await import('node:util');
   const tty = terminal(t);
   tty.output.columns = 90;
   tty.output.rows = 20;
 
+  tty.ui.write('Type /help for commands, @file to attach files, !<cmd> for shell, or enter a task.\n');
   tty.ui.event({ type: 'reasoning', source: 'provider', text: 'Checking files without vertical bars\n' });
   tty.ui.event({ type: 'text', text: 'Direct bullet answer without [answer] tag.\n' });
   await new Promise(resolve => setTimeout(resolve, 25));
 
+  // Verify 'Type /help for commands...' is dimmed with \x1b[2m
+  assert(tty.ui.renderedFrame().includes('\x1b[2mType /help for commands'), 'Type /help line must be styled dim');
+
   // Verify transient approval prompt appears while waiting and is removed once answered
   const approvalPromise = tty.ui.askTransient('\n• Allow bash?\n  $ npm test\n', '[y/N/a(lways)] ');
   await new Promise(resolve => setTimeout(resolve, 25));
-  let frame = stripVTControlCharacters(tty.written.split('\x1b[H\x1b[2J').at(-1));
+  let frame = stripVTControlCharacters(tty.ui.renderedFrame());
   assert.match(frame, /• Allow bash\?/);
   assert.match(frame, /\$ npm test/);
 
@@ -354,7 +353,7 @@ test('Codex TUI renders rounded composer text box with spacer gap, pipe-free thi
   assert.equal(await approvalPromise, 'y');
   await new Promise(resolve => setTimeout(resolve, 25));
 
-  frame = stripVTControlCharacters(tty.written.split('\x1b[H\x1b[2J').at(-1));
+  frame = stripVTControlCharacters(tty.ui.renderedFrame());
   assert(!frame.includes('Allow bash?'), 'Transient approval prompt should be removed from transcript after answer');
   assert.match(frame, /• Thinking/);
   assert.match(frame, /  Checking files without vertical bars/);
@@ -370,21 +369,31 @@ test('Codex TUI renders rounded composer text box with spacer gap, pipe-free thi
   assert.match(frame, /│ › Ask anything\.\.\..*0 tokens │/);
   assert.match(frame, /╰──/);
   assert(!frame.includes('Ready ·'), 'Bottom border should not contain Ready footer text');
+  assert(!frame.includes('Queue'), 'Must not render Queue label when empty');
 
-  // Queue prompt while busy (no pending question active)
+  // Verify differential rendering while busy: spinner ticks must NOT emit \x1b[2J or rewrite transcript lines
+  const writtenLenBeforeSpin = tty.written.length;
   tty.ui.setStatus('Running');
+  await new Promise(resolve => setTimeout(resolve, 180));
+  const spinOutput = tty.written.slice(writtenLenBeforeSpin);
+  assert(!spinOutput.includes('\x1b[2J'), 'Spinner ticks while working must NEVER emit \\x1b[2J (which resets mouse selection)');
+  assert(!spinOutput.includes('Direct bullet answer'), 'Spinner ticks must not rewrite unchanged transcript rows');
+
+  // Queue prompt while busy (no pending question active) — shown without the word 'Queue'
   tty.key('queued follow-up task', undefined);
   tty.key('', 'return');
   await new Promise(resolve => setTimeout(resolve, 25));
 
-  frame = stripVTControlCharacters(tty.written.split('\x1b[H\x1b[2J').at(-1));
-  assert.match(frame, /↳ Queue \(1\): #1 "queued follow-up task"/);
+  frame = stripVTControlCharacters(tty.ui.renderedFrame());
+  assert.match(frame, /↳ queued follow-up task \(Alt\+↑ edit\)/);
+  assert(!frame.includes('Queue'), 'Queued row must not include the word Queue');
 
   // Next question(remember=true) automatically dequeues and resolves the queued prompt
   tty.ui.setStatus('Ready');
   const dequeued = await tty.ui.question('goon> ', undefined, true);
   assert.equal(dequeued, 'queued follow-up task');
 });
+
 
 
 

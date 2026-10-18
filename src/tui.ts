@@ -238,6 +238,12 @@ export class TerminalUI {
   private activeToolStream?: { name: string; preview: string };
   private exploreGroup: Array<{ kind: 'read' | 'list' | 'search'; summary: string }> = [];
   private lastRenderedFrame = '';
+  private lastFrameRows: string[] = [];
+  private lastCols = 0;
+  private lastRows = 0;
+  private lastCursorSeq = '';
+  private lastBodyTotalLines = 0;
+  private needsFullClear = true;
   private inBracketedPaste = false;
   private inSgrMouse = false;
   private sgrMouseBuf = '';
@@ -266,6 +272,10 @@ export class TerminalUI {
     this.render();
   }
 
+  renderedFrame(): string {
+    return this.lastFrameRows.join('\r\n');
+  }
+
   clear() {
     this.transcript = '';
     this.scroll = 0;
@@ -275,6 +285,9 @@ export class TerminalUI {
     this.reasoningHeader = undefined;
     this.reasoningDetail = undefined;
     this.activeToolStream = undefined;
+    this.lastFrameRows = [];
+    this.lastBodyTotalLines = 0;
+    this.needsFullClear = true;
     this.schedule();
   }
 
@@ -939,6 +952,8 @@ export class TerminalUI {
 
   private resize = () => {
     this.lastRenderedFrame = '';
+    this.lastFrameRows = [];
+    this.needsFullClear = true;
     this.schedule();
   };
 
@@ -1113,6 +1128,9 @@ export class TerminalUI {
     if (line.startsWith('╭') || line.startsWith('╰') || line.startsWith('│') || line.startsWith('  >_ ')) {
       return `\x1b[38;2;99;168;248m${line}\x1b[0m`;
     }
+    if (line.startsWith('Type /help')) {
+      return `\x1b[2m${line}\x1b[0m`;
+    }
     if (block === 'user') {
       return padRightAnsi(`\x1b[1;97m${formatInlineMarkdown(line, '\x1b[1;97m\x1b[48;5;236m')}`, columns, '\x1b[48;5;236m');
     }
@@ -1205,6 +1223,49 @@ export class TerminalUI {
     return formatInlineMarkdown(line);
   }
 
+  /**
+   * Flushes `screenLines` to the terminal using Ratatui/Codex-style Row-Level Differential Rendering.
+   * Never emits `\x1b[2J` after the initial frame (unless `clear()` or terminal resize occurred),
+   * and NEVER touches unchanged rows so native mouse text selection (`bôi đen`) is never reset while working.
+   */
+  private flushScreenLines(screenLines: string[], columns: number, rows: number, cursorSeq: string) {
+    if (
+      this.needsFullClear ||
+      columns !== this.lastCols ||
+      rows !== this.lastRows ||
+      this.lastFrameRows.length !== screenLines.length
+    ) {
+      this.needsFullClear = false;
+      this.lastCols = columns;
+      this.lastRows = rows;
+      this.lastFrameRows = [...screenLines];
+      this.lastCursorSeq = cursorSeq;
+      const fullFrame =
+        `\x1b[?2026h\x1b[?25l\x1b[H\x1b[2J${screenLines.map(l => `${l}\x1b[K`).join('\r\n')}` +
+        cursorSeq +
+        `\x1b[?2026l`;
+      this.lastRenderedFrame = fullFrame;
+      this.target.write(fullFrame);
+      return;
+    }
+
+    const patches: string[] = [];
+    for (let i = 0; i < screenLines.length; i++) {
+      if (screenLines[i] !== this.lastFrameRows[i]) {
+        patches.push(`\x1b[${i + 1};1H\x1b[0m${screenLines[i]}\x1b[K`);
+        this.lastFrameRows[i] = screenLines[i];
+      }
+    }
+
+    if (patches.length === 0 && cursorSeq === this.lastCursorSeq) {
+      return;
+    }
+    this.lastCursorSeq = cursorSeq;
+    const diffFrame = `\x1b[?2026h\x1b[?25l${patches.join('')}${cursorSeq}\x1b[?2026l`;
+    this.lastRenderedFrame = this.lastFrameRows.join('\r\n');
+    this.target.write(diffFrame);
+  }
+
   private render() {
     if (this.closed) return;
     const columns = Math.max(4, this.target.columns || 80);
@@ -1230,8 +1291,13 @@ export class TerminalUI {
       ? `\x1b[1;38;2;99;168;248m>_\x1b[0m \x1b[1mgoon\x1b[0m\x1b[2m${headerRaw.slice(7)}\x1b[0m`
       : clip(`goon · ${sessionLabel}`);
 
-    // Body lines with strict width bound
+    // Body lines with strict width bound & scroll-anchor lock when scrolled up
     const all = this.renderStyledBodyLines(safeCols, rich);
+    if (this.scroll > 0 && this.lastBodyTotalLines > 0 && all.length > this.lastBodyTotalLines) {
+      this.scroll += all.length - this.lastBodyTotalLines;
+    }
+    this.lastBodyTotalLines = all.length;
+
     const chromeRows = rich ? 7 : 4;
     const height = Math.max(2, rows - chromeRows);
     this.maxScroll = Math.max(0, all.length - height);
@@ -1272,18 +1338,12 @@ export class TerminalUI {
       : clip(toolsText);
 
     if (rich) {
-      // Rounded Composer Text Box with guaranteed spacer gap + Queue Prompt row above
+      // Rounded Composer Text Box with guaranteed spacer gap + queued messages row (no 'Queue' label)
       const gapLine = '';
-      const queueRaw =
-        this.queuedPrompts.length > 0
-          ? `  ↳ Queue (${this.queuedPrompts.length}): ${this.queuedPrompts
-              .map((q, i) => `#${i + 1} "${q.slice(0, 36)}${q.length > 36 ? '…' : ''}"`)
-              .join(' · ')} (Alt+↑ edit)`
-          : `  ↳ Queue (0): empty · press Enter while busy to queue prompt`;
       const queueLine =
         this.queuedPrompts.length > 0
-          ? `\x1b[1;36m${clip(queueRaw)}\x1b[0m`
-          : `\x1b[2m${clip(queueRaw)}\x1b[0m`;
+          ? `\x1b[2;3m${clip(`  ↳ ${this.queuedPrompts.join(' · ')} (Alt+↑ edit)`)}\x1b[0m`
+          : '';
 
       const boxPromptLabel = this.label === 'goon> ' ? '› ' : clip(this.label);
       const boxLabelCols = visibleLength(boxPromptLabel);
@@ -1318,16 +1378,12 @@ export class TerminalUI {
       const botDashes = '─'.repeat(Math.max(1, safeCols - 2));
       const boxBot = `${borderColor}╰${botDashes}╯\x1b[0m`;
 
+      const screenLines = [header, ...body, gapLine, toolsLine, queueLine, boxTop, boxMid, boxBot];
+      const boxMidRow = screenLines.length - 1;
       const boxCursorCol = Math.min(safeCols - 1, 2 + boxLabelCols + visibleLength(visibleBeforeCursor) + 1);
-      const frame =
-        `\x1b[?2026h\x1b[?25l\x1b[H\x1b[2J${[header, ...body, gapLine, toolsLine, queueLine, boxTop, boxMid, boxBot].join('\r\n')}` +
-        (this.pending || busy ? `\x1b[1A\r\x1b[${boxCursorCol}G\x1b[?25h` : '') +
-        `\x1b[?2026l`;
-
-      if (frame !== this.lastRenderedFrame) {
-        this.lastRenderedFrame = frame;
-        this.target.write(frame);
-      }
+      const cursorSeq =
+        this.pending || this.input.length > 0 ? `\x1b[${boxMidRow};${boxCursorCol}H\x1b[?25h` : '';
+      this.flushScreenLines(screenLines, columns, rows, cursorSeq);
       return;
     }
 
@@ -1345,15 +1401,9 @@ export class TerminalUI {
     const prompt = wrapTerminal(label + shownInput, safeCols)[0];
     const cursorColumn = Math.min(columns, labelCols + visibleLength(visibleBeforeCursor) + 1);
 
-    const frame =
-      `\x1b[?2026h\x1b[?25l\x1b[H\x1b[2J${[header, ...body, toolsLine, footer, prompt].join('\r\n')}` +
-      (this.pending ? `\r\x1b[${cursorColumn}G\x1b[?25h` : '') +
-      `\x1b[?2026l`;
-
-    if (frame !== this.lastRenderedFrame) {
-      this.lastRenderedFrame = frame;
-      this.target.write(frame);
-    }
+    const screenLines = [header, ...body, toolsLine, footer, prompt];
+    const cursorSeq = this.pending ? `\x1b[${screenLines.length};${cursorColumn}H\x1b[?25h` : '';
+    this.flushScreenLines(screenLines, columns, rows, cursorSeq);
   }
 
   close() {
