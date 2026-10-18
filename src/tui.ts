@@ -260,9 +260,9 @@ export class TerminalUI {
     source.on('keypress', this.keypress);
     source.on('end', this.ended);
     target.on('resize', this.resize);
-    // Enter Alternate Screen (\x1b[?1049h), enable SGR Mouse Wheel Tracking (\x1b[?1000h\x1b[?1006h) +
-    // DEC Alternate Scroll (\x1b[?1007h), enable Bracketed Paste (\x1b[?2004h), and hide cursor (\x1b[?25l).
-    target.write('\x1b[?1049h\x1b[?1000h\x1b[?1006h\x1b[?1007h\x1b[?2004h\x1b[?25l');
+    // Enter Alternate Screen (\x1b[?1049h), ensure mouse click capture is OFF (\x1b[?1000l\x1b[?1006l) so native
+    // mouse text selection/copy works, enable DEC Alternate Scroll (\x1b[?1007h) for wheel scrolling, and enable Bracketed Paste (\x1b[?2004h).
+    target.write('\x1b[?1049h\x1b[?1000l\x1b[?1006l\x1b[?1007h\x1b[?2004h\x1b[?25l');
     this.render();
   }
 
