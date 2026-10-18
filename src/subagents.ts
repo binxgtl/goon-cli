@@ -60,7 +60,7 @@ export class Subagents {
         return allowed;
       }, readOnly || this.registry.readOnly);
       // No delegation tools are registered in children: depth is exactly one.
-      const config = { ...this.config, runTokenBudget: Math.min(this.config.runTokenBudget || 30_000, 30_000) };
+      const config = { ...this.config };
       await new Harness(config, store, tools, event => {
         // Parent progress is a control channel. The complete text/reasoning
         // belongs to the child transcript, never a per-token parent mirror.

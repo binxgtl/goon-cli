@@ -584,7 +584,23 @@ test('Harness retries transient HTTP 500 API errors up to 3 times and SessionSto
   const remaining = await SessionStore.list(sessionsRoot);
   assert.equal(remaining.length, 1);
   assert.equal(remaining[0].id, s1.session.id);
+
+  // Verify loadConfig defaults runTokenBudget to 0 (unlimited) and migrates legacy saved defaults
+  const { loadConfig } = await import('../dist/index.js');
+  const { mkdir, writeFile } = await import('node:fs/promises');
+  const oldCfgHome = process.env.XDG_CONFIG_HOME;
+  process.env.XDG_CONFIG_HOME = f.config;
+  try {
+    await mkdir(join(f.config, 'goon'), { recursive: true });
+    await writeFile(join(f.config, 'goon', 'config.json'), JSON.stringify({ model: 'gpt-5.4', runTokenBudget: 120000 }), 'utf8');
+    const migratedCfg = await loadConfig();
+    assert.equal(migratedCfg.runTokenBudget, 0, 'Legacy 120000 runTokenBudget should migrate to 0 (unlimited)');
+  } finally {
+    if (oldCfgHome === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = oldCfgHome;
+  }
 });
+
 
 
 

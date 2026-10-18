@@ -51,8 +51,8 @@ Options:
       --inline-reasoning MODE leading-think (default) | off
       --show-reasoning      Separate reasoning events / labeled stderr output
       --context-window N    Actual model context window (default 128000)
-      --max-output-tokens N  Per-request output limit (default 8192)
-      --run-token-budget N   Run token budget (default 100000; 0 disables)
+      --max-output-tokens N  Per-request output limit (default 16384)
+      --run-token-budget N   Run token budget (default 0 = unlimited)
       --timeout-ms N        Model request deadline (default 300000)
   -h, --help                Show help
   -v, --version             Show version

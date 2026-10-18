@@ -16,7 +16,7 @@ export const configSchema = z.object({
   contextWindow: z.number().int().min(8192).max(2_000_000).default(128_000),
   maxOutputTokens: z.number().int().min(128).max(131_072).default(16_384),
   timeoutMs: z.number().int().min(1000).max(1_800_000).default(300_000),
-  runTokenBudget: z.number().int().min(0).default(1_000_000),
+  runTokenBudget: z.number().int().min(0).default(0),
   inlineReasoning: z.enum(['leading-think', 'off']).default('leading-think'),
   showReasoning: z.boolean().default(false),
 }).strict();
@@ -90,6 +90,13 @@ export async function loadConfig(overrides: Record<string, unknown> = {}): Promi
       ? Number(process.env[name]) : process.env[name];
   }
   const merged = { ...validated, ...env, ...overrides };
+  if (
+    env.runTokenBudget === undefined &&
+    overrides.runTokenBudget === undefined &&
+    (merged.runTokenBudget === 120_000 || merged.runTokenBudget === 1_000_000)
+  ) {
+    merged.runTokenBudget = 0;
+  }
   const explicitMaxOut =
     (stored && typeof stored === 'object' && 'maxOutputTokens' in stored) ||
     env.maxOutputTokens !== undefined ||
