@@ -46,31 +46,93 @@ export async function loadProjectInstructions(cwd: string): Promise<string> {
 
 const IMAGE_EXT_REGEX = /\.(png|jpe?g|webp|gif)$/i;
 
+/**
+ * Normalizes a candidate pasted string if it looks like a single filesystem image path
+ * (Windows drive path C:\..., UNC \\..., POSIX /..., relative ./..., or file:// URL),
+ * matching OpenAI Codex's `clipboard_paste::normalize_pasted_path`.
+ */
+export function extractCandidatePaths(prompt: string): Array<{ rawToken: string; path: string; isExplicitMention: boolean }> {
+  const results: Array<{ rawToken: string; path: string; isExplicitMention: boolean }> = [];
+  const seen = new Set<string>();
+
+  const add = (rawToken: string, candidate: string, isExplicitMention: boolean) => {
+    const cleaned = candidate.trim().replace(/[.,;:!?)]+$/, '');
+    if (!cleaned || seen.has(cleaned)) return;
+    seen.add(cleaned);
+    results.push({ rawToken, path: cleaned, isExplicitMention });
+  };
+
+  // 1. Check if the entire prompt (unquoted or quoted) is a single image path (even with spaces!)
+  const trimmedPrompt = prompt.trim();
+  const unquotedWhole =
+    (trimmedPrompt.startsWith('"') && trimmedPrompt.endsWith('"')) ||
+    (trimmedPrompt.startsWith("'") && trimmedPrompt.endsWith("'"))
+      ? trimmedPrompt.slice(1, -1).trim()
+      : trimmedPrompt;
+  if (
+    IMAGE_EXT_REGEX.test(unquotedWhole) &&
+    !unquotedWhole.includes('\n') &&
+    (/^[A-Za-z]:[\\/]/.test(unquotedWhole) ||
+      unquotedWhole.startsWith('\\\\') ||
+      unquotedWhole.startsWith('/') ||
+      unquotedWhole.startsWith('./') ||
+      unquotedWhole.startsWith('../') ||
+      unquotedWhole.startsWith('file://'))
+  ) {
+    add(trimmedPrompt, unquotedWhole, false);
+  }
+
+  // 2. Explicit @mentions: @"...", @'...', or @path (supporting drive colons : and GUID braces {})
+  const mentionRegex = /(?:^|\s)(@(?:"([^"]+)"|'([^']+)'|([A-Za-z0-9_./\\:{}-]+)))/g;
+  for (const m of prompt.matchAll(mentionRegex)) {
+    const token = m[1];
+    const target = m[2] || m[3] || m[4] || '';
+    add(token, target, true);
+  }
+
+  // 3. Quoted local image paths without @: "C:\...\image.png" or '/tmp/image.png'
+  const quotedImgRegex = /(["']((?:[A-Za-z]:[\\/]|\\\\|\/|\.{1,2}[\\/]|file:\/\/)[^"'\r\n]+?\.(?:png|jpe?g|webp|gif))["'])/gi;
+  for (const m of prompt.matchAll(quotedImgRegex)) {
+    add(m[1], m[2], false);
+  }
+
+  // 4. Bare local image paths without @ (e.g. Windows Terminal ScreenClip paste: C:\Users\...\ScreenClip\{GUID}.png)
+  const bareImgRegex = /(?:^|\s)((?:[A-Za-z]:[\\/]|\\\\|\/|\.{1,2}[\\/]|file:\/\/)[^\s"']+?\.(?:png|jpe?g|webp|gif))(?=$|\s|[.,;:!?)])/gi;
+  for (const m of prompt.matchAll(bareImgRegex)) {
+    add(m[1], m[1], false);
+  }
+
+  return results;
+}
+
 export async function expandFileMentions(
   prompt: string,
   files: WorkspaceFiles,
   options?: { model?: string; supportsVision?: boolean },
 ): Promise<{ expandedPrompt: string; text: string; attachedPaths: string[]; mentioned: string[]; imageParts: ImagePart[] }> {
-  const regex = /(?:^|\s)@(?:"([^"]+)"|([A-Za-z0-9_./\\-]+))/g;
-  const matches = [...prompt.matchAll(regex)];
-  if (!matches.length) return { expandedPrompt: prompt, text: prompt, attachedPaths: [], mentioned: [], imageParts: [] };
+  const candidates = extractCandidatePaths(prompt);
+  if (!candidates.length) {
+    return { expandedPrompt: prompt, text: prompt, attachedPaths: [], mentioned: [], imageParts: [] };
+  }
 
   const supportsVision = options?.supportsVision
     ?? resolveModelCapabilities(options?.model ?? '').supportsVision
     ?? true;
-  const seen = new Set<string>();
   const attachedPaths: string[] = [];
   const blocks: string[] = [];
   const imageParts: ImagePart[] = [];
+  let workingPrompt = prompt;
 
-  for (const m of matches) {
-    const rawPath = (m[1] || m[2] || '').trim().replace(/[.,;:!?)]+$/, '');
-    if (!rawPath || seen.has(rawPath)) continue;
-    seen.add(rawPath);
+  for (const item of candidates) {
+    const rawPath = item.path;
     if (IMAGE_EXT_REGEX.test(rawPath)) {
       try {
         const img = await files.readImage(rawPath);
         attachedPaths.push(rawPath);
+        const shortName = rawPath.split(/[\\/]/).pop() || rawPath;
+        if (!item.isExplicitMention && workingPrompt.includes(item.rawToken)) {
+          workingPrompt = workingPrompt.replace(item.rawToken, `[Image #${imageParts.length + 1}: ${shortName}]`);
+        }
         if (!supportsVision) {
           blocks.push(`[Attached image @${rawPath} omitted: model "${options?.model || 'beam'}" is text-only]`);
         } else {
@@ -81,10 +143,11 @@ export async function expandFileMentions(
           });
         }
       } catch {
-        // Ignore invalid or missing @image paths
+        // Ignore invalid or missing image paths
       }
       continue;
     }
+    if (!item.isExplicitMention) continue;
     try {
       const content = await files.read(rawPath, 1, 250);
       attachedPaths.push(rawPath);
@@ -94,7 +157,8 @@ export async function expandFileMentions(
     }
   }
 
-  const expandedPrompt = blocks.length ? `${prompt}\n\n${blocks.join('\n\n')}` : prompt;
+  const baseText = workingPrompt.trim() || (imageParts.length ? 'Analyze the attached image(s).' : prompt);
+  const expandedPrompt = blocks.length ? `${baseText}\n\n${blocks.join('\n\n')}` : baseText;
   return {
     expandedPrompt,
     text: expandedPrompt,

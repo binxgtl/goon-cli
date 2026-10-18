@@ -234,4 +234,101 @@ test('Codex TUI renders Markdown bullets without false-positive red diff colorin
   assert(diffRemovedLine.includes('\x1b[31m'), 'Real diff deletion line must be colored red');
 });
 
+test('Codex TUI collapses pasted ScreenClip image paths into [Image #1], prevents line-wrap cursor drift, and scrolls with mouse wheel and Up/Down', async t => {
+  const { fixture } = await import('./helpers.mjs');
+  const { mkdir, writeFile } = await import('node:fs/promises');
+  const { join } = await import('node:path');
+  const { stripVTControlCharacters } = await import('node:util');
+  const { WorkspaceFiles, expandFileMentions } = await import('../dist/index.js');
+
+  const f = await fixture(t);
+  await mkdir(f.data, { recursive: true });
+  const pngBytes = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
+    'base64',
+  );
+  // Create an image file with a Windows ScreenClip-style GUID filename in f.data (outside workspace f.cwd!)
+  const externalImgPath = join(f.data, '{25D1BD96-7B57-4392-BBF0-17E774BEEFF2}.png');
+  await writeFile(externalImgPath, pngBytes);
+
+  const tty = terminal(t);
+  tty.output.columns = 80;
+  tty.output.rows = 16;
+
+  // 1. Emit 25 lines of long reasoning & answer text to overflow the 16-row viewport
+  tty.ui.event({
+    type: 'reasoning',
+    source: 'provider',
+    text: ('Long reasoning line that previously wrapped after adding the 4-char prefix. ').repeat(6) + '\n',
+  });
+  for (let i = 1; i <= 15; i++) {
+    tty.ui.event({ type: 'text', text: `Line ${i} of assistant answer in transcript.\n` });
+  }
+  await new Promise(resolve => setTimeout(resolve, 25));
+
+  // Verify NO rendered line in the frame exceeds columns - 1 (79 visible chars)
+  const rawLastFrame = tty.written.split('\x1b[H\x1b[2J').at(-1);
+  const frameAfterStream = rawLastFrame.endsWith('\x1b[?2026l')
+    ? rawLastFrame.slice(0, -'\x1b[?2026l'.length)
+    : rawLastFrame;
+  for (const rawLine of frameAfterStream.split('\r\n')) {
+    const cleanLine = stripVTControlCharacters(rawLine.split('\r')[0]);
+    assert(
+      cleanLine.length <= 79,
+      `Rendered line exceeded 79 visible columns (${cleanLine.length}): ${JSON.stringify(cleanLine)}`,
+    );
+  }
+
+  // 2. Start prompt question and test Up/Down & SGR Mouse Wheel scrollback when transcript overflows
+  const q = tty.ui.question('goon> ', undefined, true);
+  await new Promise(resolve => setTimeout(resolve, 25));
+
+  // Press Up arrow on empty input -> scrolls up in transcript and displays "↑ Scrolled up" banner
+  tty.key('', 'up');
+  await new Promise(resolve => setTimeout(resolve, 25));
+  let latestFrame = tty.written.split('\x1b[H\x1b[2J').at(-1);
+  assert.match(latestFrame, /↑ Scrolled up/);
+
+  // SGR mouse wheel up (\x1b[<64;10;10M) scrolls further up without leaking "64;10;10M" into input
+  tty.key(undefined, 'undefined', { sequence: '\x1b[<' });
+  for (const ch of '64;10;10M') tty.key(ch, ch);
+  await new Promise(resolve => setTimeout(resolve, 25));
+
+  // Press Escape while scrolled up -> returns to bottom (scroll = 0)
+  tty.key('', 'escape');
+  await new Promise(resolve => setTimeout(resolve, 25));
+  latestFrame = tty.written.split('\x1b[H\x1b[2J').at(-1);
+  assert(!latestFrame.includes('↑ Scrolled up'), 'Escape should return scroll position to bottom');
+
+  // 3. Simulate pasting the external ScreenClip image path via bracketed paste
+  tty.key(undefined, 'paste-start', { sequence: '\x1b[200~' });
+  tty.key(externalImgPath, undefined);
+  tty.key(undefined, 'paste-end', { sequence: '\x1b[201~' });
+  await new Promise(resolve => setTimeout(resolve, 25));
+
+  latestFrame = tty.written.split('\x1b[H\x1b[2J').at(-1);
+  // Composer shows [Image #1] pill and Attached status bar instead of raw 100+ char path
+  assert.match(latestFrame, /\[Image #1\]/);
+  assert.match(latestFrame, /📎 Attached \[Image #1\]/);
+  // Cursor is positioned on the prompt line itself via \r\x1b[<col>G\x1b[?25h
+  assert(latestFrame.includes('\r\x1b[') && latestFrame.includes('G\x1b[?25h'));
+
+  // Submit the pasted image
+  tty.key('', 'return');
+  const submitted = await q;
+  assert.equal(submitted.trim(), `@"${externalImgPath}"`);
+
+  // 4. Verify expandFileMentions loads both @"<externalImgPath>" AND bare pasted externalImgPath (without @)
+  const wsFiles = new WorkspaceFiles(f.cwd);
+  const fromMention = await expandFileMentions(submitted, wsFiles, { model: 'space-bunny' });
+  assert.equal(fromMention.imageParts.length, 1);
+  assert.equal(fromMention.imageParts[0].mediaType, 'image/png');
+
+  const fromBarePaste = await expandFileMentions(`Please inspect ${externalImgPath}`, wsFiles, { model: 'space-bunny' });
+  assert.equal(fromBarePaste.imageParts.length, 1);
+  assert.equal(fromBarePaste.imageParts[0].mediaType, 'image/png');
+  assert.match(fromBarePaste.text, /\[Image #1: \{25D1BD96-7B57-4392-BBF0-17E774BEEFF2\}\.png\]/);
+});
+
+
 

@@ -480,21 +480,43 @@ export class WorkspaceFiles {
     }
     return files.sort();
   }
-  async readImage(userPath: string, maxBytes = 5 * 1024 * 1024): Promise<{ buffer: Buffer; mediaType: string }> {
-    const ext = userPath.toLowerCase().match(/\.(png|jpe?g|webp|gif)$/)?.[1];
+  async readImage(userPath: string, maxBytes = 5 * 1024 * 1024): Promise<{ buffer: Buffer; mediaType: string; resolvedPath: string }> {
+    let cleaned = userPath.trim();
+    if ((cleaned.startsWith('"') && cleaned.endsWith('"')) || (cleaned.startsWith("'") && cleaned.endsWith("'"))) {
+      cleaned = cleaned.slice(1, -1).trim();
+    }
+    if (cleaned.startsWith('file://')) {
+      try {
+        const { fileURLToPath } = await import('node:url');
+        cleaned = fileURLToPath(cleaned);
+      } catch {
+        // Keep cleaned if URL conversion fails
+      }
+    }
+    const ext = cleaned.toLowerCase().match(/\.(png|jpe?g|webp|gif)$/)?.[1];
     if (!ext) throw new Error('Unsupported image extension.');
     const mediaType =
       ext === 'png' ? 'image/png'
       : ext === 'webp' ? 'image/webp'
       : ext === 'gif' ? 'image/gif'
       : 'image/jpeg';
-    const file = await this.path(userPath);
+    let file: string;
+    const isAbsWinOrPosix = isAbsolute(cleaned) || /^[A-Za-z]:[\\/]/.test(cleaned) || cleaned.startsWith('\\\\');
+    if (isAbsWinOrPosix) {
+      file = await realpath(resolve(cleaned));
+    } else {
+      try {
+        file = await this.path(cleaned);
+      } catch {
+        file = await realpath(resolve(this.root, cleaned));
+      }
+    }
     const info = await stat(file);
     if (!info.isFile() || info.size > maxBytes) {
       throw new Error('Expected a regular image file no larger than 5 MiB.');
     }
     const buffer = await readFile(file);
-    return { buffer, mediaType };
+    return { buffer, mediaType, resolvedPath: file };
   }
   async previewDiff(tool: string, input: unknown): Promise<string | undefined> {
     try {
