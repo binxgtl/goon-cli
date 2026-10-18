@@ -1573,9 +1573,6 @@ export class TerminalUI {
     const modelName = titleParts[0] || this.title;
     const sessionLabel = titleParts.slice(1).join(' · ') || 'session';
     const elapsedStr = this.turnStartedAt ? `${formatCompactDuration(Date.now() - this.turnStartedAt)} • ` : '';
-    const liveActivity = this.reasoningHeader
-      ? `${this.reasoningHeader}${this.reasoningDetail ? ` — ${this.reasoningDetail}` : ''}`
-      : [...this.toolStates.values()].slice(-2).join(' | ');
 
     // Body lines with strict width bound & scroll-anchor lock when scrolled up
     const all = this.renderStyledBodyLines(safeCols, rich);
@@ -1597,7 +1594,7 @@ export class TerminalUI {
       const body = all.slice(Math.max(0, end - height), end);
       while (body.length < height) body.push('');
 
-      const livePart = busy ? `${indicator} ${liveActivity || 'Working'} · ` : '';
+      const livePart = busy ? `${indicator} Working (${elapsedStr}esc to interrupt) · ` : '';
       const linePos = `Line ${Math.max(1, end)}/${Math.max(1, all.length)}`;
       const txFooterRaw = clip(
         ` T R A N S C R I P T  │  ${livePart}${linePos}  │  ↑↓/PgUp/PgDn/Wheel scroll · Home/End · Ctrl+T or Esc to return `,
@@ -1640,8 +1637,7 @@ export class TerminalUI {
       const items = [...this.attachedImages.entries()].map(([k, p]) => `${k}: ${basename(p)}`).join(' · ');
       toolsText = `📎 Attached ${items} (Enter to send · Backspace to remove)`;
     } else if (busy) {
-      const statusTitle = liveActivity || 'Working';
-      toolsText = `• ${statusTitle} (${elapsedStr}esc to interrupt · ctrl+t transcript)`;
+      toolsText = `• Working (${elapsedStr}esc to interrupt · ctrl+t transcript)`;
     } else if (this.statusNotice) {
       toolsText = this.statusNotice;
     } else {
