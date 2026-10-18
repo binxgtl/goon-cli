@@ -394,7 +394,60 @@ test('Codex TUI renders rounded composer text box with spacer gap, pipe-free thi
   assert.equal(dequeued, 'queued follow-up task');
 });
 
+test('Codex TUI backtrack/revert removes reverted turns from screen, restores prompt into composer box, and supports Esc Esc rewind', async t => {
+  const { stripVTControlCharacters } = await import('node:util');
+  const tty = terminal(t);
+  tty.output.columns = 90;
+  tty.output.rows = 20;
 
+  tty.ui.write('Welcome banner line\n');
 
+  // Turn 1
+  tty.ui.markTurnStart();
+  tty.ui.write('\n> first prompt\n');
+  tty.ui.event({ type: 'text', text: 'First answer.\n' });
 
+  // Turn 2 (failed turn like HTTP 500 in screenshot)
+  tty.ui.markTurnStart();
+  tty.ui.write('\n> can u play valorant\n');
+  tty.ui.write('\nUpstream provider returned HTTP 500:\n');
+  await new Promise(resolve => setTimeout(resolve, 25));
 
+  let frame = stripVTControlCharacters(tty.ui.renderedFrame());
+  assert.match(frame, /› can u play valorant/);
+  assert.match(frame, /Upstream provider returned HTTP 500:/);
+
+  // Start idle composer question and press Esc twice (Esc Esc) to trigger /revert
+  const q1 = tty.ui.question('goon> ', undefined, true);
+  await new Promise(resolve => setTimeout(resolve, 20));
+
+  tty.key('', 'escape');
+  await new Promise(resolve => setTimeout(resolve, 20));
+  frame = stripVTControlCharacters(tty.ui.renderedFrame());
+  assert.match(frame, /Press Esc again to rewind & edit previous prompt/);
+
+  tty.key('', 'escape');
+  assert.equal(await q1, '/revert');
+
+  // Simulate CLI executing /revert for Turn 2: rewind 1 turn and restore prompt to composer
+  assert.equal(tty.ui.rewindTurns(1), true);
+  tty.ui.setInput('can u play valorant', true);
+  tty.ui.setNotice('↺ Rewound 1 turn — edit prompt below, Enter to resend, or Esc Esc to rewind further');
+
+  const q2 = tty.ui.question('goon> ', undefined, true);
+  await new Promise(resolve => setTimeout(resolve, 25));
+
+  frame = stripVTControlCharacters(tty.ui.renderedFrame());
+  // Reverted Turn 2 is completely removed from the transcript body!
+  assert(!frame.includes('Upstream provider returned HTTP 500:'), 'Failed turn error must be removed from screen');
+  // Turn 1 is still intact on screen
+  assert.match(frame, /› first prompt/);
+  assert.match(frame, /• First answer\./);
+  // And the reverted prompt 'can u play valorant' is restored inside the Composer Input Box!
+  assert.match(frame, /│ › can u play valorant.*0 tokens │/);
+
+  // Pressing Esc Esc again while restored prompt is untouched in composer triggers another /revert!
+  tty.key('', 'escape');
+  tty.key('', 'escape');
+  assert.equal(await q2, '/revert');
+});

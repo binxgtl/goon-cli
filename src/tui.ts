@@ -19,8 +19,9 @@ const SLASH_DESCRIPTIONS: Record<string, string> = {
   '/effort': 'set reasoning effort (low..max)',
   '/plan': 'toggle read-only Plan Mode',
   '/mode': 'cycle ask / plan / auto / readonly',
-  '/revert': 'revert turns (code + messages)',
-  '/undo': 'undo last turn (code + messages)',
+  '/revert': 'rewind turn(s) & restore prompt to composer (or Esc Esc)',
+  '/undo': 'rewind last turn & restore prompt to composer (or Esc Esc)',
+  '/checkpoints': 'pick a previous turn checkpoint to rewind to',
   '/compact': 'summarize history to free context',
   '/diff': 'show git diff in workspace',
   '/review': 'run code review on current diff',
@@ -250,6 +251,11 @@ export class TerminalUI {
   private attachedImages = new Map<string, string>();
   private nextImageIdx = 1;
   private queuedPrompts: string[] = [];
+  private turnSnapshots: string[] = [];
+  private inputRestoredFromRevert = false;
+  private escPrimed?: 'backtrack' | 'clear';
+  private escPrimeTimer?: NodeJS.Timeout;
+  private statusNotice?: string;
   onToggleMode?: () => void;
   onCycleEffort?: (direction: 1 | -1) => void;
 
@@ -281,6 +287,14 @@ export class TerminalUI {
     this.scroll = 0;
     this.maxScroll = 0;
     this.exploreGroup = [];
+    this.turnSnapshots = [];
+    this.inputRestoredFromRevert = false;
+    this.escPrimed = undefined;
+    if (this.escPrimeTimer) {
+      clearTimeout(this.escPrimeTimer);
+      this.escPrimeTimer = undefined;
+    }
+    this.statusNotice = undefined;
     this.reasoningBuffer = '';
     this.reasoningHeader = undefined;
     this.reasoningDetail = undefined;
@@ -289,6 +303,60 @@ export class TerminalUI {
     this.lastBodyTotalLines = 0;
     this.needsFullClear = true;
     this.schedule();
+  }
+
+  /**
+   * Captures the exact TUI transcript state before a user turn begins so `/revert` or `Esc Esc`
+   * can cleanly remove the reverted turn(s) from the visible screen (Codex backtrack pattern).
+   */
+  markTurnStart() {
+    this.flushExploreGroup();
+    this.outputChannel = undefined;
+    this.turnSnapshots.push(this.transcript);
+    if (this.turnSnapshots.length > 100) this.turnSnapshots.shift();
+  }
+
+  /**
+   * Rewinds the visible TUI transcript back `steps` turn(s).
+   * Returns true if restored from live turn snapshots; false if caller should rebuild from session messages.
+   */
+  rewindTurns(steps: number): boolean {
+    this.flushExploreGroup();
+    this.outputChannel = undefined;
+    if (steps > 0 && this.turnSnapshots.length >= steps) {
+      const targetIdx = this.turnSnapshots.length - steps;
+      const restored = this.turnSnapshots[targetIdx];
+      this.turnSnapshots.length = targetIdx;
+      this.transcript = restored;
+      this.scroll = 0;
+      this.maxScroll = 0;
+      this.lastFrameRows = [];
+      this.lastBodyTotalLines = 0;
+      this.needsFullClear = true;
+      this.schedule(0);
+      return true;
+    }
+    this.turnSnapshots = [];
+    return false;
+  }
+
+  /**
+   * Restores a user prompt into the Composer Input Box for in-place editing or immediate Enter resend (Codex pattern).
+   */
+  setInput(text: string, fromRevert = false) {
+    const clean = terminalText(text).replace(/\r?\n/g, ' ');
+    this.input = [...clean];
+    this.cursor = this.input.length;
+    this.inputRestoredFromRevert = fromRevert;
+    this.attachedImages.clear();
+    this.nextImageIdx = 1;
+    this.collapsePastedImagePathsInInput();
+    this.schedule(0);
+  }
+
+  setNotice(notice: string | undefined) {
+    this.statusNotice = notice ? terminalText(notice) : undefined;
+    this.schedule(0);
   }
 
   setTitle(title: string) {
@@ -722,6 +790,16 @@ export class TerminalUI {
     }
 
     if (!this.inBracketedPaste) {
+      if (key.name !== 'escape' && this.escPrimed) {
+        this.escPrimed = undefined;
+        if (this.escPrimeTimer) {
+          clearTimeout(this.escPrimeTimer);
+          this.escPrimeTimer = undefined;
+        }
+      }
+      if (this.statusNotice && key.name !== 'escape') {
+        this.statusNotice = undefined;
+      }
       if (key.ctrl && key.name === 'c') {
         this.cancel();
         return;
@@ -735,6 +813,63 @@ export class TerminalUI {
           this.scroll = 0;
           this.schedule(0);
           return;
+        }
+        // Codex Esc Esc backtrack / clear input flow when in main composer prompt
+        if (this.pending && this.remember) {
+          const wantBacktrack = this.input.length === 0 || this.inputRestoredFromRevert;
+          if (wantBacktrack) {
+            if (this.escPrimed === 'backtrack') {
+              this.escPrimed = undefined;
+              if (this.escPrimeTimer) {
+                clearTimeout(this.escPrimeTimer);
+                this.escPrimeTimer = undefined;
+              }
+              const pending = this.pending;
+              this.pending = undefined;
+              pending.cleanup();
+              this.input = [];
+              this.cursor = 0;
+              this.inputRestoredFromRevert = false;
+              this.attachedImages.clear();
+              pending.resolve('/revert');
+              this.schedule(0);
+              return;
+            }
+            this.escPrimed = 'backtrack';
+            if (this.escPrimeTimer) clearTimeout(this.escPrimeTimer);
+            this.escPrimeTimer = setTimeout(() => {
+              this.escPrimed = undefined;
+              this.escPrimeTimer = undefined;
+              this.schedule(0);
+            }, 2500);
+            this.escPrimeTimer.unref?.();
+            this.schedule(0);
+            return;
+          } else {
+            if (this.escPrimed === 'clear') {
+              this.escPrimed = undefined;
+              if (this.escPrimeTimer) {
+                clearTimeout(this.escPrimeTimer);
+                this.escPrimeTimer = undefined;
+              }
+              this.input = [];
+              this.cursor = 0;
+              this.inputRestoredFromRevert = false;
+              this.attachedImages.clear();
+              this.schedule(0);
+              return;
+            }
+            this.escPrimed = 'clear';
+            if (this.escPrimeTimer) clearTimeout(this.escPrimeTimer);
+            this.escPrimeTimer = setTimeout(() => {
+              this.escPrimed = undefined;
+              this.escPrimeTimer = undefined;
+              this.schedule(0);
+            }, 2500);
+            this.escPrimeTimer.unref?.();
+            this.schedule(0);
+            return;
+          }
         }
       }
       if (key.ctrl && key.name === 'l') {
@@ -750,6 +885,7 @@ export class TerminalUI {
         const popped = this.queuedPrompts.pop()!;
         this.input = [...popped];
         this.cursor = this.input.length;
+        this.inputRestoredFromRevert = false;
         this.schedule(0);
         return;
       }
@@ -815,6 +951,7 @@ export class TerminalUI {
         if (match) {
           this.input = [...(match + ' ')];
           this.cursor = this.input.length;
+          this.inputRestoredFromRevert = false;
           this.schedule();
         }
         return;
@@ -829,6 +966,7 @@ export class TerminalUI {
           const prefixLen = current.length - atMatch[1].length;
           this.input = [...(current.slice(0, prefixLen) + found + ' ')];
           this.cursor = this.input.length;
+          this.inputRestoredFromRevert = false;
           this.schedule();
         }
       }
@@ -852,6 +990,7 @@ export class TerminalUI {
           if (this.history.length > 100) this.history.shift();
           this.input = [];
           this.cursor = 0;
+          this.inputRestoredFromRevert = false;
           this.attachedImages.clear();
           this.nextImageIdx = 1;
           this.schedule(0);
@@ -867,6 +1006,7 @@ export class TerminalUI {
       }
       this.input = [];
       this.cursor = 0;
+      this.inputRestoredFromRevert = false;
       this.scroll = 0;
       this.attachedImages.clear();
       pending.resolve(value);
@@ -888,6 +1028,7 @@ export class TerminalUI {
           this.cursor = this.input.length;
         }
       } else if (key.name === 'backspace') {
+        this.inputRestoredFromRevert = false;
         if (this.cursor > 0) {
           // Atomic deletion of [Image #N] placeholder if cursor is right after it
           const before = this.input.slice(0, this.cursor).join('');
@@ -903,19 +1044,23 @@ export class TerminalUI {
           }
         }
       } else if (key.name === 'delete') {
+        this.inputRestoredFromRevert = false;
         this.input.splice(this.cursor, 1);
       } else if (key.ctrl && key.name === 'w') {
+        this.inputRestoredFromRevert = false;
         while (this.cursor > 0 && this.input[this.cursor - 1] === ' ') this.input.splice(--this.cursor, 1);
         while (this.cursor > 0 && this.input[this.cursor - 1] !== ' ') this.input.splice(--this.cursor, 1);
       } else if (
         (key.name === 'up' || key.name === 'down' || (key.ctrl && (key.name === 'p' || key.name === 'n'))) &&
         this.remember
       ) {
+        this.inputRestoredFromRevert = false;
         const delta = key.name === 'up' || key.name === 'p' ? -1 : 1;
         this.historyIndex = Math.min(this.history.length, Math.max(0, this.historyIndex + delta));
         this.input = [...(this.history[this.historyIndex] ?? '')];
         this.cursor = this.input.length;
       } else if (key.ctrl && key.name === 'u') {
+        this.inputRestoredFromRevert = false;
         if (this.input.length > 0) {
           this.input = [];
           this.cursor = 0;
@@ -924,6 +1069,7 @@ export class TerminalUI {
           this.scrollBy(5);
         }
       } else if (text && !key.ctrl && !key.meta && this.input.length < 16_000) {
+        this.inputRestoredFromRevert = false;
         const chars = [...terminalText(text).replace(/\n/g, ' ')];
         this.input.splice(this.cursor, 0, ...chars);
         this.cursor += chars.length;
@@ -1144,8 +1290,8 @@ export class TerminalUI {
       if (line.startsWith('  ╭─') || line.startsWith('  ╰─')) return `\x1b[2;36m${line}\x1b[0m`;
       return `\x1b[38;2;180;210;255m${line}\x1b[0m`;
     }
-    // Codex Explored / Ran / Edited cells
-    if (/^• (?:Explored|Exploring|Resumed)\b/.test(line)) {
+    // Codex Explored / Ran / Edited / Reverted cells
+    if (/^• (?:Explored|Exploring|Resumed|Reverted)\b/.test(line)) {
       return `\x1b[2m•\x1b[0m \x1b[1m${line.slice(2)}\x1b[0m`;
     }
     if (/^• (?:Ran|Running)\b/.test(line)) {
@@ -1315,6 +1461,10 @@ export class TerminalUI {
     let toolsText = '';
     if (this.scroll > 0) {
       toolsText = `↑ Scrolled up ${this.scroll}/${this.maxScroll} lines (Wheel / ↑↓ scroll · End / Esc to bottom)`;
+    } else if (this.escPrimed === 'backtrack') {
+      toolsText = 'Press Esc again to rewind & edit previous prompt';
+    } else if (this.escPrimed === 'clear') {
+      toolsText = 'Press Esc again to clear input';
     } else if (slashMatches.length) {
       const firstCmd = slashMatches[0];
       const desc = SLASH_DESCRIPTIONS[firstCmd] ? ` (${SLASH_DESCRIPTIONS[firstCmd]})` : '';
@@ -1325,6 +1475,8 @@ export class TerminalUI {
     } else if (busy) {
       const statusTitle = liveActivity || 'Working';
       toolsText = `• ${statusTitle} (${elapsedStr}esc to interrupt)`;
+    } else if (this.statusNotice) {
+      toolsText = this.statusNotice;
     } else {
       toolsText = [...this.toolStates.values()].slice(-2).join(' | ');
     }
@@ -1334,7 +1486,9 @@ export class TerminalUI {
         ? `\x1b[1;36m${clip(toolsText)}\x1b[0m`
         : busy
           ? `\x1b[1;38;2;99;168;248m${indicator}\x1b[0m \x1b[1m${clip(toolsText.slice(2))}\x1b[0m`
-          : `\x1b[33m${clip(toolsText)}\x1b[0m`
+          : this.escPrimed || this.statusNotice
+            ? `\x1b[2;36m${clip(toolsText)}\x1b[0m`
+            : `\x1b[33m${clip(toolsText)}\x1b[0m`
       : clip(toolsText);
 
     if (rich) {
@@ -1411,6 +1565,7 @@ export class TerminalUI {
     this.closed = true;
     clearTimeout(this.timer);
     if (this.pasteBurstTimer) clearTimeout(this.pasteBurstTimer);
+    if (this.escPrimeTimer) clearTimeout(this.escPrimeTimer);
     if (this.spinTimer) {
       clearInterval(this.spinTimer);
       this.spinTimer = undefined;

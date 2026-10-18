@@ -352,11 +352,10 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
           })();
         };
       }
-      const renderResumedHistory = () => {
+      const renderResumedHistory = (showBanner = true) => {
         const msgs = store.session.messages;
         if (!msgs.length) return;
         if (tui) {
-          const blocks: string[] = [];
           const tail = msgs.slice(-30);
           for (const m of tail) {
             if (m.role === 'user') {
@@ -369,27 +368,31 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
                 .replace(/<referenced_file\s+path="([^"]+)"[\s\S]*?<\/referenced_file>/g, '[@$1]')
                 .replace(/\r?\n/g, ' ')
                 .trim();
-              if (cleaned) blocks.push(`\n> ${cleaned}\n`);
+              if (cleaned) {
+                tui.markTurnStart();
+                display(`\n> ${cleaned}\n`);
+              }
             } else if (m.role === 'assistant') {
               if (typeof m.content === 'string') {
                 const txt = m.content.trim();
-                if (txt) blocks.push(`\n[answer]\n${txt}\n`);
+                if (txt) display(`\n[answer]\n${txt}\n`);
               } else if (Array.isArray(m.content)) {
                 for (const part of m.content) {
                   if (part.type === 'reasoning' && 'text' in part && typeof part.text === 'string' && part.text.trim()) {
-                    blocks.push(`\n[reasoning]\n${part.text.trim()}\n`);
+                    display(`\n[reasoning]\n${part.text.trim()}\n`);
                   } else if (part.type === 'text' && 'text' in part && typeof part.text === 'string' && part.text.trim()) {
-                    blocks.push(`\n[answer]\n${part.text.trim()}\n`);
+                    display(`\n[answer]\n${part.text.trim()}\n`);
                   }
                 }
               }
             }
           }
-          const titleSuffix = store.session.title ? ` (${store.session.title})` : '';
-          blocks.push(
-            `\n• Resumed session ${store.session.id.slice(0, 8)}${titleSuffix} · ${msgs.length} messages · ${store.session.checkpoints?.length ?? 0} checkpoints\n`,
-          );
-          display(blocks.join(''));
+          if (showBanner) {
+            const titleSuffix = store.session.title ? ` (${store.session.title})` : '';
+            display(
+              `\n• Resumed session ${store.session.id.slice(0, 8)}${titleSuffix} · ${msgs.length} messages · ${store.session.checkpoints?.length ?? 0} checkpoints\n`,
+            );
+          }
           if (store.session.todos?.length) {
             tui.event({ type: 'todo', todos: store.session.todos });
           }
@@ -426,7 +429,10 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         denied = false;
         controller = new AbortController();
         tui?.setStatus('Running');
-        if (tui) tui.write(`\n> ${input}\n`);
+        if (tui) {
+          tui.markTurnStart();
+          tui.write(`\n> ${input}\n`);
+        }
         try {
           const text = await harness.run(input, controller.signal);
           if (jsonOutput) stdout.write(JSON.stringify({ type: 'done', text, denied, sessionId: store.session.id }) + '\n');
@@ -467,8 +473,8 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
               '  /effort [low|medium|high|xhigh|max|default] Switch reasoning effort (or Alt+./Alt+,)\n' +
               '  /mode [ask|plan|auto|readonly]    Switch mode (or press Shift+Tab)\n' +
               '  /plan [off|execute|<prompt>]      Enter/exit Plan Mode or execute approved plan\n' +
-              '  /revert, /undo [code|msg|both] [N] Revert last N turns (both messages AND modified files!)\n' +
-              '  /checkpoints                      List turn checkpoints & modified files in this session\n' +
+              '  /revert, /undo [code|msg|both] [N] Rewind last N turns & restore prompt to composer (or press Esc Esc)\n' +
+              '  /checkpoints                      Interactive picker to rewind to any earlier turn checkpoint\n' +
               '  /todo [clear]                     View or clear the current task checklist\n' +
               '  /resume [latest|<number>|<id>]    Interactive session picker or hot-swap to saved session\n' +
               '  /new [title]                      Start a fresh session in this workspace\n' +
@@ -670,18 +676,36 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             await run(arg);
             continue;
           }
-          if (input === '/checkpoints' || input === '/revert list' || input === '/undo list') {
+          if (input === '/checkpoints' || input === '/revert list' || input === '/undo list' || input === '/revert pick' || input === '/undo pick') {
             const cps = store.session.checkpoints ?? [];
             if (!cps.length) {
-              display('No turn checkpoints recorded in this session yet.\n');
+              if (tui) tui.setNotice('↺ No previous turns to rewind in this session.');
+              else display('No turn checkpoints recorded in this session yet.\n');
+              continue;
+            }
+            if (tui) {
+              const reversed = [...cps].reverse();
+              const rows = reversed.slice(0, 15).map((cp, idx) => {
+                const numStr = String(idx + 1).padStart(2, ' ');
+                const fileDesc = cp.files.length ? `${cp.files.length} file(s): ${cp.files.map(f => f.path).join(', ')}` : 'no file changes';
+                const promptPreview = cp.prompt.replace(/\s+/g, ' ').slice(0, 54);
+                return `  ${numStr}. #${cp.id} [${cp.createdAt.slice(11, 19)}] "${promptPreview}" (${fileDesc})`;
+              });
+              const pickerBlock = `\n╭─── Rewind to Turn Checkpoint (${cps.length} available) ──────────────────────────╮\n${rows.join('\n')}\n╰──────────────────────────────────────────────────────────────────────────╯\n`;
+              const choice = (await tui.askTransient(pickerBlock, `Rewind [1-${Math.min(15, reversed.length)}, or Enter to cancel]: `)).trim();
+              const pickedNum = Number(choice);
+              if (!choice || !Number.isInteger(pickedNum) || pickedNum < 1 || pickedNum > reversed.length) {
+                continue;
+              }
+              input = `/revert ${pickedNum}`;
             } else {
               display(`\nTurn Checkpoints (${cps.length}):\n`);
               for (const cp of cps) {
                 const fileDesc = cp.files.length ? `files: ${cp.files.map(f => f.path).join(', ')}` : 'no file changes';
                 display(`  #${cp.id} [${cp.createdAt.slice(11, 19)}] "${cp.prompt.slice(0, 60)}" (${fileDesc})\n`);
               }
+              continue;
             }
-            continue;
           }
           if (input === '/revert' || input.startsWith('/revert ') || input === '/undo' || input.startsWith('/undo ')) {
             const raw = input.replace(/^\/(?:revert|undo)\b/, '').trim();
@@ -700,15 +724,49 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             }
             try {
               const res = await harness.revert({ steps, scope });
-              display(
-                `\n↺ Reverted ${res.turnsReverted} turn(s) [scope: ${scope}] (${res.messagesRemoved} messages removed)\n` +
-                (res.restoredFiles.length ? `  Restored source files: ${res.restoredFiles.join(', ')}\n` : '') +
-                (res.deletedFiles.length ? `  Deleted newly created files: ${res.deletedFiles.join(', ')}\n` : '') +
-                (!res.restoredFiles.length && !res.deletedFiles.length && scope !== 'messages' ? `  No source files were modified in the reverted turn(s).\n` : '') +
-                (res.revertedPrompts.length ? `  Reverted prompt: "${res.revertedPrompts[0].slice(0, 80)}"\n` : '')
-              );
+              if (tui) {
+                tui.setTokens(store.session.tokens);
+                const changedFiles = [...res.restoredFiles, ...res.deletedFiles];
+                if (scope === 'both' || scope === 'messages') {
+                  const rewoundFromSnapshot = tui.rewindTurns(res.turnsReverted);
+                  if (!rewoundFromSnapshot) {
+                    tui.clear();
+                    display(welcomeBanner(runtime.model, runtime.provider, runtime.baseUrl, runtime.effort, runtime.cwd, store.session.id, mode));
+                    display('Type /help for commands, @file to attach files, !<cmd> for shell, or enter a task.\n');
+                    renderResumedHistory(false);
+                  }
+                  if (changedFiles.length > 0) {
+                    display(`\n• Reverted ${res.turnsReverted} turn${res.turnsReverted > 1 ? 's' : ''} (files restored: ${changedFiles.join(', ')})\n`);
+                  }
+                  const restoredPrompt = res.revertedPrompts[0];
+                  if (restoredPrompt) {
+                    tui.setInput(restoredPrompt, true);
+                  }
+                  const fileNote = changedFiles.length > 0 ? ` · restored ${changedFiles.length} file(s)` : '';
+                  tui.setNotice(
+                    `↺ Rewound ${res.turnsReverted} turn${res.turnsReverted > 1 ? 's' : ''}${fileNote} — edit prompt below, Enter to resend, or Esc Esc to rewind further`,
+                  );
+                } else {
+                  display(
+                    `\n• Reverted file changes from ${res.turnsReverted} turn${res.turnsReverted > 1 ? 's' : ''}` +
+                      (changedFiles.length ? ` (${changedFiles.join(', ')})\n` : ' (no files modified)\n'),
+                  );
+                }
+              } else {
+                display(
+                  `\n↺ Reverted ${res.turnsReverted} turn(s) [scope: ${scope}] (${res.messagesRemoved} messages removed)\n` +
+                  (res.restoredFiles.length ? `  Restored source files: ${res.restoredFiles.join(', ')}\n` : '') +
+                  (res.deletedFiles.length ? `  Deleted newly created files: ${res.deletedFiles.join(', ')}\n` : '') +
+                  (!res.restoredFiles.length && !res.deletedFiles.length && scope !== 'messages' ? `  No source files were modified in the reverted turn(s).\n` : '') +
+                  (res.revertedPrompts.length ? `  Reverted prompt: "${res.revertedPrompts[0].slice(0, 80)}"\n` : '')
+                );
+              }
             } catch (error) {
-              display(`${safeError(error, apiKey)}\n`);
+              if (tui) {
+                tui.setNotice(`↺ ${safeError(error, apiKey)}`);
+              } else {
+                display(`${safeError(error, apiKey)}\n`);
+              }
             }
             continue;
           }

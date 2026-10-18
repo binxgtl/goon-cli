@@ -318,20 +318,18 @@ export class Harness {
       throw error;
     } finally {
       const files = this.tools.files.takeTurnBackups();
-      if (session.messages.length > messageIndexBeforeTurn || files.length > 0) {
-        session.checkpoints ??= [];
-        const nextId = (session.checkpoints.at(-1)?.id ?? 0) + 1;
-        const cp: TurnCheckpoint = {
-          id: nextId,
-          createdAt: turnStartedAt,
-          prompt,
-          messageIndex: messageIndexBeforeTurn,
-          tokensBefore: tokensBeforeTurn,
-          files,
-        };
-        session.checkpoints.push(cp);
-        await this.store.save().catch(() => {});
-      }
+      session.checkpoints ??= [];
+      const nextId = (session.checkpoints.at(-1)?.id ?? 0) + 1;
+      const cp: TurnCheckpoint = {
+        id: nextId,
+        createdAt: turnStartedAt,
+        prompt,
+        messageIndex: messageIndexBeforeTurn,
+        tokensBefore: tokensBeforeTurn,
+        files,
+      };
+      session.checkpoints.push(cp);
+      await this.store.save().catch(() => {});
       this.running = false;
       this.tools.budget = undefined;
     }
