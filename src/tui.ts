@@ -243,6 +243,7 @@ export class TerminalUI {
   private sgrMouseBuf = '';
   private attachedImages = new Map<string, string>();
   private nextImageIdx = 1;
+  private queuedPrompts: string[] = [];
   onToggleMode?: () => void;
   onCycleEffort?: (direction: 1 | -1) => void;
 
@@ -341,12 +342,21 @@ export class TerminalUI {
     this.outputChannel = undefined;
     const snapshot = this.transcript;
     const prevLabel = this.label;
+    const savedInput = [...this.input];
+    const savedCursor = this.cursor;
+    const savedImages = new Map(this.attachedImages);
+    this.input = [];
+    this.cursor = 0;
+    this.attachedImages.clear();
     this.appendTranscript(previewBlock, true);
     try {
       return await this.question(label, signal, false);
     } finally {
       this.transcript = snapshot;
       this.label = prevLabel;
+      this.input = savedInput;
+      this.cursor = savedCursor;
+      this.attachedImages = savedImages;
       this.schedule(16);
     }
   }
@@ -513,10 +523,17 @@ export class TerminalUI {
     if (this.pending) return Promise.reject(new Error('A terminal question is already active.'));
     signal?.throwIfAborted();
     this.label = terminalText(label);
-    this.input = [];
-    this.cursor = 0;
-    this.attachedImages.clear();
-    this.nextImageIdx = 1;
+    if (remember && this.queuedPrompts.length > 0) {
+      const nextQueued = this.queuedPrompts.shift()!;
+      this.schedule(0);
+      return Promise.resolve(nextQueued);
+    }
+    if (!remember) {
+      this.input = [];
+      this.cursor = 0;
+      this.attachedImages.clear();
+      this.nextImageIdx = 1;
+    }
     this.historyIndex = this.history.length;
     this.remember = remember;
     const result = new Promise<string>((resolve, reject) => {
@@ -597,7 +614,7 @@ export class TerminalUI {
    * or when Ctrl+V sends raw \x16 instead of terminal-pasted text (Codex `clipboard_paste.rs` pattern).
    */
   private async pasteFromSystemClipboard(): Promise<void> {
-    if (process.platform !== 'win32' || !this.pending) return;
+    if (process.platform !== 'win32' || this.closed) return;
     try {
       const { runCommand } = await import('./process.js');
       const psScript = [
@@ -621,7 +638,7 @@ export class TerminalUI {
         signal: AbortSignal.timeout(4000),
         timeoutMs: 4000,
       });
-      if (res.code !== 0 || !res.output.trim() || !this.pending) return;
+      if (res.code !== 0 || !res.output.trim() || this.closed) return;
       const out = res.output.trim();
       if (out.startsWith('IMG:') || out.startsWith('FILE:')) {
         const filePath = out.replace(/^(?:IMG|FILE):/, '').trim();
@@ -715,6 +732,14 @@ export class TerminalUI {
         this.ended();
         return;
       }
+      // Alt+Up pops the last queued prompt back into the composer box for editing (Codex pattern)
+      if (key.meta && key.name === 'up' && this.queuedPrompts.length > 0) {
+        const popped = this.queuedPrompts.pop()!;
+        this.input = [...popped];
+        this.cursor = this.input.length;
+        this.schedule(0);
+        return;
+      }
       // PageUp / PageDown & Shift+Up / Shift+Down always scroll the transcript
       if (key.name === 'pageup' || (key.name === 'up' && (key.shift || key.ctrl))) {
         const step = key.name === 'pageup' ? Math.max(2, (this.target.rows || 24) - 8) : 4;
@@ -730,7 +755,7 @@ export class TerminalUI {
       // Scroll transcript when agent is busy, when already scrolled up, or when transcript overflows and input is empty.
       if (key.name === 'up' || key.name === 'down') {
         const dir = key.name === 'up' ? 2 : -2;
-        if (!this.pending) {
+        if (!this.pending && this.input.length === 0) {
           this.scrollBy(dir);
           return;
         }
@@ -770,8 +795,6 @@ export class TerminalUI {
       }
     }
 
-    if (!this.pending) return;
-
     if (!this.inBracketedPaste && key.name === 'tab') {
       const current = this.input.join('');
       if (current.startsWith('/')) {
@@ -807,6 +830,20 @@ export class TerminalUI {
         if (value.includes(placeholder)) {
           value = value.split(placeholder).join(`@"${fullPath}"`);
         }
+      }
+      if (!this.pending) {
+        // Agent is currently busy -> queue this prompt into queuedPrompts!
+        if (value.trim()) {
+          this.queuedPrompts.push(value);
+          this.history.push(this.input.join(''));
+          if (this.history.length > 100) this.history.shift();
+          this.input = [];
+          this.cursor = 0;
+          this.attachedImages.clear();
+          this.nextImageIdx = 1;
+          this.schedule(0);
+        }
+        return;
       }
       const pending = this.pending;
       this.pending = undefined;
@@ -1183,15 +1220,19 @@ export class TerminalUI {
     const rich = columns >= 48 && rows >= 12;
     const todoBadge = this.todoLabel ? ` · ${this.todoLabel}` : '';
 
-    // Top Codex Bar
-    const headerRaw = clip(`>_ goon · ${this.title} · [${this.modeLabel}] · effort:${this.effortLabel}${todoBadge}`);
+    const titleParts = this.title.split(' · ');
+    const modelName = titleParts[0] || this.title;
+    const sessionLabel = titleParts.slice(1).join(' · ') || 'session';
+
+    // Top Codex Bar (without model name or effort, since those live in the bottom composer box)
+    const headerRaw = clip(`>_ goon · ${sessionLabel}${todoBadge}`);
     const header = rich
       ? `\x1b[1;38;2;99;168;248m>_\x1b[0m \x1b[1mgoon\x1b[0m\x1b[2m${headerRaw.slice(7)}\x1b[0m`
-      : clip(`goon · ${this.title}`);
+      : clip(`goon · ${sessionLabel}`);
 
     // Body lines with strict width bound
     const all = this.renderStyledBodyLines(safeCols, rich);
-    const chromeRows = rich ? 6 : 4;
+    const chromeRows = rich ? 7 : 4;
     const height = Math.max(2, rows - chromeRows);
     this.maxScroll = Math.max(0, all.length - height);
     this.scroll = Math.min(this.scroll, this.maxScroll);
@@ -1231,11 +1272,24 @@ export class TerminalUI {
       : clip(toolsText);
 
     if (rich) {
-      // Rounded Composer Text Box with guaranteed spacer gap above
+      // Rounded Composer Text Box with guaranteed spacer gap + Queue Prompt row above
       const gapLine = '';
+      const queueRaw =
+        this.queuedPrompts.length > 0
+          ? `  ↳ Queue (${this.queuedPrompts.length}): ${this.queuedPrompts
+              .map((q, i) => `#${i + 1} "${q.slice(0, 36)}${q.length > 36 ? '…' : ''}"`)
+              .join(' · ')} (Alt+↑ edit)`
+          : `  ↳ Queue (0): empty · press Enter while busy to queue prompt`;
+      const queueLine =
+        this.queuedPrompts.length > 0
+          ? `\x1b[1;36m${clip(queueRaw)}\x1b[0m`
+          : `\x1b[2m${clip(queueRaw)}\x1b[0m`;
+
       const boxPromptLabel = this.label === 'goon> ' ? '› ' : clip(this.label);
       const boxLabelCols = visibleLength(boxPromptLabel);
-      const boxInnerCols = Math.max(1, safeCols - 4 - boxLabelCols);
+      const tokenBadge = ` ${this.tokens} tokens`;
+      const tokenCols = visibleLength(tokenBadge);
+      const boxInnerCols = Math.max(1, safeCols - 4 - boxLabelCols - tokenCols);
 
       let visibleBeforeCursor = this.input.slice(0, this.cursor).join('');
       while (visibleBeforeCursor && visibleLength(visibleBeforeCursor) >= boxInnerCols) {
@@ -1253,21 +1307,21 @@ export class TerminalUI {
       const innerPadSpaces = ' '.repeat(Math.max(0, boxInnerCols - visibleLength(placeholder || shownInput)));
 
       const borderColor = busy ? '\x1b[2m' : '\x1b[38;2;99;168;248m';
-      const topMeta = clip(` ${this.modeLabel} · effort:${this.effortLabel} · ${this.tokens} tokens${todoBadge} `);
+      const topMeta = clip(` ${this.modeLabel} · ${modelName} · effort:${this.effortLabel} `);
       const topDashes = '─'.repeat(Math.max(1, safeCols - 3 - visibleLength(topMeta)));
       const boxTop = `${borderColor}╭─\x1b[0m\x1b[1;36m${topMeta}\x1b[0m${borderColor}${topDashes}╮\x1b[0m`;
 
       const boxMid =
         `${borderColor}│\x1b[0m \x1b[1;38;2;99;168;248m${boxPromptLabel}\x1b[0m` +
-        `${innerContent}${innerPadSpaces} ${borderColor}│\x1b[0m`;
+        `${innerContent}${innerPadSpaces}\x1b[2m${tokenBadge}\x1b[0m ${borderColor}│\x1b[0m`;
 
       const botDashes = '─'.repeat(Math.max(1, safeCols - 2));
       const boxBot = `${borderColor}╰${botDashes}╯\x1b[0m`;
 
       const boxCursorCol = Math.min(safeCols - 1, 2 + boxLabelCols + visibleLength(visibleBeforeCursor) + 1);
       const frame =
-        `\x1b[?2026h\x1b[?25l\x1b[H\x1b[2J${[header, ...body, gapLine, toolsLine, boxTop, boxMid, boxBot].join('\r\n')}` +
-        (this.pending ? `\x1b[1A\r\x1b[${boxCursorCol}G\x1b[?25h` : '') +
+        `\x1b[?2026h\x1b[?25l\x1b[H\x1b[2J${[header, ...body, gapLine, toolsLine, queueLine, boxTop, boxMid, boxBot].join('\r\n')}` +
+        (this.pending || busy ? `\x1b[1A\r\x1b[${boxCursorCol}G\x1b[?25h` : '') +
         `\x1b[?2026l`;
 
       if (frame !== this.lastRenderedFrame) {

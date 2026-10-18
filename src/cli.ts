@@ -79,7 +79,6 @@ function welcomeBanner(
   const row = (label: string, val: string) => `│  ${label.padEnd(10)}: ${val.slice(0, 52).padEnd(52)} │`;
   return [
     `╭─── >_ goon cli (v${VERSION}) ──────────────────────────────────────────╮`,
-    row('model', `${model} · effort: ${effort ?? 'default'} (/model · /effort)`),
     row('gateway', `${baseUrl} (${provider})`),
     row('directory', cwd),
     row('session', `${sessionId.slice(0, 8)} · mode: ${mode} (Shift+Tab or /mode)`),

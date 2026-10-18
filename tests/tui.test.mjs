@@ -359,10 +359,31 @@ test('Codex TUI renders rounded composer text box with spacer gap, pipe-free thi
   assert.match(frame, /• Thinking/);
   assert.match(frame, /  Checking files without vertical bars/);
   assert.match(frame, /• Direct bullet answer without \[answer\] tag\./);
-  assert.match(frame, /╭─ ask · effort:default · 0 tokens ─/);
-  assert.match(frame, /│ › /);
+
+  // Top header should NOT contain model name or effort
+  const topHeaderLine = frame.split('\r\n')[0];
+  assert(!topHeaderLine.includes('test-model'), 'Top header should not repeat model name');
+  assert(!topHeaderLine.includes('effort:'), 'Top header should not repeat effort');
+
+  // Box top border has mode + model + effort; Box middle row has Ask anything... and 0 tokens on the same row
+  assert.match(frame, /╭─ ask · test-model · effort:default ─/);
+  assert.match(frame, /│ › Ask anything\.\.\..*0 tokens │/);
   assert.match(frame, /╰──/);
   assert(!frame.includes('Ready ·'), 'Bottom border should not contain Ready footer text');
+
+  // Queue prompt while busy (no pending question active)
+  tty.ui.setStatus('Running');
+  tty.key('queued follow-up task', undefined);
+  tty.key('', 'return');
+  await new Promise(resolve => setTimeout(resolve, 25));
+
+  frame = stripVTControlCharacters(tty.written.split('\x1b[H\x1b[2J').at(-1));
+  assert.match(frame, /↳ Queue \(1\): #1 "queued follow-up task"/);
+
+  // Next question(remember=true) automatically dequeues and resolves the queued prompt
+  tty.ui.setStatus('Ready');
+  const dequeued = await tty.ui.question('goon> ', undefined, true);
+  assert.equal(dequeued, 'queued follow-up task');
 });
 
 
