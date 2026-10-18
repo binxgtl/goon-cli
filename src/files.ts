@@ -480,12 +480,32 @@ export class WorkspaceFiles {
     }
     return files.sort();
   }
+  async readImage(userPath: string, maxBytes = 5 * 1024 * 1024): Promise<{ buffer: Buffer; mediaType: string }> {
+    const ext = userPath.toLowerCase().match(/\.(png|jpe?g|webp|gif)$/)?.[1];
+    if (!ext) throw new Error('Unsupported image extension.');
+    const mediaType =
+      ext === 'png' ? 'image/png'
+      : ext === 'webp' ? 'image/webp'
+      : ext === 'gif' ? 'image/gif'
+      : 'image/jpeg';
+    const file = await this.path(userPath);
+    const info = await stat(file);
+    if (!info.isFile() || info.size > maxBytes) {
+      throw new Error('Expected a regular image file no larger than 5 MiB.');
+    }
+    const buffer = await readFile(file);
+    return { buffer, mediaType };
+  }
   async previewDiff(tool: string, input: unknown): Promise<string | undefined> {
     try {
       if (!input || typeof input !== 'object') return undefined;
-      const rec = input as Record<string, unknown>;
-      if (tool === 'apply_patch' && typeof rec.patch === 'string') {
-        const ops = parsePatchText(rec.patch);
+      const raw = input as Record<string, unknown>;
+      const normalizedTool = tool === 'write' ? 'write_file' : tool === 'edit' ? 'edit_file' : tool;
+      const pathVal = raw.path ?? raw.filePath ?? raw.file_path ?? raw.directory;
+      const oldVal = raw.oldText ?? raw.old_string ?? raw.old_str;
+      const newVal = raw.newText ?? raw.new_string ?? raw.new_str;
+      if (normalizedTool === 'apply_patch' && typeof raw.patch === 'string') {
+        const ops = parsePatchText(raw.patch);
         const diffs: string[] = [];
         for (const op of ops) {
           const file = await this.path(op.path);
@@ -502,28 +522,28 @@ export class WorkspaceFiles {
         }
         return diffs.join('\n');
       }
-      if (typeof rec.path !== 'string') return undefined;
-      const file = await this.path(rec.path);
+      if (typeof pathVal !== 'string') return undefined;
+      const file = await this.path(pathVal);
       let before = '';
       try { before = await this.text(file); } catch { before = ''; }
-      if (tool === 'write_file' && typeof rec.content === 'string') {
-        return computeUnifiedDiff(rec.path, before, rec.content);
+      if (normalizedTool === 'write_file' && typeof raw.content === 'string') {
+        return computeUnifiedDiff(pathVal, before, raw.content);
       }
-      if (tool === 'edit_file' && typeof rec.oldText === 'string' && typeof rec.newText === 'string') {
-        const replaceAll = rec.replaceAll === true;
-        let targetOld = rec.oldText;
-        let targetNew = rec.newText;
+      if (normalizedTool === 'edit_file' && typeof oldVal === 'string' && typeof newVal === 'string') {
+        const replaceAll = raw.replaceAll === true;
+        let targetOld = oldVal;
+        let targetNew = newVal;
         if (!before.includes(targetOld) && before.includes('\r\n') && !targetOld.includes('\r\n')) {
           targetOld = targetOld.replace(/\n/g, '\r\n');
           targetNew = targetNew.replace(/\r?\n/g, '\r\n');
         }
         if (before.includes(targetOld)) {
           const after = replaceAll ? before.split(targetOld).join(targetNew) : before.replace(targetOld, targetNew);
-          return computeUnifiedDiff(rec.path, before, after);
+          return computeUnifiedDiff(pathVal, before, after);
         }
-        const trimmed = matchTrimmedLines(before, rec.oldText, rec.newText);
+        const trimmed = matchTrimmedLines(before, oldVal, newVal);
         if (trimmed.matched && trimmed.result !== undefined) {
-          return computeUnifiedDiff(rec.path, before, trimmed.result);
+          return computeUnifiedDiff(pathVal, before, trimmed.result);
         }
       }
       return undefined;

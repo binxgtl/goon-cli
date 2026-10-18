@@ -157,3 +157,81 @@ test('TUI supports slash-command Tab completion, Shift+Tab mode toggle, Alt+. ef
   assert.equal(runtime.effort, 'xhigh');
 });
 
+test('Codex TUI renders Markdown bullets without false-positive red diff coloring, coalesces Explored cells, and streams tool_stream status', async t => {
+  const tty = terminal(t);
+  tty.output.columns = 100;
+  tty.output.rows = 30;
+  tty.ui.setStatus('Running');
+
+  // 1. Live tool_stream event updates status bar immediately
+  tty.ui.event({ type: 'tool_stream', id: 'tc1', name: 'write_file', state: 'delta', preview: 'src/app.ts' });
+  await new Promise(resolve => setTimeout(resolve, 25));
+  assert(tty.written.includes('\x1b[?2026h'), 'Should wrap frames in DEC Mode 2026 synchronized output');
+  assert(tty.written.includes('Streaming write_file: src/app.ts'), 'Should display live tool_stream progress');
+
+  // 2. Coalesced Explored cell for consecutive read/list/search tools
+  tty.ui.event({
+    type: 'tool',
+    id: 'r1',
+    name: 'read_file',
+    state: 'done',
+    meta: { kind: 'read', summary: 'src/index.ts' },
+  });
+  tty.ui.event({
+    type: 'tool',
+    id: 's1',
+    name: 'search',
+    state: 'done',
+    meta: { kind: 'search', summary: 'createModel in src' },
+  });
+
+  // 3. Ran cell and Edited cell with (+A -R) diff
+  tty.ui.event({
+    type: 'tool',
+    id: 'b1',
+    name: 'bash',
+    state: 'done',
+    meta: { kind: 'exec', summary: 'npm test', durationMs: 1200, outputPreview: ['PASS all tests'], omittedLines: 0 },
+  });
+  tty.ui.event({
+    type: 'tool',
+    id: 'e1',
+    name: 'edit_file',
+    state: 'done',
+    meta: {
+      kind: 'edit',
+      verb: 'Edited',
+      summary: 'src/app.ts',
+      added: 1,
+      removed: 1,
+      diff: '--- a/src/app.ts\n+++ b/src/app.ts\n@@ -1,1 +1,1 @@\n-const oldVal = 1;\n+const newVal = 2;',
+    },
+  });
+
+  // 4. Markdown answer with bullet lists (- item) must NOT be colored red (\x1b[31m)
+  tty.ui.event({
+    type: 'text',
+    text: '# Summary\n- **Todo list:** completed\n- `inline_code` works\n',
+  });
+  await new Promise(resolve => setTimeout(resolve, 30));
+
+  const lastFrame = tty.written.split('\x1b[H\x1b[2J').at(-1);
+  assert.match(lastFrame, /Explored/);
+  assert.match(lastFrame, /Read.*src\/index\.ts/);
+  assert.match(lastFrame, /Search.*createModel in src/);
+  assert.match(lastFrame, /Ran/);
+  assert.match(lastFrame, /Edited/);
+  assert.match(lastFrame, /• .*Todo list:.* completed/);
+
+  // Verify the bullet list line is NOT colored red (\x1b[31m), while the real diff deletion line IS colored red
+  const lines = lastFrame.split('\r\n');
+  const todoBulletLine = lines.find(l => l.includes('Todo list:'));
+  assert(todoBulletLine, 'Should find rendered Todo list bullet line');
+  assert(!todoBulletLine.includes('\x1b[31m'), 'Markdown bullet list item must NOT be colored red as a diff deletion');
+
+  const diffRemovedLine = lines.find(l => l.includes('const oldVal = 1;'));
+  assert(diffRemovedLine, 'Should find rendered diff deletion line');
+  assert(diffRemovedLine.includes('\x1b[31m'), 'Real diff deletion line must be colored red');
+});
+
+

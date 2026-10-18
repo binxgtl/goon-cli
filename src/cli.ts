@@ -3,12 +3,14 @@ import { createInterface } from 'node:readline/promises';
 import { stdin, stdout, stderr } from 'node:process';
 import { join, resolve } from 'node:path';
 import {
+  DEFAULT_GATEWAY_URL,
   EFFORT_LEVELS,
   type Config,
   type EffortLevel,
   configPath,
   dataDir,
   loadConfig,
+  normalizeGatewayUrl,
   resolveApiKey,
   resolveRuntime,
   saveConfig,
@@ -20,7 +22,7 @@ import type { SubagentEvent } from './subagents.js';
 import { terminalText as cleanTerminal, TerminalUI } from './tui.js';
 import type { McpManager } from './mcp.js';
 import { EFFORT_DESCRIPTIONS, parseEffortInput, runSetupWizard } from './setup.js';
-import { discoverModels } from './provider.js';
+import { discoverModels, formatModelBadge, resolveModelCapabilities, type DiscoveredModel } from './provider.js';
 
 const HELP = `goon cli ${VERSION} — independent coding harness
 
@@ -76,15 +78,12 @@ function welcomeBanner(
 ): string {
   const row = (label: string, val: string) => `│  ${label.padEnd(10)}: ${val.slice(0, 52).padEnd(52)} │`;
   return [
-    `╭─── ✻ goon cli v${VERSION} ──────────────────────────────────────────────╮`,
-    row('Model', `${model} (${provider})`),
-    row('Effort', `${effort ?? 'default'} (low | medium | high | xhigh | max)`),
-    row('Endpoint', baseUrl),
-    row('Workspace', cwd),
-    row('Session', sessionId.slice(0, 8)),
-    row('Mode', `${mode} (Shift+Tab or /mode | /plan)`),
-    `│                                                                   │`,
-    row('Commands', '/help · /plan · /revert · /model · /effort · /compact'),
+    `╭─── >_ goon cli (v${VERSION}) ──────────────────────────────────────────╮`,
+    row('model', `${model} · effort: ${effort ?? 'default'} (/model · /effort)`),
+    row('gateway', `${baseUrl} (${provider})`),
+    row('directory', cwd),
+    row('session', `${sessionId.slice(0, 8)} · mode: ${mode} (Shift+Tab or /mode)`),
+    row('commands', '/help · /plan · /revert · /resume · /diff · /compact'),
     `╰───────────────────────────────────────────────────────────────────╯`,
     '',
   ].join('\n');
@@ -156,10 +155,15 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         catch { return false; }
       };
       const [bash, rg, resolvedKey] = await Promise.all([executable('bash'), executable('rg'), resolveApiKey(config)]);
+      const targetUrl = normalizeGatewayUrl(config.baseUrl ?? DEFAULT_GATEWAY_URL);
+      const discovered = await discoverModels(targetUrl, resolvedKey ?? '', config.provider);
+      const modelIds = discovered.map((m) => m.id);
+      const modelAvailable = config.model ? (modelIds.length === 0 || modelIds.includes(config.model)) : false;
       stdout.write(JSON.stringify({ version: VERSION, node: process.version, platform: process.platform, arch: process.arch,
         config: configPath(), provider: config.provider, model: config.model ?? null, effort: config.effort ?? 'default',
         baseUrl: config.baseUrl ?? 'provider default', credentialVariable: config.keyEnv, credentialPresent: Boolean(resolvedKey),
-        bash, ripgrep: rg, searchFallback: !rg, data: dataDir(), networkTested: false }, null, 2) + '\n');
+        bash, ripgrep: rg, searchFallback: !rg, data: dataDir(), networkTested: true,
+        discoveredModels: modelIds, modelAvailable }, null, 2) + '\n');
       if (!bash || !config.model || !resolvedKey) process.exitCode = 1;
       return;
     }
@@ -185,6 +189,10 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     if (!prompt && stdin.isTTY && !jsonOutput && (!config.model || !(await resolveApiKey(config)))) {
       config = await runSetupWizard(config);
     }
+    const interactive = !prompt;
+    if (interactive && !jsonOutput && values['show-reasoning'] === undefined) {
+      config.showReasoning = true;
+    }
     let runtime = await resolveRuntime(config, values.cwd ?? process.cwd());
     apiKey = runtime.apiKey;
     let store = await SessionStore.open(join(runtime.dataDir, 'sessions'), runtime, values.resume);
@@ -197,7 +205,6 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     let prePlanMode: PermissionMode = values.yes ? 'auto' : 'ask';
 
     const sessionAllowedTools = new Set<string>();
-    const interactive = !prompt;
     const stop = () => {
       if (starting) process.exitCode = 130;
       if (controller && !controller.signal.aborted) controller.abort(new Error('Cancelled by user.'));
@@ -227,6 +234,10 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         if (event.type === 'plan_exit') {
           mode = prePlanMode;
           tui?.setMode(mode);
+        }
+        if (event.type === 'tool_stream') {
+          if (tui) tui.event(event);
+          return;
         }
         if (jsonOutput) { stdout.write(JSON.stringify(event) + '\n'); return; }
         if (tui) { tui.event(event); return; }
@@ -423,6 +434,9 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
               write: text => display(text),
               ask: label => question(label),
             });
+            if (interactive && !jsonOutput && values['show-reasoning'] === undefined) {
+              config.showReasoning = true;
+            }
             runtime = await resolveRuntime(config, runtime.cwd);
             apiKey = runtime.apiKey;
             store.session.model = runtime.model;
@@ -436,6 +450,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
           if (input === '/model' || input.startsWith('/model ')) {
             const rawArgs = input.slice(6).trim();
             let nextModel: string | undefined;
+            let selectedModel: DiscoveredModel | undefined;
             let nextEffort = config.effort;
             let effortChanged = false;
             if (rawArgs) {
@@ -450,20 +465,21 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
                 }
               }
             } else {
-              display(`\nCurrent model: ${runtime.model} (effort: ${runtime.effort ?? 'default'} · ${runtime.provider} · ${runtime.baseUrl})\nProbing ${runtime.baseUrl}/models ...\n`);
+              display(`\nCurrent model: ${runtime.model} (ctx: ${Math.round(runtime.contextWindow / 1024)}k · out: ${Math.round(runtime.maxOutputTokens / 1000)}k · effort: ${runtime.effort ?? 'default'} · ${runtime.provider} · ${runtime.baseUrl})\nProbing ${runtime.baseUrl}/models ...\n`);
               const discovered = await discoverModels(runtime.baseUrl, runtime.apiKey, runtime.provider);
               if (discovered.length > 0) {
                 const shown = discovered.slice(0, 30);
                 for (const [idx, m] of shown.entries()) {
-                  const meta = m.contextWindow ? ` (ctx: ${Math.round(m.contextWindow / 1024)}k)` : '';
-                  display(`  [${idx + 1}] ${m.id}${meta}\n`);
+                  display(`  [${idx + 1}] ${m.id}${formatModelBadge(m)}\n`);
                 }
                 const pick = (await question(`Select [1-${shown.length}] or enter model ID (Enter to keep ${runtime.model}): `)).trim();
                 const pickIdx = Number(pick) - 1;
                 if (pick && Number.isInteger(pickIdx) && pickIdx >= 0 && pickIdx < shown.length) {
-                  nextModel = shown[pickIdx].id;
+                  selectedModel = shown[pickIdx];
+                  nextModel = selectedModel.id;
                 } else if (pick) {
                   nextModel = pick;
+                  selectedModel = discovered.find((m) => m.id === pick);
                 }
               } else {
                 const typed = (await question(`Enter model ID (Enter to keep ${runtime.model}): `)).trim();
@@ -471,10 +487,18 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
               }
             }
             if (!nextModel && !effortChanged) continue;
+            const targetModelId = nextModel ?? runtime.model;
+            const caps = resolveModelCapabilities(targetModelId, selectedModel);
+            const autoContextWindow = (nextModel ? caps.contextWindow : undefined) ?? config.contextWindow;
+            const rawMaxOut = (nextModel ? caps.maxOutputTokens : undefined) ?? config.maxOutputTokens;
+            const autoMaxOutputTokens = Math.min(rawMaxOut, Math.floor(autoContextWindow / 2));
+            const finalEffort = effortChanged
+              ? nextEffort
+              : (nextModel && caps.defaultEffort ? caps.defaultEffort : config.effort);
             config = await loadConfig({
               ...config,
-              ...(nextModel ? { model: nextModel } : {}),
-              ...(effortChanged ? { effort: nextEffort } : {}),
+              ...(nextModel ? { model: nextModel, contextWindow: autoContextWindow, maxOutputTokens: autoMaxOutputTokens } : {}),
+              ...(finalEffort ? { effort: finalEffort } : {}),
             });
             await saveConfig(config);
             runtime = await resolveRuntime(config, runtime.cwd);
@@ -484,7 +508,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             const built = await buildHarness(mode);
             tools = built.tools;
             harness = built.harness;
-            display(`Active model: ${runtime.model} (effort: ${runtime.effort ?? 'default'})\n`);
+            display(`Active model: ${runtime.model} (ctx: ${Math.round(runtime.contextWindow / 1024)}k · out: ${Math.round(runtime.maxOutputTokens / 1000)}k · ${caps.supportsVision === false ? 'text-only' : 'vision'} · effort: ${runtime.effort ?? 'default'})\n`);
             continue;
           }
           if (input === '/effort' || input.startsWith('/effort ')) {
@@ -844,8 +868,20 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
               try { return (await runCommand(cmd, ['--version'], { cwd: runtime.cwd, signal: AbortSignal.timeout(5000), timeoutMs: 5000 })).code === 0; }
               catch { return false; }
             };
-            const [b, r] = await Promise.all([ok('bash'), ok('rg')]);
-            display(`Provider: ${runtime.provider} | Model: ${runtime.model} | Effort: ${runtime.effort ?? 'default'} | BaseURL: ${runtime.baseUrl}\nBash: ${b ? 'OK' : 'Missing'} | Ripgrep: ${r ? 'OK' : 'JS fallback'} | API Key: Configured\n`);
+            const [b, r, discovered] = await Promise.all([
+              ok('bash'),
+              ok('rg'),
+              discoverModels(runtime.baseUrl, runtime.apiKey, runtime.provider),
+            ]);
+            const modelInList = discovered.some((m) => m.id === runtime.model);
+            const gatewayStatus = discovered.length > 0
+              ? `OK (${discovered.length} models: ${discovered.map((m) => m.id).join(', ')} · active model ${modelInList ? 'verified' : 'NOT listed'})`
+              : 'Unreachable or no /models response';
+            display(
+              `Provider: ${runtime.provider} | Model: ${runtime.model} | Effort: ${runtime.effort ?? 'default'} | BaseURL: ${runtime.baseUrl}\n` +
+              `Bash: ${b ? 'OK' : 'Missing'} | Ripgrep: ${r ? 'OK' : 'JS fallback'} | API Key: Configured\n` +
+              `Gateway (/models): ${gatewayStatus}\n`,
+            );
             continue;
           }
           if (input === '/status') {

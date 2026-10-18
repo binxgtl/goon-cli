@@ -134,9 +134,9 @@ test('OpenAI Responses streams through the same independent harness', async t =>
   assert(result.stdout.includes('Responses works.'));
 });
 
-test('init saves only configuration, doctor makes no network request', async t => {
+test('init saves only configuration, doctor probes /models without calling completions', async t => {
   const f = await fixture(t);
-  const p = await provider(t, () => { throw new Error('Offline commands must not call a model'); });
+  const p = await provider(t, () => { throw new Error('Doctor must not call chat completions'); });
   const init = await cli(f, p.url, ['init']).done;
   assert.equal(init.code, 0, init.stderr);
   const saved = await readFile(join(f.config, 'goon/config.json'), 'utf8');
@@ -144,7 +144,9 @@ test('init saves only configuration, doctor makes no network request', async t =
   assert.equal(JSON.parse(saved).model, 'test-model');
   const doctor = await cli(f, p.url, ['doctor']).done;
   assert.equal(doctor.code, 0, doctor.stderr);
-  assert.equal(JSON.parse(doctor.stdout).networkTested, false);
+  const docJson = JSON.parse(doctor.stdout);
+  assert.equal(docJson.networkTested, true);
+  assert(Array.isArray(docJson.discoveredModels));
   assert.equal(p.requests.length, 0);
 });
 
@@ -352,5 +354,165 @@ test('Plan Mode blocks mutating tools until exit_plan_mode is approved, @file me
   assert.equal(await readFile(join(f.cwd, 'app.ts'), 'utf8'), 'export const v = 1;\n');
   await assert.rejects(readFile(join(f.cwd, 'extra.ts'), 'utf8'));
 });
+
+test('AI Gateway ultra-compatibility: session affinity headers, 4 gateway models metadata, compaction effort downgrade, tool/param aliases, and @image.png vision vs beam filtering', async t => {
+  const { createServer } = await import('node:http');
+  const { writeFile } = await import('node:fs/promises');
+  const {
+    Harness,
+    SessionStore,
+    ToolRegistry,
+    WorkspaceFiles,
+    compactNow,
+    createModel,
+    discoverModels,
+    expandFileMentions,
+    formatModelBadge,
+    normalizeGatewayUrl,
+    resolveModelCapabilities,
+  } = await import('../dist/index.js');
+  const f = await fixture(t);
+
+  // 1. Gateway URL normalization & 4 gateway models capability resolution
+  assert.equal(normalizeGatewayUrl('https://api.yuristore.xyz/'), 'https://api.yuristore.xyz/v1');
+  assert.equal(normalizeGatewayUrl('http://127.0.0.1:8000'), 'http://127.0.0.1:8000/v1');
+
+  const gwServer = createServer((req, res) => {
+    if (req.url === '/v1/models') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        data: [
+          { id: 'glm-5.3-flash', context_window: 200000, max_output_tokens: 32000, supports_vision: true, reasoning_effort: 'max' },
+          { id: 'deepseek-v4.1-flash', context_window: 200000, max_output_tokens: 32000, supports_vision: true, reasoning_effort: 'max' },
+          { id: 'space-bunny', context_window: 1048576, max_output_tokens: 65536, supports_vision: true, supports_1m_context: true, reasoning_effort: 'max' },
+          { id: 'beam', context_window: 1048576, max_output_tokens: 65536, supports_vision: false, supports_1m_context: true, reasoning_effort: 'max' },
+        ],
+      }));
+      return;
+    }
+    res.writeHead(404).end();
+  });
+  await new Promise(resolve => gwServer.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise(resolve => gwServer.close(resolve)));
+  const gwUrl = `http://127.0.0.1:${gwServer.address().port}/v1`;
+  const models = await discoverModels(gwUrl, 'gw-key');
+  assert.equal(models.length, 4);
+  assert.equal(`${models[2].id}${formatModelBadge(models[2])}`, 'space-bunny (ctx: 1024k · out: 64k · vision · effort: max)');
+  assert.equal(`${models[3].id}${formatModelBadge(models[3])}`, 'beam (ctx: 1024k · out: 64k · text-only · effort: max)');
+  assert.deepEqual(resolveModelCapabilities('beam'), {
+    id: 'beam',
+    contextWindow: 1048576,
+    maxOutputTokens: 65536,
+    supportsVision: false,
+    defaultEffort: 'max',
+  });
+
+  // 2. Multimodal @image.png expansion for vision models vs automatic text-only omission for 'beam'
+  // 1x1 transparent PNG
+  const pngBytes = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
+    'base64',
+  );
+  await writeFile(join(f.cwd, 'shot.png'), pngBytes);
+  const wsFiles = new WorkspaceFiles(f.cwd);
+
+  const visionExpanded = await expandFileMentions('Check @shot.png please', wsFiles, { model: 'space-bunny' });
+  assert.equal(visionExpanded.mentioned.includes('shot.png'), true);
+  assert.equal(visionExpanded.imageParts.length, 1);
+  assert.equal(visionExpanded.imageParts[0].type, 'image');
+  assert.equal(visionExpanded.imageParts[0].mediaType, 'image/png');
+
+  const beamExpanded = await expandFileMentions('Check @shot.png please', wsFiles, { model: 'beam' });
+  assert.equal(beamExpanded.imageParts.length, 0);
+  assert.match(beamExpanded.text, /\[Attached image @shot\.png omitted: model "beam" is text-only\]/);
+
+  // 3. Session Affinity Headers (x-session-id & x-opencode-session), Tool/Param Aliases, and Compaction Effort Downgrade
+  await writeFile(join(f.cwd, 'hello.txt'), 'line one\n', 'utf8');
+  const observedHeaders = [];
+  const observedEfforts = [];
+  const p = await provider(t, (body, response, n, req) => {
+    observedHeaders.push({
+      sessionId: req.headers['x-session-id'],
+      opencodeSession: req.headers['x-opencode-session'],
+    });
+    observedEfforts.push(body.reasoning_effort);
+    if (n === 1) {
+      // Model uses tool alias 'read' with parameter alias 'filePath'
+      return sse(response, {
+        calls: [{
+          id: 'c_alias_1',
+          name: 'read',
+          input: { filePath: 'hello.txt' },
+        }],
+      });
+    }
+    if (n === 2) {
+      // Model uses tool alias 'edit' with parameter aliases 'file_path', 'old_string', 'new_string'
+      return sse(response, {
+        calls: [{
+          id: 'c_alias_2',
+          name: 'edit',
+          input: { file_path: 'hello.txt', old_string: 'line one', new_string: 'line two' },
+        }],
+      });
+    }
+    if (n === 3) {
+      return sse(response, { text: 'Aliases and session headers verified.' });
+    }
+    // Request 4: Compaction request (no tools, compaction system prompt) -> effort must be downgraded to 'low'!
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({
+      id: 'summary',
+      object: 'chat.completion',
+      created: 1,
+      model: 'space-bunny',
+      choices: [{
+        index: 0,
+        message: { role: 'assistant', content: 'Clean checkpoint summary of gateway test.' },
+        finish_reason: 'stop',
+      }],
+      usage: { prompt_tokens: 40, completion_tokens: 15, total_tokens: 55 },
+    }));
+  });
+
+  const config = {
+    provider: 'openai-compatible',
+    baseUrl: p.url,
+    model: 'space-bunny',
+    effort: 'max',
+    keyEnv: 'GOON_API_KEY',
+    apiKey: 'test-secret-never-echo',
+    cwd: f.cwd,
+    contextWindow: 1048576,
+    maxOutputTokens: 65536,
+    runTokenBudget: 1000000,
+    timeoutMs: 30000,
+    maxTurns: 8,
+    inlineReasoning: 'leading-think',
+    showReasoning: false,
+  };
+  const store = await SessionStore.open(join(f.data, 'sessions'), config);
+  t.after(() => store.close());
+  const tools = new ToolRegistry(f.cwd, async () => true, false);
+  const harness = new Harness(config, store, tools);
+
+  const answer = await harness.run('Edit @shot.png and hello.txt', new AbortController().signal);
+  assert.equal(answer, 'Aliases and session headers verified.');
+  assert.equal(await readFile(join(f.cwd, 'hello.txt'), 'utf8'), 'line two\n');
+
+  // Verify x-session-id & x-opencode-session headers matched store.session.id on all turn requests
+  for (const h of observedHeaders) {
+    assert.equal(h.sessionId, store.session.id);
+    assert.equal(h.opencodeSession, store.session.id);
+  }
+  assert.deepEqual(observedEfforts.slice(0, 3), ['max', 'max', 'max']);
+
+  // Verify compaction downgrades reasoning_effort from 'max' to 'low' so reasoning doesn't exhaust maxOutputTokens
+  const model = createModel(config, store.session.id);
+  const compacted = await compactNow(store, config, model, new AbortController().signal);
+  assert.equal(compacted.compactions, 1);
+  assert.equal(observedEfforts[3], 'low');
+});
+
 
 

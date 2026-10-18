@@ -8,7 +8,7 @@ import { limitText } from './files.js';
 import { safeError } from './errors.js';
 import { lastAssistantAnswer } from './reasoning.js';
 
-export type SubagentProgress = Exclude<HarnessEvent, { type: 'text' | 'reasoning' }>;
+export type SubagentProgress = Exclude<HarnessEvent, { type: 'text' | 'reasoning' | 'tool_stream' }>;
 export type SubagentEvent =
   | { type: 'subagent'; id: string; state: 'start'; task: string }
   | { type: 'subagent'; id: string; state: 'progress'; event: SubagentProgress }
@@ -64,7 +64,9 @@ export class Subagents {
       await new Harness(config, store, tools, event => {
         // Parent progress is a control channel. The complete text/reasoning
         // belongs to the child transcript, never a per-token parent mirror.
-        if (event.type !== 'text' && event.type !== 'reasoning') this.emit({ type: 'subagent', id, state: 'progress', event });
+        if (event.type !== 'text' && event.type !== 'reasoning' && event.type !== 'tool_stream') {
+          this.emit({ type: 'subagent', id, state: 'progress', event });
+        }
       }).run(
         `You are a delegated agent. Complete this task and return a concise report with evidence. Do not ask other agents.\n\n${task}`, signal, budget);
       if (denied) throw new PermissionDeniedError('Permission denied in a subagent. Stop this run.');

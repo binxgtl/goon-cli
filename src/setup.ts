@@ -3,15 +3,22 @@ import { stdin, stderr } from 'node:process';
 import {
   type Config,
   type EffortLevel,
+  DEFAULT_GATEWAY_URL,
   EFFORT_LEVELS,
   configPath,
   credentialsPath,
   loadConfig,
+  normalizeGatewayUrl,
   resolveApiKey,
   saveConfig,
   saveCredential,
 } from './config.js';
-import { discoverModels, type DiscoveredModel } from './provider.js';
+import {
+  discoverModels,
+  formatModelBadge,
+  resolveModelCapabilities,
+  type DiscoveredModel,
+} from './provider.js';
 import { VERSION } from './version.js';
 
 export interface ProviderPreset {
@@ -24,21 +31,21 @@ export interface ProviderPreset {
 export const PROVIDER_PRESETS: ProviderPreset[] = [
   {
     id: 'anthropic',
-    label: 'Anthropic Messages API (Claude / Anthropic-compatible)',
+    label: 'Anthropic Messages API (YuriStore / Claude / Anthropic-compatible)',
     provider: 'anthropic',
-    baseUrl: 'https://api.anthropic.com/v1',
+    baseUrl: DEFAULT_GATEWAY_URL,
   },
   {
     id: 'openai-responses',
-    label: 'OpenAI Responses API (Codex / Responses endpoint)',
+    label: 'OpenAI Responses API (YuriStore / Codex / Responses endpoint)',
     provider: 'openai-responses',
-    baseUrl: 'https://api.openai.com/v1',
+    baseUrl: DEFAULT_GATEWAY_URL,
   },
   {
     id: 'openai-compatible',
-    label: 'OpenAI Chat Completions (Standard / Custom Gateway)',
+    label: 'YuriStore AI Gateway (https://api.yuristore.xyz/v1 · glm-5.3 / deepseek-v4.1 / space-bunny / beam)',
     provider: 'openai-compatible',
-    baseUrl: 'https://api.openai.com/v1',
+    baseUrl: DEFAULT_GATEWAY_URL,
   },
   {
     id: 'openrouter',
@@ -60,9 +67,9 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
   },
   {
     id: 'local-proxy',
-    label: 'Local Gateway / Proxy (CLIProxyAPI / LiteLLM / Ollama / vLLM)',
+    label: 'Local AI Gateway (http://127.0.0.1:8000/v1)',
     provider: 'openai-compatible',
-    baseUrl: 'http://127.0.0.1:8317/v1',
+    baseUrl: 'http://127.0.0.1:8000/v1',
   },
 ];
 
@@ -129,7 +136,7 @@ export async function runSetupWizard(initialConfig?: Config, io?: SetupIO): Prom
     const defaultUrl = current.baseUrl && chosenIdx === defaultIndex ? current.baseUrl : preset.baseUrl;
     write(`\nStep 2/5 · API Base URL (${preset.provider}):\n`);
     const urlInput = (await ask(`Base URL [${defaultUrl}]: `)).trim();
-    const baseUrl = urlInput || defaultUrl;
+    const baseUrl = normalizeGatewayUrl(urlInput || defaultUrl);
 
     const keyHint = existingKey
       ? `saved (${existingKey.slice(0, 4)}...${existingKey.slice(-2)}) — press Enter to keep`
@@ -146,8 +153,7 @@ export async function runSetupWizard(initialConfig?: Config, io?: SetupIO): Prom
     if (discovered.length > 0) {
       const shown = discovered.slice(0, 30);
       for (const [idx, m] of shown.entries()) {
-        const meta = m.contextWindow ? ` (ctx: ${Math.round(m.contextWindow / 1024)}k)` : '';
-        write(`    [${idx + 1}] ${m.id}${meta}\n`);
+        write(`    [${idx + 1}] ${m.id}${formatModelBadge(m)}\n`);
       }
       if (discovered.length > shown.length) {
         write(`    ... and ${discovered.length - shown.length} more models available on endpoint\n`);
@@ -171,8 +177,13 @@ export async function runSetupWizard(initialConfig?: Config, io?: SetupIO): Prom
       if (!model) write(`  ! Model ID is required (no models are hardcoded).\n`);
     }
 
+    const meta = resolveModelCapabilities(model, discovered.find(d => d.id === model));
+    const nextContextWindow = meta.contextWindow ?? current.contextWindow;
+    const rawMaxOut = meta.maxOutputTokens ?? current.maxOutputTokens;
+    const nextMaxOutputTokens = Math.min(131_072, Math.min(rawMaxOut, Math.floor(nextContextWindow / 2) - 1));
+
     write(`\nStep 5/5 · Reasoning Effort:\n`);
-    const currentEffort = current.effort;
+    const currentEffort = current.effort ?? meta.defaultEffort;
     write(`  ${!currentEffort ? '●' : ' '} [1] default  — Use provider/model default reasoning behavior\n`);
     for (const [idx, level] of EFFORT_LEVELS.entries()) {
       const marker = currentEffort === level ? '●' : ' ';
@@ -186,6 +197,8 @@ export async function runSetupWizard(initialConfig?: Config, io?: SetupIO): Prom
       baseUrl,
       model,
       effort,
+      contextWindow: nextContextWindow,
+      maxOutputTokens: nextMaxOutputTokens,
       keyEnv: current.keyEnv,
     });
     await saveConfig(updated);
@@ -197,6 +210,7 @@ export async function runSetupWizard(initialConfig?: Config, io?: SetupIO): Prom
       `│  Base URL : ${(updated.baseUrl ?? 'default').slice(0, 54).padEnd(54)}│\n` +
       `│  Model    : ${(updated.model ?? '').slice(0, 54).padEnd(54)}│\n` +
       `│  Effort   : ${(updated.effort ?? 'default').padEnd(54)}│\n` +
+      `│  Context  : ${`${updated.contextWindow} tokens (out: ${updated.maxOutputTokens})`.slice(0, 54).padEnd(54)}│\n` +
       `│  API Key  : ${(finalKey ? 'Configured ✓' : `Missing (set ${updated.keyEnv})`).padEnd(54)}│\n` +
       `│  Config   : ${configPath().slice(0, 54).padEnd(54)}│\n` +
       `╰─────────────────────────────────────────────────────────────────────╯\n\n`

@@ -32,6 +32,62 @@ export function formatTodos(todos: TodoItem[]): string {
   return `Todos (${completed}/${todos.length} completed, ${inProgress} in progress, ${pending} pending):\n${lines.join('\n')}`;
 }
 
+export const TOOL_NAME_ALIASES: Record<string, string> = {
+  read: 'read_file',
+  glob: 'list_files',
+  ls: 'list_files',
+  grep: 'search',
+  edit: 'edit_file',
+  write: 'write_file',
+};
+
+export function normalizeToolName(name: string, hasExact?: (n: string) => boolean): string {
+  const clean = name.trim();
+  if (hasExact?.(clean)) return clean;
+  return TOOL_NAME_ALIASES[clean] ?? clean;
+}
+
+export function normalizeToolInput(toolName: string, input: unknown): unknown {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return input;
+  const obj = { ...(input as Record<string, unknown>) };
+  if (['read_file', 'write_file', 'edit_file', 'list_files', 'search'].includes(toolName)) {
+    if (obj.path === undefined) {
+      const aliasPath = obj.filePath ?? obj.file_path ?? obj.directory;
+      if (aliasPath !== undefined) obj.path = aliasPath;
+    }
+    delete obj.filePath;
+    delete obj.file_path;
+    delete obj.directory;
+  }
+  if (toolName === 'search') {
+    if (obj.query === undefined && obj.pattern !== undefined) {
+      obj.query = obj.pattern;
+    }
+    delete obj.pattern;
+  }
+  if (toolName === 'edit_file') {
+    if (obj.oldText === undefined) {
+      const aliasOld = obj.old_string ?? obj.old_str;
+      if (aliasOld !== undefined) obj.oldText = aliasOld;
+    }
+    if (obj.newText === undefined) {
+      const aliasNew = obj.new_string ?? obj.new_str;
+      if (aliasNew !== undefined) obj.newText = aliasNew;
+    }
+    delete obj.old_string;
+    delete obj.old_str;
+    delete obj.new_string;
+    delete obj.new_str;
+  }
+  if (toolName === 'bash') {
+    if (obj.command === undefined && obj.cmd !== undefined) {
+      obj.command = obj.cmd;
+    }
+    delete obj.cmd;
+  }
+  return obj;
+}
+
 export class ToolRegistry {
   readonly files: WorkspaceFiles;
   budget?: RunBudget;
@@ -148,6 +204,9 @@ export class ToolRegistry {
     this.definitions.set(name, definition);
     return () => this.definitions.delete(name);
   }
+  resolveToolName(name: string): string {
+    return normalizeToolName(name, n => this.definitions.has(n));
+  }
   schemas(): ToolSet {
     return Object.fromEntries([...this.definitions].filter(([name, d]) => {
       if (name === 'exit_plan_mode' && !this.planMode) return false;
@@ -156,15 +215,20 @@ export class ToolRegistry {
     }).map(([name, d]) => [name, tool({ description: d.description, inputSchema: d.schema })]));
   }
   isReadOnly(name: string) {
-    if (name === 'exit_plan_mode' || name === 'todo_write') return false; // serialize state transitions
-    return this.definitions.get(name)?.readOnly === true;
+    const canonical = this.resolveToolName(name);
+    if (canonical === 'exit_plan_mode' || canonical === 'todo_write') return false; // serialize state transitions
+    return this.definitions.get(canonical)?.readOnly === true;
   }
   async execute(call: ToolCall, signal: AbortSignal): Promise<{ text: string; denied?: boolean }> {
     signal.throwIfAborted();
-    const definition = this.definitions.get(call.toolName);
-    if (!definition || (this.effectiveReadOnly && !definition.readOnly)) throw new Error(`Tool is not available in ${this.planMode ? 'plan' : 'read-only'} mode: ${call.toolName}`);
-    const input = definition.parse(call.input);
-    if (!definition.readOnly && !await this.approve({ tool: call.toolName, input, signal })) {
+    const canonicalName = this.resolveToolName(call.toolName);
+    const definition = this.definitions.get(canonicalName);
+    if (!definition || (this.effectiveReadOnly && !definition.readOnly)) {
+      throw new Error(`Tool is not available in ${this.planMode ? 'plan' : 'read-only'} mode: ${call.toolName}`);
+    }
+    const normalizedInput = normalizeToolInput(canonicalName, call.input);
+    const input = definition.parse(normalizedInput);
+    if (!definition.readOnly && !await this.approve({ tool: canonicalName, input, signal })) {
       return { text: 'Permission denied by the user. Stop this run.', denied: true };
     }
     signal.throwIfAborted();
@@ -175,4 +239,5 @@ export class ToolRegistry {
     }
   }
 }
+
 

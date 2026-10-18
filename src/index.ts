@@ -1,12 +1,12 @@
 export { Harness } from './harness.js';
-export type { HarnessEvent, RevertResult } from './harness.js';
-export { ToolRegistry, formatTodos } from './tools.js';
+export type { HarnessEvent, RevertResult, ToolEventMeta } from './harness.js';
+export { ToolRegistry, formatTodos, normalizeToolName, normalizeToolInput, TOOL_NAME_ALIASES } from './tools.js';
 export type { ToolDefinition, ToolCall, Approve, Approval, RunBudget } from './tools.js';
 export { SessionStore, repairInterrupted, fileBackupSchema, turnCheckpointSchema, todoItemSchema } from './session.js';
 export type { Session, SessionSummary, FileBackup, TurnCheckpoint, TodoItem } from './session.js';
-export { createModel, buildProviderOptions, discoverModels } from './provider.js';
+export { createModel, buildProviderOptions, discoverModels, KNOWN_GATEWAY_MODELS, resolveModelCapabilities, formatModelBadge } from './provider.js';
 export type { DiscoveredModel, ProviderOptionsMap } from './provider.js';
-export { loadConfig, resolveRuntime, resolveApiKey, saveCredential, credentialsPath, EFFORT_LEVELS } from './config.js';
+export { loadConfig, resolveRuntime, resolveApiKey, saveCredential, credentialsPath, EFFORT_LEVELS, DEFAULT_GATEWAY_URL, normalizeGatewayUrl } from './config.js';
 export type { Config, RuntimeConfig, EffortLevel } from './config.js';
 export { runSetupWizard, PROVIDER_PRESETS, EFFORT_DESCRIPTIONS, parseEffortInput } from './setup.js';
 export type { ProviderPreset, SetupIO } from './setup.js';
@@ -19,6 +19,6 @@ export { Subagents } from './subagents.js';
 export type { SubagentEvent, SubagentProgress } from './subagents.js';
 export { AnswerProjection, visibleAnswer, lastAssistantAnswer } from './reasoning.js';
 export type { AnswerPart, InlineReasoning } from './reasoning.js';
-export { TerminalUI, SLASH_COMMANDS } from './tui.js';
+export { TerminalUI, SLASH_COMMANDS, formatInlineMarkdown } from './tui.js';
 
 

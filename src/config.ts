@@ -14,9 +14,9 @@ export const configSchema = z.object({
   effort: z.enum(EFFORT_LEVELS).optional(),
   keyEnv: z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/).default('GOON_API_KEY'),
   contextWindow: z.number().int().min(8192).max(2_000_000).default(128_000),
-  maxOutputTokens: z.number().int().min(128).max(128_000).default(8192),
+  maxOutputTokens: z.number().int().min(128).max(131_072).default(16_384),
   timeoutMs: z.number().int().min(1000).max(1_800_000).default(300_000),
-  runTokenBudget: z.number().int().min(0).default(100_000),
+  runTokenBudget: z.number().int().min(0).default(1_000_000),
   inlineReasoning: z.enum(['leading-think', 'off']).default('leading-think'),
   showReasoning: z.boolean().default(false),
 }).strict();
@@ -55,6 +55,25 @@ export async function resolveApiKey(config: Config): Promise<string | undefined>
   return fromStore || undefined;
 }
 
+export const DEFAULT_GATEWAY_URL = 'https://api.yuristore.xyz/v1';
+
+export function normalizeGatewayUrl(rawUrl: string): string {
+  const trimmed = rawUrl.trim().replace(/\/+$/, '');
+  try {
+    const parsed = new URL(trimmed);
+    const isKnownGatewayRoot =
+      parsed.hostname === 'api.yuristore.xyz' ||
+      parsed.host === '127.0.0.1:8000' ||
+      parsed.host === 'localhost:8000';
+    if ((parsed.pathname === '/' || parsed.pathname === '') && isKnownGatewayRoot) {
+      return `${trimmed}/v1`;
+    }
+  } catch {
+    // Keep original if URL parsing fails; loadConfig validates URL format
+  }
+  return trimmed;
+}
+
 export async function loadConfig(overrides: Record<string, unknown> = {}): Promise<Config> {
   let stored: unknown = {};
   try { stored = JSON.parse(await readFile(configPath(), 'utf8')); }
@@ -70,13 +89,22 @@ export async function loadConfig(overrides: Record<string, unknown> = {}): Promi
     if (process.env[name] !== undefined) env[key] = ['contextWindow', 'maxOutputTokens', 'timeoutMs', 'runTokenBudget'].includes(key)
       ? Number(process.env[name]) : process.env[name];
   }
-  const config = configSchema.parse({ ...validated, ...env, ...overrides });
+  const merged = { ...validated, ...env, ...overrides };
+  const explicitMaxOut =
+    (stored && typeof stored === 'object' && 'maxOutputTokens' in stored) ||
+    env.maxOutputTokens !== undefined ||
+    overrides.maxOutputTokens !== undefined;
+  if (!explicitMaxOut && typeof merged.contextWindow === 'number' && merged.contextWindow > 0 && merged.maxOutputTokens >= merged.contextWindow / 2) {
+    merged.maxOutputTokens = Math.max(128, Math.floor(merged.contextWindow / 4));
+  }
+  const config = configSchema.parse(merged);
   if (config.maxOutputTokens >= config.contextWindow / 2) throw new Error('maxOutputTokens must be less than half contextWindow.');
   if (config.baseUrl) {
     const url = new URL(config.baseUrl);
     if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
       throw new Error('baseUrl must be HTTP(S), without credentials, query or fragment.');
     }
+    config.baseUrl = normalizeGatewayUrl(config.baseUrl);
   }
   return config;
 }
@@ -85,7 +113,7 @@ export async function resolveRuntime(config: Config, cwd: string): Promise<Runti
   if (!config.model) throw new Error('Missing model. Run "goon setup" or "goon init --model MODEL --base-url URL".');
   const apiKey = await resolveApiKey(config);
   if (!apiKey) throw new Error(`Missing ${config.keyEnv}. Run "goon setup" or set ${config.keyEnv} in your shell.`);
-  const baseUrl = config.baseUrl ?? (config.provider === 'anthropic' ? 'https://api.anthropic.com/v1' : 'https://api.openai.com/v1');
+  const baseUrl = config.baseUrl ? normalizeGatewayUrl(config.baseUrl) : DEFAULT_GATEWAY_URL;
   return { ...config, model: config.model, baseUrl, apiKey, cwd: await realpath(resolve(cwd)), dataDir: dataDir() };
 }
 
