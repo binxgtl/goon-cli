@@ -221,7 +221,8 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       config = await runSetupWizard(config);
     }
     const interactive = !prompt;
-    let viewMode: 'normal' | 'verbose' = config.showReasoning ? 'verbose' : 'normal';
+    let viewMode: 'normal' | 'verbose' | 'transcript' =
+      config.viewMode ?? (config.showReasoning ? 'verbose' : 'normal');
     if (interactive && !jsonOutput) {
       config.showReasoning = true;
     }
@@ -244,8 +245,14 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     let manager: McpManager | undefined;
     let controller: AbortController | undefined;
     let denied = false, exiting = false, terminating = false, starting = true;
-    let mode: PermissionMode = values['read-only'] ? 'readonly' : values.plan ? 'plan' : values.yes ? 'auto' : 'ask';
-    let prePlanMode: PermissionMode = values.yes ? 'auto' : 'ask';
+    let mode: PermissionMode = values['read-only']
+      ? 'readonly'
+      : values.plan
+        ? 'plan'
+        : values.yes
+          ? 'auto'
+          : (config.approvalMode ?? 'ask');
+    let prePlanMode: PermissionMode = values.yes || config.approvalMode === 'auto' ? 'auto' : 'ask';
 
     const sessionAllowedTools = new Set<string>();
     const stop = () => {
@@ -310,7 +317,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
 
       const buildHarness = async (currentMode: PermissionMode) => {
         const reg = new ToolRegistry(runtime.cwd, async request => {
-          if (currentMode === 'auto' || sessionAllowedTools.has(request.tool)) return true;
+          if (mode === 'auto' || currentMode === 'auto' || sessionAllowedTools.has(request.tool)) return true;
           if (!rl && !tui) return false;
           if (request.tool === 'exit_plan_mode' && request.input && typeof request.input === 'object' && 'plan' in request.input) {
             const planStr = String((request.input as { plan: unknown }).plan);
@@ -363,18 +370,26 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         return { tools: reg, harness: new Harness(runtime, store, reg, emit) };
       };
 
+      const applyPermissionMode = (nextMode: PermissionMode) => {
+        if (nextMode === 'plan' && mode !== 'plan') prePlanMode = mode;
+        mode = nextMode;
+        tools.readOnly = mode === 'readonly';
+        tools.planMode = mode === 'plan';
+        tui?.setMode(mode);
+        config.approvalMode = mode;
+        void saveConfig(config).catch(() => {});
+        const label = mode === 'auto' ? 'auto-approve (all tools & commands auto-approved)' : mode;
+        if (tui) tui.setNotice(`Mode: ${label}`);
+        display(`\n[Mode switched to: ${label}]\n`);
+      };
+
       let { tools, harness } = await buildHarness(mode);
       if (tui) {
         void tools.files.listWorkspaceFiles().then(files => tui?.setWorkspaceFiles(files)).catch(() => {});
         tui.onToggleMode = () => {
-          const order: PermissionMode[] = ['ask', 'plan', 'auto', 'readonly'];
+          const order: PermissionMode[] = ['ask', 'auto', 'plan', 'readonly'];
           const next = order[(order.indexOf(mode) + 1) % order.length];
-          if (next === 'plan' && mode !== 'plan') prePlanMode = mode;
-          mode = next;
-          tools.readOnly = mode === 'readonly';
-          tools.planMode = mode === 'plan';
-          tui?.setMode(mode);
-          display(`\n[Mode switched to: ${mode}]\n`);
+          applyPermissionMode(next);
         };
         tui.onCycleEffort = direction => {
           const ring: (EffortLevel | undefined)[] = [undefined, ...EFFORT_LEVELS];
@@ -489,6 +504,333 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
           if (tui) void tools.files.listWorkspaceFiles().then(files => tui?.setWorkspaceFiles(files)).catch(() => {});
         }
       };
+
+      const executeImmediateCommand = async (rawCmd: string): Promise<boolean> => {
+        const cmdInput = rawCmd.trim();
+        if (!cmdInput) return true;
+        if (['/exit', '/quit'].includes(cmdInput)) {
+          exiting = true;
+          controller?.abort(new Error('Exited by user.'));
+          rl?.close();
+          tui?.close();
+          return true;
+        }
+        if (cmdInput === '/clear') {
+          tui?.clear();
+          display(welcomeBanner(runtime.model, runtime.provider, runtime.baseUrl, runtime.effort, runtime.cwd, store.session.id, mode));
+          return true;
+        }
+        if (cmdInput === '/help') {
+          display(
+            '\nCommands (can also run while agent is working):\n' +
+            '  /auto [on|off], /yolo             Toggle Auto-Approve mode (or press Shift+Tab)\n' +
+            '  /transcript [on|off]              Toggle Codex full-screen Transcript mode (or press Ctrl+T)\n' +
+            '  /view [normal|verbose|transcript] Switch view: normal (hide thinking) | verbose | transcript\n' +
+            '  /mode [ask|auto|plan|readonly]    Switch approval mode (or press Shift+Tab)\n' +
+            '  /setup, /config                   Interactive provider, URL, key, model & effort setup\n' +
+            '  /model [id] [--effort=<level>]    Discover/pick model from /models or set model ID\n' +
+            '  /effort [low|medium|high|xhigh|max|default] Switch reasoning effort (or Alt+./Alt+,)\n' +
+            '  /plan [off|execute|<prompt>]      Enter/exit Plan Mode or execute approved plan\n' +
+            '  /revert, /undo [code|msg|both] [N] Rewind last N turns & restore prompt to composer (or press Esc Esc)\n' +
+            '  /checkpoints                      Interactive picker to rewind to any earlier turn checkpoint\n' +
+            '  /todo [clear]                     View or clear the current task checklist\n' +
+            '  /resume [latest|<number>|<id>]    Interactive session picker or hot-swap to saved session\n' +
+            '  /new [title]                      Start a fresh session in this workspace\n' +
+            '  /compact [focus instructions]     Summarize & archive earlier context history\n' +
+            '  /diff                             Show git status and unified diff in workspace\n' +
+            '  /review [instructions]            Run an agentic code review on current changes\n' +
+            '  /fork [title]                     Clone current session into a new forked session ID\n' +
+            '  /rename <title>                   Set a title for the current session\n' +
+            '  /export [filename.md]             Export session transcript to a Markdown file\n' +
+            '  /init                             Generate or update AGENTS.md for this project\n' +
+            '  /status                           Show session, model, effort & context window stats\n' +
+            '  /tools                            List active tools in current mode\n' +
+            '  /sessions                         List saved workspace sessions\n' +
+            '  /doctor                           Check environment health\n' +
+            '  /clear                            Clear screen (or press Ctrl+L)\n' +
+            '  /exit                             Exit goon (or press Ctrl+D on empty input)\n' +
+            '  !<command>                        Execute shell command directly & record in context\n' +
+            '  @<filepath>                       Attach workspace file directly in prompt (Tab completes)\n'
+          );
+          return true;
+        }
+        if (cmdInput === '/auto' || cmdInput.startsWith('/auto ') || cmdInput === '/yolo') {
+          const arg = cmdInput === '/yolo' ? 'on' : cmdInput.slice(5).trim().toLowerCase();
+          let next: PermissionMode;
+          if (!arg || arg === 'toggle') {
+            next = mode === 'auto' ? 'ask' : 'auto';
+          } else if (arg === 'on' || arg === 'true' || arg === '1' || arg === 'yes') {
+            next = 'auto';
+          } else if (arg === 'off' || arg === 'false' || arg === '0' || arg === 'ask') {
+            next = 'ask';
+          } else {
+            display('Usage: /auto [on | off] (or /yolo)\n');
+            return true;
+          }
+          applyPermissionMode(next);
+          return true;
+        }
+        if (cmdInput === '/mode' || cmdInput.startsWith('/mode ')) {
+          const arg = cmdInput.slice(5).trim().toLowerCase();
+          let next: PermissionMode;
+          if (!arg) {
+            const order: PermissionMode[] = ['ask', 'auto', 'plan', 'readonly'];
+            next = order[(order.indexOf(mode) + 1) % order.length];
+          } else if (
+            arg === 'ask' ||
+            arg === 'plan' ||
+            arg === 'auto' ||
+            arg === 'auto-approve' ||
+            arg === 'yolo' ||
+            arg === 'readonly' ||
+            arg === 'read-only'
+          ) {
+            next =
+              arg === 'read-only'
+                ? 'readonly'
+                : arg === 'auto-approve' || arg === 'yolo'
+                  ? 'auto'
+                  : arg;
+          } else {
+            display('Usage: /mode [ask | auto | plan | readonly]\n');
+            return true;
+          }
+          applyPermissionMode(next);
+          return true;
+        }
+        if (cmdInput === '/transcript' || cmdInput.startsWith('/transcript ')) {
+          const arg = cmdInput.slice(11).trim().toLowerCase();
+          if (tui) {
+            const nextOverlay =
+              arg === 'on' || arg === 'true'
+                ? true
+                : arg === 'off' || arg === 'false'
+                  ? false
+                  : !tui.isTranscriptOverlay();
+            tui.setTranscriptOverlay(nextOverlay);
+            if (nextOverlay) {
+              viewMode = 'transcript';
+              tui.setViewMode('transcript');
+            }
+          } else {
+            viewMode = viewMode === 'transcript' ? 'normal' : 'transcript';
+            display(`Transcript mode: ${viewMode === 'transcript' ? 'ON' : 'OFF'}\n`);
+          }
+          return true;
+        }
+        if (cmdInput === '/view' || cmdInput.startsWith('/view ')) {
+          const arg = cmdInput.slice(5).trim().toLowerCase();
+          if (!arg) {
+            const order: Array<'normal' | 'verbose' | 'transcript'> = ['normal', 'verbose', 'transcript'];
+            viewMode = order[(order.indexOf(viewMode) + 1) % order.length];
+          } else if (arg === 'normal' || arg === 'compact' || arg === 'default' || arg === 'hide') {
+            viewMode = 'normal';
+          } else if (arg === 'verbose' || arg === 'all' || arg === 'full' || arg === 'show') {
+            viewMode = 'verbose';
+          } else if (arg === 'transcript' || arg === 'tx') {
+            viewMode = 'transcript';
+          } else {
+            display('Usage: /view [normal | verbose | transcript] (or press Ctrl+T for full-screen transcript)\n');
+            return true;
+          }
+          config.viewMode = viewMode;
+          config.showReasoning = viewMode !== 'normal';
+          await saveConfig(config);
+          tui?.setViewMode(viewMode);
+          if (tui && arg === 'transcript') {
+            tui.setTranscriptOverlay(true);
+          } else if (tui && (arg === 'normal' || arg === 'verbose')) {
+            tui.setTranscriptOverlay(false);
+          }
+          const desc =
+            viewMode === 'transcript'
+              ? 'transcript (show thinking, uncollapsed tool calls, full outputs & diffs · Ctrl+T full-screen)'
+              : viewMode === 'verbose'
+                ? 'verbose (show thinking & extended details)'
+                : 'normal (hide thinking blocks)';
+          if (tui) tui.setNotice(`View mode: ${desc}`);
+          else display(`View mode set to: ${desc}\n`);
+          return true;
+        }
+        if (cmdInput.startsWith('/effort ')) {
+          const arg = cmdInput.slice(7).trim();
+          const clean = arg.toLowerCase();
+          const isClear = ['default', 'off', 'none', '0', '1'].includes(clean);
+          const parsed = parseEffortInput(arg, undefined);
+          if (!isClear && !parsed) {
+            display(`Invalid effort "${arg}". Choose from: low, medium, high, xhigh, max, default.\n`);
+            return true;
+          }
+          config = await loadConfig({ ...config, effort: isClear ? undefined : parsed });
+          await saveConfig(config);
+          runtime = await resolveRuntime(config, runtime.cwd);
+          tui?.setEffort(runtime.effort);
+          display(`Reasoning effort set to: ${runtime.effort ?? 'default'}\n`);
+          return true;
+        }
+        if (cmdInput === '/todo' || cmdInput.startsWith('/todo ')) {
+          const arg = cmdInput.slice(5).trim().toLowerCase();
+          if (arg === 'clear' || arg === 'reset') {
+            tools.todos = [];
+            store.session.todos = [];
+            await store.save();
+            tui?.event({ type: 'todo', todos: [] });
+            display('Cleared todo checklist.\n');
+          } else {
+            display(`\n${formatTodos(tools.todos)}\n`);
+          }
+          return true;
+        }
+        if (cmdInput === '/diff') {
+          const { runCommand } = await import('./process.js');
+          try {
+            const [statusRes, diffRes] = await Promise.all([
+              runCommand('git', ['status', '--short'], { cwd: runtime.cwd, signal: AbortSignal.timeout(10_000), timeoutMs: 10_000 }),
+              runCommand('git', ['diff', '--no-ext-diff'], { cwd: runtime.cwd, signal: AbortSignal.timeout(10_000), timeoutMs: 10_000 }),
+            ]);
+            const statusOut = statusRes.output.trim();
+            const diffOut = diffRes.output.trim();
+            if (!statusOut && !diffOut) {
+              display('Working tree is clean (no uncommitted changes).\n');
+            } else {
+              if (statusOut) display(`\nGit Status:\n${statusOut}\n`);
+              if (diffOut) display(`\n${diffOut.slice(0, 16_000)}\n`);
+            }
+          } catch (error) {
+            display(`Failed to run git diff: ${safeError(error, apiKey)}\n`);
+          }
+          return true;
+        }
+        if (cmdInput === '/tools') {
+          const names = Object.keys(tools.schemas());
+          display(names.map(n => `  ${tools.isReadOnly(n) ? '● [read]' : '◆ [exec]'} ${n}`).join('\n') + '\n');
+          return true;
+        }
+        if (cmdInput === '/sessions') {
+          const list = await SessionStore.list(join(runtime.dataDir, 'sessions'));
+          display((list.length ? list.map(s => {
+            const cur = s.id === store.session.id ? ' [current]' : '';
+            const label = s.title ? ` [${s.title}]` : s.preview ? ` "${s.preview}"` : '';
+            return `  ${s.id.slice(0, 8)}${cur}  (${s.messagesCount ?? 0} msgs)  ${s.updatedAt}  ${s.model}${label}  ${s.cwd}`;
+          }).join('\n') : '  No saved sessions.') + '\n');
+          return true;
+        }
+        if (cmdInput === '/doctor') {
+          const { runCommand } = await import('./process.js');
+          const ok = async (cmd: string) => {
+            try { return (await runCommand(cmd, ['--version'], { cwd: runtime.cwd, signal: AbortSignal.timeout(5000), timeoutMs: 5000 })).code === 0; }
+            catch { return false; }
+          };
+          const [b, r, discovered] = await Promise.all([
+            ok('bash'),
+            ok('rg'),
+            discoverModels(runtime.baseUrl, runtime.apiKey, runtime.provider),
+          ]);
+          const modelInList = discovered.some((m) => m.id === runtime.model);
+          const gatewayStatus = discovered.length > 0
+            ? `OK (${discovered.length} models: ${discovered.map((m) => m.id).join(', ')} · active model ${modelInList ? 'verified' : 'NOT listed'})`
+            : 'Unreachable or no /models response';
+          display(
+            `Provider: ${runtime.provider} | Model: ${runtime.model} | Effort: ${runtime.effort ?? 'default'} | BaseURL: ${runtime.baseUrl}\n` +
+            `Bash: ${b ? 'OK' : 'Missing'} | Ripgrep: ${r ? 'OK' : 'JS fallback'} | API Key: Configured\n` +
+            `Gateway (/models): ${gatewayStatus}\n`,
+          );
+          return true;
+        }
+        if (cmdInput === '/status') {
+          const { estimatedTokens } = await import('./context.js');
+          const usedEst = estimatedTokens(store.session.messages, '');
+          const pct = Math.min(100, Math.round((usedEst / runtime.contextWindow) * 100));
+          display(
+            `Session        ${store.session.id}${store.session.title ? ` (${store.session.title})` : ''}\n` +
+            `Provider       ${runtime.provider} (${runtime.baseUrl})\n` +
+            `Model          ${runtime.model}\n` +
+            `Effort         ${runtime.effort ?? 'default'}\n` +
+            `Mode           ${mode === 'auto' ? 'auto-approve' : mode}\n` +
+            `View           ${viewMode}\n` +
+            `Workspace      ${runtime.cwd}\n` +
+            `Checkpoints    ${store.session.checkpoints?.length ?? 0} turn(s)\n` +
+            `Context usage  ~${usedEst} / ${runtime.contextWindow} tokens (${pct}%)\n` +
+            `Compactions    ${store.session.compactions}\n` +
+            `Session tokens ${store.session.tokens}\n` +
+            `MCP tools      ${manager?.tools.length ?? 0}\n`
+          );
+          return true;
+        }
+        if (cmdInput.startsWith('/rename ')) {
+          const newTitle = cmdInput.slice(8).trim();
+          if (newTitle) {
+            store.session.title = newTitle;
+            await store.save();
+            tui?.setTitle(`${runtime.model} · ${newTitle}`);
+            display(`Session renamed to: ${newTitle}\n`);
+          }
+          return true;
+        }
+        if (cmdInput === '/export' || cmdInput.startsWith('/export ')) {
+          const { writeFile } = await import('node:fs/promises');
+          const outName = cmdInput.slice(7).trim() || `goon-session-${store.session.id.slice(0, 8)}.md`;
+          const targetFile = await tools.files.path(outName);
+          const lines: string[] = [
+            `# Goon Session ${store.session.title ?? store.session.id}`,
+            `- **Model**: ${runtime.model} (${runtime.provider})`,
+            `- **Updated**: ${store.session.updatedAt}`,
+            '',
+          ];
+          for (const m of store.session.messages) {
+            lines.push(`## ${m.role.toUpperCase()}`);
+            lines.push(typeof m.content === 'string' ? m.content : JSON.stringify(m.content, null, 2));
+            lines.push('');
+          }
+          await writeFile(targetFile, lines.join('\n'), 'utf8');
+          display(`Exported session transcript to ${outName}\n`);
+          return true;
+        }
+        if (cmdInput === '/fork' || cmdInput.startsWith('/fork ')) {
+          const title = cmdInput.slice(5).trim() || undefined;
+          const forkedId = await store.forkToNewFile(title);
+          display(`Forked current session (${store.session.messages.length} messages) -> new session ID: ${forkedId}\nSwitch to it now with: /resume ${forkedId.slice(0, 8)} (or goon --resume ${forkedId.slice(0, 8)})\n`);
+          return true;
+        }
+        if (cmdInput.startsWith('!')) {
+          const { sanitizeBashCommand } = await import('./tools.js');
+          const rawShell = cmdInput.slice(1).trim();
+          if (!rawShell) {
+            display('Usage: !<command> (runs a shell command directly in workspace and records output in session context)\n');
+            return true;
+          }
+          const cmd = sanitizeBashCommand(rawShell);
+          const { runCommand } = await import('./process.js');
+          display(`\n$ ${cmd}\n`);
+          try {
+            const res = await runCommand('bash', ['-c', cmd], { cwd: runtime.cwd, signal: AbortSignal.timeout(60_000), timeoutMs: 60_000 });
+            display(`${res.output || '(no output)'}\n[Exit code: ${res.code}]\n`);
+            store.session.messages.push({
+              role: 'user',
+              content: `<user_shell_command>\n<command>${cmd}</command>\n<result>\nExit code: ${res.code}\n${res.output.slice(0, 8000)}\n</result>\n</user_shell_command>`,
+            });
+            await store.save();
+          } catch (error) {
+            display(`Shell command failed: ${safeError(error, apiKey)}\n`);
+          }
+          return true;
+        }
+        return false;
+      };
+
+      if (tui) {
+        tui.onImmediateCommand = async cmd => {
+          const handled = await executeImmediateCommand(cmd);
+          if (!handled) {
+            // Command requires interactive prompts or turn completion (e.g. /revert, /model picker, /resume picker)
+            if (cmd.startsWith('/revert') || cmd.startsWith('/undo') || cmd === '/checkpoints') {
+              controller?.abort(new Error('Interrupted for revert.'));
+            }
+            tui?.setNotice(`Queued command "${cmd}" to run as soon as current step finishes.`);
+          }
+        };
+      }
+
       if (prompt) await run(prompt);
       else {
         if (!rl && !tui) throw new Error('Interactive mode requires a TTY.');
@@ -505,42 +847,8 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             catch { break; }
           }
           if (!input) continue;
-          if (['/exit', '/quit'].includes(input)) break;
-          if (input === '/clear') {
-            tui?.clear();
-            display(welcomeBanner(runtime.model, runtime.provider, runtime.baseUrl, runtime.effort, runtime.cwd, store.session.id, mode));
-            continue;
-          }
-          if (input === '/help') {
-            display(
-              '\nCommands:\n' +
-              '  /setup, /config                   Interactive provider, URL, key, model & effort setup\n' +
-              '  /model [id] [--effort=<level>]    Discover/pick model from /models or set model ID\n' +
-              '  /effort [low|medium|high|xhigh|max|default] Switch reasoning effort (or Alt+./Alt+,)\n' +
-              '  /mode [ask|plan|auto|readonly]    Switch mode (or press Shift+Tab)\n' +
-              '  /view [normal|verbose]            Switch view mode: normal (hide thinking) | verbose (show all)\n' +
-              '  /plan [off|execute|<prompt>]      Enter/exit Plan Mode or execute approved plan\n' +
-              '  /revert, /undo [code|msg|both] [N] Rewind last N turns & restore prompt to composer (or press Esc Esc)\n' +
-              '  /checkpoints                      Interactive picker to rewind to any earlier turn checkpoint\n' +
-              '  /todo [clear]                     View or clear the current task checklist\n' +
-              '  /resume [latest|<number>|<id>]    Interactive session picker or hot-swap to saved session\n' +
-              '  /new [title]                      Start a fresh session in this workspace\n' +
-              '  /compact [focus instructions]     Summarize & archive earlier context history\n' +
-              '  /diff                             Show git status and unified diff in workspace\n' +
-              '  /review [instructions]            Run an agentic code review on current changes\n' +
-              '  /fork [title]                     Clone current session into a new forked session ID\n' +
-              '  /rename <title>                   Set a title for the current session\n' +
-              '  /export [filename.md]             Export session transcript to a Markdown file\n' +
-              '  /init                             Generate or update AGENTS.md for this project\n' +
-              '  /status                           Show session, model, effort & context window stats\n' +
-              '  /tools                            List active tools in current mode\n' +
-              '  /sessions                         List saved workspace sessions\n' +
-              '  /doctor                           Check environment health\n' +
-              '  /clear                            Clear screen (or press Ctrl+L)\n' +
-              '  /exit                             Exit goon (or press Ctrl+D on empty input)\n' +
-              '  !<command>                        Execute shell command directly & record in context\n' +
-              '  @<filepath>                       Attach workspace file directly in prompt (Tab completes)\n'
-            );
+          if (await executeImmediateCommand(input)) {
+            if (exiting) break;
             continue;
           }
 
@@ -652,47 +960,6 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             tools = built.tools;
             harness = built.harness;
             display(`Reasoning effort set to: ${runtime.effort ?? 'default'}\n`);
-            continue;
-          }
-          if (input === '/mode' || input.startsWith('/mode ')) {
-            const arg = input.slice(5).trim().toLowerCase();
-            if (!arg) {
-              const order: PermissionMode[] = ['ask', 'plan', 'auto', 'readonly'];
-              const next = order[(order.indexOf(mode) + 1) % order.length];
-              if (next === 'plan' && mode !== 'plan') prePlanMode = mode;
-              mode = next;
-            } else if (arg === 'ask' || arg === 'plan' || arg === 'auto' || arg === 'readonly' || arg === 'read-only') {
-              const next: PermissionMode = arg === 'read-only' ? 'readonly' : arg;
-              if (next === 'plan' && mode !== 'plan') prePlanMode = mode;
-              mode = next;
-            } else {
-              display('Usage: /mode [ask | plan | auto | readonly]\n');
-              continue;
-            }
-            tools.readOnly = mode === 'readonly';
-            tools.planMode = mode === 'plan';
-            tui?.setMode(mode);
-            display(`Mode set to: ${mode}\n`);
-            continue;
-          }
-          if (input === '/view' || input.startsWith('/view ')) {
-            const arg = input.slice(5).trim().toLowerCase();
-            if (!arg) {
-              viewMode = viewMode === 'verbose' ? 'normal' : 'verbose';
-            } else if (arg === 'normal' || arg === 'compact' || arg === 'default' || arg === 'hide') {
-              viewMode = 'normal';
-            } else if (arg === 'verbose' || arg === 'all' || arg === 'full' || arg === 'show') {
-              viewMode = 'verbose';
-            } else {
-              display('Usage: /view [normal | verbose]\n');
-              continue;
-            }
-            config.showReasoning = viewMode === 'verbose';
-            await saveConfig(config);
-            tui?.setViewMode(viewMode);
-            const desc = viewMode === 'verbose' ? 'verbose (show thinking & all details)' : 'normal (hide thinking blocks)';
-            if (tui) tui.setNotice(`View mode: ${desc}`);
-            else display(`View mode set to: ${desc}\n`);
             continue;
           }
           if (input === '/plan' || input.startsWith('/plan ')) {

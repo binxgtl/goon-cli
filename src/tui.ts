@@ -8,7 +8,7 @@ import type { SubagentEvent } from './subagents.js';
 
 const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 export const SLASH_COMMANDS = [
-  '/help', '/setup', '/model', '/effort', '/mode', '/view', '/plan', '/revert', '/undo',
+  '/help', '/setup', '/model', '/effort', '/mode', '/auto', '/yolo', '/view', '/transcript', '/plan', '/revert', '/undo',
   '/checkpoints', '/todo', '/resume', '/new', '/compact', '/diff', '/review', '/fork', '/rename',
   '/export', '/init', '/status', '/tools', '/sessions', '/doctor', '/clear', '/exit',
 ];
@@ -17,9 +17,12 @@ const SLASH_DESCRIPTIONS: Record<string, string> = {
   '/help': 'show commands & shortcuts',
   '/model': 'switch model & auto-sync limits',
   '/effort': 'set reasoning effort (low..max)',
-  '/view': 'switch view mode: normal (hide thinking) | verbose (show all)',
+  '/auto': 'toggle auto-approve mode for writes & shell (or /mode auto)',
+  '/yolo': 'enable auto-approve mode for all tools',
+  '/view': 'switch view mode: normal | verbose | transcript',
+  '/transcript': 'toggle full transcript mode (or Ctrl+O)',
   '/plan': 'toggle read-only Plan Mode',
-  '/mode': 'cycle ask / plan / auto / readonly',
+  '/mode': 'cycle ask / auto / plan / readonly (or Shift+Tab)',
   '/revert': 'rewind turn(s) & restore prompt to composer (or Esc Esc)',
   '/undo': 'rewind last turn & restore prompt to composer (or Esc Esc)',
   '/checkpoints': 'pick a previous turn checkpoint to rewind to',
@@ -33,12 +36,14 @@ const SLASH_DESCRIPTIONS: Record<string, string> = {
   '/exit': 'quit goon cli',
 };
 
+// oxlint-disable-next-line no-control-regex
+const CONTROL_CHARS_RE = new RegExp('[\\u0000-\\u0008\\u000b-\\u001f\\u007f-\\u009f]', 'g');
+
 // Strip whole escape sequences before removing remaining control bytes, normalizing combining accents to NFC.
 export function terminalText(value: string): string {
-  // oxlint-disable-next-line eslint/no-control-regex
   return stripVTControlCharacters(value)
     .normalize('NFC')
-    .replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, '');
+    .replace(CONTROL_CHARS_RE, '');
 }
 
 const width = (c: string) =>
@@ -283,9 +288,12 @@ export class TerminalUI {
   private escPrimed?: 'backtrack' | 'clear';
   private escPrimeTimer?: NodeJS.Timeout;
   private statusNotice?: string;
-  private viewMode: 'normal' | 'verbose' = 'verbose';
+  private viewMode: 'normal' | 'verbose' | 'transcript' = 'verbose';
+  private inTranscriptOverlay = false;
   onToggleMode?: () => void;
   onCycleEffort?: (direction: 1 | -1) => void;
+  onToggleTranscript?: (active: boolean) => void;
+  onImmediateCommand?: (cmd: string) => void | Promise<void>;
 
   constructor(
     public title: string,
@@ -394,17 +402,38 @@ export class TerminalUI {
 
   setMode(mode: string) {
     this.modeLabel = terminalText(mode);
+    // If switched to 'auto' while waiting at a tool approval prompt, auto-approve it immediately!
+    if (mode === 'auto' && this.pending && !this.remember && this.label.includes('y/N')) {
+      const pending = this.pending;
+      this.pending = undefined;
+      pending.cleanup();
+      pending.resolve('a');
+    }
     this.schedule();
   }
 
-  setViewMode(mode: 'normal' | 'verbose') {
+  setViewMode(mode: 'normal' | 'verbose' | 'transcript') {
     this.viewMode = mode;
+    this.inTranscriptOverlay = mode === 'transcript';
     this.scroll = 0;
+    this.needsFullClear = true;
     this.schedule(0);
   }
 
-  getViewMode(): 'normal' | 'verbose' {
-    return this.viewMode;
+  getViewMode(): 'normal' | 'verbose' | 'transcript' {
+    return this.inTranscriptOverlay ? 'transcript' : this.viewMode;
+  }
+
+  setTranscriptOverlay(active: boolean) {
+    this.inTranscriptOverlay = active;
+    if (active) this.flushExploreGroup();
+    this.needsFullClear = true;
+    this.schedule(0);
+    this.onToggleTranscript?.(active);
+  }
+
+  isTranscriptOverlay(): boolean {
+    return this.inTranscriptOverlay;
   }
 
   setEffort(effort: string | undefined) {
@@ -572,22 +601,36 @@ export class TerminalUI {
 
   private recordCompletedToolCell(name: string, state: 'done' | 'error', meta: ToolEventMeta) {
     this.outputChannel = undefined;
-    if (state === 'done' && (meta.kind === 'read' || meta.kind === 'list' || meta.kind === 'search')) {
+    const isFullTranscript = this.viewMode === 'transcript' || this.inTranscriptOverlay;
+    if (
+      state === 'done' &&
+      !isFullTranscript &&
+      (meta.kind === 'read' || meta.kind === 'list' || meta.kind === 'search')
+    ) {
       this.exploreGroup.push({ kind: meta.kind, summary: meta.summary });
       if (this.exploreGroup.length >= 6) this.flushExploreGroup();
       return;
     }
     this.flushExploreGroup();
+    if (isFullTranscript && (meta.kind === 'read' || meta.kind === 'list' || meta.kind === 'search')) {
+      const verb = meta.kind === 'read' ? 'Read' : meta.kind === 'list' ? 'Listed' : 'Searched';
+      const dur = meta.durationMs !== undefined ? ` (${formatCompactDuration(meta.durationMs)})` : '';
+      this.appendTranscript(`\n• ${state === 'error' ? 'Failed' : verb} ${meta.summary}${dur}\n`);
+      return;
+    }
     if (meta.kind === 'exec') {
       const dur = meta.durationMs !== undefined ? ` (${formatCompactDuration(meta.durationMs)})` : '';
       const header = state === 'error' ? `• Failed ${meta.summary}${dur}` : `• Ran ${meta.summary}${dur}`;
       const previewLines: string[] = [];
       if (meta.outputPreview?.length) {
-        for (const [idx, line] of meta.outputPreview.entries()) {
+        const maxExecLines = isFullTranscript ? 80 : this.viewMode === 'verbose' ? 15 : 5;
+        const shown = meta.outputPreview.slice(0, maxExecLines);
+        for (const [idx, line] of shown.entries()) {
           previewLines.push(`  ${idx === 0 ? '└' : ' '} ${line}`);
         }
-        if (meta.omittedLines && meta.omittedLines > 0) {
-          previewLines.push(`    … +${meta.omittedLines} lines`);
+        const totalOmitted = (meta.omittedLines ?? 0) + Math.max(0, meta.outputPreview.length - shown.length);
+        if (totalOmitted > 0) {
+          previewLines.push(`    … +${totalOmitted} lines`);
         }
       } else {
         previewLines.push('  └ (no output)');
@@ -601,7 +644,8 @@ export class TerminalUI {
         meta.added !== undefined || meta.removed !== undefined
           ? ` (+${meta.added ?? 0} -${meta.removed ?? 0})`
           : '';
-      const diffLines = meta.diff ? formatCompactDiff(meta.diff, this.viewMode === 'verbose' ? 120 : 30) : [];
+      const maxDiffLines = isFullTranscript ? 500 : this.viewMode === 'verbose' ? 120 : 30;
+      const diffLines = meta.diff ? formatCompactDiff(meta.diff, maxDiffLines) : [];
       const diffBlock = diffLines.length ? `\n${diffLines.join('\n')}` : '';
       this.appendTranscript(`\n• ${verb} ${meta.summary}${stats}${diffBlock}\n`);
       return;
@@ -847,6 +891,33 @@ export class TerminalUI {
         this.cancel();
         return;
       }
+      // Codex Ctrl+T: toggle full-screen Transcript Mode at any time (idle or working)
+      if ((key.ctrl && key.name === 't') || key.sequence === '\x14') {
+        this.setTranscriptOverlay(!this.inTranscriptOverlay);
+        this.onToggleTranscript?.(this.inTranscriptOverlay);
+        return;
+      }
+      if (this.inTranscriptOverlay) {
+        if (key.name === 'escape' || (!key.ctrl && !key.meta && text === 'q' && this.input.length === 0)) {
+          this.setTranscriptOverlay(false);
+          this.onToggleTranscript?.(false);
+          return;
+        }
+        if (key.name === 'up' || key.name === 'down') {
+          this.scrollBy(key.name === 'up' ? 3 : -3);
+          return;
+        }
+        if (key.name === 'home' || (!key.ctrl && !key.meta && text === 'g' && this.input.length === 0)) {
+          this.scroll = this.maxScroll;
+          this.schedule(0);
+          return;
+        }
+        if (key.name === 'end' || (!key.ctrl && !key.meta && text === 'G' && this.input.length === 0)) {
+          this.scroll = 0;
+          this.schedule(0);
+          return;
+        }
+      }
       if (key.name === 'escape') {
         if (this.status === 'Running' || this.status === 'Compacting') {
           this.cancel();
@@ -1036,9 +1107,8 @@ export class TerminalUI {
         }
       }
       if (!this.pending) {
-        // Agent is currently busy -> queue this prompt into queuedPrompts!
-        if (value.trim()) {
-          this.queuedPrompts.push(value);
+        const trimmed = value.trim();
+        if (trimmed) {
           this.history.push(this.input.join(''));
           if (this.history.length > 100) this.history.shift();
           this.input = [];
@@ -1046,6 +1116,14 @@ export class TerminalUI {
           this.inputRestoredFromRevert = false;
           this.attachedImages.clear();
           this.nextImageIdx = 1;
+          // Execute slash commands (/auto, /mode, /view, /transcript, /status, etc.) and !<cmd> immediately even while working!
+          if ((trimmed.startsWith('/') || trimmed.startsWith('!')) && this.onImmediateCommand) {
+            this.schedule(0);
+            void this.onImmediateCommand(trimmed);
+            return;
+          }
+          // Otherwise queue user prompts for the next turn
+          this.queuedPrompts.push(value);
           this.schedule(0);
         }
         return;
@@ -1177,6 +1255,7 @@ export class TerminalUI {
     let currentBlock: 'normal' | 'answer' | 'reasoning' | 'code' | 'diff' = 'normal';
     let preCodeBlock: 'normal' | 'answer' = 'normal';
     let answerFirstLine = false;
+    const showReasoning = this.viewMode !== 'normal' || this.inTranscriptOverlay;
 
     const ensureBlankLine = () => {
       if (wrapped.length > 0 && wrapped[wrapped.length - 1].text.trim() !== '') {
@@ -1193,7 +1272,7 @@ export class TerminalUI {
       }
       if (rawLine.startsWith('[reasoning')) {
         currentBlock = 'reasoning';
-        if (this.viewMode === 'normal') continue;
+        if (!showReasoning) continue;
         ensureBlankLine();
         wrapped.push({ text: '• Thinking', block: 'reasoning' });
         continue;
@@ -1205,7 +1284,7 @@ export class TerminalUI {
         continue;
       }
       if (trimmed.startsWith('```')) {
-        if (currentBlock === 'reasoning' && this.viewMode === 'normal') continue;
+        if (currentBlock === 'reasoning' && !showReasoning) continue;
         const lang = trimmed.slice(3).trim();
         if (currentBlock === 'code') {
           currentBlock = preCodeBlock;
@@ -1228,7 +1307,9 @@ export class TerminalUI {
         rawLine.startsWith('Allow ')
       ) {
         if (
-          /^• (?:Explored|Exploring|Ran|Running|Failed|Edited|Added|Deleted|Allow |Resumed |Reverted )\b/.test(rawLine) ||
+          /^• (?:Explored|Exploring|Read|Listed|Searched|Ran|Running|Failed|Edited|Added|Deleted|Allow |Resumed |Reverted )\b/.test(
+            rawLine,
+          ) ||
           rawLine.startsWith('Allow ') ||
           rawLine.startsWith('[todo ') ||
           rawLine.startsWith('[Plan ') ||
@@ -1281,7 +1362,7 @@ export class TerminalUI {
       const lineBlock = currentBlock;
 
       if (lineBlock === 'reasoning') {
-        if (this.viewMode === 'normal') continue;
+        if (!showReasoning) continue;
         for (const chunk of wrapWithIndent(rawLine, safeCols, '  ', '  ')) {
           wrapped.push({ text: chunk, block: 'reasoning' });
         }
@@ -1351,8 +1432,8 @@ export class TerminalUI {
       if (line.startsWith('  ╭─') || line.startsWith('  ╰─')) return `\x1b[2;36m${line}\x1b[0m`;
       return `\x1b[38;2;180;210;255m${line}\x1b[0m`;
     }
-    // Codex Explored / Ran / Edited / Reverted cells
-    if (/^• (?:Explored|Exploring|Resumed|Reverted)\b/.test(line)) {
+    // Codex Explored / Read / Listed / Searched / Ran / Edited / Reverted cells
+    if (/^• (?:Explored|Exploring|Read|Listed|Searched|Resumed|Reverted)\b/.test(line)) {
       return `\x1b[2m•\x1b[0m \x1b[1m${line.slice(2)}\x1b[0m`;
     }
     if (/^• (?:Ran|Running)\b/.test(line)) {
@@ -1491,12 +1572,10 @@ export class TerminalUI {
     const titleParts = this.title.split(' · ');
     const modelName = titleParts[0] || this.title;
     const sessionLabel = titleParts.slice(1).join(' · ') || 'session';
-
-    // Top Codex Bar (without model name or effort, since those live in the bottom composer box)
-    const headerRaw = clip(`>_ goon · ${sessionLabel}${todoBadge}`);
-    const header = rich
-      ? `\x1b[1;38;2;99;168;248m>_\x1b[0m \x1b[1mgoon\x1b[0m\x1b[2m${headerRaw.slice(7)}\x1b[0m`
-      : clip(`goon · ${sessionLabel}`);
+    const elapsedStr = this.turnStartedAt ? `${formatCompactDuration(Date.now() - this.turnStartedAt)} • ` : '';
+    const liveActivity = this.reasoningHeader
+      ? `${this.reasoningHeader}${this.reasoningDetail ? ` — ${this.reasoningDetail}` : ''}`
+      : [...this.toolStates.values()].slice(-2).join(' | ');
 
     // Body lines with strict width bound & scroll-anchor lock when scrolled up
     const all = this.renderStyledBodyLines(safeCols, rich);
@@ -1504,6 +1583,38 @@ export class TerminalUI {
       this.scroll += all.length - this.lastBodyTotalLines;
     }
     this.lastBodyTotalLines = all.length;
+
+    // Codex Full-Screen Transcript Overlay Mode (Ctrl+T or /transcript)
+    if (this.inTranscriptOverlay) {
+      const txHeaderRaw = clip(`>_ goon · T R A N S C R I P T · ${sessionLabel}${todoBadge}`);
+      const txHeader = rich
+        ? `\x1b[1;38;2;99;168;248m>_\x1b[0m \x1b[1mgoon\x1b[0m · \x1b[1;35mT R A N S C R I P T\x1b[0m\x1b[2m · ${clip(`${sessionLabel}${todoBadge}`)}\x1b[0m`
+        : txHeaderRaw;
+      const height = Math.max(2, rows - 2);
+      this.maxScroll = Math.max(0, all.length - height);
+      this.scroll = Math.min(this.scroll, this.maxScroll);
+      const end = all.length - this.scroll;
+      const body = all.slice(Math.max(0, end - height), end);
+      while (body.length < height) body.push('');
+
+      const livePart = busy ? `${indicator} ${liveActivity || 'Working'} · ` : '';
+      const linePos = `Line ${Math.max(1, end)}/${Math.max(1, all.length)}`;
+      const txFooterRaw = clip(
+        ` T R A N S C R I P T  │  ${livePart}${linePos}  │  ↑↓/PgUp/PgDn/Wheel scroll · Home/End · Ctrl+T or Esc to return `,
+      );
+      const txFooter = rich
+        ? padRightAnsi(`\x1b[1;97m${txFooterRaw}`, safeCols, '\x1b[48;5;236m')
+        : txFooterRaw;
+      const screenLines = [txHeader, ...body, txFooter];
+      this.flushScreenLines(screenLines, columns, rows, '');
+      return;
+    }
+
+    // Top Codex Bar (without model name or effort, since those live in the bottom composer box)
+    const headerRaw = clip(`>_ goon · ${sessionLabel}${todoBadge}`);
+    const header = rich
+      ? `\x1b[1;38;2;99;168;248m>_\x1b[0m \x1b[1mgoon\x1b[0m\x1b[2m${headerRaw.slice(7)}\x1b[0m`
+      : clip(`goon · ${sessionLabel}`);
 
     const chromeRows = rich ? 7 : 4;
     const height = Math.max(2, rows - chromeRows);
@@ -1514,14 +1625,9 @@ export class TerminalUI {
     while (body.length < height) body.push('');
 
     // Codex Live Status Indicator / Slash Command / Attached Images / Scroll Indicator Bar
-    const elapsedStr = this.turnStartedAt ? `${formatCompactDuration(Date.now() - this.turnStartedAt)} • ` : '';
-    const liveActivity = this.reasoningHeader
-      ? `${this.reasoningHeader}${this.reasoningDetail ? ` — ${this.reasoningDetail}` : ''}`
-      : [...this.toolStates.values()].slice(-2).join(' | ');
-
     let toolsText = '';
     if (this.scroll > 0) {
-      toolsText = `↑ Scrolled up ${this.scroll}/${this.maxScroll} lines (Wheel / ↑↓ scroll · End / Esc to bottom)`;
+      toolsText = `↑ Scrolled up ${this.scroll}/${this.maxScroll} lines (Wheel / ↑↓ scroll · Ctrl+T transcript · End / Esc to bottom)`;
     } else if (this.escPrimed === 'backtrack') {
       toolsText = 'Press Esc again to rewind & edit previous prompt';
     } else if (this.escPrimed === 'clear') {
@@ -1535,7 +1641,7 @@ export class TerminalUI {
       toolsText = `📎 Attached ${items} (Enter to send · Backspace to remove)`;
     } else if (busy) {
       const statusTitle = liveActivity || 'Working';
-      toolsText = `• ${statusTitle} (${elapsedStr}esc to interrupt)`;
+      toolsText = `• ${statusTitle} (${elapsedStr}esc to interrupt · ctrl+t transcript)`;
     } else if (this.statusNotice) {
       toolsText = this.statusNotice;
     } else {
@@ -1573,8 +1679,11 @@ export class TerminalUI {
       const afterCursor = this.input.slice(this.cursor).join('');
       const shownInput = wrapTerminal(visibleBeforeCursor + afterCursor, boxInnerCols)[0];
       const isEmptyInput = this.input.length === 0 && this.label === 'goon> ';
+      const placeholderText = busy
+        ? 'Run /command now or type to queue · Ctrl+T transcript'
+        : 'Ask anything... (Shift+Tab mode · Ctrl+T transcript)';
       const placeholder = isEmptyInput
-        ? wrapTerminal('Ask anything...', boxInnerCols)[0]
+        ? wrapTerminal(placeholderText, boxInnerCols)[0]
         : '';
       const innerContent = placeholder
         ? `\x1b[2m${placeholder}\x1b[0m`
@@ -1582,9 +1691,15 @@ export class TerminalUI {
       const innerPadSpaces = ' '.repeat(Math.max(0, boxInnerCols - visibleLength(placeholder || shownInput)));
 
       const borderColor = busy ? '\x1b[2m' : '\x1b[38;2;99;168;248m';
-      const topMeta = clip(` ${this.modeLabel} · ${modelName} · effort:${this.effortLabel} `);
+      const displayMode = this.modeLabel === 'auto' ? 'auto-approve' : this.modeLabel;
+      const viewBadge = this.viewMode === 'transcript' ? ' · view:transcript' : '';
+      const topMeta = clip(` ${displayMode} · ${modelName} · effort:${this.effortLabel}${viewBadge} `);
       const topDashes = '─'.repeat(Math.max(1, safeCols - 3 - visibleLength(topMeta)));
-      const boxTop = `${borderColor}╭─\x1b[0m\x1b[1;36m${topMeta}\x1b[0m${borderColor}${topDashes}╮\x1b[0m`;
+      const styledTopMeta =
+        displayMode === 'auto-approve'
+          ? topMeta.replace('auto-approve', '\x1b[1;32mauto-approve\x1b[1;36m')
+          : topMeta;
+      const boxTop = `${borderColor}╭─\x1b[0m\x1b[1;36m${styledTopMeta}\x1b[0m${borderColor}${topDashes}╮\x1b[0m`;
 
       const boxMid =
         `${borderColor}│\x1b[0m \x1b[1;38;2;99;168;248m${boxPromptLabel}\x1b[0m` +

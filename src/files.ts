@@ -4,6 +4,42 @@ import { createHash, randomUUID } from 'node:crypto';
 import type { FileBackup } from './session.js';
 
 const MAX_FILE_BYTES = 2 * 1024 * 1024;
+export const WINDOWS_RESERVED_DEVICE_RE = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i;
+
+export function toWinExtendedPath(absPath: string): string {
+  if (process.platform !== 'win32' || absPath.startsWith('\\\\?\\')) return absPath;
+  return `\\\\?\\${resolve(absPath)}`;
+}
+
+export async function unlinkSafe(absPath: string): Promise<void> {
+  if (process.platform === 'win32') {
+    const base = absPath.split(/[\\/]/).pop() ?? '';
+    if (WINDOWS_RESERVED_DEVICE_RE.test(base)) {
+      try {
+        await unlink(toWinExtendedPath(absPath));
+      } catch (err) {
+        if ((err as { code?: string })?.code !== 'ENOENT') throw err;
+      }
+      return;
+    }
+    try {
+      await unlink(absPath);
+    } catch {
+      try {
+        await unlink(toWinExtendedPath(absPath));
+      } catch (err) {
+        if ((err as { code?: string })?.code !== 'ENOENT') throw err;
+      }
+    }
+    return;
+  }
+  try {
+    await unlink(absPath);
+  } catch (err) {
+    if ((err as { code?: string })?.code !== 'ENOENT') throw err;
+  }
+}
+
 export const limitText = (text: string, limit = 32_000): string => {
   if (text.length <= limit) return text;
   const headLen = Math.floor(limit * 0.65);
@@ -281,11 +317,23 @@ export class WorkspaceFiles {
       throw new Error('File path escapes the workspace.');
     }
   }
+  private assertNotWindowsReserved(file: string) {
+    if (process.platform !== 'win32') return;
+    const rel = relative(this.root, file);
+    for (const seg of rel.split(/[\\/]/)) {
+      if (WINDOWS_RESERVED_DEVICE_RE.test(seg)) {
+        throw new Error(`Refusing to create Windows reserved device name "${seg}" (use /dev/null instead of nul).`);
+      }
+    }
+  }
   private digest(text: string) { return createHash('sha256').update(text).digest('hex'); }
   async text(file: string) {
-    const info = await stat(file);
+    const target = process.platform === 'win32' && WINDOWS_RESERVED_DEVICE_RE.test(file.split(/[\\/]/).pop() ?? '')
+      ? toWinExtendedPath(file)
+      : file;
+    const info = await stat(target);
     if (!info.isFile() || info.size > MAX_FILE_BYTES) throw new Error('Expected a regular text file no larger than 2 MiB.');
-    const text = await readFile(file, 'utf8');
+    const text = await readFile(target, 'utf8');
     if (text.includes('\0')) throw new Error('Binary files are not supported.');
     return text;
   }
@@ -297,6 +345,7 @@ export class WorkspaceFiles {
     return limitText(`${path} (${all.length} lines)\n${all.slice(offset - 1, offset - 1 + lines).map((line, i) => `${offset + i}: ${line}`).join('\n')}`);
   }
   private async writeRaw(file: string, content: string, mode: number, existing: boolean) {
+    this.assertNotWindowsReserved(file);
     await mkdir(dirname(file), { recursive: true });
     const temporary = join(dirname(file), `.goon-${randomUUID()}.tmp`);
     const handle = await open(temporary, 'wx', mode);
@@ -315,6 +364,7 @@ export class WorkspaceFiles {
   }
   async write(path: string, content: string) {
     const file = await this.path(path);
+    this.assertNotWindowsReserved(file);
     if (Buffer.byteLength(content) > MAX_FILE_BYTES) throw new Error('Write exceeds 2 MiB.');
     let mode = 0o644;
     let existing = false;
@@ -376,6 +426,7 @@ export class WorkspaceFiles {
       const file = await this.path(op.path);
       const relPath = relative(this.root, file);
       if (op.kind === 'add') {
+        this.assertNotWindowsReserved(file);
         let existing = false;
         let beforeContent: string | undefined;
         let mode = 0o644;
@@ -388,10 +439,14 @@ export class WorkspaceFiles {
         }
         planned.push({ op, file, relPath, existing, beforeContent, mode, afterContent: op.content });
       } else if (op.kind === 'delete') {
+        const target = process.platform === 'win32' && WINDOWS_RESERVED_DEVICE_RE.test(op.path.split(/[\\/]/).pop() ?? '')
+          ? toWinExtendedPath(file)
+          : file;
         const beforeContent = await this.text(file);
-        const mode = (await stat(file)).mode & 0o777;
+        const mode = (await stat(target)).mode & 0o777;
         planned.push({ op, file, relPath, existing: true, beforeContent, mode });
       } else {
+        this.assertNotWindowsReserved(file);
         const beforeContent = await this.text(file);
         const mode = (await stat(file)).mode & 0o777;
         const afterContent = applyHunksToContent(beforeContent, op.hunks, op.path);
@@ -403,7 +458,7 @@ export class WorkspaceFiles {
     for (const item of planned) {
       this.recordBackup(item.relPath, item.existing, item.beforeContent, item.existing ? item.mode : undefined, item.afterContent);
       if (item.op.kind === 'delete') {
-        await unlink(item.file);
+        await unlinkSafe(item.file);
         this.revisions.delete(item.file);
         summary.push(`Deleted ${item.op.path}`);
       } else {
@@ -419,7 +474,7 @@ export class WorkspaceFiles {
     for (const b of backups) {
       const file = await this.path(b.path);
       if (!b.existed) {
-        await unlink(file).catch(() => {});
+        await unlinkSafe(file).catch(() => {});
         this.revisions.delete(file);
         deleted.push(b.path);
       } else if (b.content !== undefined) {
@@ -443,9 +498,12 @@ export class WorkspaceFiles {
         if (entry.isDirectory()) { queue.push(full); continue; }
         if (!entry.isFile()) continue;
         try {
-          const info = await stat(full);
+          const ioPath = process.platform === 'win32' && WINDOWS_RESERVED_DEVICE_RE.test(entry.name)
+            ? toWinExtendedPath(full)
+            : full;
+          const info = await stat(ioPath);
           if (info.size > 256 * 1024) continue;
-          const content = await readFile(full, 'utf8');
+          const content = await readFile(ioPath, 'utf8');
           if (content.includes('\0')) continue;
           const rel = relative(this.root, full).replace(/\\/g, '/');
           snap.set(rel, { content, mode: info.mode & 0o777, digest: this.digest(content) });
@@ -470,6 +528,11 @@ export class WorkspaceFiles {
     }
     for (const [rel, curr] of after) {
       if (!before.has(rel)) {
+        const baseName = rel.split('/').pop() ?? '';
+        if (process.platform === 'win32' && WINDOWS_RESERVED_DEVICE_RE.test(baseName)) {
+          await unlinkSafe(resolve(this.root, rel)).catch(() => {});
+          continue;
+        }
         this.recordBackup(rel, false, undefined, undefined, curr.content);
       }
     }

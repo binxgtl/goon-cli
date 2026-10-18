@@ -19,6 +19,8 @@ export const configSchema = z.object({
   runTokenBudget: z.number().int().min(0).default(0),
   inlineReasoning: z.enum(['leading-think', 'off']).default('leading-think'),
   showReasoning: z.boolean().default(false),
+  approvalMode: z.enum(['ask', 'auto', 'plan', 'readonly']).optional(),
+  viewMode: z.enum(['normal', 'verbose', 'transcript']).optional(),
 }).strict();
 export type Config = z.infer<typeof configSchema>;
 export interface RuntimeConfig extends Config { cwd: string; apiKey: string; dataDir: string; baseUrl: string; model: string }

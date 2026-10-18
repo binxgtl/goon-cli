@@ -1,6 +1,6 @@
 export { Harness, MAX_API_RETRIES } from './harness.js';
 export type { HarnessEvent, RevertResult, ToolEventMeta } from './harness.js';
-export { ToolRegistry, formatTodos, normalizeToolName, normalizeToolInput, TOOL_NAME_ALIASES } from './tools.js';
+export { ToolRegistry, formatTodos, normalizeToolName, normalizeToolInput, sanitizeBashCommand, TOOL_NAME_ALIASES } from './tools.js';
 export type { ToolDefinition, ToolCall, Approve, Approval, RunBudget } from './tools.js';
 export { SessionStore, sameWorkspace, repairInterrupted, fileBackupSchema, turnCheckpointSchema, todoItemSchema } from './session.js';
 export type { Session, SessionSummary, FileBackup, TurnCheckpoint, TodoItem } from './session.js';
@@ -10,7 +10,7 @@ export { loadConfig, resolveRuntime, resolveApiKey, saveCredential, credentialsP
 export type { Config, RuntimeConfig, EffortLevel } from './config.js';
 export { runSetupWizard, PROVIDER_PRESETS, EFFORT_DESCRIPTIONS, parseEffortInput } from './setup.js';
 export type { ProviderPreset, SetupIO } from './setup.js';
-export { computeUnifiedDiff, parsePatchText, applyHunksToContent, WorkspaceFiles, limitText } from './files.js';
+export { computeUnifiedDiff, parsePatchText, applyHunksToContent, WorkspaceFiles, limitText, WINDOWS_RESERVED_DEVICE_RE, toWinExtendedPath, unlinkSafe } from './files.js';
 export type { PatchHunk, PatchOperation } from './files.js';
 export { compactIfNeeded, compactNow, expandFileMentions, loadProjectInstructions, systemPrompt, estimatedTokens } from './context.js';
 export { McpManager, loadMcpConfig, mcpConfigSchema, mcpConfigPath, mcpToolName } from './mcp.js';

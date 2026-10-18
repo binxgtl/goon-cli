@@ -431,8 +431,8 @@ export class Harness {
         meta.durationMs = Date.now() - startedMs;
         if (meta.kind === 'exec' && result.text) {
           const allLines = result.text.split(/\r?\n/).map(l => l.trimEnd()).filter(Boolean);
-          meta.outputPreview = allLines.slice(0, 5);
-          if (allLines.length > 5) meta.omittedLines = allLines.length - 5;
+          meta.outputPreview = allLines.slice(0, 80);
+          if (allLines.length > 80) meta.omittedLines = allLines.length - 80;
         }
         const loopNote = !result.denied && (this.repeatCount === 3 || this.repeatCount === 5 || this.repeatCount >= 8)
           ? `\n[Loop warning: ${call.toolName} was called ${this.repeatCount} times consecutively with identical arguments. Analyze the previous result and try a different approach.]`

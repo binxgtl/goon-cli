@@ -1,9 +1,15 @@
+import { join } from 'node:path';
 import { tool, jsonSchema, type FlexibleSchema, type ToolSet } from 'ai';
 import { Ajv } from 'ajv';
 import { z } from 'zod';
-import { WorkspaceFiles, limitText } from './files.js';
+import { WorkspaceFiles, limitText, unlinkSafe } from './files.js';
 import { runCommand } from './process.js';
 import { todoItemSchema, type TodoItem } from './session.js';
+
+export function sanitizeBashCommand(command: string, platform = process.platform): string {
+  if (platform !== 'win32') return command;
+  return command.replace(/((?:^|[\s;&|()])(?:\d+|&)?>>?\s*)(?:nul|\/dev\/nul)(?=$|[\s;&|()><])/gi, '$1/dev/null');
+}
 
 export interface Approval { tool: string; input: unknown; signal: AbortSignal }
 export type Approve = (request: Approval) => Promise<boolean>;
@@ -84,6 +90,9 @@ export function normalizeToolInput(toolName: string, input: unknown): unknown {
       obj.command = obj.cmd;
     }
     delete obj.cmd;
+    if (typeof obj.command === 'string') {
+      obj.command = sanitizeBashCommand(obj.command);
+    }
   }
   return obj;
 }
@@ -170,14 +179,18 @@ export class ToolRegistry {
       execute: input => this.files.applyPatch(input.patch),
     });
     this.register('bash', {
-      description: 'Execute a shell command in the workspace as the current OS user. No OS sandbox. Use for git, builds and tests. Output is bounded; do not start persistent background servers.',
+      description: 'Execute a POSIX bash command in the workspace (Git Bash on Windows, NOT cmd.exe). Always use POSIX syntax and /dev/null (never >nul or 2>nul). Output is bounded; do not start persistent background servers.',
       schema: z.object({ command: z.string().min(1), timeoutMs: z.number().int().min(1000).max(600_000).default(120_000) }),
       readOnly: false, execute: async (input, signal) => {
         const beforeSnap = await this.files.snapshotWorkspace();
+        const safeCmd = sanitizeBashCommand(input.command);
         try {
-          const result = await runCommand('bash', ['-c', input.command], { cwd, signal, timeoutMs: input.timeoutMs });
+          const result = await runCommand('bash', ['-c', safeCmd], { cwd, signal, timeoutMs: input.timeoutMs });
           return `Exit code: ${result.code}\n${result.output}`;
         } finally {
+          if (process.platform === 'win32') {
+            await unlinkSafe(join(cwd, 'nul')).catch(() => {});
+          }
           await this.files.captureWorkspaceDiff(beforeSnap).catch(() => {});
         }
       },

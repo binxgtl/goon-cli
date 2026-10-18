@@ -500,4 +500,84 @@ test('welcomeBanner aligns all box borders to 69 visible columns with NFD Vietna
   assert.equal(plusLines.length, 250, 'computeUnifiedDiff must include all 250 added lines, not cap at 60');
 });
 
+test('Windows nul device bug prevention: sanitizeBashCommand, WorkspaceFiles rejection, and unlinkSafe', async () => {
+  const { sanitizeBashCommand, WorkspaceFiles, WINDOWS_RESERVED_DEVICE_RE, toWinExtendedPath } =
+    await import('../dist/index.js');
+  const { mkdtemp, rm } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+
+  assert.equal(WINDOWS_RESERVED_DEVICE_RE.test('nul'), true);
+  assert.equal(WINDOWS_RESERVED_DEVICE_RE.test('NUL.txt'), true);
+  assert.equal(WINDOWS_RESERVED_DEVICE_RE.test('CON'), true);
+  assert.equal(WINDOWS_RESERVED_DEVICE_RE.test('normal.ts'), false);
+
+  if (process.platform === 'win32') {
+    assert.equal(sanitizeBashCommand('dir /a /b 2>nul'), 'dir /a /b 2>/dev/null');
+    assert.equal(sanitizeBashCommand('git status >nul 2>&1'), 'git status >/dev/null 2>&1');
+    assert.equal(sanitizeBashCommand('cmd >> NUL'), 'cmd >> /dev/null');
+    assert.equal(sanitizeBashCommand('cat foo >/dev/nul'), 'cat foo >/dev/null');
+    assert.match(toWinExtendedPath('D:\\testcli\\nul'), /^\\\\\?\\D:\\testcli\\nul$/i);
+  }
+
+  const dir = await mkdtemp(join(tmpdir(), 'goon-nul-test-'));
+  try {
+    const files = new WorkspaceFiles(dir);
+    await assert.rejects(() => files.write('nul', 'bad'), /Windows reserved device name/);
+    await assert.rejects(() => files.write('src/CON.txt', 'bad'), /Windows reserved device name/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('TerminalUI Ctrl+T toggles Codex Transcript Mode, auto-approve mode, and immediate slash commands while working', async t => {
+  const { stripVTControlCharacters } = await import('node:util');
+  const tty = terminal(t);
+  tty.output.columns = 95;
+  tty.output.rows = 22;
+
+  tty.ui.setViewMode('normal');
+  tty.ui.event({ type: 'reasoning', source: 'provider', text: 'Hidden reasoning visible in Ctrl+T.\n' });
+  tty.ui.event({ type: 'text', text: 'Visible answer text.\n' });
+  await new Promise(resolve => setTimeout(resolve, 25));
+
+  // Press Ctrl+T (\x14) -> enters full-screen T R A N S C R I P T mode even when viewMode is 'normal'
+  tty.input.write('\x14');
+  await new Promise(resolve => setTimeout(resolve, 25));
+  assert.equal(tty.ui.isTranscriptOverlay(), true);
+  let frame = stripVTControlCharacters(tty.ui.renderedFrame());
+  assert.match(frame, /T R A N S C R I P T/);
+  assert.match(frame, /• Thinking/);
+  assert.match(frame, /Hidden reasoning visible in Ctrl\+T\./);
+
+  // Press Esc (\x1b) -> exits Transcript Mode back to normal Composer view
+  tty.input.write('\x1b');
+  await new Promise(resolve => setTimeout(resolve, 25));
+  assert.equal(tty.ui.isTranscriptOverlay(), false);
+
+  // Simulate agent working (status === 'Running', no pending question)
+  tty.ui.setStatus('Running');
+  const immediateExecuted = [];
+  tty.ui.onImmediateCommand = cmd => {
+    immediateExecuted.push(cmd);
+    if (cmd === '/auto') tty.ui.setMode('auto');
+  };
+
+  // Typing a slash command (/auto) while Running executes IMMEDIATELY instead of queueing!
+  tty.input.write('/auto\r');
+  await new Promise(resolve => setTimeout(resolve, 25));
+  assert.deepEqual(immediateExecuted, ['/auto']);
+
+  frame = stripVTControlCharacters(tty.ui.renderedFrame());
+  assert.match(frame, /auto-approve/);
+
+  // Typing a normal non-slash message while Running still queues into queuedPrompts
+  tty.input.write('do next task after this\r');
+  await new Promise(resolve => setTimeout(resolve, 25));
+  assert.deepEqual(immediateExecuted, ['/auto']);
+  frame = stripVTControlCharacters(tty.ui.renderedFrame());
+  assert.match(frame, /do next task after this/);
+});
+
+
 
