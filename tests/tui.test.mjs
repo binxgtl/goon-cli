@@ -359,9 +359,10 @@ test('Codex TUI renders rounded composer text box with spacer gap, pipe-free thi
   assert.match(frame, /• Thinking/);
   assert.match(frame, /  Checking files without vertical bars/);
   assert.match(frame, /• Direct bullet answer without \[answer\] tag\./);
-  assert.match(frame, /╭─/);
+  assert.match(frame, /╭─ ask · effort:default · 0 tokens ─/);
   assert.match(frame, /│ › /);
-  assert.match(frame, /╰─/);
+  assert.match(frame, /╰──/);
+  assert(!frame.includes('Ready ·'), 'Bottom border should not contain Ready footer text');
 });
 
 

@@ -83,7 +83,7 @@ function welcomeBanner(
     row('gateway', `${baseUrl} (${provider})`),
     row('directory', cwd),
     row('session', `${sessionId.slice(0, 8)} · mode: ${mode} (Shift+Tab or /mode)`),
-    row('commands', '/help · /plan · /revert · /resume · /diff · /compact'),
+    row('commands', 'Type /help · /plan · /revert · /resume · /diff'),
     `╰───────────────────────────────────────────────────────────────────╯`,
     '',
   ].join('\n');

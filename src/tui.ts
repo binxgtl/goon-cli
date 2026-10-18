@@ -1245,7 +1245,7 @@ export class TerminalUI {
       const shownInput = wrapTerminal(visibleBeforeCursor + afterCursor, boxInnerCols)[0];
       const isEmptyInput = this.input.length === 0 && this.label === 'goon> ';
       const placeholder = isEmptyInput
-        ? wrapTerminal('Ask anything… (Type /help, @ files, Ctrl+V paste image)', boxInnerCols)[0]
+        ? wrapTerminal('Ask anything...', boxInnerCols)[0]
         : '';
       const innerContent = placeholder
         ? `\x1b[2m${placeholder}\x1b[0m`
@@ -1253,7 +1253,7 @@ export class TerminalUI {
       const innerPadSpaces = ' '.repeat(Math.max(0, boxInnerCols - visibleLength(placeholder || shownInput)));
 
       const borderColor = busy ? '\x1b[2m' : '\x1b[38;2;99;168;248m';
-      const topMeta = clip(` ${this.modeLabel} · effort:${this.effortLabel}${todoBadge} `);
+      const topMeta = clip(` ${this.modeLabel} · effort:${this.effortLabel} · ${this.tokens} tokens${todoBadge} `);
       const topDashes = '─'.repeat(Math.max(1, safeCols - 3 - visibleLength(topMeta)));
       const boxTop = `${borderColor}╭─\x1b[0m\x1b[1;36m${topMeta}\x1b[0m${borderColor}${topDashes}╮\x1b[0m`;
 
@@ -1261,11 +1261,8 @@ export class TerminalUI {
         `${borderColor}│\x1b[0m \x1b[1;38;2;99;168;248m${boxPromptLabel}\x1b[0m` +
         `${innerContent}${innerPadSpaces} ${borderColor}│\x1b[0m`;
 
-      const botMeta = clip(
-        ` ${this.status} · ${this.tokens} tokens · ↑↓/Wheel scroll · Shift+Tab mode · Ctrl+V paste img `,
-      );
-      const botDashes = '─'.repeat(Math.max(1, safeCols - 3 - visibleLength(botMeta)));
-      const boxBot = `${borderColor}╰─\x1b[0m\x1b[2m${botMeta}\x1b[0m${borderColor}${botDashes}╯\x1b[0m`;
+      const botDashes = '─'.repeat(Math.max(1, safeCols - 2));
+      const boxBot = `${borderColor}╰${botDashes}╯\x1b[0m`;
 
       const boxCursorCol = Math.min(safeCols - 1, 2 + boxLabelCols + visibleLength(visibleBeforeCursor) + 1);
       const frame =
