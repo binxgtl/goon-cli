@@ -92,11 +92,7 @@ export async function loadConfig(overrides: Record<string, unknown> = {}): Promi
       ? Number(process.env[name]) : process.env[name];
   }
   const merged = { ...validated, ...env, ...overrides };
-  if (
-    env.runTokenBudget === undefined &&
-    overrides.runTokenBudget === undefined &&
-    (merged.runTokenBudget === 120_000 || merged.runTokenBudget === 1_000_000)
-  ) {
+  if (env.runTokenBudget === undefined && overrides.runTokenBudget === undefined) {
     merged.runTokenBudget = 0;
   }
   const explicitMaxOut =
