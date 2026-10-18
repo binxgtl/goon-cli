@@ -187,7 +187,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     }
     let runtime = await resolveRuntime(config, values.cwd ?? process.cwd());
     apiKey = runtime.apiKey;
-    const store = await SessionStore.open(join(runtime.dataDir, 'sessions'), runtime, values.resume);
+    let store = await SessionStore.open(join(runtime.dataDir, 'sessions'), runtime, values.resume);
     let rl: ReturnType<typeof createInterface> | undefined;
     let tui: TerminalUI | undefined;
     let manager: McpManager | undefined;
@@ -215,6 +215,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         tui = new TerminalUI(titleLabel, stop);
         tui.setMode(mode);
         tui.setEffort(runtime.effort);
+        tui.setTokens(store.session.tokens);
       } else if (stdin.isTTY) rl = createInterface({ input: stdin, output: stderr, terminal: true });
       rl?.on('SIGINT', stop);
       const display = (text: string) => tui ? tui.write(text) : stderr.write(cleanTerminal(text));
@@ -315,9 +316,37 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
           })();
         };
       }
+      const renderResumedHistory = () => {
+        const msgs = store.session.messages;
+        if (!msgs.length) return;
+        const lines: string[] = [
+          `\n╭─── Resumed Session ${store.session.id.slice(0, 8)}${store.session.title ? ` (${store.session.title})` : ''} · ${msgs.length} messages · ${store.session.checkpoints?.length ?? 0} checkpoints ───╮`,
+        ];
+        const previewMsgs = msgs.filter(m => m.role === 'user' || m.role === 'assistant').slice(-6);
+        for (const m of previewMsgs) {
+          const text = typeof m.content === 'string'
+            ? m.content
+            : Array.isArray(m.content)
+              ? m.content.map(p => ('text' in p && typeof p.text === 'string' ? p.text : p.type === 'tool-call' ? `[tool:${p.toolName}]` : '')).filter(Boolean).join(' ')
+              : '';
+          const cleaned = text.replace(/<referenced_file[\s\S]*?<\/referenced_file>/g, '[attached file]').replace(/\s+/g, ' ').trim();
+          if (cleaned) {
+            lines.push(`  ${m.role === 'user' ? '▸ You' : '◆ Goon'}: ${cleaned.slice(0, 140)}${cleaned.length > 140 ? '…' : ''}`);
+          }
+        }
+        lines.push('╰──────────────────────────────────────────────────────────────────────────────────╯\n');
+        display(lines.join('\n'));
+        if (store.session.todos?.length) {
+          tui?.event({ type: 'todo', todos: store.session.todos });
+        }
+      };
+
       starting = false;
       if (jsonOutput) stdout.write(JSON.stringify({ type: 'session', id: store.session.id, cwd: runtime.cwd }) + '\n');
-      else if (interactive) display(welcomeBanner(runtime.model, runtime.provider, runtime.baseUrl, runtime.effort, runtime.cwd, store.session.id, mode));
+      else if (interactive) {
+        display(welcomeBanner(runtime.model, runtime.provider, runtime.baseUrl, runtime.effort, runtime.cwd, store.session.id, mode));
+        renderResumedHistory();
+      }
       else display(`goon · ${runtime.model} · session ${store.session.id}\n`);
       const run = async (input: string) => {
         if (Buffer.byteLength(input) > 1024 * 1024) throw new Error('Prompt exceeds 1 MiB.');
@@ -368,6 +397,8 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
               '  /revert, /undo [code|msg|both] [N] Revert last N turns (both messages AND modified files!)\n' +
               '  /checkpoints                      List turn checkpoints & modified files in this session\n' +
               '  /todo [clear]                     View or clear the current task checklist\n' +
+              '  /resume [latest|<number>|<id>]    Interactive session picker or hot-swap to saved session\n' +
+              '  /new [title]                      Start a fresh session in this workspace\n' +
               '  /compact [focus instructions]     Summarize & archive earlier context history\n' +
               '  /diff                             Show git status and unified diff in workspace\n' +
               '  /review [instructions]            Run an agentic code review on current changes\n' +
@@ -611,7 +642,86 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
           if (input === '/fork' || input.startsWith('/fork ')) {
             const title = input.slice(5).trim() || undefined;
             const forkedId = await store.forkToNewFile(title);
-            display(`Forked current session (${store.session.messages.length} messages) -> new session ID: ${forkedId}\nResume anytime with: goon --resume ${forkedId}\n`);
+            display(`Forked current session (${store.session.messages.length} messages) -> new session ID: ${forkedId}\nSwitch to it now with: /resume ${forkedId.slice(0, 8)} (or goon --resume ${forkedId.slice(0, 8)})\n`);
+            continue;
+          }
+          if (input === '/new' || input.startsWith('/new ')) {
+            const newTitle = input.slice(4).trim() || undefined;
+            const sessionsRoot = join(runtime.dataDir, 'sessions');
+            const newStore = await SessionStore.open(sessionsRoot, runtime);
+            if (newTitle) {
+              newStore.session.title = newTitle;
+              await newStore.save();
+            }
+            const oldStore = store;
+            store = newStore;
+            await oldStore.close();
+            const built = await buildHarness(mode);
+            tools = built.tools;
+            harness = built.harness;
+            tui?.clear();
+            tui?.setTitle(store.session.title ? `${runtime.model} · ${store.session.title}` : `${runtime.model} · ${store.session.id.slice(0, 8)}`);
+            tui?.setTokens(0);
+            tui?.event({ type: 'todo', todos: [] });
+            display(welcomeBanner(runtime.model, runtime.provider, runtime.baseUrl, runtime.effort, runtime.cwd, store.session.id, mode));
+            display(`Started new session: ${store.session.id}${store.session.title ? ` (${store.session.title})` : ''}\n`);
+            continue;
+          }
+          if (input === '/resume' || input.startsWith('/resume ')) {
+            const sessionsRoot = join(runtime.dataDir, 'sessions');
+            const allList = await SessionStore.list(sessionsRoot);
+            const wsList = allList.filter(s => s.cwd === runtime.cwd);
+            const candidates = wsList.length ? wsList : allList;
+            let arg = input.slice(7).trim();
+            if (!arg) {
+              if (!candidates.length) {
+                display('No saved sessions found.\n');
+                continue;
+              }
+              const rows = candidates.slice(0, 15).map((s, idx) => {
+                const currentTag = s.id === store.session.id ? ' [current]' : '';
+                const msgTag = `${s.messagesCount ?? 0} msgs`;
+                const label = s.title ? `[${s.title}]` : s.preview ? `"${s.preview}"` : '(empty)';
+                return `  ${idx + 1}. ${s.id.slice(0, 8)}${currentTag} · ${msgTag} · ${s.updatedAt.slice(0, 19).replace('T', ' ')} · ${label}`;
+              });
+              display(`\nSaved sessions in workspace (${candidates.length}):\n${rows.join('\n')}\n`);
+              const choice = (await question(`Resume session [1-${Math.min(15, candidates.length)}, latest, ID prefix, or Enter to cancel]: `)).trim();
+              if (!choice) {
+                display('Cancelled /resume.\n');
+                continue;
+              }
+              arg = choice;
+            }
+            const num = Number(arg);
+            if (Number.isInteger(num) && num >= 1 && num <= candidates.length) {
+              arg = candidates[num - 1].id;
+            }
+            try {
+              const targetMatch = arg === 'latest'
+                ? candidates.find(s => s.id !== store.session.id)?.id ?? candidates[0]?.id
+                : candidates.find(s => s.id === arg || s.id.toLowerCase().startsWith(arg.toLowerCase()))?.id ?? arg;
+              if (targetMatch === store.session.id) {
+                display(`Already in session ${store.session.id.slice(0, 8)}.\n`);
+                renderResumedHistory();
+                continue;
+              }
+              const newStore = await SessionStore.open(sessionsRoot, runtime, targetMatch, store.session.id);
+              const oldStore = store;
+              store = newStore;
+              await oldStore.close();
+              const built = await buildHarness(mode);
+              tools = built.tools;
+              harness = built.harness;
+              tui?.setTitle(store.session.title ? `${runtime.model} · ${store.session.title}` : `${runtime.model} · ${store.session.id.slice(0, 8)}`);
+              tui?.setTokens(store.session.tokens);
+              tui?.event({ type: 'todo', todos: store.session.todos ?? [] });
+              renderResumedHistory();
+              if (!store.session.messages.length) {
+                display(`Resumed session ${store.session.id.slice(0, 8)} (0 messages).\n`);
+              }
+            } catch (error) {
+              display(`Failed to resume session: ${safeError(error, apiKey)}\n`);
+            }
             continue;
           }
           if (input.startsWith('/rename ')) {
@@ -720,8 +830,12 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             continue;
           }
           if (input === '/sessions') {
-            const list = await SessionStore.list(join(dataDir(), 'sessions'));
-            display((list.length ? list.map(s => `  ${s.id.slice(0, 8)}  ${s.updatedAt}  ${s.model}${s.title ? `  [${s.title}]` : ''}  ${s.cwd}`).join('\n') : '  No saved sessions.') + '\n');
+            const list = await SessionStore.list(join(runtime.dataDir, 'sessions'));
+            display((list.length ? list.map(s => {
+              const cur = s.id === store.session.id ? ' [current]' : '';
+              const label = s.title ? ` [${s.title}]` : s.preview ? ` "${s.preview}"` : '';
+              return `  ${s.id.slice(0, 8)}${cur}  (${s.messagesCount ?? 0} msgs)  ${s.updatedAt}  ${s.model}${label}  ${s.cwd}`;
+            }).join('\n') : '  No saved sessions.') + '\n');
             continue;
           }
           if (input === '/doctor') {

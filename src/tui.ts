@@ -7,7 +7,7 @@ import type { SubagentEvent } from './subagents.js';
 const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 export const SLASH_COMMANDS = [
   '/help', '/setup', '/model', '/effort', '/mode', '/plan', '/revert', '/undo',
-  '/checkpoints', '/todo', '/compact', '/diff', '/review', '/fork', '/rename',
+  '/checkpoints', '/todo', '/resume', '/new', '/compact', '/diff', '/review', '/fork', '/rename',
   '/export', '/init', '/status', '/tools', '/sessions', '/doctor', '/clear', '/exit',
 ];
 
@@ -80,6 +80,10 @@ export class TerminalUI {
   }
   setEffort(effort: string | undefined) {
     this.effortLabel = terminalText(effort || 'default');
+    this.schedule();
+  }
+  setTokens(tokens: number) {
+    this.tokens = tokens;
     this.schedule();
   }
   setWorkspaceFiles(files: string[]) {

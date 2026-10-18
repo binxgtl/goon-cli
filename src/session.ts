@@ -41,8 +41,24 @@ const sessionSchema = z.object({
   todos: z.array(todoItemSchema).optional(),
 });
 export type Session = z.infer<typeof sessionSchema>;
-export type SessionSummary = Pick<Session, 'id' | 'cwd' | 'updatedAt' | 'model' | 'title'>;
+export type SessionSummary = Pick<Session, 'id' | 'cwd' | 'updatedAt' | 'model' | 'title'> & {
+  messagesCount?: number;
+  preview?: string;
+};
 
+function firstUserPreview(messages: ModelMessage[]): string | undefined {
+  for (const m of messages) {
+    if (m.role !== 'user') continue;
+    const raw = typeof m.content === 'string'
+      ? m.content
+      : Array.isArray(m.content)
+        ? m.content.map(p => ('text' in p && typeof p.text === 'string' ? p.text : '')).join(' ')
+        : '';
+    const cleaned = raw.replace(/<referenced_file[\s\S]*?<\/referenced_file>/g, '').replace(/\s+/g, ' ').trim();
+    if (cleaned) return cleaned.slice(0, 72);
+  }
+  return undefined;
+}
 
 export function repairInterrupted(messages: ModelMessage[]): boolean {
   const pending = new Map<string, string>();
@@ -65,10 +81,19 @@ export function repairInterrupted(messages: ModelMessage[]): boolean {
 export class SessionStore {
   private closed = false;
   private constructor(readonly root: string, readonly session: Session, private readonly lock: string) {}
-  static async open(root: string, input: { cwd: string; provider: string; model: string; baseUrl: string }, resume?: string): Promise<SessionStore> {
+  static async open(root: string, input: { cwd: string; provider: string; model: string; baseUrl: string }, resume?: string, excludeId?: string): Promise<SessionStore> {
     await mkdir(root, { recursive: true, mode: 0o700 });
-    let id = resume;
-    if (id === 'latest') id = (await SessionStore.list(root)).find(s => s.cwd === input.cwd)?.id;
+    let id = resume?.trim();
+    if (id === 'latest') {
+      const list = await SessionStore.list(root);
+      id = list.find(s => s.cwd === input.cwd && s.id !== excludeId)?.id ?? list.find(s => s.cwd === input.cwd)?.id;
+    } else if (id && !z.string().uuid().safeParse(id).success && /^[0-9a-f-]{4,35}$/i.test(id)) {
+      const prefix = id.toLowerCase();
+      const list = await SessionStore.list(root);
+      id = list.find(s => s.cwd === input.cwd && s.id.toLowerCase().startsWith(prefix))?.id
+        ?? list.find(s => s.id.toLowerCase().startsWith(prefix))?.id
+        ?? id;
+    }
     if (resume && !id) throw new Error('No matching session to resume in this workspace.');
     if (id && !z.string().uuid().safeParse(id).success) throw new Error('Invalid session ID.');
     id ??= randomUUID();
@@ -126,7 +151,16 @@ export class SessionStore {
     for (const name of names.filter(n => /^[0-9a-f-]{36}\.json$/.test(n))) {
       try {
         const s = sessionSchema.parse(JSON.parse(await readFile(join(root, name), 'utf8')));
-        results.push({ id: s.id, cwd: s.cwd, updatedAt: s.updatedAt, model: s.model, ...(s.title ? { title: s.title } : {}) });
+        const preview = firstUserPreview(s.messages);
+        results.push({
+          id: s.id,
+          cwd: s.cwd,
+          updatedAt: s.updatedAt,
+          model: s.model,
+          messagesCount: s.messages.length,
+          ...(s.title ? { title: s.title } : {}),
+          ...(preview ? { preview } : {}),
+        });
       } catch { /* Invalid/incomplete entries never become resumable sessions. */ }
     }
     return results.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));

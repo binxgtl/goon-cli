@@ -52,3 +52,26 @@ test('dead process lock can be recovered and archives do not duplicate session l
   assert.equal((await SessionStore.list(root)).length, 1);
   await resumed.close();
 });
+
+test('SessionStore supports short 8-char ID prefix resume, excludeId on latest, and forkToNewFile', async t => {
+  const f = await fixture(t), root = join(f.root, 'sessions');
+  const input = { cwd: f.cwd, provider: 'test', model: 'model', baseUrl: 'http://localhost/v1' };
+  const s1 = await SessionStore.open(root, input);
+  s1.session.messages.push({ role: 'user', content: 'First task in session 1' });
+  await s1.save();
+  const forkedId = await s1.forkToNewFile('Forked branch');
+  await s1.close();
+
+  // Resume by 8-char prefix
+  const byPrefix = await SessionStore.open(root, input, forkedId.slice(0, 8));
+  assert.equal(byPrefix.session.id, forkedId);
+  assert.equal(byPrefix.session.title, 'Forked branch');
+  assert.equal(byPrefix.session.messages.length, 1);
+
+  // Resume latest excluding currently active session
+  const latestOther = await SessionStore.open(root, input, 'latest', forkedId);
+  assert.equal(latestOther.session.id, s1.session.id);
+  await byPrefix.close();
+  await latestOther.close();
+});
+
