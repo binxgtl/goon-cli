@@ -347,9 +347,6 @@ export class Harness {
             const response = await result.response;
             calls = (await result.toolCalls).map(c => ({ toolCallId: c.toolCallId, toolName: c.toolName, input: c.input }));
             if (calls.length > 32 || new Set(calls.map(c => c.toolCallId)).size !== calls.length) throw new Error('Invalid or excessive tool call batch. No tools executed.');
-            // A successful terminal step needs its own answer. Reasoning may be
-            // opaque to the adapter, and earlier tool narration is not completion.
-            if (!calls.length && !stepText.trim()) throw new Error('Model finished without a visible answer.');
             const usage = await result.usage;
             const input = usage.inputTokens ?? estimatedTokens(session.messages, system);
             const output = usage.outputTokens ?? Math.ceil(JSON.stringify(response.messages).length / 2);
@@ -361,7 +358,13 @@ export class Harness {
             await this.store.save(); // Persist tool declarations before any side effect.
             break;
           } catch (stepErr) {
-            if (attempt >= MAX_API_RETRIES || isNonRetryableApiError(stepErr, signal)) {
+            if (
+              attempt >= MAX_API_RETRIES ||
+              isNonRetryableApiError(stepErr, signal) ||
+              /output limit|Model stopped unexpectedly|Invalid or excessive tool call batch/i.test(
+                stepErr instanceof Error ? stepErr.message : String(stepErr),
+              )
+            ) {
               throw stepErr;
             }
             const nextRetry = attempt + 1;
@@ -374,6 +377,9 @@ export class Harness {
             await sleepWithAbort(Math.min(1500, 150 * 2 ** attempt), signal);
           }
         }
+        // A successful terminal step needs its own answer. Reasoning may be
+        // opaque to the adapter, and earlier tool narration is not completion.
+        if (!calls.length && !stepText.trim()) throw new Error('Model finished without a visible answer.');
         if (!calls.length) return text;
         const outcome = await this.executeBatch(calls, signal);
         if (outcome.denied) { this.emit({ type: 'stopped', reason: 'Permission denied.' }); return text; }
