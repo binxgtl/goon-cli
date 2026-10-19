@@ -36,6 +36,9 @@ test('version synchronization preserves dependencies and rejects a divergent loc
 
 test('CLI version comes from the installed package manifest', async () => {
   const manifest = JSON.parse(await readFile('package.json', 'utf8'));
+  const lock = JSON.parse(await readFile('npm-shrinkwrap.json', 'utf8'));
+  assert.equal(lock.version, manifest.version, 'npm-shrinkwrap.json version must match package.json');
+  assert.equal(lock.packages?.['']?.version, manifest.version, 'npm-shrinkwrap.json root package version must match package.json');
   const { stdout } = await promisify(execFile)(process.execPath, ['bin/goon.mjs', '--version']);
   assert.equal(stdout.trim(), `goon cli ${manifest.version}`);
 });

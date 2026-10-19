@@ -30,7 +30,7 @@ def wait_for(needle):
     raise RuntimeError('TUI did not reach ' + needle + '\n' + output.decode(errors='replace')[-4000:])
 
 try:
-    wait_for('Type /help')
+    wait_for('/help commands')
     os.write(master, b'/status\r')
     wait_for('Session tokens 0')
     # Resize the actual terminal while the UI is live.
