@@ -33,7 +33,7 @@ export { Subagents } from './subagents.js';
 export type { SubagentEvent, SubagentProgress } from './subagents.js';
 export { AnswerProjection, visibleAnswer, lastAssistantAnswer } from './reasoning.js';
 export type { AnswerPart, InlineReasoning } from './reasoning.js';
-export { TerminalUI, SLASH_COMMANDS, THEME, GLYPH, formatInlineMarkdown, formatTokenCount, visibleLength, padEndVisible } from './tui.js';
+export { TerminalUI, InputCancelledError, SLASH_COMMANDS, THEME, GLYPH, formatInlineMarkdown, formatTokenCount, visibleLength, padEndVisible } from './tui.js';
 export { welcomeBanner, readGitBranch } from './cli.js';
 
 

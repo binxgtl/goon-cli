@@ -396,6 +396,14 @@ function formatCompactDiff(diffText: string, maxLines = 20): string[] {
 const LOCAL_IMAGE_PATH_REGEX =
   /(?:"((?:[A-Za-z]:[\\/]|\\\\|\/)[^"\r\n]+?\.(?:png|jpe?g|webp|gif))"|'((?:[A-Za-z]:[\\/]|\\\\|\/)[^'\r\n]+?\.(?:png|jpe?g|webp|gif))'|((?:[A-Za-z]:[\\/]|\\\\|\/)[^\s"']+?\.(?:png|jpe?g|webp|gif)))/gi;
 
+/** Rejection reason when the user presses Esc on a question opened with `escCancels`. */
+export class InputCancelledError extends Error {
+  constructor() {
+    super('Cancelled by user.');
+    this.name = 'InputCancelledError';
+  }
+}
+
 interface Pending {
   resolve: (value: string) => void;
   reject: (error: Error) => void;
@@ -449,6 +457,8 @@ export class TerminalUI {
   private queuedPrompts: string[] = [];
   private popupIndex = 0;
   private popupFor = '';
+  private escCancels = false;
+  private escHint = 'skip';
   private turnSnapshots: string[] = [];
   private inputRestoredFromRevert = false;
   private escPrimed?: 'backtrack' | 'clear';
@@ -707,7 +717,12 @@ export class TerminalUI {
     this.appendTranscript(this.blockReset() + cleaned, isUserPrompt);
   }
 
-  async askTransient(previewBlock: string, label = '[y/N/a(lways)] ', signal?: AbortSignal): Promise<string> {
+  async askTransient(
+    previewBlock: string,
+    label = '[y/N/a(lways)] ',
+    signal?: AbortSignal,
+    opts: { escCancels?: boolean; escHint?: string } = {},
+  ): Promise<string> {
     this.flushExploreGroup();
     this.outputChannel = undefined;
     const snapshot = this.transcript;
@@ -720,7 +735,7 @@ export class TerminalUI {
     this.attachedImages.clear();
     this.appendTranscript(this.blockReset() + previewBlock, true);
     try {
-      return await this.question(label, signal, false);
+      return await this.question(label, signal, false, opts);
     } finally {
       this.transcript = snapshot;
       this.label = prevLabel;
@@ -908,11 +923,36 @@ export class TerminalUI {
     this.schedule();
   }
 
-  question(label = 'goon> ', signal?: AbortSignal, remember = false): Promise<string> {
+  getStatus(): string {
+    return this.status;
+  }
+
+  /**
+   * Runs `work` under a temporary status and always restores the previous one afterwards (even on
+   * throw), so transient phases such as MCP reconnects can never leave the UI stuck on "Working".
+   */
+  async withStatus<T>(status: string, work: () => Promise<T>): Promise<T> {
+    const previous = this.status;
+    this.setStatus(status);
+    try {
+      return await work();
+    } finally {
+      if (!this.closed) this.setStatus(previous === status ? 'Ready' : previous);
+    }
+  }
+
+  question(
+    label = 'goon> ',
+    signal?: AbortSignal,
+    remember = false,
+    opts: { escCancels?: boolean; escHint?: string } = {},
+  ): Promise<string> {
     if (this.closed) return Promise.reject(new Error('Terminal closed.'));
     if (this.pending) return Promise.reject(new Error('A terminal question is already active.'));
     signal?.throwIfAborted();
     this.label = terminalText(label);
+    this.escCancels = Boolean(opts.escCancels);
+    this.escHint = opts.escHint ?? (opts.escCancels ? 'cancel' : /y\/N/.test(label) ? 'deny' : 'skip');
     if (remember && this.queuedPrompts.length > 0) {
       const nextQueued = this.queuedPrompts.shift()!;
       this.schedule(0);
@@ -1238,7 +1278,8 @@ export class TerminalUI {
           this.input = [];
           this.cursor = 0;
           this.attachedImages.clear();
-          pending.resolve('');
+          if (this.escCancels) pending.reject(new InputCancelledError());
+          else pending.resolve('');
           this.schedule(0);
           return;
         }
@@ -2126,7 +2167,7 @@ export class TerminalUI {
 
     const tokenBadge = ` ${formatTokenCount(this.tokens)} tokens `;
     const hintText = asking
-      ? ' enter submit · esc cancel '
+      ? ` enter submit · esc ${this.escHint} `
       : busy
         ? ' enter queues · esc interrupt '
         : ' shift+tab mode · ctrl+o copy · ctrl+t transcript ';

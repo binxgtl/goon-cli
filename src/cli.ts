@@ -20,7 +20,7 @@ import { safeError } from './errors.js';
 import { VERSION } from './version.js';
 import type { HarnessEvent } from './harness.js';
 import type { SubagentEvent } from './subagents.js';
-import { padEndVisible, sliceVisible, terminalText as cleanTerminal, TerminalUI, visibleLength } from './tui.js';
+import { InputCancelledError, padEndVisible, sliceVisible, terminalText as cleanTerminal, TerminalUI, visibleLength } from './tui.js';
 import type { McpManager } from './mcp.js';
 import { EFFORT_DESCRIPTIONS, parseEffortInput, runSetupWizard } from './setup.js';
 import { discoverModels, formatModelBadge, resolveModelCapabilities, type DiscoveredModel } from './provider.js';
@@ -577,7 +577,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
               const qBlock = `\n◇ ${q.header || 'Question'}\n  ${q.question}\n${optLines.join('\n')}\n`;
               const promptLabel = `Select [1-${q.options.length}] or type answer (Enter for 1): `;
               const rawReply = tui
-                ? (await tui.askTransient(qBlock, promptLabel, callSignal)).trim()
+                ? (await tui.askTransient(qBlock, promptLabel, callSignal, { escHint: 'picks 1' })).trim()
                 : (display(qBlock), (await question(promptLabel, callSignal)).trim());
               const num = Number(rawReply);
               if (!rawReply) {
@@ -598,10 +598,11 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         if (!values['no-mcp']) {
           const { loadMcpConfig, McpManager } = await import('./mcp.js');
           controller = new AbortController();
-          tui?.setStatus('Connecting MCP');
           try {
             manager = new McpManager(await loadMcpConfig(), runtime.cwd);
-            await manager.connect(reg, controller.signal);
+            const connecting = manager.connect(reg, controller.signal);
+            // Restores the previous status afterwards so rebuilds (/setup, /model, /cd…) never stick on Working.
+            await (tui ? tui.withStatus('Connecting MCP', () => connecting) : connecting);
             for (const st of manager.statuses) {
               if (st.status === 'error') {
                 display(`[MCP warning: server "${st.name}" failed to start: ${st.error ?? 'unknown error'}]\n`);
@@ -1444,10 +1445,19 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
           }
 
           if (input === '/setup' || input === '/config') {
-            config = await runSetupWizard(config, {
-              write: text => display(text),
-              ask: label => question(label),
-            });
+            try {
+              config = await runSetupWizard(config, {
+                write: text => display(text),
+                // Esc cancels the whole wizard (nothing is persisted until the final step).
+                ask: label => (tui ? tui.question(label, undefined, false, { escCancels: true }) : question(label)),
+              });
+            } catch (error) {
+              if (error instanceof InputCancelledError) {
+                display('\n↺ Setup cancelled — configuration unchanged.\n');
+                continue;
+              }
+              throw error;
+            }
             if (interactive && !jsonOutput) {
               config.showReasoning = true;
             }
@@ -1620,7 +1630,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
                 return `  ${numStr}. #${cp.id} [${cp.createdAt.slice(11, 19)}] "${promptPreview}" (${fileDesc})`;
               });
               const pickerBlock = `\n◇ Rewind to turn checkpoint · ${cps.length} available\n${rows.join('\n')}\n`;
-              const choice = (await tui.askTransient(pickerBlock, `Rewind [1-${Math.min(15, reversed.length)}, or Enter to cancel]: `)).trim();
+              const choice = (await tui.askTransient(pickerBlock, `Rewind [1-${Math.min(15, reversed.length)}, or Enter to cancel]: `, undefined, { escHint: 'cancel' })).trim();
               const pickedNum = Number(choice);
               if (!choice || !Number.isInteger(pickedNum) || pickedNum < 1 || pickedNum > reversed.length) {
                 continue;
@@ -1766,7 +1776,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
               const pickerBlock = `\n◇ Resume saved session · ${candidates.length} in workspace\n${rows.join('\n')}\n`;
               const promptText = `Resume [1-${Math.min(15, candidates.length)}, latest, ID prefix, or Esc/q to cancel]: `;
               const choice = tui
-                ? (await tui.askTransient(pickerBlock, promptText)).trim()
+                ? (await tui.askTransient(pickerBlock, promptText, undefined, { escHint: 'cancel' })).trim()
                 : (display(pickerBlock), (await question(promptText)).trim());
               if (!choice || choice.toLowerCase() === 'q' || choice.toLowerCase() === 'cancel' || choice === '0') {
                 if (tui) tui.setNotice('Cancelled /resume.');

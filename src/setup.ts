@@ -146,9 +146,7 @@ export async function runSetupWizard(initialConfig?: Config, io?: SetupIO): Prom
       : `stored in ${credentialsPath()}`;
     write(`\nStep 3/5 · API Key (${current.keyEnv}, ${keyHint}):\n`);
     const keyInput = (await ask(`API Key: `)).trim();
-    if (keyInput) {
-      await saveCredential(current.keyEnv, keyInput);
-    }
+    // Persisted only after the final step so cancelling the wizard leaves credentials untouched.
     const activeKey = keyInput || existingKey;
 
     write(`\nStep 4/5 · Model ID (probing ${baseUrl}/models ...):\n`);
@@ -204,6 +202,7 @@ export async function runSetupWizard(initialConfig?: Config, io?: SetupIO): Prom
       maxOutputTokens: nextMaxOutputTokens,
       keyEnv: current.keyEnv,
     });
+    if (keyInput) await saveCredential(current.keyEnv, keyInput);
     await saveConfig(updated);
 
     const finalKey = await resolveApiKey(updated);

@@ -764,3 +764,91 @@ test('redesign: formatTokenCount and readGitBranch agree with independent oracle
     assert.equal(readGitBranch(process.cwd()), git.stdout.trim());
   }
 });
+test('setup: Esc truly cancels a cancellable question; default questions keep Esc = empty answer; hints match behavior', async t => {
+  const { stripVTControlCharacters } = await import('node:util');
+  const tty = terminal(t);
+  tty.output.columns = 100;
+  tty.output.rows = 20;
+
+  const cancellable = tty.ui.question('Base URL: ', undefined, false, { escCancels: true });
+  await new Promise(resolve => setTimeout(resolve, 25));
+  assert.match(stripVTControlCharacters(tty.ui.renderedFrame()), /enter submit · esc cancel/);
+  tty.key('https://typed-but-cancelled', undefined);
+  tty.key('', 'escape');
+  await assert.rejects(cancellable, err => err.name === 'InputCancelledError');
+
+  const approval = tty.ui.question('[y/N/a(lways)] ');
+  await new Promise(resolve => setTimeout(resolve, 25));
+  assert.match(stripVTControlCharacters(tty.ui.renderedFrame()), /esc deny/);
+  tty.key('', 'escape');
+  assert.equal(await approval, '', 'non-cancellable questions still resolve empty on Esc');
+});
+
+test('setup: transient status (MCP reconnect) is always restored, including on failure, so the UI never sticks on Working', async t => {
+  const { stripVTControlCharacters } = await import('node:util');
+  const tty = terminal(t);
+  tty.output.columns = 100;
+  tty.output.rows = 20;
+  tty.ui.setStatus('Ready');
+
+  const value = await tty.ui.withStatus('Connecting MCP', async () => {
+    assert.equal(tty.ui.getStatus(), 'Connecting MCP');
+    return 42;
+  });
+  assert.equal(value, 42);
+  assert.equal(tty.ui.getStatus(), 'Ready');
+  await new Promise(resolve => setTimeout(resolve, 25));
+  assert(!stripVTControlCharacters(tty.ui.renderedFrame()).includes('Working'), 'no Working indicator after reconnect');
+
+  await assert.rejects(tty.ui.withStatus('Connecting MCP', async () => { throw new Error('mcp boom'); }), /mcp boom/);
+  assert.equal(tty.ui.getStatus(), 'Ready', 'status restored after a failed reconnect');
+
+  tty.ui.setStatus('Running');
+  await tty.ui.withStatus('Connecting MCP', async () => {});
+  assert.equal(tty.ui.getStatus(), 'Running', 'an active run keeps its Running status');
+  tty.ui.setStatus('Ready');
+});
+
+test('setup: cancelling the wizard mid-way persists neither the API key nor the config', async t => {
+  const { fixture } = await import('./helpers.mjs');
+  const { readdir, readFile } = await import('node:fs/promises');
+  const { join } = await import('node:path');
+  const { runSetupWizard } = await import('../dist/index.js');
+  const f = await fixture(t);
+  const oldConfigHome = process.env.XDG_CONFIG_HOME;
+  const oldKey = process.env.GOON_API_KEY;
+  process.env.XDG_CONFIG_HOME = f.config;
+  delete process.env.GOON_API_KEY;
+  t.after(() => {
+    if (oldConfigHome === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = oldConfigHome;
+    if (oldKey !== undefined) process.env.GOON_API_KEY = oldKey;
+  });
+
+  const answers = ['4', 'https://openrouter.ai/api/v1', 'sk-cancelled-secret-key'];
+  await assert.rejects(
+    runSetupWizard(undefined, {
+      write: () => {},
+      ask: async () => {
+        if (answers.length) return answers.shift();
+        throw Object.assign(new Error('Cancelled by user.'), { name: 'InputCancelledError' }); // Esc at the model step
+      },
+      discover: async () => [],
+    }),
+    err => err.name === 'InputCancelledError',
+  );
+
+  const walk = async dir => {
+    const out = [];
+    for (const entry of await readdir(dir, { withFileTypes: true }).catch(() => [])) {
+      const p = join(dir, entry.name);
+      if (entry.isDirectory()) out.push(...(await walk(p)));
+      else out.push(p);
+    }
+    return out;
+  };
+  for (const file of await walk(f.config)) {
+    assert(!(await readFile(file, 'utf8')).includes('sk-cancelled-secret-key'), `secret leaked into ${file}`);
+  }
+  assert(!(await walk(f.config)).some(p => p.endsWith('config.json')), 'config must not be written on cancel');
+});
