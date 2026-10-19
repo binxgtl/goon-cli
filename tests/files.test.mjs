@@ -152,7 +152,6 @@ test('applyPatch supports Add/Update/Delete and restoreBackups reverts modified,
 
   const backups = files.takeTurnBackups();
   assert.equal(backups.length, 3);
-  assert.equal(files.isTurnBackupPartial(), false);
 
   const restored = await files.restoreBackups(backups);
   assert.deepEqual(restored.restored.sort(), ['keep.txt', 'remove-me.txt']);
@@ -162,13 +161,20 @@ test('applyPatch supports Add/Update/Delete and restoreBackups reverts modified,
   assert.equal(await readFile(join(f.cwd, 'remove-me.txt'), 'utf8'), 'goodbye\n');
   await assert.rejects(readFile(join(f.cwd, 'added.txt'), 'utf8'));
 
-  // Shell command snapshot/diff marks turn backup as partial
+  // Subagent backups merge cleanly and preserve earliest pre-turn state
   files.beginTurn();
-  assert.equal(files.isTurnBackupPartial(), false);
-  const before = await files.snapshotWorkspace();
-  await writeFile(join(f.cwd, 'keep.txt'), 'shell-modified\n', 'utf8');
-  await files.captureWorkspaceDiff(before);
-  assert.equal(files.isTurnBackupPartial(), true);
-  assert.equal(files.takeTurnBackups().length, 1);
+  await files.read('keep.txt');
+  await files.edit('keep.txt', 'line2', 'parent_edit');
+  files.mergeBackups([
+    { path: 'keep.txt', existed: true, content: 'child_saw_parent_edit\n', mode: 0o644 },
+    { path: 'child-added.txt', existed: false },
+  ]);
+  await writeFile(join(f.cwd, 'child-added.txt'), 'from child\n', 'utf8');
+  const merged = files.takeTurnBackups();
+  assert.equal(merged.length, 2);
+  const restoredMerged = await files.restoreBackups(merged);
+  assert.deepEqual(restoredMerged.restored, ['keep.txt']);
+  assert.deepEqual(restoredMerged.deleted, ['child-added.txt']);
+  assert.equal(await readFile(join(f.cwd, 'keep.txt'), 'utf8'), 'line1\nline2\nline3\n');
 });
 

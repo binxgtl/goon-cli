@@ -138,9 +138,8 @@ Khi model đang suy nghĩ hoặc chạy tool:
   - **Kế hoạch & Tương tác**: `todo_read`, `todo_write`, `update_plan`, `request_user_input`, `exit_plan_mode`.
   - **Subagents (7 công cụ)**: Vòng đời tương tác (`spawn_agent`, `wait_agent`, `send_input`, `close_agent`, `list_agents`) và uỷ thác theo lô (`delegate_task`, `delegate_edit`).
   - **MCP Resources & Tools**: `list_mcp_resources`, `list_mcp_resource_templates`, `read_mcp_resource` cùng các tool động từ MCP server (`mcp__<server>__<tool>`).
-- **Cơ chế Checkpoint & Giới hạn hoàn tác (`/rewind`, `/revert`, `/undo`)**:
-  - Các thay đổi thực hiện qua công cụ file (`write_file`, `edit_file`, `apply_patch`) được sao lưu nguyên bản **100%** trước khi ghi.
-  - Các thay đổi file phát sinh gián tiếp từ lệnh shell (`bash`) được ghi nhận theo cơ chế best-effort qua `snapshotWorkspace()`: quét tối đa `400` file văn bản có dung lượng `<= 256 KiB` (bỏ qua `.git`, `node_modules`, `dist`, `.goon`, `.refs`, symlink và file nhị phân). Nếu chạy lệnh shell biến đổi hàng loạt file lớn vượt ngưỡng này, bạn nên dùng Git (`git diff` / `git checkout` / Git worktree) để hoàn tác toàn diện.
+- **Cơ chế Checkpoint & Rollback nhẹ, chính xác (`/rewind`, `/revert`, `/undo`)**:
+  - Chỉ các file được sửa trực tiếp qua bộ công cụ chỉnh sửa (`write_file`, `edit_file`, `apply_patch` — bao gồm cả subagent worker được uỷ quyền sửa file) mới được ghi nhận bản sao lưu trước lượt chạy (trạng thái tồn tại, nội dung gốc và file mode) để rollback tức thì 100% và không tốn I/O quét toàn bộ workspace khi chạy lệnh shell (`bash`).
 - **Tự động Retry API**: Khi gặp lỗi mạng hoặc lỗi upstream tạm thời (HTTP `5xx`, `429`, `408`, lỗi đóng stream/socket bất ngờ), Harness tự động thử lại tối đa **3 lần** với exponential backoff trước khi dừng.
 - **Hiển thị đầy đủ Unified Diff**: `computeUnifiedDiff` hiển thị trọn vẹn số dòng thêm/xoá thực tế (`+N -M`, hỗ trợ tới 5.000 dòng mỗi hunk).
 - **Bảo vệ chống lỗi file `nul` trên Windows**:

@@ -471,6 +471,10 @@ export class Subagents {
       }
     }
     try {
+      const lastCp = store?.session.checkpoints?.at(-1);
+      if (lastCp) {
+        this.registry.files.mergeBackups(lastCp.files);
+      }
       await store?.close();
     } catch (error) {
       failure ??= { error };
@@ -788,6 +792,11 @@ export class Subagents {
       failure = { error };
     }
     try {
+      if (store?.session.checkpoints?.length) {
+        for (const cp of store.session.checkpoints) {
+          this.registry.files.mergeBackups(cp.files);
+        }
+      }
       await store?.close();
     } catch (error) {
       // Preserve a primary run/denial error if cleanup also fails; a successful

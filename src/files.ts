@@ -261,29 +261,28 @@ export function applyHunksToContent(current: string, hunks: PatchHunk[], path: s
   return lines.join(eol);
 }
 
-export interface WorkspaceSnapEntry {
-  content: string;
-  mode: number;
-  digest: string;
-}
-
 export class WorkspaceFiles {
   private revisions = new Map<string, string>();
   private activeBackups = new Map<string, FileBackup>();
-  private turnPartialBackup = false;
   constructor(readonly root: string) {}
   beginTurn() {
     this.activeBackups.clear();
-    this.turnPartialBackup = false;
-  }
-  isTurnBackupPartial(): boolean {
-    return this.turnPartialBackup;
   }
   takeTurnBackups(): FileBackup[] {
     const list = [...this.activeBackups.values()];
     this.activeBackups.clear();
-    this.turnPartialBackup = false;
     return list;
+  }
+  mergeBackups(backups: FileBackup[]) {
+    for (const b of backups) {
+      const key = b.path.replace(/\\/g, '/');
+      const existing = this.activeBackups.get(key);
+      if (!existing) {
+        this.activeBackups.set(key, { ...b, path: key });
+      } else {
+        existing.afterHash = b.afterHash;
+      }
+    }
   }
   private recordBackup(relPath: string, existed: boolean, content?: string, mode?: number, afterContent?: string) {
     const key = relPath.replace(/\\/g, '/');
@@ -488,60 +487,6 @@ export class WorkspaceFiles {
       }
     }
     return { restored, deleted };
-  }
-  async snapshotWorkspace(maxFiles = 400): Promise<Map<string, WorkspaceSnapEntry>> {
-    const snap = new Map<string, WorkspaceSnapEntry>();
-    const queue = [this.root];
-    while (queue.length && snap.size < maxFiles) {
-      const dir = queue.shift()!;
-      let entries;
-      try { entries = await readdir(dir, { withFileTypes: true }); } catch { continue; }
-      for (const entry of entries) {
-        if (snap.size >= maxFiles) break;
-        if (entry.name === '.git' || entry.name === 'node_modules' || entry.name === 'dist' || entry.name === '.goon' || entry.name === '.refs' || entry.isSymbolicLink()) continue;
-        const full = join(dir, entry.name);
-        if (entry.isDirectory()) { queue.push(full); continue; }
-        if (!entry.isFile()) continue;
-        try {
-          const ioPath = process.platform === 'win32' && WINDOWS_RESERVED_DEVICE_RE.test(entry.name)
-            ? toWinExtendedPath(full)
-            : full;
-          const info = await stat(ioPath);
-          if (info.size > 256 * 1024) continue;
-          const content = await readFile(ioPath, 'utf8');
-          if (content.includes('\0')) continue;
-          const rel = relative(this.root, full).replace(/\\/g, '/');
-          snap.set(rel, { content, mode: info.mode & 0o777, digest: this.digest(content) });
-        } catch { continue; }
-      }
-    }
-    return snap;
-  }
-  async captureWorkspaceDiff(before: Map<string, WorkspaceSnapEntry>): Promise<void> {
-    this.turnPartialBackup = true;
-    const after = await this.snapshotWorkspace();
-    for (const [rel, prev] of before) {
-      const curr = after.get(rel);
-      if (!curr) {
-        this.recordBackup(rel, true, prev.content, prev.mode, undefined);
-        const abs = resolve(this.root, rel);
-        this.revisions.delete(abs);
-      } else if (curr.digest !== prev.digest) {
-        this.recordBackup(rel, true, prev.content, prev.mode, curr.content);
-        const abs = resolve(this.root, rel);
-        if (this.revisions.has(abs)) this.revisions.set(abs, curr.digest);
-      }
-    }
-    for (const [rel, curr] of after) {
-      if (!before.has(rel)) {
-        const baseName = rel.split('/').pop() ?? '';
-        if (process.platform === 'win32' && WINDOWS_RESERVED_DEVICE_RE.test(baseName)) {
-          await unlinkSafe(resolve(this.root, rel)).catch(() => {});
-          continue;
-        }
-        this.recordBackup(rel, false, undefined, undefined, curr.content);
-      }
-    }
   }
   async listWorkspaceFiles(maxFiles = 500): Promise<string[]> {
     const files: string[] = [];

@@ -415,7 +415,6 @@ export class ToolRegistry {
       description: 'Execute a POSIX bash command in the workspace (Git Bash on Windows, NOT cmd.exe). Always use POSIX syntax and /dev/null (never >nul or 2>nul). Output is bounded; do not start persistent background servers.',
       schema: z.object({ command: z.string().min(1), timeoutMs: z.number().int().min(1000).max(600_000).default(120_000) }),
       readOnly: false, execute: async (input, signal) => {
-        const beforeSnap = await this.files.snapshotWorkspace();
         const safeCmd = sanitizeBashCommand(input.command);
         try {
           const result = await runCommand('bash', ['-c', safeCmd], { cwd, signal, timeoutMs: input.timeoutMs });
@@ -424,7 +423,6 @@ export class ToolRegistry {
           if (process.platform === 'win32') {
             await unlinkSafe(join(cwd, 'nul')).catch(() => {});
           }
-          await this.files.captureWorkspaceDiff(beforeSnap).catch(() => {});
         }
       },
     });

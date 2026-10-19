@@ -78,7 +78,6 @@ export interface RevertResult {
   restoredFiles: string[];
   deletedFiles: string[];
   revertedPrompts: string[];
-  partial?: boolean;
 }
 
 function extractStreamPreview(rawJson: string): string {
@@ -317,14 +316,12 @@ export class Harness {
     }
 
     await this.store.save();
-    const partial = target.some(c => c.partial === true);
     return {
       turnsReverted: count,
       messagesRemoved,
       restoredFiles: [...restoredSet],
       deletedFiles: [...deletedSet],
       revertedPrompts: target.map(c => c.prompt),
-      ...(partial ? { partial: true } : {}),
     };
   }
   async run(prompt: string, signal: AbortSignal, sharedBudget?: RunBudget): Promise<string> {
@@ -476,7 +473,6 @@ export class Harness {
       await this.store.save();
       throw error;
     } finally {
-      const partial = this.tools.files.isTurnBackupPartial();
       const files = this.tools.files.takeTurnBackups();
       session.checkpoints ??= [];
       const nextId = (session.checkpoints.at(-1)?.id ?? 0) + 1;
@@ -487,7 +483,6 @@ export class Harness {
         messageIndex: messageIndexBeforeTurn,
         tokensBefore: tokensBeforeTurn,
         files,
-        ...(partial ? { partial: true } : {}),
       };
       session.checkpoints.push(cp);
       await this.store.save().catch(() => {});
