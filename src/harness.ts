@@ -1,11 +1,11 @@
-import { streamText, type LanguageModel, type ToolResultPart } from 'ai';
+import { streamText, type LanguageModel, type ModelMessage, type ToolResultPart } from 'ai';
 import type { RuntimeConfig } from './config.js';
 import { SessionStore, repairInterrupted, type TodoItem, type TurnCheckpoint } from './session.js';
 import { ToolRegistry, normalizeToolInput, normalizeToolName, type ToolCall, type RunBudget } from './tools.js';
-import { buildProviderOptions, createModel } from './provider.js';
+import { buildProviderOptions, createModel, resolveModelCapabilities } from './provider.js';
 import { safeError } from './errors.js';
-import { compactIfNeeded, compactNow, estimatedTokens, expandFileMentions, systemPrompt } from './context.js';
-import { AnswerProjection, type AnswerPart } from './reasoning.js';
+import { compactIfNeeded, compactNow, estimatedTokens, expandFileMentions, recapSession, systemPrompt } from './context.js';
+import { AnswerProjection, visibleAnswer, type AnswerPart } from './reasoning.js';
 
 export interface ToolEventMeta {
   kind: 'read' | 'list' | 'search' | 'exec' | 'edit' | 'other';
@@ -99,7 +99,7 @@ function buildToolMeta(toolName: string, rawInput: unknown): ToolEventMeta {
   const rec = norm && typeof norm === 'object' ? (norm as Record<string, unknown>) : {};
   const pathStr = typeof rec.path === 'string' && rec.path.trim() ? rec.path.trim() : '.';
 
-  if (canonical === 'read_file') {
+  if (canonical === 'read_file' || canonical === 'view_image') {
     const range = typeof rec.startLine === 'number'
       ? `:${rec.startLine}${typeof rec.endLine === 'number' ? `-${rec.endLine}` : ''}`
       : '';
@@ -122,6 +122,20 @@ function buildToolMeta(toolName: string, rawInput: unknown): ToolEventMeta {
       return { kind: 'edit', summary: files.join(', ') || 'patch' };
     }
     return { kind: 'edit', summary: pathStr };
+  }
+  if (canonical === 'update_plan') {
+    const count = Array.isArray(rec.plan) ? rec.plan.length : 0;
+    return { kind: 'other', summary: `${count} step(s)` };
+  }
+  if (canonical === 'request_user_input') {
+    const count = Array.isArray(rec.questions) ? rec.questions.length : 1;
+    return { kind: 'other', summary: `${count} question(s)` };
+  }
+  if (canonical === 'list_mcp_resources' || canonical === 'list_mcp_resource_templates') {
+    return { kind: 'list', summary: typeof rec.server === 'string' ? rec.server : 'all servers' };
+  }
+  if (canonical === 'read_mcp_resource') {
+    return { kind: 'read', summary: `${typeof rec.server === 'string' ? rec.server : ''}:${typeof rec.uri === 'string' ? rec.uri : ''}` };
   }
   if (canonical === 'spawn_agent') {
     const role = typeof rec.agent_type === 'string' ? rec.agent_type : typeof rec.role === 'string' ? rec.role : 'default';
@@ -216,6 +230,44 @@ export class Harness {
       this.running = false;
     }
   }
+  async recap(signal: AbortSignal): Promise<{ text: string; tokens: number }> {
+    const res = await recapSession(this.store, this.config, this.model, signal);
+    if (res.tokens > 0) this.emit({ type: 'usage', input: 0, output: 0, total: res.tokens });
+    return res;
+  }
+  async askSideQuestion(question: string, signal: AbortSignal): Promise<{ text: string; tokens: number }> {
+    const clonedHistory: ModelMessage[] = structuredClone(this.store.session.messages);
+    repairInterrupted(clonedHistory);
+    const { expandedPrompt } = await expandFileMentions(question, this.tools.files, { model: this.config.model });
+    clonedHistory.push({
+      role: 'user',
+      content: `[Ephemeral Side Question (/btw) — answer concisely without modifying session state]:\n${expandedPrompt}`,
+    });
+    const providerOptions = buildProviderOptions({
+      provider: this.config.provider,
+      effort: this.config.effort ? 'low' : undefined,
+    });
+    const sys = await systemPrompt(this.config, true, false, this.store.session.goal);
+    const result = streamText({
+      model: this.model,
+      system: `${sys}\n\nYou are answering an ephemeral side question (/btw). Do not call tools; answer directly and concisely from the conversation context and your knowledge.`,
+      messages: clonedHistory,
+      maxOutputTokens: Math.min(8_192, this.config.maxOutputTokens),
+      maxRetries: 2,
+      ...(providerOptions ? { providerOptions } : {}),
+      abortSignal: AbortSignal.any([signal, AbortSignal.timeout(this.config.timeoutMs)]),
+      onError: () => {},
+    });
+    let raw = '';
+    for await (const event of result.fullStream) {
+      if (event.type === 'error') throw event.error;
+      if (event.type === 'text-delta') raw += event.text;
+    }
+    const usage = await result.usage;
+    const text = visibleAnswer(raw, this.config.inlineReasoning).trim() || raw.trim();
+    const tokens = usage.totalTokens ?? 0;
+    return { text, tokens };
+  }
   async revert(options?: { steps?: number; scope?: 'both' | 'code' | 'messages' }): Promise<RevertResult> {
     if (this.running) throw new Error('Cannot revert while a run is active.');
     const session = this.store.session;
@@ -303,7 +355,7 @@ export class Harness {
       for (;;) {
         signal.throwIfAborted();
         if (exhausted()) throw new Error('Run token budget reached. Resume with a new prompt or increase --run-token-budget.');
-        const system = await systemPrompt(this.config, this.tools.readOnly, this.tools.planMode);
+        const system = await systemPrompt(this.config, this.tools.readOnly, this.tools.planMode, session.goal);
         const oldCount = session.compactions;
         account(await compactIfNeeded(this.store, this.config, this.model, system, signal, measuredInput));
         if (session.compactions !== oldCount) { measuredInput = 0; this.emit({ type: 'compaction', count: session.compactions }); }
@@ -494,6 +546,24 @@ export class Harness {
       if (previous?.role === 'tool') previous.content.push(...content.splice(0));
       else this.store.session.messages.push({ role: 'tool', content: content.splice(0) });
       await this.store.save();
+    }
+    const pendingImgs = this.tools.takePendingImages();
+    if (pendingImgs.length > 0) {
+      const supportsVision = resolveModelCapabilities(this.config.model).supportsVision ?? true;
+      if (supportsVision) {
+        this.store.session.messages.push({
+          role: 'user',
+          content: [
+            { type: 'text', text: `[Attached image(s) from view_image: ${pendingImgs.map(i => i.path).join(', ')}]` },
+            ...pendingImgs.map(img => ({
+              type: 'image' as const,
+              image: img.bytes,
+              mediaType: img.mimeType,
+            })),
+          ],
+        });
+        await this.store.save();
+      }
     }
     signal.throwIfAborted();
     return { denied };

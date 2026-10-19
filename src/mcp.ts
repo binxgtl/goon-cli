@@ -587,6 +587,8 @@ export async function importCodexMcpServers(
 }
 
 interface Connection {
+  server: string;
+  timeoutMs: number;
   client: Client;
   transport: Transport;
   remove: (() => unknown)[];
@@ -718,7 +720,7 @@ export class McpManager {
           const client = new Client({ name: 'goon-cli', version: VERSION }, { capabilities: {} });
           // Never send raw SDK/server errors to stderr; CLI controls presentation.
           client.onerror = () => {};
-          connection = { client, transport, remove: [] };
+          connection = { server, timeoutMs: config.timeoutMs, client, transport, remove: [] };
           this.connections.push(connection);
           await client.connect(transport, { signal, timeout: config.timeoutMs });
 
@@ -802,6 +804,86 @@ export class McpManager {
           }
           this.warnings.push(`MCP ${server}: ${errMsg}`);
         }
+      }
+      if (registry && this.connections.length > 0) {
+        const hostConn = this.connections[0];
+        hostConn.remove.push(
+          registry.register('list_mcp_resources', {
+            description: 'Lists resources provided by connected MCP servers.',
+            schema: z.object({
+              server: z.string().optional().describe('Optional MCP server name filter.'),
+              cursor: z.string().optional().describe('Opaque pagination cursor.'),
+            }),
+            readOnly: true,
+            execute: async (input, callSignal) => {
+              const targets = input.server
+                ? this.connections.filter(c => c.server === input.server)
+                : this.connections;
+              if (!targets.length) return `No active MCP server matching "${input.server ?? ''}".`;
+              const results: Record<string, unknown> = {};
+              for (const c of targets) {
+                try {
+                  const res = await c.client.listResources(
+                    input.cursor ? { cursor: input.cursor } : {},
+                    { signal: callSignal, timeout: c.timeoutMs },
+                  );
+                  results[c.server] = res;
+                } catch (err) {
+                  results[c.server] = { error: this.error(err).message };
+                }
+              }
+              return limitText(JSON.stringify(results, null, 2));
+            },
+          }),
+          registry.register('list_mcp_resource_templates', {
+            description: 'Lists parameterized resource templates provided by connected MCP servers.',
+            schema: z.object({
+              server: z.string().optional().describe('Optional MCP server name filter.'),
+              cursor: z.string().optional().describe('Opaque pagination cursor.'),
+            }),
+            readOnly: true,
+            execute: async (input, callSignal) => {
+              const targets = input.server
+                ? this.connections.filter(c => c.server === input.server)
+                : this.connections;
+              if (!targets.length) return `No active MCP server matching "${input.server ?? ''}".`;
+              const results: Record<string, unknown> = {};
+              for (const c of targets) {
+                try {
+                  const res = await c.client.listResourceTemplates(
+                    input.cursor ? { cursor: input.cursor } : {},
+                    { signal: callSignal, timeout: c.timeoutMs },
+                  );
+                  results[c.server] = res;
+                } catch (err) {
+                  results[c.server] = { error: this.error(err).message };
+                }
+              }
+              return limitText(JSON.stringify(results, null, 2));
+            },
+          }),
+          registry.register('read_mcp_resource', {
+            description: 'Read a specific resource from an MCP server by server name and resource URI.',
+            schema: z.object({
+              server: z.string().min(1).describe('MCP server name.'),
+              uri: z.string().min(1).describe('Resource URI to read.'),
+            }),
+            readOnly: true,
+            execute: async (input, callSignal) => {
+              const conn = this.connections.find(c => c.server === input.server);
+              if (!conn) throw new Error(`Unknown or disconnected MCP server: ${input.server}`);
+              try {
+                const res = await conn.client.readResource(
+                  { uri: input.uri },
+                  { signal: callSignal, timeout: conn.timeoutMs },
+                );
+                return limitText(JSON.stringify(res, null, 2));
+              } catch (err) {
+                throw this.error(err);
+              }
+            },
+          }),
+        );
       }
       return this.tools;
     } catch (error) {

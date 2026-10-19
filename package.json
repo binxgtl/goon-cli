@@ -1,6 +1,6 @@
 {
   "name": "goon-cli",
-  "version": "0.2.14",
+  "version": "0.2.15",
   "description": "A small independent coding harness for Termux and external model APIs",
   "type": "module",
   "license": "MIT",

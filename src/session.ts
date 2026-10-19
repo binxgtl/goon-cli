@@ -31,6 +31,16 @@ export const todoItemSchema = z.object({
 });
 export type TodoItem = z.infer<typeof todoItemSchema>;
 
+export const sessionGoalSchema = z.object({
+  objective: z.string().min(1),
+  status: z.enum(['active', 'paused', 'complete']).default('active'),
+  createdAt: z.string().datetime(),
+  updatedAt: z.string().datetime(),
+  tokensAtStart: z.number().nonnegative().default(0),
+  tokenBudget: z.number().positive().optional(),
+});
+export type SessionGoal = z.infer<typeof sessionGoalSchema>;
+
 const sessionSchema = z.object({
   version: z.literal(1), id: z.string().uuid(), cwd: z.string(),
   title: z.string().optional(),
@@ -39,6 +49,7 @@ const sessionSchema = z.object({
   messages: z.array(modelMessageSchema), tokens: z.number().nonnegative(), compactions: z.number().int().nonnegative(),
   checkpoints: z.array(turnCheckpointSchema).optional(),
   todos: z.array(todoItemSchema).optional(),
+  goal: sessionGoalSchema.optional(),
 });
 export type Session = z.infer<typeof sessionSchema>;
 export type SessionSummary = Pick<Session, 'id' | 'cwd' | 'updatedAt' | 'model' | 'title'> & {
@@ -181,6 +192,24 @@ export class SessionStore {
       } catch { /* Invalid/incomplete entries never become resumable sessions. */ }
     }
     return results.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  }
+  static async deleteSession(root: string, idOrPrefix: string): Promise<string | undefined> {
+    const trimmed = idOrPrefix.trim().toLowerCase();
+    if (!trimmed) return undefined;
+    const list = await SessionStore.list(root);
+    const match = list.find(s => s.id.toLowerCase() === trimmed || s.id.toLowerCase().startsWith(trimmed));
+    if (!match) return undefined;
+    try {
+      await unlink(join(root, `${match.id}.json`));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+    try {
+      await unlink(join(root, `${match.id}.lock`));
+    } catch {
+      // ignore
+    }
+    return match.id;
   }
   async forkToNewFile(title?: string): Promise<string> {
     const forkedId = randomUUID();

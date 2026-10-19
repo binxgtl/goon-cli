@@ -258,3 +258,101 @@ test('model autonomously invokes Codex multi-agent tools (spawn_agent, wait_agen
   assert(summaries.some(s => s.nickname === 'Euclid' && s.status === 'shutdown'));
 });
 
+test('Codex tools (update_plan, request_user_input, view_image), $skill-name expansion, /btw side question, and /copy extraction work end-to-end', async t => {
+  const { mkdir, writeFile } = await import('node:fs/promises');
+  const { discoverSkills, expandFileMentions } = await import('../dist/context.js');
+  const { extractCopyableFromMessages } = await import('../dist/cli.js');
+  const f = await fixture(t);
+
+  // Create a skill in .codex/skills/audit-sec/SKILL.md
+  const skillDir = join(f.cwd, '.codex', 'skills', 'audit-sec');
+  await mkdir(skillDir, { recursive: true });
+  await writeFile(
+    join(skillDir, 'SKILL.md'),
+    '---\nname: audit-sec\ndescription: Security audit checklist\n---\nAlways check SQL injection and SSRF.',
+  );
+
+  const skills = await discoverSkills(f.cwd);
+  assert(skills.some(s => s.name === 'audit-sec' && s.description === 'Security audit checklist'));
+
+  // Create a valid 1x1 PNG file for view_image
+  const png1x1 = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
+    'base64',
+  );
+  await writeFile(join(f.cwd, 'sample.png'), png1x1);
+
+  const p = await provider(t, (body, response) => {
+    const lastUser = [...body.messages].reverse().find(m => m.role === 'user');
+    if (lastUser && typeof lastUser.content === 'string' && lastUser.content.includes('Ephemeral Side Question (/btw)')) {
+      return sse(response, { text: 'Side answer: 42' });
+    }
+    const toolMsgs = body.messages.filter(m => m.role === 'tool');
+    if (toolMsgs.length === 0) {
+      assert(JSON.stringify(body.messages).includes('Always check SQL injection and SSRF.'));
+      return sse(response, {
+        calls: [
+          {
+            id: 'plan-1',
+            name: 'update_plan',
+            input: {
+              explanation: 'Initial steps',
+              steps: [
+                { step: 'Inspect sample.png', status: 'in_progress' },
+                { step: 'Ask user preference', status: 'pending' },
+              ],
+            },
+          },
+          {
+            id: 'ask-1',
+            name: 'ask_user',
+            input: {
+              id: 'mode_choice',
+              question: 'Which mode should we use?',
+              options: ['Strict (Recommended)', 'Permissive'],
+            },
+          },
+          {
+            id: 'img-1',
+            name: 'view_image',
+            input: 'sample.png',
+          },
+        ],
+      });
+    }
+    return sse(response, { text: 'Completed task.\n```ts\nconst ok = true;\n```' });
+  });
+
+  const config = configFor(f, p);
+  const store = await SessionStore.open(join(f.data, 'sessions'), config);
+  t.after(() => store.close());
+  const tools = new ToolRegistry(f.cwd, async () => true);
+  tools.askUser = async questions => {
+    assert.equal(questions.length, 1);
+    assert.equal(questions[0].id, 'mode_choice');
+    return { mode_choice: ['Strict (Recommended)'] };
+  };
+
+  const expanded = await expandFileMentions('Run $audit-sec now', tools.files);
+  assert(expanded.attachedPaths.includes('$audit-sec'));
+
+  const h = new Harness(config, store, tools);
+  const ans = await h.run('Run $audit-sec now', AbortSignal.timeout(5000));
+  assert.match(ans, /Completed task/);
+  assert.equal(tools.todos.length, 2);
+  assert.equal(tools.todos[0].content, 'Inspect sample.png');
+
+  // Verify /btw askSideQuestion does not mutate session.messages
+  const msgCountBefore = store.session.messages.length;
+  const side = await h.askSideQuestion('What is the side answer?', AbortSignal.timeout(5000));
+  assert.equal(side.text, 'Side answer: 42');
+  assert.equal(store.session.messages.length, msgCountBefore);
+
+  // Verify /copy extraction (last response and code block)
+  const copiedLast = extractCopyableFromMessages(store.session.messages, 'last');
+  assert(copiedLast?.text.includes('Completed task.'));
+  const copiedCode = extractCopyableFromMessages(store.session.messages, 'code');
+  assert.equal(copiedCode?.text, 'const ok = true;');
+});
+
+

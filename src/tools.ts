@@ -38,6 +38,24 @@ export function formatTodos(todos: TodoItem[]): string {
   return `Todos (${completed}/${todos.length} completed, ${inProgress} in progress, ${pending} pending):\n${lines.join('\n')}`;
 }
 
+export const updatePlanItemSchema = z.object({
+  step: z.string().min(1).describe('Task step text.'),
+  status: z.enum(['pending', 'in_progress', 'completed']).describe('Step status.'),
+});
+
+export const userInputOptionSchema = z.object({
+  label: z.string().min(1).describe('User-facing option label (1-5 words).'),
+  description: z.string().default('').describe('One short sentence explaining impact/tradeoff if selected.'),
+});
+
+export const userInputQuestionSchema = z.object({
+  id: z.string().min(1).describe('Stable identifier for mapping answers (snake_case).'),
+  header: z.string().default('Question').describe('Short header label shown in the UI (12 or fewer chars).'),
+  question: z.string().min(1).describe('Single-sentence prompt shown to the user.'),
+  options: z.array(userInputOptionSchema).min(1).describe('2-3 choices. Put the recommended option first with "(Recommended)".'),
+});
+export type UserInputQuestion = z.infer<typeof userInputQuestionSchema>;
+
 export const TOOL_NAME_ALIASES: Record<string, string> = {
   read: 'read_file',
   glob: 'list_files',
@@ -51,6 +69,9 @@ export const TOOL_NAME_ALIASES: Record<string, string> = {
   interrupt_agent: 'close_agent',
   subagent: 'spawn_agent',
   task: 'spawn_agent',
+  ask_user: 'request_user_input',
+  ask_question: 'request_user_input',
+  read_image: 'view_image',
 };
 
 export function normalizeToolName(name: string, hasExact?: (n: string) => boolean): string {
@@ -65,11 +86,12 @@ export function normalizeToolInput(toolName: string, input: unknown): unknown {
     if (toolName === 'spawn_agent') return { message: input };
     if (toolName === 'wait_agent') return { targets: [input] };
     if (toolName === 'close_agent' || toolName === 'resume_agent') return { target: input };
+    if (toolName === 'view_image') return { path: input };
     return input;
   }
   if (!input || typeof input !== 'object' || Array.isArray(input)) return input;
   const obj = { ...(input as Record<string, unknown>) };
-  if (['read_file', 'write_file', 'edit_file', 'list_files', 'search'].includes(toolName)) {
+  if (['read_file', 'write_file', 'edit_file', 'list_files', 'search', 'view_image'].includes(toolName)) {
     if (obj.path === undefined) {
       const aliasPath = obj.filePath ?? obj.file_path ?? obj.directory;
       if (aliasPath !== undefined) obj.path = aliasPath;
@@ -215,6 +237,42 @@ export function normalizeToolInput(toolName: string, input: unknown): unknown {
     delete obj.agent_id;
     delete obj.task_name;
   }
+  if (toolName === 'update_plan') {
+    if (obj.plan === undefined) {
+      const alt = obj.steps ?? obj.items ?? obj.todos;
+      if (Array.isArray(alt)) {
+        obj.plan = alt.map(item => {
+          if (typeof item === 'string') return { step: item, status: 'pending' };
+          if (item && typeof item === 'object') {
+            const rec = item as Record<string, unknown>;
+            return {
+              step: String(rec.step ?? rec.content ?? rec.title ?? rec.text ?? ''),
+              status: rec.status === 'in_progress' || rec.status === 'completed' ? rec.status : 'pending',
+            };
+          }
+          return item;
+        });
+      }
+    }
+    delete obj.steps;
+    delete obj.items;
+    delete obj.todos;
+  }
+  if (toolName === 'request_user_input') {
+    if (obj.questions === undefined && typeof obj.question === 'string') {
+      const rawOpts = Array.isArray(obj.options) ? obj.options : ['Yes (Recommended)', 'No'];
+      obj.questions = [{
+        id: typeof obj.id === 'string' ? obj.id : 'question_1',
+        header: typeof obj.header === 'string' ? obj.header : 'Question',
+        question: obj.question,
+        options: rawOpts.map(o => typeof o === 'string' ? { label: o, description: '' } : o),
+      }];
+      delete obj.question;
+      delete obj.options;
+      delete obj.id;
+      delete obj.header;
+    }
+  }
   return obj;
 }
 
@@ -225,6 +283,8 @@ export class ToolRegistry {
   todos: TodoItem[] = [];
   onTodoUpdate?: (todos: TodoItem[]) => void;
   onPlanExit?: (plan: string) => void;
+  askUser?: (questions: UserInputQuestion[], signal: AbortSignal) => Promise<Record<string, string[]>>;
+  pendingImages: Array<{ path: string; mimeType: string; bytes: Uint8Array }> = [];
   private definitions = new Map<string, RegisteredTool>();
   constructor(readonly cwd: string, readonly approve: Approve, public readOnly = false) {
     this.files = new WorkspaceFiles(cwd);
@@ -267,6 +327,58 @@ export class ToolRegistry {
       description: 'Read the current session task checklist.',
       schema: z.object({}), readOnly: true,
       execute: async () => formatTodos(this.todos),
+    });
+    this.register('update_plan', {
+      description: 'Updates the task plan (Codex-compatible). Provide an optional explanation and a list of plan items, each with a step and status (pending, in_progress, completed). At most one step should be in_progress at a time.',
+      schema: z.object({
+        explanation: z.string().optional().describe('Optional note explaining why the plan changed.'),
+        plan: z.array(updatePlanItemSchema).describe('The list of plan steps.'),
+      }),
+      readOnly: true,
+      execute: async input => {
+        this.todos = input.plan.map((item, idx) => ({
+          id: String(idx + 1),
+          content: item.step,
+          status: item.status,
+          priority: 'medium' as const,
+        }));
+        this.onTodoUpdate?.(this.todos);
+        const header = input.explanation ? `Plan updated (${input.explanation}).` : 'Plan updated.';
+        return `${header}\n${formatTodos(this.todos)}`;
+      },
+    });
+    this.register('request_user_input', {
+      description: 'Request user input for one to three short multiple-choice questions and wait for the response.',
+      schema: z.object({
+        questions: z.array(userInputQuestionSchema).min(1).max(3).describe('Questions to show the user. Prefer 1 and do not exceed 3.'),
+      }),
+      readOnly: true,
+      execute: async (input, signal) => {
+        if (this.askUser) {
+          const answers = await this.askUser(input.questions, signal);
+          const formatted = Object.fromEntries(
+            Object.entries(answers).map(([id, list]) => [id, { answers: list }]),
+          );
+          return JSON.stringify({ answers: formatted });
+        }
+        const fallback = Object.fromEntries(
+          input.questions.map(q => [q.id, { answers: [q.options[0]?.label ?? ''] }]),
+        );
+        return JSON.stringify({ answers: fallback, note: 'Non-interactive mode: selected default first option.' });
+      },
+    });
+    this.register('view_image', {
+      description: 'Attach a local image from the filesystem (PNG, JPEG, WEBP, GIF) to the conversation context so you can inspect it visually.',
+      schema: z.object({
+        path: z.string().min(1).describe('Local filesystem path to an image file.'),
+        detail: z.enum(['high', 'original']).optional().describe('Optional detail override.'),
+      }),
+      readOnly: true,
+      execute: async input => {
+        const img = await this.files.readImage(input.path);
+        this.pendingImages.push({ path: img.resolvedPath, mimeType: img.mediaType, bytes: img.buffer });
+        return `Attached image ${img.resolvedPath} (${img.mediaType}, ${img.buffer.byteLength} bytes).`;
+      },
     });
     this.register('exit_plan_mode', {
       description: 'Use in plan mode when your implementation plan is complete. Presents the Markdown plan for user approval and exits plan mode upon approval so you can begin coding.',
@@ -317,6 +429,11 @@ export class ToolRegistry {
       },
     });
   }
+  takePendingImages() {
+    const out = this.pendingImages.slice();
+    this.pendingImages.length = 0;
+    return out;
+  }
   get effectiveReadOnly(): boolean {
     return this.readOnly || this.planMode;
   }
@@ -355,7 +472,11 @@ export class ToolRegistry {
     return normalizeToolName(name, n => this.definitions.has(n));
   }
   schemas(): ToolSet {
-    const collabTools = new Set(['spawn_agent', 'wait_agent', 'send_input', 'close_agent', 'resume_agent', 'list_agents']);
+    const collabTools = new Set([
+      'spawn_agent', 'wait_agent', 'send_input', 'close_agent', 'resume_agent', 'list_agents',
+      'update_plan', 'request_user_input', 'view_image',
+      'list_mcp_resources', 'list_mcp_resource_templates', 'read_mcp_resource',
+    ]);
     return Object.fromEntries([...this.definitions].filter(([name, d]) => {
       if (name === 'exit_plan_mode' && !this.planMode) return false;
       if ((name === 'todo_write' || name === 'todo_read' || collabTools.has(name)) && this.readOnly && !this.planMode) return false;
@@ -367,6 +488,8 @@ export class ToolRegistry {
     if (
       canonical === 'exit_plan_mode' ||
       canonical === 'todo_write' ||
+      canonical === 'update_plan' ||
+      canonical === 'request_user_input' ||
       canonical === 'wait_agent' ||
       canonical === 'send_input' ||
       canonical === 'close_agent' ||

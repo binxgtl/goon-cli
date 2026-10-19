@@ -58,10 +58,11 @@ Options:
   -v, --version             Show version
 
 Interactive commands:
-  /help, /setup, /model, /effort, /mode, /auto, /view, /transcript, /mcp, /plan,
-  /revert, /undo, /checkpoints, /todo, /compact, /diff, /review, /fork, /rename,
-  /export, /init, /status, /tools, /sessions, /doctor, /clear, /exit, or !<cmd>.
-Shortcuts: Shift+Tab mode, Ctrl+T transcript, Alt+. / Alt+, effort, Tab autocomplete, Esc Esc rewind, Ctrl+C cancel.
+  /help, /setup, /model, /effort, /mode, /auto, /view, /transcript, /copy, /btw,
+  /goal, /recap, /skills, /memories, /presets, /mention, /cd, /pwd, /mcp, /subagents,
+  /plan, /revert, /undo, /checkpoints, /todo, /compact, /diff, /review, /fork, /rename,
+  /delete, /export, /init, /status, /tools, /sessions, /debug-config, /warnings, /doctor, /clear, /exit, or !<cmd>.
+Shortcuts: Shift+Tab mode, Ctrl+T transcript, Ctrl+O copy, Alt+. / Alt+, effort, Tab autocomplete, Esc Esc rewind, Ctrl+C cancel.
 API keys are read from environment variables or ~/.config/goon/credentials.json.
 Shell commands run as your OS user; approvals are not an OS sandbox.
 `;
@@ -105,6 +106,71 @@ function formatRelativeTime(isoDate: string): string {
   const days = Math.floor(hrs / 24);
   if (days < 30) return `${days}d ago`;
   return isoDate.slice(0, 10);
+}
+
+export function extractCopyableFromMessages(
+  messages: Array<{ role: string; content: unknown }>,
+  selector = '',
+): { text: string; label: string } | undefined {
+  const assistantOutputs: string[] = [];
+  for (const m of messages) {
+    if (m.role !== 'assistant') continue;
+    let text = '';
+    if (typeof m.content === 'string') {
+      text = m.content;
+    } else if (Array.isArray(m.content)) {
+      text = m.content
+        .map(p => (p && typeof p === 'object' && 'type' in p && p.type === 'text' && 'text' in p && typeof p.text === 'string' ? p.text : ''))
+        .filter(Boolean)
+        .join('\n');
+    }
+    const cleaned = text.replace(/^<think>[\s\S]*?<\/think>\s*/i, '').trim();
+    if (cleaned) assistantOutputs.push(cleaned);
+  }
+  if (!assistantOutputs.length) return undefined;
+  const arg = selector.trim().toLowerCase();
+  if (arg === 'code' || arg === 'block' || arg === 'snippet') {
+    for (let i = assistantOutputs.length - 1; i >= 0; i--) {
+      const blocks = [...assistantOutputs[i].matchAll(/```[^\r\n]*\r?\n([\s\S]*?)```/g)];
+      if (blocks.length > 0) {
+        const lastBlock = blocks[blocks.length - 1][1].trimEnd();
+        if (lastBlock) return { text: lastBlock, label: 'last code block' };
+      }
+    }
+  }
+  const idxNum = Number(arg);
+  if (Number.isInteger(idxNum) && idxNum >= 1 && idxNum <= assistantOutputs.length) {
+    const picked = assistantOutputs[assistantOutputs.length - idxNum];
+    return { text: picked, label: idxNum === 1 ? 'last response' : `response #${idxNum} from latest` };
+  }
+  return { text: assistantOutputs[assistantOutputs.length - 1], label: 'last response' };
+}
+
+async function copyTextToClipboard(text: string): Promise<boolean> {
+  let copied = false;
+  if (stdout.isTTY && text.length <= 100_000) {
+    const b64 = Buffer.from(text, 'utf8').toString('base64');
+    stdout.write(`\x1b]52;c;${b64}\x07`);
+    copied = true;
+  }
+  try {
+    const { spawn } = await import('node:child_process');
+    const cmd =
+      process.platform === 'win32'
+        ? { bin: 'powershell.exe', args: ['-NoProfile', '-NonInteractive', '-Command', '[Console]::InputEncoding = [System.Text.Encoding]::UTF8; Set-Clipboard -Value ([Console]::In.ReadToEnd())'] }
+        : process.platform === 'darwin'
+          ? { bin: 'pbcopy', args: [] }
+          : { bin: 'xclip', args: ['-selection', 'clipboard'] };
+    await new Promise<void>((resolve, reject) => {
+      const child = spawn(cmd.bin, cmd.args, { stdio: ['pipe', 'ignore', 'ignore'], windowsHide: true });
+      child.on('error', reject);
+      child.on('close', code => (code === 0 ? resolve() : reject(new Error(`exit ${code}`))));
+      child.stdin.end(text, 'utf8');
+    });
+    return true;
+  } catch {
+    return copied;
+  }
 }
 
 export async function main(argv = process.argv.slice(2)): Promise<void> {
@@ -454,6 +520,30 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
           return reply === 'y' || reply === 'yes';
         }, currentMode === 'readonly');
         reg.planMode = currentMode === 'plan';
+        if (rl || tui) {
+          reg.askUser = async (questions, callSignal) => {
+            const out: Record<string, string[]> = {};
+            for (const q of questions) {
+              const optLines = q.options.map(
+                (o, idx) => `  [${idx + 1}] ${o.label}${o.description ? ` — ${o.description}` : ''}`,
+              );
+              const qBlock = `\n╭─── ${q.header || 'Question'} ────────────────────────────────────────────────╮\n  ${q.question}\n${optLines.join('\n')}\n╰─────────────────────────────────────────────────────────────────╯\n`;
+              const promptLabel = `Select [1-${q.options.length}] or type answer (Enter for 1): `;
+              const rawReply = tui
+                ? (await tui.askTransient(qBlock, promptLabel, callSignal)).trim()
+                : (display(qBlock), (await question(promptLabel, callSignal)).trim());
+              const num = Number(rawReply);
+              if (!rawReply) {
+                out[q.id] = [q.options[0]?.label ?? ''];
+              } else if (Number.isInteger(num) && num >= 1 && num <= q.options.length) {
+                out[q.id] = [q.options[num - 1].label];
+              } else {
+                out[q.id] = [rawReply];
+              }
+            }
+            return out;
+          };
+        }
         if (!values['no-mcp'] && manager) {
           await manager.close();
           manager = undefined;
@@ -507,6 +597,20 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       let { tools, harness } = await buildHarness(mode);
       if (tui) {
         void tools.files.listWorkspaceFiles().then(files => tui?.setWorkspaceFiles(files)).catch(() => {});
+        tui.onCopy = async () => {
+          const found = extractCopyableFromMessages(store.session.messages);
+          if (!found) {
+            tui?.setNotice('Nothing to copy yet (no assistant output in this session).');
+            return;
+          }
+          const ok = await copyTextToClipboard(found.text);
+          const lines = found.text.split(/\r?\n/).length;
+          tui?.setNotice(
+            ok
+              ? `Copied ${found.label} (${found.text.length} chars · ${lines} lines) to clipboard`
+              : `Failed to copy ${found.label} to system clipboard`,
+          );
+        };
         tui.onToggleMode = () => {
           const order: PermissionMode[] = ['ask', 'auto', 'plan', 'readonly'];
           const next = order[(order.indexOf(mode) + 1) % order.length];
@@ -647,6 +751,15 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             '  /auto [on|off], /yolo             Toggle Auto-Approve mode (or press Shift+Tab)\n' +
             '  /transcript [on|off]              Toggle Codex full-screen Transcript mode (or press Ctrl+T)\n' +
             '  /view [normal|verbose|transcript] Switch view: normal (hide thinking) | verbose | transcript\n' +
+            '  /copy [last|code|<N>]             Copy last response, code block, or Nth response (or press Ctrl+O)\n' +
+            '  /btw <question>, /side <question> Ask an ephemeral side question without modifying history\n' +
+            '  /goal [<objective>|pause|resume|complete|clear] Set or inspect session goal & token usage\n' +
+            '  /recap                            Generate a live summary of current session progress\n' +
+            '  /skills [list|<name>]             List or inspect SKILL.md skills (use $skill-name in prompt)\n' +
+            '  /memories [list|add <text>|rm <id>|clear] Manage persistent user memories across sessions\n' +
+            '  /presets [list|save <name> <prompt>|run <name>|rm <name>] Manage reusable prompt presets\n' +
+            '  /mention <filepath>               Insert @filepath mention into the composer\n' +
+            '  /cd <dir>, /pwd                   Change or show active workspace directory\n' +
             '  /mode [ask|auto|plan|readonly]    Switch approval mode (or press Shift+Tab)\n' +
             '  /setup, /config                   Interactive provider, URL, key, model & effort setup\n' +
             '  /model [id] [--effort=<level>]    Discover/pick model from /models or set model ID\n' +
@@ -657,14 +770,15 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             '  /todo [clear]                     View or clear the current task checklist\n' +
             '  /resume [latest|<number>|<id>]    Interactive session picker or hot-swap to saved session\n' +
             '  /new [title]                      Start a fresh session in this workspace\n' +
+            '  /delete [<id>|current]            Delete a saved session or current session\n' +
             '  /compact [focus instructions]     Summarize & archive earlier context history\n' +
-            '  /diff                             Show git status and unified diff in workspace\n' +
-            '  /review [instructions]            Run an agentic code review on current changes\n' +
+            '  /diff                             Show git status, staged/unstaged diff & untracked files\n' +
+            '  /review [branch <b?>|commit <c?>|<instructions>] Run code review on diff, branch, or commit\n' +
             '  /fork [title]                     Clone current session into a new forked session ID\n' +
             '  /rename <title>                   Set a title for the current session\n' +
             '  /export [filename.md]             Export session transcript to a Markdown file\n' +
             '  /init                             Generate or update AGENTS.md for this project\n' +
-            '  /status                           Show session, model, effort & context window stats\n' +
+            '  /status, /debug-config, /warnings Show session status, config layers, or runtime warnings\n' +
             '  /mcp [list|check|import-codex|reload] Inspect, check, reload, or import Codex MCP servers\n' +
             '  /subagents [list|show <id>|<task>] List spawned subagents, view transcript, or run a subagent\n' +
             '  /tools                            List active tools in current mode\n' +
@@ -673,8 +787,264 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             '  /clear                            Clear screen (or press Ctrl+L)\n' +
             '  /exit                             Exit goon (or press Ctrl+D on empty input)\n' +
             '  !<command>                        Execute shell command directly & record in context\n' +
-            '  @<filepath>                       Attach workspace file directly in prompt (Tab completes)\n'
+            '  @<filepath> / $<skill-name>       Attach workspace file or invoke SKILL.md in prompt\n'
           );
+          return true;
+        }
+        if (cmdInput === '/copy' || cmdInput.startsWith('/copy ')) {
+          const selector = cmdInput.slice(5).trim();
+          const found = extractCopyableFromMessages(store.session.messages, selector);
+          if (!found) {
+            if (tui) tui.setNotice('Nothing to copy yet (no assistant output in this session).');
+            else display('Nothing to copy yet (no assistant output in this session).\n');
+            return true;
+          }
+          const ok = await copyTextToClipboard(found.text);
+          const lines = found.text.split(/\r?\n/).length;
+          const msg = ok
+            ? `Copied ${found.label} (${found.text.length} chars · ${lines} lines) to clipboard.`
+            : `Copied ${found.label} (${found.text.length} chars · ${lines} lines).`;
+          if (tui) tui.setNotice(msg);
+          display(`${msg}\n`);
+          return true;
+        }
+        if (cmdInput === '/btw' || cmdInput.startsWith('/btw ') || cmdInput === '/side' || cmdInput.startsWith('/side ')) {
+          const questionText = cmdInput.replace(/^\/(?:btw|side)\b/, '').trim();
+          if (!questionText) {
+            display('Usage: /btw <question> (asks a side question without modifying the session history)\n');
+            return true;
+          }
+          if (tui) tui.setNotice('Answering side question (/btw)...');
+          else display('\n[Answering side question (/btw)...]\n');
+          void (async () => {
+            try {
+              const res = await harness.askSideQuestion(questionText, AbortSignal.timeout(runtime.timeoutMs));
+              display(
+                `\n╭─── Side Answer (/btw) ──────────────────────────────────────────╮\n` +
+                `  Q: ${questionText}\n` +
+                `  A: ${res.text.split('\n').join('\n     ')}\n` +
+                `╰─────────────────────────────────────────────────────────────────╯\n`
+              );
+              if (tui) tui.setNotice('Side question (/btw) answered (history unchanged).');
+            } catch (error) {
+              display(`\n[Side question failed: ${safeError(error, apiKey)}]\n`);
+            }
+          })();
+          return true;
+        }
+        if (cmdInput === '/goal' || cmdInput.startsWith('/goal ')) {
+          const arg = cmdInput.slice(5).trim();
+          const lower = arg.toLowerCase();
+          const now = new Date().toISOString();
+          if (!arg) {
+            const g = store.session.goal;
+            if (!g) {
+              display('No active session goal. Set one with: /goal <objective>\n');
+            } else {
+              const elapsedSec = Math.max(0, Math.floor((Date.now() - Date.parse(g.createdAt)) / 1000));
+              const mins = Math.floor(elapsedSec / 60);
+              const secs = elapsedSec % 60;
+              const spentTokens = Math.max(0, store.session.tokens - (g.tokensAtStart ?? 0));
+              display(
+                `\nSession Goal [${g.status.toUpperCase()}]:\n` +
+                `  Objective : ${g.objective}\n` +
+                `  Elapsed   : ${mins > 0 ? `${mins}m ${secs}s` : `${secs}s`} (since ${g.createdAt.slice(11, 19)})\n` +
+                `  Tokens    : ${spentTokens} tokens used since goal start\n`
+              );
+            }
+            return true;
+          }
+          if (lower === 'clear' || lower === 'off' || lower === 'none') {
+            store.session.goal = undefined;
+            await store.save();
+            if (tui) tui.setNotice('Cleared session goal.');
+            display('Cleared session goal.\n');
+            return true;
+          }
+          if (lower === 'pause' || lower === 'resume' || lower === 'complete' || lower === 'done') {
+            if (!store.session.goal) {
+              display('No session goal set yet. Use: /goal <objective>\n');
+              return true;
+            }
+            store.session.goal.status =
+              lower === 'pause' ? 'paused' : lower === 'resume' ? 'active' : 'complete';
+            store.session.goal.updatedAt = now;
+            await store.save();
+            display(`Session goal status updated to: ${store.session.goal.status} (${store.session.goal.objective})\n`);
+            return true;
+          }
+          store.session.goal = {
+            objective: arg,
+            status: 'active',
+            createdAt: now,
+            updatedAt: now,
+            tokensAtStart: store.session.tokens,
+          };
+          await store.save();
+          if (tui) tui.setNotice(`Goal active: ${arg.slice(0, 60)}`);
+          display(`Active session goal set: ${arg}\n`);
+          return true;
+        }
+        if (cmdInput === '/pwd' || cmdInput === '/cwd') {
+          display(`Workspace directory: ${runtime.cwd}\n`);
+          return true;
+        }
+        if (cmdInput === '/skills' || cmdInput.startsWith('/skills ')) {
+          const { discoverSkills } = await import('./context.js');
+          const { readFile } = await import('node:fs/promises');
+          const arg = cmdInput.slice(7).trim();
+          const skills = await discoverSkills(runtime.cwd);
+          if (!arg || arg.toLowerCase() === 'list') {
+            if (!skills.length) {
+              display('No SKILL.md skills found in .agents/skills, .codex/skills, skills/, or ~/.config/goon/skills.\n');
+            } else {
+              const lines = skills.map(s => `  $${s.name.padEnd(22)} [${s.scope}] — ${s.description}`);
+              display(`Available Skills (${skills.length}) — mention $<name> in any prompt to activate:\n${lines.join('\n')}\n`);
+            }
+            return true;
+          }
+          const cleanName = arg.replace(/^\$/, '').toLowerCase();
+          const matched = skills.find(s => s.name.toLowerCase() === cleanName);
+          if (!matched) {
+            display(`Skill "${arg}" not found. Run /skills to list discovered skills.\n`);
+            return true;
+          }
+          const content = await readFile(matched.path, 'utf8');
+          display(`\nSkill $${matched.name} (${matched.path}):\n${content.slice(0, 4000)}\n`);
+          return true;
+        }
+        if (cmdInput === '/memories' || cmdInput === '/memory' || cmdInput.startsWith('/memories ') || cmdInput.startsWith('/memory ')) {
+          const { loadMemories, saveMemories, memoriesPath } = await import('./context.js');
+          const rest = cmdInput.replace(/^\/memor(?:ies|y)\b/, '').trim();
+          const entries = await loadMemories();
+          if (!rest || rest.toLowerCase() === 'list') {
+            if (!entries.length) {
+              display(`No saved memories (${memoriesPath()}).\nUse "/memories add <note>" to save a persistent preference across sessions.\n`);
+            } else {
+              const lines = entries.map((m, i) => `  [${i + 1}] ${m.text} (${m.createdAt.slice(0, 10)})`);
+              display(`Saved Memories (${entries.length}):\n${lines.join('\n')}\n`);
+            }
+            return true;
+          }
+          if (rest.toLowerCase() === 'clear' || rest.toLowerCase() === 'reset') {
+            await saveMemories([]);
+            display('Cleared all saved memories.\n');
+            return true;
+          }
+          if (rest.toLowerCase().startsWith('rm ') || rest.toLowerCase().startsWith('remove ') || rest.toLowerCase().startsWith('del ')) {
+            const target = rest.replace(/^(?:rm|remove|del)\s+/i, '').trim();
+            const idx = Number(target) - 1;
+            if (Number.isInteger(idx) && idx >= 0 && idx < entries.length) {
+              const removed = entries.splice(idx, 1)[0];
+              await saveMemories(entries);
+              display(`Removed memory: "${removed.text}"\n`);
+            } else {
+              display(`Invalid memory index "${target}". Use /memories list.\n`);
+            }
+            return true;
+          }
+          const note = rest.toLowerCase().startsWith('add ') ? rest.slice(4).trim() : rest;
+          entries.push({
+            id: String(Date.now()),
+            text: note,
+            createdAt: new Date().toISOString(),
+          });
+          await saveMemories(entries);
+          display(`Saved memory #${entries.length}: "${note}"\n`);
+          return true;
+        }
+        if (cmdInput === '/presets' || cmdInput === '/preset' || cmdInput.startsWith('/presets ') || cmdInput.startsWith('/preset ')) {
+          const { loadPresets, savePresets, presetsPath } = await import('./context.js');
+          const rest = cmdInput.replace(/^\/presets?\b/, '').trim();
+          const presets = await loadPresets();
+          if (!rest || rest.toLowerCase() === 'list') {
+            const list = Object.values(presets);
+            if (!list.length) {
+              display(`No saved prompt presets (${presetsPath()}).\nUse "/presets save <name> <prompt>" and "/presets run <name>".\n`);
+            } else {
+              const lines = list.map(p => `  ${p.name.padEnd(18)} — ${p.prompt.replace(/\s+/g, ' ').slice(0, 80)}`);
+              display(`Saved Presets (${list.length}):\n${lines.join('\n')}\n`);
+            }
+            return true;
+          }
+          if (rest.toLowerCase().startsWith('save ') || rest.toLowerCase().startsWith('add ')) {
+            const body = rest.replace(/^(?:save|add)\s+/i, '').trim();
+            const sp = body.search(/\s/);
+            if (sp <= 0) {
+              display('Usage: /presets save <name> <prompt text>\n');
+              return true;
+            }
+            const name = body.slice(0, sp).trim();
+            const promptText = body.slice(sp + 1).trim();
+            presets[name] = { name, prompt: promptText, updatedAt: new Date().toISOString() };
+            await savePresets(presets);
+            display(`Saved preset "${name}". Run it with: /presets run ${name}\n`);
+            return true;
+          }
+          if (rest.toLowerCase().startsWith('rm ') || rest.toLowerCase().startsWith('remove ')) {
+            const name = rest.replace(/^(?:rm|remove)\s+/i, '').trim();
+            if (!presets[name]) {
+              display(`Preset "${name}" not found.\n`);
+              return true;
+            }
+            delete presets[name];
+            await savePresets(presets);
+            display(`Removed preset "${name}".\n`);
+            return true;
+          }
+          // Let "/presets run <name>" fall through to main loop when idle so it executes `run(preset.prompt)`
+          return false;
+        }
+        if (cmdInput === '/mention' || cmdInput.startsWith('/mention ')) {
+          const target = cmdInput.slice(8).trim();
+          if (!target) {
+            display('Usage: /mention <filepath> (or type @ in the composer to autocomplete workspace files)\n');
+            return true;
+          }
+          const formatted = target.includes(' ') ? `@"${target}" ` : `@${target} `;
+          if (tui) {
+            tui.insertText(formatted);
+            tui.setNotice(`Attached ${formatted.trim()} into composer.`);
+          } else {
+            display(`Tip: Include ${formatted.trim()} in your next prompt to attach the file.\n`);
+          }
+          return true;
+        }
+        if (cmdInput === '/debug-config') {
+          const { credentialsPath } = await import('./config.js');
+          const { mcpConfigPath } = await import('./mcp.js');
+          const { memoriesPath, presetsPath } = await import('./context.js');
+          const caps = resolveModelCapabilities(runtime.model);
+          display(
+            `\nResolved Configuration & Layers:\n` +
+            `  Config file      : ${configPath()}\n` +
+            `  Credentials file : ${credentialsPath()} (keyEnv: ${runtime.keyEnv})\n` +
+            `  MCP config file  : ${mcpConfigPath()}\n` +
+            `  Memories file    : ${memoriesPath()}\n` +
+            `  Presets file     : ${presetsPath()}\n` +
+            `  Data directory   : ${runtime.dataDir}\n` +
+            `  Workspace (cwd)  : ${runtime.cwd}\n` +
+            `  Provider & URL   : ${runtime.provider} (${runtime.baseUrl})\n` +
+            `  Model & Effort   : ${runtime.model} (effort: ${runtime.effort ?? 'default'})\n` +
+            `  Capabilities     : ctx=${runtime.contextWindow}, maxOut=${runtime.maxOutputTokens}, vision=${caps.supportsVision !== false}, defaultEffort=${caps.defaultEffort ?? 'default'}\n` +
+            `  Approval & View  : mode=${mode}, view=${viewMode}, showReasoning=${config.showReasoning}\n` +
+            `  Registered Tools : ${Object.keys(tools.schemas()).length} active (${manager?.tools.length ?? 0} from MCP)\n`
+          );
+          return true;
+        }
+        if (cmdInput === '/warnings') {
+          const warns = [...(manager?.warnings ?? [])];
+          for (const st of manager?.statuses ?? []) {
+            if (st.status === 'error' && st.error) {
+              const msg = `MCP ${st.name}: ${st.error}`;
+              if (!warns.includes(msg)) warns.push(msg);
+            }
+          }
+          if (!warns.length) {
+            display('No active runtime or MCP warnings.\n');
+          } else {
+            display(`Warnings (${warns.length}):\n${warns.map(w => `  • ${w}`).join('\n')}\n`);
+          }
           return true;
         }
         if (cmdInput === '/auto' || cmdInput.startsWith('/auto ') || cmdInput === '/yolo') {
@@ -807,12 +1177,13 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         if (cmdInput === '/diff') {
           const { runCommand } = await import('./process.js');
           try {
-            const [statusRes, diffRes] = await Promise.all([
+            const [statusRes, diffRes, stagedRes] = await Promise.all([
               runCommand('git', ['status', '--short'], { cwd: runtime.cwd, signal: AbortSignal.timeout(10_000), timeoutMs: 10_000 }),
               runCommand('git', ['diff', '--no-ext-diff'], { cwd: runtime.cwd, signal: AbortSignal.timeout(10_000), timeoutMs: 10_000 }),
+              runCommand('git', ['diff', '--cached', '--no-ext-diff'], { cwd: runtime.cwd, signal: AbortSignal.timeout(10_000), timeoutMs: 10_000 }),
             ]);
             const statusOut = statusRes.output.trim();
-            const diffOut = diffRes.output.trim();
+            const diffOut = [stagedRes.output.trim(), diffRes.output.trim()].filter(Boolean).join('\n\n');
             if (!statusOut && !diffOut) {
               display('Working tree is clean (no uncommitted changes).\n');
             } else {
@@ -909,8 +1280,12 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
           const { estimatedTokens } = await import('./context.js');
           const usedEst = estimatedTokens(store.session.messages, '');
           const pct = Math.min(100, Math.round((usedEst / runtime.contextWindow) * 100));
+          const goalLine = store.session.goal
+            ? `Goal           [${store.session.goal.status}] ${store.session.goal.objective}\n`
+            : '';
           display(
             `Session        ${store.session.id}${store.session.title ? ` (${store.session.title})` : ''}\n` +
+            goalLine +
             `Provider       ${runtime.provider} (${runtime.baseUrl})\n` +
             `Model          ${runtime.model}\n` +
             `Effort         ${runtime.effort ?? 'default'}\n` +
@@ -1462,32 +1837,126 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             }
             continue;
           }
-          if (input === '/diff') {
-            const { runCommand } = await import('./process.js');
+          if (input === '/recap') {
+            controller = new AbortController();
+            tui?.setStatus('Running');
             try {
-              const [statusRes, diffRes] = await Promise.all([
-                runCommand('git', ['status', '--short'], { cwd: runtime.cwd, signal: AbortSignal.timeout(10_000), timeoutMs: 10_000 }),
-                runCommand('git', ['diff', '--no-ext-diff'], { cwd: runtime.cwd, signal: AbortSignal.timeout(10_000), timeoutMs: 10_000 }),
-              ]);
-              const statusOut = statusRes.output.trim();
-              const diffOut = diffRes.output.trim();
-              if (!statusOut && !diffOut) {
-                display('Working tree is clean (no uncommitted changes).\n');
-              } else {
-                if (statusOut) display(`\nGit Status:\n${statusOut}\n`);
-                if (diffOut) display(`\n${diffOut.slice(0, 16_000)}\n`);
-              }
+              const res = await harness.recap(controller.signal);
+              display(
+                `\n╭─── Session Recap (/recap) ──────────────────────────────────────╮\n` +
+                `${res.text}\n` +
+                `╰─────────────────────────────────────────────────────────────────╯\n`
+              );
             } catch (error) {
-              display(`Failed to run git diff: ${safeError(error, apiKey)}\n`);
+              display(`Recap failed: ${safeError(error, apiKey)}\n`);
+            } finally {
+              controller = undefined;
+              tui?.setStatus('Ready');
             }
+            continue;
+          }
+          if (input === '/cd' || input.startsWith('/cd ')) {
+            const targetDir = input.slice(3).trim();
+            if (!targetDir) {
+              display(`Current workspace directory: ${runtime.cwd}\nUsage: /cd <directory>\n`);
+              continue;
+            }
+            const { stat, realpath } = await import('node:fs/promises');
+            try {
+              const candidate = resolve(runtime.cwd, targetDir);
+              const st = await stat(candidate);
+              if (!st.isDirectory()) {
+                display(`Not a directory: ${candidate}\n`);
+                continue;
+              }
+              const real = await realpath(candidate).catch(() => candidate);
+              runtime = { ...runtime, cwd: real };
+              store.session.cwd = real;
+              await store.save();
+              const built = await buildHarness(mode);
+              tools = built.tools;
+              harness = built.harness;
+              if (tui) {
+                void tools.files.listWorkspaceFiles().then(files => tui?.setWorkspaceFiles(files)).catch(() => {});
+                tui.setNotice(`Changed directory to: ${real}`);
+              }
+              display(`Changed workspace directory to: ${real}\n`);
+            } catch (error) {
+              display(`Failed to change directory: ${safeError(error, apiKey)}\n`);
+            }
+            continue;
+          }
+          if (input === '/delete' || input.startsWith('/delete ')) {
+            const target = input.slice(7).trim();
+            const sessionsRoot = join(runtime.dataDir, 'sessions');
+            if (!target || target.toLowerCase() === 'current') {
+              const oldId = store.session.id;
+              const oldStore = store;
+              store = await SessionStore.open(sessionsRoot, runtime);
+              await oldStore.close();
+              await SessionStore.deleteSession(sessionsRoot, oldId);
+              const built = await buildHarness(mode);
+              tools = built.tools;
+              harness = built.harness;
+              tui?.clear();
+              tui?.setTitle(`${runtime.model} · ${store.session.id.slice(0, 8)}`);
+              tui?.setTokens(0);
+              tui?.event({ type: 'todo', todos: [] });
+              display(welcomeBanner(runtime.model, runtime.provider, runtime.baseUrl, runtime.effort, runtime.cwd, store.session.id, mode));
+              display(`Deleted session ${oldId.slice(0, 8)} and started fresh session ${store.session.id.slice(0, 8)}.\n`);
+              continue;
+            }
+            try {
+              if (store.session.id.toLowerCase().startsWith(target.toLowerCase())) {
+                display('To delete the currently active session, run: /delete current\n');
+                continue;
+              }
+              const deletedId = await SessionStore.deleteSession(sessionsRoot, target);
+              display(`Deleted saved session: ${deletedId}\n`);
+            } catch (error) {
+              display(`Failed to delete session: ${safeError(error, apiKey)}\n`);
+            }
+            continue;
+          }
+          if (input.startsWith('/presets ') || input.startsWith('/preset ')) {
+            const { loadPresets } = await import('./context.js');
+            const rest = input.replace(/^\/presets?\s+/, '').trim();
+            const name = rest.replace(/^run\s+/i, '').trim();
+            const presets = await loadPresets();
+            const matched = presets[name];
+            if (!matched) {
+              display(`Preset "${name}" not found. Use "/presets list" or "/presets save <name> <prompt>".\n`);
+              continue;
+            }
+            display(`Running preset "${matched.name}":\n`);
+            await run(matched.prompt);
             continue;
           }
           if (input === '/review' || input.startsWith('/review ')) {
             const extra = input.slice(7).trim();
-            const reviewPrompt =
-              `Review the current changes in this repository (run git status and git diff or inspect modified files). ` +
-              `Focus on correctness, bugs, security issues, edge cases, and missing tests. Report findings ordered by severity with exact file and line references.` +
-              (extra ? `\nAdditional review focus: ${extra}` : '');
+            const branchMatch = /^branch\s+(\S+)(?:\s+([\s\S]+))?$/i.exec(extra);
+            const commitMatch = /^commit\s+(\S+)(?:\s+([\s\S]+))?$/i.exec(extra);
+            let reviewPrompt: string;
+            if (branchMatch) {
+              const baseBranch = branchMatch[1];
+              const notes = branchMatch[2]?.trim();
+              reviewPrompt =
+                `Review the changes on the current branch compared to "${baseBranch}" (run \`git diff ${baseBranch}...HEAD\` and \`git log --oneline ${baseBranch}..HEAD\`). ` +
+                `Focus on correctness, bugs, regressions, security issues, edge cases, and missing tests. Report findings ordered by severity with exact file and line references.` +
+                (notes ? `\nAdditional review focus: ${notes}` : '');
+            } else if (commitMatch) {
+              const sha = commitMatch[1];
+              const notes = commitMatch[2]?.trim();
+              reviewPrompt =
+                `Review commit "${sha}" in this repository (run \`git show ${sha}\`). ` +
+                `Focus on correctness, bugs, regressions, security issues, edge cases, and missing tests. Report findings ordered by severity with exact file and line references.` +
+                (notes ? `\nAdditional review focus: ${notes}` : '');
+            } else {
+              reviewPrompt =
+                `Review the current changes in this repository (run git status and git diff or inspect modified files). ` +
+                `Focus on correctness, bugs, security issues, edge cases, and missing tests. Report findings ordered by severity with exact file and line references.` +
+                (extra ? `\nAdditional review focus: ${extra}` : '');
+            }
             await run(reviewPrompt);
             continue;
           }

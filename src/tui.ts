@@ -8,9 +8,11 @@ import type { SubagentEvent } from './subagents.js';
 
 const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 export const SLASH_COMMANDS = [
-  '/help', '/setup', '/model', '/effort', '/mode', '/auto', '/yolo', '/view', '/transcript', '/mcp', '/subagents', '/agent', '/plan', '/revert', '/undo',
-  '/checkpoints', '/todo', '/resume', '/new', '/compact', '/diff', '/review', '/fork', '/rename',
-  '/export', '/init', '/status', '/tools', '/sessions', '/doctor', '/clear', '/exit',
+  '/help', '/setup', '/model', '/effort', '/mode', '/auto', '/yolo', '/view', '/transcript',
+  '/copy', '/btw', '/side', '/goal', '/recap', '/skills', '/memories', '/presets', '/mention',
+  '/cd', '/pwd', '/mcp', '/subagents', '/agent', '/plan', '/revert', '/undo',
+  '/checkpoints', '/todo', '/resume', '/new', '/delete', '/compact', '/diff', '/review', '/fork', '/rename',
+  '/export', '/init', '/status', '/tools', '/sessions', '/debug-config', '/warnings', '/doctor', '/clear', '/exit',
 ];
 
 const SLASH_DESCRIPTIONS: Record<string, string> = {
@@ -21,6 +23,17 @@ const SLASH_DESCRIPTIONS: Record<string, string> = {
   '/yolo': 'enable auto-approve mode for all tools',
   '/view': 'switch view mode: normal | verbose | transcript',
   '/transcript': 'toggle full transcript mode (or Ctrl+T)',
+  '/copy': 'copy last assistant response or code block to clipboard (or Ctrl+O)',
+  '/btw': 'ask an ephemeral side question without modifying history',
+  '/side': 'ask an ephemeral side question (/btw alias)',
+  '/goal': 'set or inspect session objective & token tracking',
+  '/recap': 'summarize current session progress without compacting',
+  '/skills': 'list or inspect SKILL.md skills (use $skill-name in prompt)',
+  '/memories': 'manage persistent user memories across sessions',
+  '/presets': 'save or run reusable prompt presets',
+  '/mention': 'attach @file mention into the composer',
+  '/cd': 'change active workspace directory',
+  '/pwd': 'show active workspace directory',
   '/mcp': 'list, check, add, remove, reload, or import-codex MCP servers',
   '/subagents': 'list spawned subagents, inspect transcripts, or run a subagent task',
   '/agent': 'spawn a subagent task or inspect subagents (/subagents)',
@@ -30,10 +43,13 @@ const SLASH_DESCRIPTIONS: Record<string, string> = {
   '/undo': 'rewind last turn & restore prompt to composer (or Esc Esc)',
   '/checkpoints': 'pick a previous turn checkpoint to rewind to',
   '/compact': 'summarize history to free context',
-  '/diff': 'show git diff in workspace',
-  '/review': 'run code review on current diff',
+  '/diff': 'show git diff in workspace (including untracked files)',
+  '/review': 'run code review on current diff, branch, or commit',
   '/resume': 'resume a saved session',
   '/new': 'start a fresh session',
+  '/delete': 'delete a saved session by id or current session',
+  '/debug-config': 'show resolved config paths, model capabilities, and settings',
+  '/warnings': 'show retained MCP or runtime warnings',
   '/status': 'show session & token status',
   '/doctor': 'verify environment & gateway /models',
   '/exit': 'quit goon cli',
@@ -297,6 +313,7 @@ export class TerminalUI {
   onCycleEffort?: (direction: 1 | -1) => void;
   onToggleTranscript?: (active: boolean) => void;
   onImmediateCommand?: (cmd: string) => void | Promise<void>;
+  onCopy?: () => void | Promise<void>;
 
   constructor(
     public title: string,
@@ -389,6 +406,15 @@ export class TerminalUI {
     this.inputRestoredFromRevert = fromRevert;
     this.attachedImages.clear();
     this.nextImageIdx = 1;
+    this.collapsePastedImagePathsInInput();
+    this.schedule(0);
+  }
+
+  insertText(text: string) {
+    const clean = terminalText(text).replace(/\r?\n/g, ' ');
+    const chars = [...clean];
+    this.input.splice(this.cursor, 0, ...chars);
+    this.cursor += chars.length;
     this.collapsePastedImagePathsInInput();
     this.schedule(0);
   }
@@ -657,7 +683,7 @@ export class TerminalUI {
       this.appendTranscript(`\n• ${verb} ${meta.summary}${stats}${diffBlock}\n`);
       return;
     }
-    if (name !== 'todo_write') {
+    if (name !== 'todo_write' && name !== 'update_plan') {
       const dur = meta.durationMs !== undefined ? ` (${formatCompactDuration(meta.durationMs)})` : '';
       this.appendTranscript(`\n• ${state === 'error' ? 'Failed' : 'Completed'} ${meta.summary}${dur}\n`);
     }
@@ -902,6 +928,11 @@ export class TerminalUI {
       if ((key.ctrl && key.name === 't') || key.sequence === '\x14') {
         this.setTranscriptOverlay(!this.inTranscriptOverlay);
         this.onToggleTranscript?.(this.inTranscriptOverlay);
+        return;
+      }
+      // Codex Ctrl+O: copy last assistant response or code block to clipboard
+      if ((key.ctrl && key.name === 'o') || key.sequence === '\x0f') {
+        void this.onCopy?.();
         return;
       }
       if (this.inTranscriptOverlay) {
