@@ -894,6 +894,7 @@ export class TerminalUI {
   }
 
   setStatus(status: string) {
+    if (this.closed) return;
     this.status = terminalText(status);
     const busy = this.status === 'Running' || this.status === 'Connecting MCP' || this.status === 'Compacting';
     if (busy) {

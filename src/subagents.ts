@@ -167,6 +167,7 @@ export class Subagents {
   private active = 0;
   private waiters: (() => void)[] = [];
   private nicknameIndex = 0;
+  private readonly usedNicknames = new Set<string>();
   readonly spawned = new Map<string, ManagedSubagent>();
   readonly metadataById = new Map<string, { nickname: string; role: AgentRoleType; task: string }>();
 
@@ -182,16 +183,23 @@ export class Subagents {
   }
 
   private allocateNickname(preferred?: string): string {
-    const used = new Set([...this.spawned.values()].map(a => a.nickname.toLowerCase()));
-    if (preferred && !used.has(preferred.toLowerCase())) return preferred;
+    for (const a of this.spawned.values()) this.usedNicknames.add(a.nickname.toLowerCase());
+    for (const m of this.metadataById.values()) this.usedNicknames.add(m.nickname.toLowerCase());
+    if (preferred && !this.usedNicknames.has(preferred.toLowerCase())) {
+      this.usedNicknames.add(preferred.toLowerCase());
+      return preferred;
+    }
     for (let i = 0; i < CODEX_AGENT_NICKNAMES.length; i++) {
       const candidate = CODEX_AGENT_NICKNAMES[(this.nicknameIndex + i) % CODEX_AGENT_NICKNAMES.length];
-      if (!used.has(candidate.toLowerCase())) {
+      if (!this.usedNicknames.has(candidate.toLowerCase())) {
         this.nicknameIndex = (this.nicknameIndex + i + 1) % CODEX_AGENT_NICKNAMES.length;
+        this.usedNicknames.add(candidate.toLowerCase());
         return candidate;
       }
     }
-    return `Agent-${this.spawned.size + 1}`;
+    const fallback = `Agent-${this.usedNicknames.size + 1}`;
+    this.usedNicknames.add(fallback.toLowerCase());
+    return fallback;
   }
 
   private resolveManagedAgent(target: string): ManagedSubagent | undefined {
@@ -362,9 +370,9 @@ export class Subagents {
       ...(input.model ? { model: input.model } : {}),
       ...(input.reasoning_effort ? { effort: input.reasoning_effort } : {}),
     };
+    const nickname = this.allocateNickname(input.nickname);
     const store = await SessionStore.open(this.subagentsRoot, childConfig);
     const id = store.session.id;
-    const nickname = this.allocateNickname(input.nickname);
     store.session.title = `${nickname} [${role}]`;
 
     if (input.fork_context) {
