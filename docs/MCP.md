@@ -75,6 +75,8 @@ to keep terminal/NDJSON output clean. Inspect server logs separately for debuggi
 Limits: 16 servers, 128 total tools, 16 continuation pages, 16k characters per
 input schema, 2 MiB stdio message buffer, 100–600000 ms configurable request
 timeout (default 30000). Startup fails on duplicates or invalid/excessive schemas
-rather than silently dropping tools. Tool lists are a startup snapshot; restart
-Goon after changing servers. Resources, prompt templates, sampling, elicitation,
-OAuth, legacy SSE and experimental MCP tasks are not implemented.
+rather than silently dropping tools. In interactive TUI sessions, `/mcp` reloads
+server connections in place; MCP resources (`list_mcp_resources`,
+`list_mcp_resource_templates`, `read_mcp_resource`) are also supported. Prompt
+templates, sampling, elicitation, OAuth, legacy SSE and experimental MCP tasks
+are not implemented.

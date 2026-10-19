@@ -26,8 +26,8 @@ Trên Termux, hãy làm việc trong `$HOME` để có đầy đủ quyền file
 ## Thiết lập nhanh (`goon setup` hoặc `goon init`)
 
 Chạy wizard tương tác để chọn provider, nhập Base URL, lưu API key an toàn
-(`keys.json` quyền `0600`), tự động quét danh sách model từ `/models` của endpoint
-(không hardcode model) và chọn mức `effort`:
+(`credentials.json` quyền `0600`), tự động quét danh sách model từ `/models` của endpoint
+(không hardcode model) và chọn mức `effort` (nhấn `Esc` bất kỳ lúc nào để huỷ không lưu dở):
 
 ```bash
 goon setup
@@ -59,14 +59,12 @@ goon
 | OpenAI Responses-compatible | `openai-responses` | API root trước `/responses` |
 | Anthropic Messages-compatible | `anthropic` | API root trước `/messages`, thường kết thúc `/v1` |
 
-Không tự thêm `/v1` cho URL của bạn: một số gateway dùng đường dẫn riêng.
-Nếu không đặt URL, provider Anthropic dùng `https://api.anthropic.com/v1`, hai
-provider còn lại dùng `https://api.openai.com/v1`. Endpoint phải hỗ trợ tool calling.
+Goon giữ nguyên đường dẫn Base URL bạn cấu hình (chỉ tự động chuẩn hoá thêm `/v1` cho một số gateway quen thuộc như `api.yuristore.xyz` hoặc `localhost:8000` khi bỏ trống path). Nếu không đặt `baseUrl`, mặc định sẽ dùng `DEFAULT_GATEWAY_URL` (`https://api.yuristore.xyz/v1`). Endpoint phải hỗ trợ tool calling.
 
 ## Cách dùng CLI
 
 ```bash
-goon                                              # Mở Codex-style TUI toàn màn hình
+goon                                              # Mở giao diện TUI toàn màn hình
 goon resume                                       # Tiếp tục phiên gần nhất có tin nhắn trong workspace
 goon --resume latest                              # Tương đương goon resume
 goon --resume SESSION_UUID -p 'Tiếp tục phần đang làm'
@@ -86,21 +84,20 @@ Mã thoát: `0` thành công, `1` lỗi, `2` từ chối quyền, `130` Ctrl+C, 
 
 ## Giao diện TUI, Phím tắt & Slash Commands
 
-Khi chạy `goon` trong terminal, TUI toàn màn hình kiểu Codex hiển thị banner căn
-chuẩn Unicode (hỗ trợ cả đường dẫn tiếng Việt NFC/NFD), lịch sử hội thoại, diff
-màu trực quan (`+dòng thêm` xanh lá, `-dòng xoá` đỏ), trạng thái tool/agent và
-khung nhập lệnh bo góc.
+Khi chạy `goon` trong terminal, giao diện TUI toàn màn hình hiển thị:
+- **Header Band**: Phiên bản, model + mức `effort`, thư mục workspace, nhánh Git hiện tại và thanh đo ngữ cảnh trực tiếp (`ctx ▰▰▰▱▱▱▱▱ 34%`).
+- **Hội thoại & Bảng biểu**: Render Markdown, bảng kẻ khung căn cột tự động, khối diff màu trực quan (`+dòng thêm` xanh lá, `-dòng xoá` đỏ) và trạng thái tool/subagent thời gian thực.
+- **Khung nhập lệnh (Composer)**: Đổi màu viền theo chế độ (`ask` / `auto` / `plan` / `readonly`), hiển thị bộ đếm token trực tiếp ở cạnh dưới và popup gợi ý lệnh `/slash` kèm mô tả.
 
 ### Phím tắt chính
 
 | Phím tắt | Chức năng |
 |---|---|
-| `Ctrl+T` | Bật/tắt **Transcript Mode** toàn màn hình (`T R A N S C R I P T`) — hiển thị đầy đủ cả khối `• Thinking`, cuộn xem toàn bộ lịch sử; nhấn `Ctrl+T`, `Esc` hoặc `q` để quay lại ngay |
+| `Ctrl+T` | Bật/tắt **Transcript Mode** toàn màn hình — hiển thị đầy đủ cả khối suy luận (`Thinking`), cuộn xem toàn bộ lịch sử; nhấn `Ctrl+T`, `Esc` hoặc `q` để quay lại ngay |
 | `Shift+Tab` | Chuyển nhanh chế độ quyền: `ask` → `auto` (auto-approve) → `plan` → `readonly` |
 | `Alt+.` / `Alt+,` | Tăng / giảm mức suy luận (`effort`: `low` ↔ `medium` ↔ `high` ↔ `xhigh` ↔ `max`) |
-| `Esc Esc` (nhấn đúp) | Mở bảng **Rewind / Revert** về checkpoint của các lượt trước và khôi phục cả file trên đĩa |
-| `Tab` | Tự động hoàn thành (autocomplete) lệnh `/slash` |
-| `Up` / `Down` | Cuộn lịch sử khi đang đọc hoặc gọi lại lệnh cũ trong ô nhập |
+| `Esc Esc` (nhấn đúp) | Mở bảng **Rewind / Revert** về checkpoint của các lượt trước và khôi phục file |
+| `Up` / `Down` / `Tab` | Di chuyển chọn lệnh trong popup `/slash` (hoặc gọi lại lịch sử lệnh khi không mở popup) |
 | `PgUp` / `PgDn` / Lăn chuột | Cuộn khung hội thoại hoặc khung Transcript |
 | `Ctrl+C` | Huỷ lượt model/tool đang chạy |
 | `Ctrl+D` | Thoát khi ô nhập trống |
@@ -118,24 +115,34 @@ Khi model đang suy nghĩ hoặc chạy tool:
 
 - `/auto` (hoặc `/yolo [on|off]`): Bật/tắt chế độ **Auto-Approve** (tự động chấp thuận mọi thao tác sửa file, bash và subagent).
 - `/mode [ask|auto|plan|readonly]`: Xem hoặc đổi chế độ quyền thực thi.
-- `/view [normal|verbose]`: Đổi chế độ hiển thị suy nghĩ (`normal` ẩn khối `• Thinking` cho gọn; `verbose` hiện đầy đủ toàn bộ quá trình suy luận).
+- `/view [normal|verbose]`: Đổi chế độ hiển thị suy nghĩ (`normal` ẩn khối `Thinking` cho gọn; `verbose` hiện đầy đủ toàn bộ quá trình suy luận).
 - `/transcript`: Bật/tắt chế độ xem Transcript toàn màn hình (giống `Ctrl+T`).
 - `/model [tên_model]` & `/models`: Đổi model hoặc quét trực tiếp danh sách model từ API.
 - `/effort [low|medium|high|xhigh|max|clear]`: Chỉnh mức độ suy luận (`reasoning_effort` / thinking budget).
 - `/resume [latest|số_thứ_tự|id_prefix]`: Mở menu chọn và khôi phục phiên làm việc cũ (tự động bỏ qua các phiên rỗng 0 tin nhắn).
 - `/new`, `/clear`, `/fork [tên]`, `/rename <tiêu_đề>`: Tạo phiên mới, xoá màn hình, nhân bản nhánh hội thoại hoặc đặt tên phiên.
-- `/rewind [N]` & `/revert [N]`: Quay lui hội thoại và khôi phục trạng thái file về trước lượt thứ `N`.
+- `/rewind [N]` & `/revert [N] [both|code|messages]`: Quay lui hội thoại và/hoặc khôi phục trạng thái file về trước lượt thứ `N`.
 - `/undo`: Hoàn tác các thay đổi file của lượt vừa chạy.
+- `/btw <câu_hỏi>`: Hỏi nhanh câu hỏi phụ (ephemeral side question) dựa trên ngữ cảnh hiện tại mà không làm bẩn lịch sử phiên.
+- `/goal [set|done|clear]`, `/memory [list|add|remove|clear]`, `/recap`: Đặt mục tiêu phiên, lưu ghi nhớ dài hạn (`memories.json`) hoặc tóm tắt tiến độ.
+- `/init`, `/skills`, `/mention <path>`: Khởi tạo `AGENTS.md`, liệt kê `SKILL.md` (gọi qua `$skill-name`) hoặc đính kèm `@file`/ảnh.
 - `/diff`, `/git`, `/review`: Xem `git status` + `git diff`, hoặc yêu cầu model review toàn bộ thay đổi hiện tại.
-- `/compact`: Chủ động nén ngữ cảnh hội thoại (có lưu archive đầy đủ trước khi nén).
-- `/setup`, `/provider`, `/key`, `/doctor`: Cấu hình lại provider, đổi API key hoặc kiểm tra kết nối/môi trường.
+- `/compact [trọng_tâm]`: Chủ động nén ngữ cảnh hội thoại (có lưu archive đầy đủ trước khi nén).
+- `/setup`, `/provider`, `/key`, `/doctor`: Cấu hình lại provider (nhấn `Esc` để huỷ), đổi API key hoặc kiểm tra kết nối/môi trường.
 - `!<lệnh>`: Chạy nhanh lệnh shell trực tiếp ngay trong TUI (ví dụ `!git status`).
 
-## Harness & Công cụ tích hợp
+## Harness, Công cụ & Hoàn tác (Checkpoint / Rewind)
 
-- **8 công cụ cốt lõi**: `read_file`, `list_files`, `search`, `write_file`, `edit_file`, `apply_patch`, `todo_write`, `bash` cùng 2 công cụ subagent (`delegate_task`, `delegate_edit`).
+- **Bộ công cụ tích hợp đầy đủ**:
+  - **File & Shell**: `read_file`, `list_files`, `search`, `write_file`, `edit_file`, `apply_patch`, `bash`, `view_image`.
+  - **Kế hoạch & Tương tác**: `todo_read`, `todo_write`, `update_plan`, `request_user_input`, `exit_plan_mode`.
+  - **Subagents (7 công cụ)**: Vòng đời tương tác (`spawn_agent`, `wait_agent`, `send_input`, `close_agent`, `list_agents`) và uỷ thác theo lô (`delegate_task`, `delegate_edit`).
+  - **MCP Resources & Tools**: `list_mcp_resources`, `list_mcp_resource_templates`, `read_mcp_resource` cùng các tool động từ MCP server (`mcp__<server>__<tool>`).
+- **Cơ chế Checkpoint & Giới hạn hoàn tác (`/rewind`, `/revert`, `/undo`)**:
+  - Các thay đổi thực hiện qua công cụ file (`write_file`, `edit_file`, `apply_patch`) được sao lưu nguyên bản **100%** trước khi ghi.
+  - Các thay đổi file phát sinh gián tiếp từ lệnh shell (`bash`) được ghi nhận theo cơ chế best-effort qua `snapshotWorkspace()`: quét tối đa `400` file văn bản có dung lượng `<= 256 KiB` (bỏ qua `.git`, `node_modules`, `dist`, `.goon`, `.refs`, symlink và file nhị phân). Nếu chạy lệnh shell biến đổi hàng loạt file lớn vượt ngưỡng này, bạn nên dùng Git (`git diff` / `git checkout` / Git worktree) để hoàn tác toàn diện.
 - **Tự động Retry API**: Khi gặp lỗi mạng hoặc lỗi upstream tạm thời (HTTP `5xx`, `429`, `408`, lỗi đóng stream/socket bất ngờ), Harness tự động thử lại tối đa **3 lần** với exponential backoff trước khi dừng.
-- **Hiển thị đầy đủ Unified Diff**: `computeUnifiedDiff` hiển thị trọn vẹn số dòng thêm/xoá thực tế (`+N -M`, hỗ trợ tới 5.000 dòng mỗi hunk thay vì cắt ở 60 dòng).
+- **Hiển thị đầy đủ Unified Diff**: `computeUnifiedDiff` hiển thị trọn vẹn số dòng thêm/xoá thực tế (`+N -M`, hỗ trợ tới 5.000 dòng mỗi hunk).
 - **Bảo vệ chống lỗi file `nul` trên Windows**:
   - Tự động chuyển hướng `>nul`, `2>nul`, `>>NUL`, `>/dev/nul` trong lệnh `bash` trên Windows về `/dev/null` an toàn (`sanitizeBashCommand`).
   - `WorkspaceFiles` từ chối tạo các tên thiết bị dành riêng của Windows (`nul`, `con`, `prn`, `aux`, `com1-9`, `lpt1-9`) trên mọi nền tảng để giữ an toàn cho Git repo đa nền tảng.
@@ -144,12 +151,14 @@ Khi model đang suy nghĩ hoặc chạy tool:
   - Lưu phiên atomic, lock tiến trình, tự động dọn phiên rỗng (`0 messages`) khi thoát hoặc đổi phiên.
   - Ghi file theo temporary file + `chmod` + `rename`, bảo toàn nguyên vẹn quyền file (`0755`, umask `027`/`007`).
 
-## Reasoning và Gateway Inline Think
+## Reasoning, Thinking Replay & Gateway Inline Think
 
-Gateway trả `<think>...</think>` ở đầu content được tách ngay khi stream, kể cả khi
-thẻ bị cắt giữa nhiều chunk. Chỉ phần answer đi vào kết quả cuối và report của
-agent con. Native reasoning, signature và provider metadata trong transcript gốc
-vẫn giữ nguyên để tool roundtrip/resume.
+- **Bảo toàn `reasoning_content` qua nhiều bước tool (`withReasoningReplay`)**:
+  - Với các endpoint `openai-compatible` ở chế độ thinking (DeepSeek, GLM, Kimi, v.v.), `goon-cli` giữ nguyên 100% `reasoning_content` thật của model qua các bước gọi tool và resume.
+  - Khi chế độ thinking đang bật (qua `--effort` hoặc lịch sử có khối reasoning) mà có bước `assistant` gọi tool nhanh không sinh thinking, `withReasoningReplay` tự động đính kèm `reasoning_content: ""` trên bản chiếu request để tránh lỗi HTTP 400 (`reasoning_content ... must be passed back`) mà không bao giờ chèn chuỗi giả vào lịch sử lưu trên đĩa.
+- **Tách `<think>...</think>` inline khi stream (`AnswerProjection`)**:
+  - Gateway trả `<think>...</think>` ở đầu `content` được tách ngay khi stream, kể cả khi thẻ bị cắt giữa nhiều chunk. Chỉ phần answer đi vào kết quả cuối và report của agent con.
+  - Native reasoning, chữ ký (`signature`) của Anthropic và provider metadata trong transcript gốc vẫn được giữ nguyên.
 
 ```bash
 goon --show-reasoning --json -p 'Kiểm tra dự án'  # xuất event reasoning riêng
@@ -159,7 +168,7 @@ goon --inline-reasoning off -p 'Trả tài liệu XML bắt đầu bằng <think
 
 ## MCP (Model Context Protocol)
 
-Goon dùng MCP SDK chính thức, hỗ trợ **tools qua stdio và Streamable HTTP**.
+Goon dùng MCP SDK chính thức, hỗ trợ **tools và resources qua stdio và Streamable HTTP**.
 Tạo `~/.config/goon/mcp.json` (hoặc `$XDG_CONFIG_HOME/goon/mcp.json`):
 
 ```json
@@ -176,21 +185,25 @@ Tạo `~/.config/goon/mcp.json` (hoặc `$XDG_CONFIG_HOME/goon/mcp.json`):
 ```
 
 ```bash
-goon mcp list    # xem cấu hình, không kết nối
-goon mcp check   # kết nối và in tên tool gốc/tên namespaced
-goon             # tự nạp các server đã bật
-goon --no-mcp    # bỏ qua MCP trong lượt này
+goon mcp list           # xem cấu hình, không kết nối
+goon mcp check          # kết nối và in tên tool gốc/tên namespaced
+goon mcp import-codex   # nhập nhanh các MCP server từ ~/.codex/config.toml
+goon                    # tự nạp các server đã bật
+goon --no-mcp           # bỏ qua MCP trong lượt này
 ```
 
 Xem [docs/MCP.md](docs/MCP.md) để biết chi tiết cấu hình stdio, biến môi trường và giới hạn.
 
-## Subagent (`delegate_task` & `delegate_edit`)
+## Subagents (Tương tác nền & Uỷ thác theo lô)
 
-- `delegate_task`: chia tối đa bốn việc đọc/review, tối đa hai agent chạy đồng thời.
-- `delegate_edit`: chia tối đa bốn việc sửa, chạy tuần tự; tôn trọng chế độ duyệt quyền (`ask` hoặc `auto`/`--yes`) của phiên cha.
+- **Vòng đời tương tác kiểu Codex (`spawn_agent`, `wait_agent`, `send_input`, `close_agent`, `list_agents`)**:
+  - Khởi chạy agent con (`explorer` chỉ đọc hoặc `worker` có quyền sửa file) chạy nền song song, gửi thêm chỉ dẫn bằng `send_input` và thu hoạch kết quả qua `wait_agent`.
+- **Uỷ thác theo lô (`delegate_task` & `delegate_edit`)**:
+  - `delegate_task`: chia tối đa 4 việc đọc/review độc lập, tối đa 2 agent chạy đồng thời.
+  - `delegate_edit`: chia tối đa 4 việc sửa file, chạy tuần tự; tôn trọng chế độ duyệt quyền (`ask` hoặc `auto`/`--yes`) của phiên cha.
 
 ```bash
-goon --read-only -p 'Dùng delegate_task để xem cấu trúc repo và tìm rủi ro trong test, rồi tổng hợp'
+goon --read-only -p 'Dùng spawn_agent hoặc delegate_task để khảo sát cấu trúc repo và tìm rủi ro trong test'
 goon -p 'Dùng delegate_edit để sửa lỗi trong src/files.ts và bổ sung regression test'
 goon --no-subagents -p 'Đọc repo và làm trực tiếp'
 ```
@@ -198,7 +211,8 @@ goon --no-subagents -p 'Đọc repo và làm trực tiếp'
 ## Cấu hình và Dữ liệu
 
 - Config: `$XDG_CONFIG_HOME/goon/config.json` (mặc định `~/.config/goon/config.json`).
-- Keys: `$XDG_CONFIG_HOME/goon/keys.json` (quyền `0600`).
+- Credentials (API Keys): `$XDG_CONFIG_HOME/goon/credentials.json` (quyền `0600`).
+- Memories & Presets: `$XDG_CONFIG_HOME/goon/memories.json`, `$XDG_CONFIG_HOME/goon/presets.json`.
 - Sessions: `$XDG_DATA_HOME/goon/sessions/` (mặc định `~/.local/share/goon/sessions/`).
 - Archives: `SESSION_UUID.compact-N.json` trong cùng thư mục session.
 - Ưu tiên: cờ CLI > biến `GOON_*` > config người dùng > mặc định.
@@ -230,17 +244,17 @@ npm install -g . --omit=dev
 
 | File | Trách nhiệm |
 |---|---|
-| `src/harness.ts` | Agent loop, retry API, điều phối tool, usage, cancellation |
-| `src/provider.ts` | Chọn adapter API, truyền `reasoningEffort` / thinking budget |
-| `src/setup.ts` | Setup wizard tương tác, quét `/models` động, quản lý `keys.json` |
+| `src/harness.ts` | Agent loop, retry API, điều phối tool, checkpoint, `/btw`, usage, cancellation |
+| `src/provider.ts` | Chọn adapter API, quét `/models`, truyền `reasoningEffort` / thinking budget |
+| `src/setup.ts` | Setup wizard tương tác (`Esc` để huỷ), quét `/models` động, lưu `credentials.json` |
 | `src/tools.ts` | Registry, schema, alias chuẩn hoá, `sanitizeBashCommand` và approval |
-| `src/files.ts`, `src/process.ts` | File I/O, unified diff, patch, bảo vệ `nul` và subprocess |
+| `src/files.ts`, `src/process.ts` | File I/O, unified diff, patch, `snapshotWorkspace`, bảo vệ `nul` và subprocess |
 | `src/session.ts` | Lock, checkpoint, rewind, resume và sửa lịch sử bị ngắt |
-| `src/context.ts` | System prompt, `AGENTS.md` và auto-compaction |
-| `src/cli.ts`, `src/tui.ts` | Flags, Codex-style TUI, Transcript Mode (`Ctrl+T`), slash commands |
-| `src/mcp.ts` | MCP client, transport, schema, lifecycle |
-| `src/subagents.ts` | Context con, concurrency, budget và approval |
-| `src/reasoning.ts` | Projection answer/reasoning, giữ transcript gốc |
+| `src/context.ts` | System prompt, `AGENTS.md`, `SKILL.md`, `memories.json`, `presets.json` và compaction |
+| `src/cli.ts`, `src/tui.ts` | Flags, giao diện TUI, Transcript Mode (`Ctrl+T`), popup `/slash` |
+| `src/mcp.ts` | MCP client, stdio/HTTP transport, resources, `import-codex`, lifecycle |
+| `src/subagents.ts` | `spawn_agent`/`wait_agent` & `delegate_task`/`delegate_edit`, concurrency, budget |
+| `src/reasoning.ts` | `withReasoningReplay` (`reasoning_content`), `AnswerProjection`, giữ transcript gốc |
 
 ## Repository & Tự động Release
 

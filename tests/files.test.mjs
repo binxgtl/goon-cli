@@ -152,6 +152,7 @@ test('applyPatch supports Add/Update/Delete and restoreBackups reverts modified,
 
   const backups = files.takeTurnBackups();
   assert.equal(backups.length, 3);
+  assert.equal(files.isTurnBackupPartial(), false);
 
   const restored = await files.restoreBackups(backups);
   assert.deepEqual(restored.restored.sort(), ['keep.txt', 'remove-me.txt']);
@@ -160,6 +161,14 @@ test('applyPatch supports Add/Update/Delete and restoreBackups reverts modified,
   assert.equal(await readFile(join(f.cwd, 'keep.txt'), 'utf8'), 'line1\nline2\nline3\n');
   assert.equal(await readFile(join(f.cwd, 'remove-me.txt'), 'utf8'), 'goodbye\n');
   await assert.rejects(readFile(join(f.cwd, 'added.txt'), 'utf8'));
-});
 
+  // Shell command snapshot/diff marks turn backup as partial
+  files.beginTurn();
+  assert.equal(files.isTurnBackupPartial(), false);
+  const before = await files.snapshotWorkspace();
+  await writeFile(join(f.cwd, 'keep.txt'), 'shell-modified\n', 'utf8');
+  await files.captureWorkspaceDiff(before);
+  assert.equal(files.isTurnBackupPartial(), true);
+  assert.equal(files.takeTurnBackups().length, 1);
+});
 

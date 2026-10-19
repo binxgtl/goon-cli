@@ -1626,8 +1626,9 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
               const rows = reversed.slice(0, 15).map((cp, idx) => {
                 const numStr = String(idx + 1).padStart(2, ' ');
                 const fileDesc = cp.files.length ? `${cp.files.length} file(s): ${cp.files.map(f => f.path).join(', ')}` : 'no file changes';
+                const partialTag = cp.partial ? ' · partial (shell)' : '';
                 const promptPreview = cp.prompt.replace(/\s+/g, ' ').slice(0, 54);
-                return `  ${numStr}. #${cp.id} [${cp.createdAt.slice(11, 19)}] "${promptPreview}" (${fileDesc})`;
+                return `  ${numStr}. #${cp.id} [${cp.createdAt.slice(11, 19)}] "${promptPreview}" (${fileDesc}${partialTag})`;
               });
               const pickerBlock = `\n◇ Rewind to turn checkpoint · ${cps.length} available\n${rows.join('\n')}\n`;
               const choice = (await tui.askTransient(pickerBlock, `Rewind [1-${Math.min(15, reversed.length)}, or Enter to cancel]: `, undefined, { escHint: 'cancel' })).trim();
@@ -1640,7 +1641,8 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
               display(`\nTurn Checkpoints (${cps.length}):\n`);
               for (const cp of cps) {
                 const fileDesc = cp.files.length ? `files: ${cp.files.map(f => f.path).join(', ')}` : 'no file changes';
-                display(`  #${cp.id} [${cp.createdAt.slice(11, 19)}] "${cp.prompt.slice(0, 60)}" (${fileDesc})\n`);
+                const partialTag = cp.partial ? ' · partial (shell)' : '';
+                display(`  #${cp.id} [${cp.createdAt.slice(11, 19)}] "${cp.prompt.slice(0, 60)}" (${fileDesc}${partialTag})\n`);
               }
               continue;
             }
@@ -1681,18 +1683,20 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
                     tui.setInput(restoredPrompt, true);
                   }
                   const fileNote = changedFiles.length > 0 ? ` · restored ${changedFiles.length} file(s)` : '';
+                  const partialNote = res.partial ? ' · partial undo (shell command ran)' : '';
                   tui.setNotice(
-                    `↺ Rewound ${res.turnsReverted} turn${res.turnsReverted > 1 ? 's' : ''}${fileNote} — edit prompt below, Enter to resend, or Esc Esc to rewind further`,
+                    `↺ Rewound ${res.turnsReverted} turn${res.turnsReverted > 1 ? 's' : ''}${fileNote}${partialNote} — edit prompt below, Enter to resend, or Esc Esc to rewind further`,
                   );
                 } else {
+                  const partialNote = res.partial ? ' [partial: shell command ran]' : '';
                   display(
-                    `\n↺ Reverted file changes from ${res.turnsReverted} turn${res.turnsReverted > 1 ? 's' : ''}` +
+                    `\n↺ Reverted file changes from ${res.turnsReverted} turn${res.turnsReverted > 1 ? 's' : ''}${partialNote}` +
                       (changedFiles.length ? ` (${changedFiles.join(', ')})\n` : ' (no files modified)\n'),
                   );
                 }
               } else {
                 display(
-                  `\n↺ Reverted ${res.turnsReverted} turn(s) [scope: ${scope}] (${res.messagesRemoved} messages removed)\n` +
+                  `\n↺ Reverted ${res.turnsReverted} turn(s) [scope: ${scope}] (${res.messagesRemoved} messages removed)${res.partial ? ' [partial undo: shell command ran]' : ''}\n` +
                   (res.restoredFiles.length ? `  Restored source files: ${res.restoredFiles.join(', ')}\n` : '') +
                   (res.deletedFiles.length ? `  Deleted newly created files: ${res.deletedFiles.join(', ')}\n` : '') +
                   (!res.restoredFiles.length && !res.deletedFiles.length && scope !== 'messages' ? `  No source files were modified in the reverted turn(s).\n` : '') +

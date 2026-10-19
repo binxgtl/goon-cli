@@ -21,6 +21,7 @@ export const turnCheckpointSchema = z.object({
   messageIndex: z.number().int().nonnegative(),
   tokensBefore: z.number().nonnegative(),
   files: z.array(fileBackupSchema),
+  partial: z.boolean().optional(),
 });
 export type TurnCheckpoint = z.infer<typeof turnCheckpointSchema>;
 

@@ -270,13 +270,19 @@ export interface WorkspaceSnapEntry {
 export class WorkspaceFiles {
   private revisions = new Map<string, string>();
   private activeBackups = new Map<string, FileBackup>();
+  private turnPartialBackup = false;
   constructor(readonly root: string) {}
   beginTurn() {
     this.activeBackups.clear();
+    this.turnPartialBackup = false;
+  }
+  isTurnBackupPartial(): boolean {
+    return this.turnPartialBackup;
   }
   takeTurnBackups(): FileBackup[] {
     const list = [...this.activeBackups.values()];
     this.activeBackups.clear();
+    this.turnPartialBackup = false;
     return list;
   }
   private recordBackup(relPath: string, existed: boolean, content?: string, mode?: number, afterContent?: string) {
@@ -512,6 +518,7 @@ export class WorkspaceFiles {
     return snap;
   }
   async captureWorkspaceDiff(before: Map<string, WorkspaceSnapEntry>): Promise<void> {
+    this.turnPartialBackup = true;
     const after = await this.snapshotWorkspace();
     for (const [rel, prev] of before) {
       const curr = after.get(rel);
