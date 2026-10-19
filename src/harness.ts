@@ -5,7 +5,7 @@ import { ToolRegistry, normalizeToolInput, normalizeToolName, type ToolCall, typ
 import { buildProviderOptions, createModel, resolveModelCapabilities } from './provider.js';
 import { safeError } from './errors.js';
 import { compactIfNeeded, compactNow, estimatedTokens, expandFileMentions, recapSession, systemPrompt } from './context.js';
-import { AnswerProjection, visibleAnswer, type AnswerPart } from './reasoning.js';
+import { AnswerProjection, visibleAnswer, withReasoningReplay, type AnswerPart } from './reasoning.js';
 
 export interface ToolEventMeta {
   kind: 'read' | 'list' | 'search' | 'exec' | 'edit' | 'other';
@@ -251,7 +251,7 @@ export class Harness {
     const result = streamText({
       model: this.model,
       system: `${sys}\n\nYou are answering an ephemeral side question (/btw). Do not call tools; answer directly and concisely from the conversation context and your knowledge.`,
-      messages: clonedHistory,
+      messages: withReasoningReplay(clonedHistory, this.config.provider),
       maxOutputTokens: Math.min(8_192, this.config.maxOutputTokens),
       maxRetries: 2,
       ...(providerOptions ? { providerOptions } : {}),
@@ -367,7 +367,7 @@ export class Harness {
           calls = [];
           try {
             const result = streamText({
-              model: this.model, system, messages: session.messages, tools: this.tools.schemas(),
+              model: this.model, system, messages: withReasoningReplay(session.messages, this.config.provider), tools: this.tools.schemas(),
               maxOutputTokens: this.config.maxOutputTokens, maxRetries: 0,
               ...(providerOptions ? { providerOptions } : {}),
               abortSignal: AbortSignal.any([signal, AbortSignal.timeout(this.config.timeoutMs)]),

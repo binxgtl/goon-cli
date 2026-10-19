@@ -4,6 +4,27 @@ export type InlineReasoning = 'leading-think' | 'off';
 export type AnswerPart = { type: 'text' | 'reasoning'; text: string };
 const OPEN = '<think>', CLOSE = '</think>';
 
+const hasProviderReasoning = (m: ModelMessage) =>
+  m.role === 'assistant' && Array.isArray(m.content) && m.content.some(p => p.type === 'reasoning' && p.text.length > 0);
+
+/**
+ * Thinking-mode endpoints (DeepSeek, GLM via OpenAI-compatible gateways) reject a request with
+ * "reasoning_content ... must be passed back" unless every replayed assistant message carries the field.
+ * The SDK already sends real reasoning verbatim, but omits the field when a step produced no reasoning
+ * (e.g. a quick tool call). Once the history proves the endpoint thinks (any non-empty reasoning part),
+ * such steps get an explicit empty `reasoning_content` — mirroring what the provider returned, never a
+ * fabricated placeholder. Returns a request-only view; the stored history is not modified.
+ */
+export function withReasoningReplay(messages: ModelMessage[], provider: string): ModelMessage[] {
+  if (provider !== 'openai-compatible' || !messages.some(hasProviderReasoning)) return messages;
+  return messages.map(m => {
+    if (m.role !== 'assistant' || hasProviderReasoning(m)) return m;
+    const compat = (m.providerOptions?.openaiCompatible ?? {}) as Record<string, unknown>;
+    if ('reasoning_content' in compat) return m;
+    return { ...m, providerOptions: { ...m.providerOptions, openaiCompatible: { ...compat, reasoning_content: '' } } };
+  });
+}
+
 /** Presentation projection only. Provider messages and signed replay data stay intact. */
 export class AnswerProjection {
   private mode: 'prefix' | 'reasoning' | 'answer' = 'prefix';

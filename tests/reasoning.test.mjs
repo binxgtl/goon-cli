@@ -149,3 +149,50 @@ test('Anthropic thinking signatures and raw inline text survive the next tool re
   const transcript = await readFile(join(f.data, 'goon/sessions', `${events[0].id}.json`), 'utf8');
   assert(transcript.includes('signature-fixture-unchanged')); assert(transcript.includes(raw));
 });
+
+// Mock of a DeepSeek/GLM-style thinking endpoint: every assistant message replayed in thinking mode must
+// carry `reasoning_content`, otherwise HTTP 400 with the upstream error text the user hit.
+function thinkingModeViolation(body) {
+  const bad = body.messages.findIndex(m => m.role === 'assistant' && typeof m.reasoning_content !== 'string');
+  return bad === -1 ? undefined : bad;
+}
+function rejectLikeThinkingEndpoint(response) {
+  response.writeHead(400, { 'content-type': 'application/json' });
+  response.end(JSON.stringify({ error: { type: 'invalid_request_error', message: 'The reasoning_content in the thinking mode must be passed back to the API.' } }));
+}
+
+test('thinking mode: real reasoning is replayed verbatim and reasoning-less tool steps still carry reasoning_content', async t => {
+  const f = await fixture(t);
+  await writeFile(join(f.cwd, 'a.txt'), 'A');
+  await writeFile(join(f.cwd, 'b.txt'), 'B');
+  const p = await provider(t, (body, response, n) => {
+    if (thinkingModeViolation(body) !== undefined) return rejectLikeThinkingEndpoint(response);
+    // Step 1 thinks, step 2 calls a tool without emitting any reasoning (seen with GLM/DeepSeek quick steps).
+    if (n === 1) return sse(response, { reasoning: 'Need a.txt first, then b.txt.', calls: [{ id: 'r1', name: 'read_file', input: { path: 'a.txt' } }] });
+    if (n === 2) return sse(response, { calls: [{ id: 'r2', name: 'read_file', input: { path: 'b.txt' } }] });
+    const assistants = body.messages.filter(m => m.role === 'assistant');
+    assert.equal(assistants.length, 2);
+    // The model's own chain of thought comes back unchanged — never a placeholder like "Thinking complete."
+    assert.equal(assistants[0].reasoning_content, 'Need a.txt first, then b.txt.');
+    assert.equal(assistants[1].reasoning_content, '');
+    return sse(response, { text: 'Read both.' });
+  });
+  const run = await cli(f, p.url, ['--json', '-p', 'read both files']).done;
+  assert.equal(run.code, 0, run.stderr + run.stdout);
+  assert.equal(p.requests.length, 3);
+  const stored = await readFile(join(f.data, 'goon/sessions', `${JSON.parse(run.stdout.split('\n')[0]).id}.json`), 'utf8');
+  assert(!stored.includes('reasoning_content'), 'the empty marker is request-only; stored history stays the provider original');
+});
+
+test('non-thinking endpoints never receive a reasoning_content field', async t => {
+  const f = await fixture(t);
+  await writeFile(join(f.cwd, 'a.txt'), 'A');
+  const p = await provider(t, (body, response, n) => {
+    if (n === 1) return sse(response, { calls: [{ id: 'r1', name: 'read_file', input: { path: 'a.txt' } }] });
+    const assistant = body.messages.find(m => m.role === 'assistant');
+    assert(!('reasoning_content' in assistant), 'no reasoning was ever produced, so none is sent');
+    return sse(response, { text: 'Done.' });
+  });
+  const run = await cli(f, p.url, ['--json', '-p', 'read a']).done;
+  assert.equal(run.code, 0, run.stderr + run.stdout);
+});
