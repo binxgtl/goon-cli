@@ -15,8 +15,8 @@ const hasProviderReasoning = (m: ModelMessage) =>
  * such steps get an explicit empty `reasoning_content` — mirroring what the provider returned, never a
  * fabricated placeholder. Returns a request-only view; the stored history is not modified.
  */
-export function withReasoningReplay(messages: ModelMessage[], provider: string): ModelMessage[] {
-  if (provider !== 'openai-compatible' || !messages.some(hasProviderReasoning)) return messages;
+export function withReasoningReplay(messages: ModelMessage[], provider: string, effort?: string): ModelMessage[] {
+  if (provider !== 'openai-compatible' || (!effort && !messages.some(hasProviderReasoning))) return messages;
   return messages.map(m => {
     if (m.role !== 'assistant' || hasProviderReasoning(m)) return m;
     const compat = (m.providerOptions?.openaiCompatible ?? {}) as Record<string, unknown>;

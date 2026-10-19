@@ -196,3 +196,18 @@ test('non-thinking endpoints never receive a reasoning_content field', async t =
   const run = await cli(f, p.url, ['--json', '-p', 'read a']).done;
   assert.equal(run.code, 0, run.stderr + run.stdout);
 });
+
+test('thinking mode with explicit --effort attaches empty reasoning_content even when step 1 emitted no reasoning', async t => {
+  const f = await fixture(t);
+  await writeFile(join(f.cwd, 'a.txt'), 'A');
+  const p = await provider(t, (body, response, n) => {
+    if (thinkingModeViolation(body) !== undefined) return rejectLikeThinkingEndpoint(response);
+    if (n === 1) return sse(response, { calls: [{ id: 'r1', name: 'read_file', input: { path: 'a.txt' } }] });
+    const assistant = body.messages.find(m => m.role === 'assistant');
+    assert.equal(assistant.reasoning_content, '');
+    return sse(response, { reasoning: 'Checked a.txt.', text: 'Done.' });
+  });
+  const run = await cli(f, p.url, ['--json', '--effort', 'high', '-p', 'read a']).done;
+  assert.equal(run.code, 0, run.stderr + run.stdout);
+});
+
