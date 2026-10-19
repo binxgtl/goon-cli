@@ -447,6 +447,8 @@ export class TerminalUI {
   private attachedImages = new Map<string, string>();
   private nextImageIdx = 1;
   private queuedPrompts: string[] = [];
+  private popupIndex = 0;
+  private popupFor = '';
   private turnSnapshots: string[] = [];
   private inputRestoredFromRevert = false;
   private escPrimed?: 'backtrack' | 'clear';
@@ -1053,6 +1055,26 @@ export class TerminalUI {
     }
   }
 
+  /**
+   * Slash popup state for the main composer: commands matching the typed `/prefix` (exact match first)
+   * and the selected index, which resets to 0 whenever the typed text changes.
+   */
+  private slashPopup(): { matches: string[]; index: number } {
+    const typed = this.input.join('');
+    if (this.label !== 'goon> ' || !typed.startsWith('/') || /\s/.test(typed)) {
+      this.popupFor = '';
+      this.popupIndex = 0;
+      return { matches: [], index: 0 };
+    }
+    const matches = SLASH_COMMANDS.filter(c => c.startsWith(typed)).sort((a, b) => Number(b === typed) - Number(a === typed));
+    if (this.popupFor !== typed) {
+      this.popupFor = typed;
+      this.popupIndex = 0;
+    }
+    const index = matches.length ? Math.min(Math.max(0, this.popupIndex), matches.length - 1) : 0;
+    return { matches, index };
+  }
+
   private scrollBy(deltaLines: number) {
     if (deltaLines === 0) return;
     this.scroll = Math.max(0, Math.min(this.maxScroll, this.scroll + deltaLines));
@@ -1252,6 +1274,14 @@ export class TerminalUI {
       // Plain Up / Down arrow (also emitted by Windows Terminal Mouse Wheel via \x1b[?1007h):
       // Scroll transcript when agent is busy, when already scrolled up, or when transcript overflows and input is empty.
       if (key.name === 'up' || key.name === 'down') {
+        // While the slash popup is open, arrows move its selection (never history recall).
+        const popup = this.slashPopup();
+        if (popup.matches.length > 0) {
+          const delta = key.name === 'up' ? -1 : 1;
+          this.popupIndex = (popup.index + delta + popup.matches.length) % popup.matches.length;
+          this.schedule(0);
+          return;
+        }
         const dir = key.name === 'up' ? 2 : -2;
         if (!this.pending && this.input.length === 0) {
           this.scrollBy(dir);
@@ -1296,7 +1326,8 @@ export class TerminalUI {
     if (!this.inBracketedPaste && key.name === 'tab') {
       const current = this.input.join('');
       if (current.startsWith('/')) {
-        const match = SLASH_COMMANDS.find(cmd => cmd.startsWith(current.trim()));
+        const popup = this.slashPopup();
+        const match = popup.matches[popup.index] ?? SLASH_COMMANDS.find(cmd => cmd.startsWith(current.trim()));
         if (match) {
           this.input = [...(match + ' ')];
           this.cursor = this.input.length;
@@ -1323,6 +1354,12 @@ export class TerminalUI {
     }
 
     if (!this.inBracketedPaste && (key.name === 'return' || key.name === 'enter')) {
+      const popup = this.slashPopup();
+      const selected = popup.matches[popup.index];
+      if (selected && selected !== this.input.join('')) {
+        this.input = [...selected];
+        this.cursor = this.input.length;
+      }
       this.collapsePastedImagePathsInInput();
       let value = this.input.join('');
       // Expand any [Image #N] placeholders to @"<path>" so expandFileMentions attaches them
@@ -2011,28 +2048,31 @@ export class TerminalUI {
         ? [`${T.faint}\x1b[3m${clip(`  ↳ ${this.queuedPrompts.join(' · ')} (Alt+↑ edit)`)}${T.reset}`]
         : [];
 
-    // Slash-command popup: live-filtered list with descriptions above the composer
+    // Slash-command popup: live-filtered list with descriptions above the composer (↑↓ select, Tab/Enter accept)
     const fixedRows = 1 + 1 + 1 + queueLines.length + 3; // header + gap + status + queue + composer box
     const popupLines: string[] = [];
-    const typedCommand = currentInput.startsWith('/') && !/\s/.test(currentInput) && !asking ? currentInput : '';
-    if (typedCommand) {
-      const matches = SLASH_COMMANDS.filter(c => c.startsWith(typedCommand));
+    const popup = this.slashPopup();
+    if (popup.matches.length) {
+      const { matches, index: selected } = popup;
       const room = Math.max(0, Math.min(6, rows - fixedRows - 3));
       const shownCount = matches.length > room ? Math.max(0, room - 1) : matches.length;
-      const nameCols = Math.max(8, ...matches.slice(0, shownCount).map(c => c.length)) + 2;
-      for (const [idx, cmd] of matches.slice(0, shownCount).entries()) {
+      const start = Math.min(Math.max(0, selected - shownCount + 1), Math.max(0, matches.length - shownCount));
+      const windowed = matches.slice(start, start + shownCount);
+      const nameCols = Math.max(8, ...windowed.map(c => c.length)) + 2;
+      for (const [offset, cmd] of windowed.entries()) {
+        const isSelected = start + offset === selected;
         const desc = SLASH_DESCRIPTIONS[cmd] ?? '';
-        const marker = idx === 0 ? '› ' : '  ';
+        const marker = isSelected ? '› ' : '  ';
         const plain = clip(`  ${marker}${cmd.padEnd(nameCols)}${desc}`);
         const nameEnd = 4 + nameCols;
         popupLines.push(
-          idx === 0
+          isSelected
             ? `${T.brandBold}${plain.slice(0, nameEnd)}${T.reset}${T.muted}${plain.slice(nameEnd)}${T.reset}`
             : `${T.text}${plain.slice(0, nameEnd)}${T.reset}${T.faint}${plain.slice(nameEnd)}${T.reset}`,
         );
       }
       if (matches.length > shownCount && room > 0) {
-        popupLines.push(`${T.faint}${clip(`    … +${matches.length - shownCount} more · Tab completes`)}${T.reset}`);
+        popupLines.push(`${T.faint}${clip(`    ${selected + 1}/${matches.length} · ↑↓ select · Tab/Enter accept`)}${T.reset}`);
       }
     }
 

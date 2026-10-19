@@ -1426,7 +1426,6 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       if (prompt) await run(prompt);
       else {
         if (!rl && !tui) throw new Error('Interactive mode requires a TTY.');
-        display('Type /help for commands, @file to attach files, !<cmd> for shell, or enter a task.\n');
         tui?.setStatus('Ready');
         let initialAutoCommand: string | undefined = launchResumePicker ? '/resume' : undefined;
         while (!exiting) {
@@ -1662,7 +1661,6 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
                   if (!rewoundFromSnapshot) {
                     tui.clear();
                     display(welcomeBanner(runtime.model, runtime.provider, runtime.baseUrl, runtime.effort, runtime.cwd, store.session.id, mode));
-                    display('Type /help for commands, @file to attach files, !<cmd> for shell, or enter a task.\n');
                     renderResumedHistory(false);
                   }
                   if (changedFiles.length > 0) {

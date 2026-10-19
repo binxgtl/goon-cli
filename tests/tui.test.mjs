@@ -661,6 +661,22 @@ test('redesign: slash popup lists matching commands with descriptions and Tab st
   assert.equal((await q).trim(), '/revert');
   await new Promise(resolve => setTimeout(resolve, 25));
   assert(!/rewind turn\(s\)/.test(stripVTControlCharacters(tty.ui.renderedFrame())), 'popup closes after submit');
+
+  // ↓ / ↑ move the popup selection and must never clear the composer (history recall used to wipe it).
+  const q2 = tty.ui.question('goon> ', undefined, true);
+  tty.key('/rev', undefined);
+  tty.key('', 'down');
+  await new Promise(resolve => setTimeout(resolve, 25));
+  let after = stripVTControlCharacters(tty.ui.renderedFrame());
+  assert.match(after, /│ › \/rev\s+│/, 'Down arrow must keep the typed input');
+  assert.match(after, /› \/review\s+run code review/, 'Down arrow must move the selection to the next match');
+  tty.key('', 'down'); // wraps back to the first match
+  tty.key('', 'up'); // and up wraps to the last
+  await new Promise(resolve => setTimeout(resolve, 25));
+  after = stripVTControlCharacters(tty.ui.renderedFrame());
+  assert.match(after, /› \/review\s+run code review/);
+  tty.key('', 'return');
+  assert.equal(await q2, '/review', 'Enter submits the highlighted command');
 });
 
 test('redesign: Markdown tables align columns across rows', async t => {
