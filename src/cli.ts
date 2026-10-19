@@ -1,7 +1,8 @@
 import { parseArgs } from 'node:util';
 import { createInterface } from 'node:readline/promises';
 import { stdin, stdout, stderr } from 'node:process';
-import { join, resolve } from 'node:path';
+import { existsSync, readFileSync, statSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 import {
   DEFAULT_GATEWAY_URL,
   EFFORT_LEVELS,
@@ -19,7 +20,7 @@ import { safeError } from './errors.js';
 import { VERSION } from './version.js';
 import type { HarnessEvent } from './harness.js';
 import type { SubagentEvent } from './subagents.js';
-import { padEndVisible, terminalText as cleanTerminal, TerminalUI, visibleLength } from './tui.js';
+import { padEndVisible, sliceVisible, terminalText as cleanTerminal, TerminalUI, visibleLength } from './tui.js';
 import type { McpManager } from './mcp.js';
 import { EFFORT_DESCRIPTIONS, parseEffortInput, runSetupWizard } from './setup.js';
 import { discoverModels, formatModelBadge, resolveModelCapabilities, type DiscoveredModel } from './provider.js';
@@ -78,20 +79,56 @@ export function welcomeBanner(
   sessionId: string,
   mode: PermissionMode,
 ): string {
-  const innerWidth = 67;
-  const row = (label: string, val: string) =>
-    `│  ${padEndVisible(label, 10)}: ${padEndVisible(val, 52)} │`;
-  const titlePrefix = `╭─── >_ goon cli (v${VERSION}) `;
-  const topDashes = '─'.repeat(Math.max(1, innerWidth + 1 - visibleLength(titlePrefix)));
+  const inner = 67;
+  const fit = (text: string, cols: number) =>
+    visibleLength(text) <= cols ? padEndVisible(text, cols) : padEndVisible(`${sliceVisible(text, cols - 1)}…`, cols);
+  const line = (content: string) => `│${fit(content, inner)}│`;
+  const field = (label: string, value: string) => line(`   ${label.padEnd(10)} ${value}`);
+  const left = ` ◆ goon  v${VERSION}`;
+  const right = `${mode === 'auto' ? 'auto-approve' : mode} · effort ${effort ?? 'default'} `;
+  const gap = Math.max(1, inner - visibleLength(left) - visibleLength(right));
+  const host = baseUrl.replace(/^https?:\/\//, '').replace(/\/+$/, '');
   return [
-    `${titlePrefix}${topDashes}╮`,
-    row('gateway', `${baseUrl} (${provider})`),
-    row('directory', cwd),
-    row('session', `${sessionId.slice(0, 8)} · mode: ${mode} (Shift+Tab or /mode)`),
-    row('commands', 'Type /help · /view · /plan · /revert · /resume'),
-    `╰${'─'.repeat(innerWidth)}╯`,
+    `╭${'─'.repeat(inner)}╮`,
+    line(`${left}${' '.repeat(gap)}${right}`),
+    line(''),
+    field('model', model),
+    field('gateway', `${host} · ${provider}`),
+    field('workspace', cwd),
+    field('session', sessionId.slice(0, 8)),
+    line(''),
+    line('   /help commands · @ files · $ skills · ! shell · shift+tab mode'),
+    `╰${'─'.repeat(inner)}╯`,
     '',
   ].join('\n');
+}
+
+/** Reads the current git branch (or short detached SHA) without spawning git; undefined outside a repo. */
+export function readGitBranch(cwd: string): string | undefined {
+  try {
+    let dir = resolve(cwd);
+    for (let depth = 0; depth < 64; depth++) {
+      const dotGit = join(dir, '.git');
+      if (existsSync(dotGit)) {
+        let gitDir = dotGit;
+        if (statSync(dotGit).isFile()) {
+          const pointer = /^gitdir:\s*(.+)$/m.exec(readFileSync(dotGit, 'utf8'));
+          if (!pointer) return undefined;
+          gitDir = resolve(dir, pointer[1].trim());
+        }
+        const head = readFileSync(join(gitDir, 'HEAD'), 'utf8').trim();
+        const ref = /^ref:\s*refs\/heads\/(.+)$/.exec(head);
+        if (ref) return ref[1];
+        return /^[0-9a-f]{7,}$/i.test(head) ? head.slice(0, 7) : undefined;
+      }
+      const parent = dirname(dir);
+      if (parent === dir) return undefined;
+      dir = parent;
+    }
+  } catch {
+    return undefined;
+  }
+  return undefined;
 }
 
 function formatRelativeTime(isoDate: string): string {
@@ -444,6 +481,16 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         tui.setTokens(store.session.tokens);
       } else if (stdin.isTTY) rl = createInterface({ input: stdin, output: stderr, terminal: true });
       rl?.on('SIGINT', stop);
+      const { estimatedTokens } = await import('./context.js');
+      const syncTuiHeader = (resetContext = false) => {
+        if (!tui) return;
+        tui.setWorkspace(runtime.cwd, readGitBranch(runtime.cwd));
+        tui.setContextWindow(runtime.contextWindow);
+        if (resetContext) {
+          tui.setContextUsage(store.session.messages.length ? estimatedTokens(store.session.messages, '') : undefined);
+        }
+      };
+      syncTuiHeader(true);
       const display = (text: string) => tui ? tui.write(text) : stderr.write(cleanTerminal(text));
       const question = (label: string, signal?: AbortSignal, remember = false) => tui ? tui.question(label, signal, remember)
         : rl ? rl.question(label, { signal }) : Promise.reject(new Error('Input requires a TTY.'));
@@ -489,7 +536,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
           if (!rl && !tui) return false;
           if (request.tool === 'exit_plan_mode' && request.input && typeof request.input === 'object' && 'plan' in request.input) {
             const planStr = String((request.input as { plan: unknown }).plan);
-            const planPrompt = `\n╭─── Proposed Implementation Plan ────────────────────────────────╮\n${planStr}\n╰─────────────────────────────────────────────────────────────────╯\nApprove plan and exit plan mode?\n`;
+            const planPrompt = `\n≡ Proposed plan\n${planStr.split(/\r?\n/).map(l => (l.trim() ? `  ${l}` : l)).join('\n')}\n\n  Approve plan and exit plan mode?\n`;
             const reply = tui
               ? (await tui.askTransient(planPrompt, '[y/N] ', request.signal)).trim().toLowerCase()
               : (display(planPrompt), (await question('[y/N] ', request.signal)).trim().toLowerCase());
@@ -509,7 +556,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             rawPreview = JSON.stringify(request.input, null, 2);
           }
           const preview = cleanTerminal(rawPreview.split(runtime.apiKey).join('[REDACTED]').slice(0, 8000));
-          const approvalBlock = `\n• Allow ${request.tool}?\n${preview}\n`;
+          const approvalBlock = `\n▲ Allow ${request.tool}?\n${preview}\n`;
           const reply = tui
             ? (await tui.askTransient(approvalBlock, '[y/N/a(lways)] ', request.signal)).trim().toLowerCase()
             : (display(approvalBlock), (await question('[y/N/a(lways)] ', request.signal)).trim().toLowerCase());
@@ -525,9 +572,9 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             const out: Record<string, string[]> = {};
             for (const q of questions) {
               const optLines = q.options.map(
-                (o, idx) => `  [${idx + 1}] ${o.label}${o.description ? ` — ${o.description}` : ''}`,
+                (o, idx) => `  ${idx + 1}. ${o.label}${o.description ? ` — ${o.description}` : ''}`,
               );
-              const qBlock = `\n╭─── ${q.header || 'Question'} ────────────────────────────────────────────────╮\n  ${q.question}\n${optLines.join('\n')}\n╰─────────────────────────────────────────────────────────────────╯\n`;
+              const qBlock = `\n◇ ${q.header || 'Question'}\n  ${q.question}\n${optLines.join('\n')}\n`;
               const promptLabel = `Select [1-${q.options.length}] or type answer (Enter for 1): `;
               const rawReply = tui
                 ? (await tui.askTransient(qBlock, promptLabel, callSignal)).trim()
@@ -625,6 +672,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             await saveConfig(config);
             runtime = await resolveRuntime(config, runtime.cwd);
             tui?.setEffort(runtime.effort);
+            syncTuiHeader();
             const built = await buildHarness(mode);
             tools = built.tools;
             harness = built.harness;
@@ -670,7 +718,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
           if (showBanner) {
             const titleSuffix = store.session.title ? ` (${store.session.title})` : '';
             display(
-              `\n• Resumed session ${store.session.id.slice(0, 8)}${titleSuffix} · ${msgs.length} messages · ${store.session.checkpoints?.length ?? 0} checkpoints\n`,
+              `\n↻ Resumed session ${store.session.id.slice(0, 8)}${titleSuffix} · ${msgs.length} messages · ${store.session.checkpoints?.length ?? 0} checkpoints\n`,
             );
           }
           if (store.session.todos?.length) {
@@ -726,6 +774,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         } finally {
           controller = undefined;
           tui?.setStatus('Ready');
+          syncTuiHeader();
           if (tui) void tools.files.listWorkspaceFiles().then(files => tui?.setWorkspaceFiles(files)).catch(() => {});
         }
       };
@@ -1408,6 +1457,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             store.session.model = runtime.model;
             tui?.setTitle(`${runtime.model} · ${store.session.id.slice(0, 8)}`);
             tui?.setEffort(runtime.effort);
+            syncTuiHeader();
             const built = await buildHarness(mode);
             tools = built.tools;
             harness = built.harness;
@@ -1471,6 +1521,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             store.session.model = runtime.model;
             tui?.setTitle(`${runtime.model} · ${store.session.id.slice(0, 8)}`);
             tui?.setEffort(runtime.effort);
+            syncTuiHeader();
             const built = await buildHarness(mode);
             tools = built.tools;
             harness = built.harness;
@@ -1499,6 +1550,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             await saveConfig(config);
             runtime = await resolveRuntime(config, runtime.cwd);
             tui?.setEffort(runtime.effort);
+            syncTuiHeader();
             const built = await buildHarness(mode);
             tools = built.tools;
             harness = built.harness;
@@ -1568,11 +1620,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
                 const promptPreview = cp.prompt.replace(/\s+/g, ' ').slice(0, 54);
                 return `  ${numStr}. #${cp.id} [${cp.createdAt.slice(11, 19)}] "${promptPreview}" (${fileDesc})`;
               });
-              const cpTitle = `─── Rewind to Turn Checkpoint (${cps.length} available) `;
-              const cpInner = Math.max(74, visibleLength(cpTitle) + 4, ...rows.map(r => visibleLength(r) + 2));
-              const cpTop = `╭${cpTitle}${'─'.repeat(Math.max(1, cpInner - visibleLength(cpTitle)))}╮`;
-              const cpBot = `╰${'─'.repeat(cpInner)}╯`;
-              const pickerBlock = `\n${cpTop}\n${rows.join('\n')}\n${cpBot}\n`;
+              const pickerBlock = `\n◇ Rewind to turn checkpoint · ${cps.length} available\n${rows.join('\n')}\n`;
               const choice = (await tui.askTransient(pickerBlock, `Rewind [1-${Math.min(15, reversed.length)}, or Enter to cancel]: `)).trim();
               const pickedNum = Number(choice);
               if (!choice || !Number.isInteger(pickedNum) || pickedNum < 1 || pickedNum > reversed.length) {
@@ -1607,6 +1655,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
               const res = await harness.revert({ steps, scope });
               if (tui) {
                 tui.setTokens(store.session.tokens);
+                syncTuiHeader(true);
                 const changedFiles = [...res.restoredFiles, ...res.deletedFiles];
                 if (scope === 'both' || scope === 'messages') {
                   const rewoundFromSnapshot = tui.rewindTurns(res.turnsReverted);
@@ -1617,7 +1666,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
                     renderResumedHistory(false);
                   }
                   if (changedFiles.length > 0) {
-                    display(`\n• Reverted ${res.turnsReverted} turn${res.turnsReverted > 1 ? 's' : ''} (files restored: ${changedFiles.join(', ')})\n`);
+                    display(`\n↺ Reverted ${res.turnsReverted} turn${res.turnsReverted > 1 ? 's' : ''} (files restored: ${changedFiles.join(', ')})\n`);
                   }
                   const restoredPrompt = res.revertedPrompts[0];
                   if (restoredPrompt) {
@@ -1629,7 +1678,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
                   );
                 } else {
                   display(
-                    `\n• Reverted file changes from ${res.turnsReverted} turn${res.turnsReverted > 1 ? 's' : ''}` +
+                    `\n↺ Reverted file changes from ${res.turnsReverted} turn${res.turnsReverted > 1 ? 's' : ''}` +
                       (changedFiles.length ? ` (${changedFiles.join(', ')})\n` : ' (no files modified)\n'),
                   );
                 }
@@ -1688,6 +1737,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             tui?.clear();
             tui?.setTitle(store.session.title ? `${runtime.model} · ${store.session.title}` : `${runtime.model} · ${store.session.id.slice(0, 8)}`);
             tui?.setTokens(0);
+            syncTuiHeader(true);
             tui?.event({ type: 'todo', todos: [] });
             display(welcomeBanner(runtime.model, runtime.provider, runtime.baseUrl, runtime.effort, runtime.cwd, store.session.id, mode));
             display(`Started new session: ${store.session.id}${store.session.title ? ` (${store.session.title})` : ''}\n`);
@@ -1715,11 +1765,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
                 const label = rawLabel.replace(/\s+/g, ' ').slice(0, 64);
                 return `  ${numStr}. ${s.id.slice(0, 8)} · ${ageTag.padEnd(8)} · ${msgTag.padEnd(8)} · ${label}${currentTag}`;
               });
-              const resTitle = `─── Resume Saved Session (${candidates.length} in workspace) `;
-              const resInner = Math.max(74, visibleLength(resTitle) + 4, ...rows.map(r => visibleLength(r) + 2));
-              const resTop = `╭${resTitle}${'─'.repeat(Math.max(1, resInner - visibleLength(resTitle)))}╮`;
-              const resBot = `╰${'─'.repeat(resInner)}╯`;
-              const pickerBlock = `\n${resTop}\n${rows.join('\n')}\n${resBot}\n`;
+              const pickerBlock = `\n◇ Resume saved session · ${candidates.length} in workspace\n${rows.join('\n')}\n`;
               const promptText = `Resume [1-${Math.min(15, candidates.length)}, latest, ID prefix, or Esc/q to cancel]: `;
               const choice = tui
                 ? (await tui.askTransient(pickerBlock, promptText)).trim()
@@ -1762,6 +1808,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
               }
               tui?.setTitle(store.session.title ? `${runtime.model} · ${store.session.title}` : `${runtime.model} · ${store.session.id.slice(0, 8)}`);
               tui?.setTokens(store.session.tokens);
+              syncTuiHeader(true);
               tui?.event({ type: 'todo', todos: store.session.todos ?? [] });
               renderResumedHistory();
               if (!store.session.messages.length) {
@@ -1878,6 +1925,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
               harness = built.harness;
               if (tui) {
                 void tools.files.listWorkspaceFiles().then(files => tui?.setWorkspaceFiles(files)).catch(() => {});
+                syncTuiHeader();
                 tui.setNotice(`Changed directory to: ${real}`);
               }
               display(`Changed workspace directory to: ${real}\n`);
@@ -1901,6 +1949,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
               tui?.clear();
               tui?.setTitle(`${runtime.model} · ${store.session.id.slice(0, 8)}`);
               tui?.setTokens(0);
+              syncTuiHeader(true);
               tui?.event({ type: 'todo', todos: [] });
               display(welcomeBanner(runtime.model, runtime.provider, runtime.baseUrl, runtime.effort, runtime.cwd, store.session.id, mode));
               display(`Deleted session ${oldId.slice(0, 8)} and started fresh session ${store.session.id.slice(0, 8)}.\n`);

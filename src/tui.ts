@@ -7,6 +7,95 @@ import type { HarnessEvent, ToolEventMeta } from './harness.js';
 import type { SubagentEvent } from './subagents.js';
 
 const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+const fg = (r: number, g: number, b: number) => `\x1b[38;2;${r};${g};${b}m`;
+const bgc = (r: number, g: number, b: number) => `\x1b[48;2;${r};${g};${b}m`;
+
+/**
+ * goon palette (truecolor, tuned for dark terminals). Violet is the brand/assistant voice, sky marks
+ * things you can act on (commands, paths, code), mint/rose/amber carry status, slate carries chrome.
+ */
+export const THEME = {
+  reset: '\x1b[0m',
+  brand: fg(167, 139, 250),
+  brandBold: `\x1b[1m${fg(167, 139, 250)}`,
+  thinking: fg(150, 135, 200),
+  bullet: fg(129, 120, 190),
+  text: fg(226, 232, 240),
+  strong: `\x1b[1m${fg(241, 245, 249)}`,
+  muted: fg(148, 163, 184),
+  faint: fg(100, 116, 139),
+  info: fg(125, 211, 252),
+  ok: fg(74, 222, 128),
+  err: fg(251, 113, 133),
+  warn: fg(251, 191, 36),
+  codeText: fg(203, 213, 225),
+  bandBg: bgc(24, 26, 36),
+  userBg: bgc(36, 38, 54),
+  codeBg: bgc(22, 24, 33),
+  addBg: bgc(18, 52, 35),
+  addFg: fg(134, 239, 172),
+  delBg: bgc(66, 24, 32),
+  delFg: fg(253, 164, 175),
+} as const;
+
+/** Single-column glyph vocabulary for transcript cells (none are Extended_Pictographic, so width() = 1). */
+export const GLYPH = {
+  brand: '◆',
+  answer: '◆',
+  user: '›',
+  thinking: '∴',
+  explored: '○',
+  ran: '●',
+  done: '●',
+  failed: '✗',
+  edit: '±',
+  agent: '◈',
+  todo: '≡',
+  allow: '▲',
+  compact: '◌',
+  resumed: '↻',
+  reverted: '↺',
+  prompt: '◇',
+} as const;
+
+const CELL_RE = /^([○●✗±◈≡▲◌↻↺◇]) (\S.*)$/u;
+const CELL_TONES: Record<string, string> = {
+  '○': THEME.muted,
+  '●': THEME.ok,
+  '✗': THEME.err,
+  '±': THEME.info,
+  '◈': THEME.brand,
+  '≡': THEME.brand,
+  '▲': THEME.warn,
+  '◌': THEME.faint,
+  '↻': THEME.info,
+  '↺': THEME.warn,
+  '◇': THEME.brand,
+};
+
+/** Private-use code point marking user-turn lines inside the plain-text transcript. */
+const USER_MARK = '\uE000';
+
+type Seg = [text: string, sgr: string];
+type RowKind =
+  | 'blank' | 'user' | 'answer' | 'normal' | 'heading' | 'quote' | 'rule' | 'table'
+  | 'reasoningHead' | 'reasoning' | 'codeHead' | 'code' | 'codeFoot'
+  | 'cell' | 'child' | 'diff' | 'diffMeta' | 'box' | 'hint';
+interface Row {
+  kind: RowKind;
+  pre: string;
+  text: string;
+  glyph?: string;
+  sign?: '+' | '-' | ' ';
+  level?: number;
+}
+
+export function formatTokenCount(n: number): string {
+  if (!Number.isFinite(n) || n < 1000) return String(Math.max(0, Math.round(n || 0)));
+  if (n < 1_000_000) return `${(n / 1000).toFixed(n < 10_000 ? 1 : 0).replace(/\.0$/, '')}k`;
+  return `${(n / 1_000_000).toFixed(1).replace(/\.0$/, '')}M`;
+}
 export const SLASH_COMMANDS = [
   '/help', '/setup', '/model', '/effort', '/mode', '/auto', '/yolo', '/view', '/transcript',
   '/copy', '/btw', '/side', '/goal', '/recap', '/skills', '/memories', '/presets', '/mention',
@@ -52,6 +141,15 @@ const SLASH_DESCRIPTIONS: Record<string, string> = {
   '/warnings': 'show retained MCP or runtime warnings',
   '/status': 'show session & token status',
   '/doctor': 'verify environment & gateway /models',
+  '/setup': 'run the provider / model setup wizard',
+  '/todo': 'show or clear the todo checklist',
+  '/fork': 'fork this session into a new one',
+  '/rename': 'rename the current session',
+  '/export': 'export the session to a Markdown file',
+  '/init': 'create or update AGENTS.md for this project',
+  '/tools': 'list available tools (built-in + MCP)',
+  '/sessions': 'list saved sessions',
+  '/clear': 'clear the screen (history is kept)',
   '/exit': 'quit goon cli',
 };
 
@@ -93,41 +191,6 @@ export function wrapTerminal(text: string, columns: number): string[] {
   return lines;
 }
 
-function wrapWithIndent(text: string, columns: number, firstPrefix: string, contPrefix = firstPrefix): string[] {
-  const firstPrefixCols = visibleLength(firstPrefix);
-  const contPrefixCols = visibleLength(contPrefix);
-  const firstAvail = Math.max(2, columns - firstPrefixCols);
-  const contAvail = Math.max(2, columns - contPrefixCols);
-
-  const out: string[] = [];
-  const rawParagraphs = terminalText(text).replace(/\t/g, '  ').split('\n');
-  for (const para of rawParagraphs) {
-    if (!para) {
-      out.push(firstPrefix.trimEnd());
-      continue;
-    }
-    let current = '';
-    let used = 0;
-    let isFirst = true;
-    for (const c of para) {
-      const size = width(c);
-      const limit = isFirst ? firstAvail : contAvail;
-      if (used + size > limit && current) {
-        out.push((isFirst ? firstPrefix : contPrefix) + current);
-        current = '';
-        used = 0;
-        isFirst = false;
-      }
-      current += c;
-      used += size;
-    }
-    if (current || isFirst) {
-      out.push((isFirst ? firstPrefix : contPrefix) + current);
-    }
-  }
-  return out.length ? out : [firstPrefix];
-}
-
 export function visibleLength(str: string): number {
   let total = 0;
   for (const c of stripVTControlCharacters(str)) total += width(c);
@@ -159,20 +222,102 @@ function padRightAnsi(str: string, cols: number, bgAnsi = ''): string {
   return `${bgAnsi}${str}${bgAnsi}${' '.repeat(pad)}\x1b[0m`;
 }
 
-/** Format inline Markdown (**bold**, *italic*, `code`, [label](url)) into ANSI spans. */
+/** Format inline Markdown (**bold**, `code`, [label](url), ~~strike~~) into ANSI spans. */
 export function formatInlineMarkdown(raw: string, baseSgr = '\x1b[0m'): string {
   let out = raw;
-  // Highlight [Image #N...] pills in Codex Cyan/Blue badge style
-  out = out.replace(/(\[Image #\d+[^\]]*\])/g, `\x1b[1;38;2;99;168;248m$1${baseSgr}`);
-  // Inline code `...` -> Codex Accent Blue (#63A8F8)
-  out = out.replace(/`([^`\n]+)`/g, `\x1b[38;2;99;168;248m$1${baseSgr}`);
+  // [Image #N] attachment pills
+  out = out.replace(/(\[Image #\d+[^\]]*\])/g, `${THEME.brandBold}$1${baseSgr}`);
+  // Inline code `...`
+  out = out.replace(/`([^`\n]+)`/g, `${THEME.info}$1${baseSgr}`);
   // Markdown links [label](url)
-  out = out.replace(/\[([^\]]+)\]\(([^)]+)\)/g, `\x1b[4;38;2;99;168;248m$1\x1b[24;2m ($2)${baseSgr}`);
+  out = out.replace(/\[([^\]]+)\]\(([^)]+)\)/g, `\x1b[4m${THEME.info}$1\x1b[24m${THEME.faint} ($2)${baseSgr}`);
   // Bold **...**
   out = out.replace(/\*\*([^*]+)\*\*/g, `\x1b[1m$1\x1b[22m${baseSgr}`);
   // Strikethrough ~~...~~
   out = out.replace(/~~([^~]+)~~/g, `\x1b[9m$1\x1b[29m${baseSgr}`);
   return out;
+}
+
+/**
+ * Wraps plain text into chunks that fit `firstAvail` columns on the first row and `contAvail` after.
+ * With `words`, breaks at the last space when the carried tail still fits; otherwise hard-wraps.
+ */
+function wrapChunks(text: string, firstAvail: number, contAvail: number, words: boolean): string[] {
+  const clean = terminalText(text).replace(/\t/g, '  ');
+  const contLimit = Math.max(1, contAvail);
+  const out: string[] = [];
+  let avail = Math.max(1, firstAvail);
+  let cur = '';
+  let used = 0;
+  for (const c of clean) {
+    const w = width(c);
+    if (used + w > avail && cur) {
+      if (words && c === ' ') {
+        out.push(cur);
+        cur = '';
+        used = 0;
+        avail = contLimit;
+        continue;
+      }
+      const cut = words ? cur.lastIndexOf(' ') : -1;
+      if (cut > 0 && visibleLength(cur.slice(cut + 1)) + w <= contLimit) {
+        out.push(cur.slice(0, cut));
+        cur = cur.slice(cut + 1);
+      } else {
+        out.push(cur);
+        cur = '';
+      }
+      used = visibleLength(cur);
+      avail = contLimit;
+    }
+    cur += c;
+    used += w;
+  }
+  out.push(cur);
+  return out;
+}
+
+const TABLE_SEPARATOR_RE = /^\|[\s:|-]+\|$/;
+const isTableRow = (line: string) => line.trimStart().startsWith('|') && line.trimEnd().endsWith('|') && line.trim().length > 1;
+const splitTableCells = (trimmedRow: string) => trimmedRow.slice(1, -1).split('|').map(c => c.trim());
+/** Text a cell displays after inline Markdown markers are consumed (used for column alignment). */
+const displayedCell = (cell: string) =>
+  cell
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/`([^`\n]+)`/g, '$1')
+    .replace(/~~([^~]+)~~/g, '$1')
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '$1 ($2)');
+
+/** Unstyled row for tiny terminals (< 48x12). */
+function plainRow(row: Row, cols: number): string {
+  if (row.kind === 'blank') return '';
+  if (row.kind === 'codeHead') return sliceVisible(`  ─ ${row.text}`, cols);
+  if (row.kind === 'codeFoot') return '  ─';
+  return `${row.pre}${row.text}`;
+}
+
+/** Paints welcome-banner / panel box rows: faint frame, brand mark, faint labels, bright values. */
+function styleBoxLine(line: string): string {
+  const T = THEME;
+  const R = T.reset;
+  if (line.startsWith('╭') || line.startsWith('╰')) {
+    return `${T.faint}${line.replace(/[^─╭╮╰╯]+/g, m => `${R}${T.brandBold}${m}${R}${T.faint}`)}${R}`;
+  }
+  const m = /^│(.*?)(│?)$/.exec(line);
+  if (!m) return line;
+  const content = m[1];
+  const close = m[2] ? `${T.faint}│${R}` : '';
+  let styled: string;
+  const title = /^(\s*)(◆ goon)(\s+)(v\S+)(\s+)(.*?)(\s*)$/.exec(content);
+  const field = /^(\s{2,4})([a-z]+)(\s{2,})(.*)$/.exec(content);
+  if (title) {
+    styled = `${title[1]}${T.brandBold}${title[2]}${R}${title[3]}${T.faint}${title[4]}${R}${title[5]}${T.muted}${title[6]}${R}${title[7]}`;
+  } else if (field) {
+    styled = `${field[1]}${T.faint}${field[2]}${R}${field[3]}${T.text}${field[4]}${R}`;
+  } else {
+    styled = `${T.faint}${content.replace(/(\/help|shift\+tab|[@$!](?= ))/g, tok => `${R}${T.info}${tok}${R}${T.faint}`)}${R}`;
+  }
+  return `${T.faint}│${R}${styled}${close}`;
 }
 
 function extractReasoningSummary(buffer: string): { header?: string; detail?: string } {
@@ -309,6 +454,10 @@ export class TerminalUI {
   private statusNotice?: string;
   private viewMode: 'normal' | 'verbose' | 'transcript' = 'verbose';
   private inTranscriptOverlay = false;
+  private workspaceName = '';
+  private branch = '';
+  private contextWindow = 0;
+  private contextUsed?: number;
   onToggleMode?: () => void;
   onCycleEffort?: (direction: 1 | -1) => void;
   onToggleTranscript?: (active: boolean) => void;
@@ -479,6 +628,25 @@ export class TerminalUI {
     this.workspaceFiles = files;
   }
 
+  /** Header identity: workspace folder name and current git branch (or short detached SHA). */
+  setWorkspace(cwd: string, branch?: string) {
+    const name = terminalText(cwd).replace(/[\\/]+$/, '').split(/[\\/]/).pop() ?? '';
+    this.workspaceName = name || terminalText(cwd);
+    this.branch = branch ? terminalText(branch) : '';
+    this.schedule();
+  }
+
+  setContextWindow(tokens: number) {
+    this.contextWindow = Number.isFinite(tokens) && tokens > 0 ? tokens : 0;
+    this.schedule();
+  }
+
+  /** Context occupancy in tokens; `undefined` hides the meter until the next provider usage report. */
+  setContextUsage(tokens: number | undefined) {
+    this.contextUsed = tokens !== undefined && Number.isFinite(tokens) && tokens >= 0 ? tokens : undefined;
+    this.schedule();
+  }
+
   private flushExploreGroup() {
     if (!this.exploreGroup.length) return;
     const reads = this.exploreGroup.filter(e => e.kind === 'read').map(e => e.summary);
@@ -490,9 +658,8 @@ export class TerminalUI {
       childLines.push(`${verb} ${item.summary}`);
     }
     const formatted = childLines.map((l, idx) => `  ${idx === 0 ? '└' : ' '} ${l}`).join('\n');
-    this.appendTranscript(`\n• Explored\n${formatted}\n`);
     this.exploreGroup = [];
-    this.outputChannel = undefined;
+    this.appendCell(`\n${GLYPH.explored} Explored\n${formatted}\n`);
   }
 
   private appendTranscript(text: string, forceBottom = false) {
@@ -502,21 +669,40 @@ export class TerminalUI {
     this.schedule(16);
   }
 
+  /**
+   * A `[normal]` marker closes any open reasoning/answer block so the following cell or CLI output
+   * can never inherit answer/thinking formatting. The marker itself renders as nothing.
+   */
+  private blockReset(): string {
+    return !this.transcript || this.transcript.endsWith('\n') ? '[normal]\n' : '\n[normal]\n';
+  }
+
+  /** Appends a glyph-prefixed transcript cell (tool result, todo, agent, notice) after closing any open block. */
+  private appendCell(text: string) {
+    this.outputChannel = undefined;
+    this.appendTranscript(this.blockReset() + text);
+  }
+
   write(text: string) {
     let cleaned = text;
     // Clean up raw @"C:\...\image.png" in user prompt echo so transcript shows [Image #1: name.png]
     cleaned = cleaned.replace(/@"([^"]+\.(?:png|jpe?g|webp|gif))"/gi, (_, p: string) => `[Image: ${basename(p)}]`);
     const trimmedStart = cleaned.trimStart();
     const isUserPrompt = trimmedStart.startsWith('> ') || trimmedStart.startsWith('› ');
-    const isTaggedBlock = trimmedStart.startsWith('[reasoning') || trimmedStart.startsWith('[answer]');
     if (isUserPrompt) {
       this.flushExploreGroup();
-      this.outputChannel = undefined;
-    } else if (this.outputChannel && !isTaggedBlock && trimmedStart.length > 0) {
-      this.outputChannel = undefined;
-      cleaned = `\n[normal]\n${cleaned}`;
+      // Only a CLI write that starts with "> " is a user turn. Mark every line of it with a private-use
+      // code point so streamed Markdown blockquotes ("> quote") in answers can never render as user turns.
+      const lead = cleaned.slice(0, cleaned.length - trimmedStart.length);
+      const body = trimmedStart
+        .slice(2)
+        .split('\n')
+        .map(line => (line.trim() ? `${USER_MARK}${line}` : line))
+        .join('\n');
+      cleaned = lead + body;
     }
-    this.appendTranscript(cleaned, isUserPrompt);
+    this.outputChannel = undefined;
+    this.appendTranscript(this.blockReset() + cleaned, isUserPrompt);
   }
 
   async askTransient(previewBlock: string, label = '[y/N/a(lways)] ', signal?: AbortSignal): Promise<string> {
@@ -530,7 +716,7 @@ export class TerminalUI {
     this.input = [];
     this.cursor = 0;
     this.attachedImages.clear();
-    this.appendTranscript(previewBlock, true);
+    this.appendTranscript(this.blockReset() + previewBlock, true);
     try {
       return await this.question(label, signal, false);
     } finally {
@@ -556,12 +742,14 @@ export class TerminalUI {
       this.toolStates.set(key, `agent ${event.id.slice(0, 8)}: ${state}`);
       if (event.state === 'start') {
         this.flushExploreGroup();
-        this.outputChannel = undefined;
-        this.appendTranscript(`\n[agent ${event.id.slice(0, 8)}] ${event.task.slice(0, 160)}\n`);
+        this.appendCell(`\n${GLYPH.agent} Agent ${event.id.slice(0, 8)} · ${event.task.slice(0, 160)}\n`);
       } else if (event.state === 'done' || event.state === 'error') {
         this.flushExploreGroup();
-        this.outputChannel = undefined;
-        this.appendTranscript(`\n• Subagent ${event.id.slice(0, 8)}: ${event.state}\n`);
+        this.appendCell(
+          event.state === 'done'
+            ? `\n${GLYPH.agent} Agent ${event.id.slice(0, 8)} finished\n`
+            : `\n${GLYPH.failed} Agent ${event.id.slice(0, 8)} failed\n`,
+        );
       }
     } else if (event.type === 'tool_stream') {
       // Do not clutter the status bar with noisy per-delta file/line counters
@@ -595,30 +783,29 @@ export class TerminalUI {
       }
     } else if (event.type === 'todo') {
       this.flushExploreGroup();
-      this.outputChannel = undefined;
       const done = event.todos.filter(t => t.status === 'completed').length;
-      this.todoLabel = event.todos.length ? `todo:${done}/${event.todos.length}` : '';
+      this.todoLabel = event.todos.length ? `${done}/${event.todos.length}` : '';
       const lines = event.todos.map(t => {
-        const icon = t.status === 'completed' ? '[x]' : t.status === 'in_progress' ? '[>]' : '[ ]';
+        const icon = t.status === 'completed' ? '✓' : t.status === 'in_progress' ? '▸' : '○';
         return `  ${icon} ${t.content}`;
       });
       if (lines.length) {
-        this.appendTranscript(`\n[todo ${done}/${event.todos.length}]\n${lines.join('\n')}\n`);
+        this.appendCell(`\n${GLYPH.todo} Todo ${done}/${event.todos.length}\n${lines.join('\n')}\n`);
       }
     } else if (event.type === 'plan_exit') {
       this.flushExploreGroup();
-      this.outputChannel = undefined;
-      this.appendTranscript('\n[Plan approved — exited plan mode]\n');
+      this.appendCell(`\n${GLYPH.todo} Plan approved — exited plan mode\n`);
     } else if (event.type === 'usage') {
       this.tokens += event.total;
+      // Prompt + completion of the latest request is the provider's own measure of context occupancy.
+      if (event.input > 0) this.contextUsed = event.input + event.output;
     } else if (event.type === 'compaction') {
       this.flushExploreGroup();
-      this.outputChannel = undefined;
-      this.appendTranscript(`\n[context compacted #${event.count}]\n`);
+      this.contextUsed = undefined;
+      this.appendCell(`\n${GLYPH.compact} Context compacted #${event.count}\n`);
     } else if (event.type === 'stopped') {
       this.flushExploreGroup();
-      this.outputChannel = undefined;
-      this.appendTranscript(`\n${event.reason}\n`);
+      this.appendCell(`\n${GLYPH.allow} ${event.reason}\n`);
     }
     this.schedule(16);
   }
@@ -648,12 +835,12 @@ export class TerminalUI {
     if (isFullTranscript && (meta.kind === 'read' || meta.kind === 'list' || meta.kind === 'search')) {
       const verb = meta.kind === 'read' ? 'Read' : meta.kind === 'list' ? 'Listed' : 'Searched';
       const dur = meta.durationMs !== undefined ? ` (${formatCompactDuration(meta.durationMs)})` : '';
-      this.appendTranscript(`\n• ${state === 'error' ? 'Failed' : verb} ${meta.summary}${dur}\n`);
+      this.appendCell(`\n${state === 'error' ? `${GLYPH.failed} Failed` : `${GLYPH.explored} ${verb}`} ${meta.summary}${dur}\n`);
       return;
     }
     if (meta.kind === 'exec') {
       const dur = meta.durationMs !== undefined ? ` (${formatCompactDuration(meta.durationMs)})` : '';
-      const header = state === 'error' ? `• Failed ${meta.summary}${dur}` : `• Ran ${meta.summary}${dur}`;
+      const header = state === 'error' ? `${GLYPH.failed} Failed ${meta.summary}${dur}` : `${GLYPH.ran} Ran ${meta.summary}${dur}`;
       const previewLines: string[] = [];
       if (meta.outputPreview?.length) {
         const maxExecLines = isFullTranscript ? 80 : this.viewMode === 'verbose' ? 15 : 5;
@@ -668,7 +855,7 @@ export class TerminalUI {
       } else {
         previewLines.push('  └ (no output)');
       }
-      this.appendTranscript(`\n${header}\n${previewLines.join('\n')}\n`);
+      this.appendCell(`\n${header}\n${previewLines.join('\n')}\n`);
       return;
     }
     if (meta.kind === 'edit') {
@@ -680,12 +867,12 @@ export class TerminalUI {
       const maxDiffLines = isFullTranscript ? 500 : this.viewMode === 'verbose' ? 120 : 30;
       const diffLines = meta.diff ? formatCompactDiff(meta.diff, maxDiffLines) : [];
       const diffBlock = diffLines.length ? `\n${diffLines.join('\n')}` : '';
-      this.appendTranscript(`\n• ${verb} ${meta.summary}${stats}${diffBlock}\n`);
+      this.appendCell(`\n${state === 'error' ? GLYPH.failed : GLYPH.edit} ${verb} ${meta.summary}${stats}${diffBlock}\n`);
       return;
     }
     if (name !== 'todo_write' && name !== 'update_plan') {
       const dur = meta.durationMs !== undefined ? ` (${formatCompactDuration(meta.durationMs)})` : '';
-      this.appendTranscript(`\n• ${state === 'error' ? 'Failed' : 'Completed'} ${meta.summary}${dur}\n`);
+      this.appendCell(`\n${state === 'error' ? `${GLYPH.failed} Failed` : `${GLYPH.done} Completed`} ${meta.summary}${dur}\n`);
     }
   }
 
@@ -1282,271 +1469,336 @@ export class TerminalUI {
   }
 
   /**
-   * Context-aware Codex Markdown & Cell Styler.
-   * Applies all line prefixes BEFORE wrapping to `columns`, guaranteeing that NO line
-   * can ever exceed the terminal width or cause terminal soft-wrap cursor drift.
+   * Transcript renderer. Parses the plain-text transcript (markers + glyph-prefixed cells) into typed
+   * rows, wraps every row to `columns` BEFORE styling (prefixes included), then paints each row.
+   * No emitted row can exceed the terminal width, so soft-wrap cursor drift is impossible.
    */
   private renderStyledBodyLines(columns: number, rich: boolean): string[] {
-    const safeCols = Math.max(4, columns);
-    const rawLines = this.transcript.split('\n');
-    const wrapped: Array<{ text: string; block: 'normal' | 'answer' | 'reasoning' | 'code' | 'diff' | 'user' }> = [];
-    let currentBlock: 'normal' | 'answer' | 'reasoning' | 'code' | 'diff' = 'normal';
-    let preCodeBlock: 'normal' | 'answer' = 'normal';
-    let answerFirstLine = false;
+    const cols = Math.max(4, columns);
     const showReasoning = this.viewMode !== 'normal' || this.inTranscriptOverlay;
-
-    const ensureBlankLine = () => {
-      if (wrapped.length > 0 && wrapped[wrapped.length - 1].text.trim() !== '') {
-        wrapped.push({ text: '', block: 'normal' });
-      }
+    const rows: Row[] = [];
+    const lastKind = (): RowKind | undefined => rows[rows.length - 1]?.kind;
+    const lastContentKind = (): RowKind | undefined => {
+      for (let i = rows.length - 1; i >= 0; i--) if (rows[i].kind !== 'blank') return rows[i].kind;
+      return undefined;
+    };
+    const blank = () => {
+      if (rows.length && lastKind() !== 'blank') rows.push({ kind: 'blank', pre: '', text: '' });
+    };
+    const wrapInto = (kind: RowKind, text: string, first: string, cont: string, extra: Partial<Row> = {}, words = true) => {
+      const chunks = wrapChunks(text, cols - visibleLength(first), cols - visibleLength(cont), words);
+      chunks.forEach((chunk, i) => rows.push({ kind, pre: i === 0 ? first : cont, text: chunk, ...extra }));
     };
 
+    /** Markdown-aware paragraph row. `base` is the indent every row starts with; `lead` replaces it on the first row. */
+    const pushMarkdown = (rawLine: string, base: string, lead: string | undefined, paraKind: RowKind) => {
+      const firstPre = (pre: string) => (lead !== undefined ? lead + pre.slice(base.length) : pre);
+      const heading = /^\s*(#{1,4})\s+(.*)$/.exec(rawLine);
+      if (heading) {
+        wrapInto('heading', heading[2], firstPre(base), base, { level: heading[1].length });
+        return;
+      }
+      if (/^\s*(?:-{3,}|\*{3,}|_{3,})\s*$/.test(rawLine)) {
+        rows.push({ kind: 'rule', pre: firstPre(base), text: '─'.repeat(Math.max(1, Math.min(48, cols - base.length - 2))) });
+        return;
+      }
+      const bullet = /^(\s*)[-*+]\s+(.*)$/.exec(rawLine);
+      if (bullet) {
+        const pre = `${base}${bullet[1]}• `;
+        wrapInto(paraKind, bullet[2], firstPre(pre), ' '.repeat(visibleLength(pre)));
+        return;
+      }
+      const numbered = /^(\s*)(\d{1,3})[.)]\s+(.*)$/.exec(rawLine);
+      if (numbered) {
+        const pre = `${base}${numbered[1]}${numbered[2]}. `;
+        wrapInto(paraKind, numbered[3], firstPre(pre), ' '.repeat(visibleLength(pre)));
+        return;
+      }
+      const quote = /^\s*>\s?(.*)$/.exec(rawLine);
+      if (quote) {
+        wrapInto('quote', quote[1], firstPre(`${base}▎ `), `${base}▎ `);
+        return;
+      }
+      if (isTableRow(rawLine)) {
+        const trimmedRow = rawLine.trim();
+        const widths = tableWidths.get(lineIndex) ?? [];
+        if (TABLE_SEPARATOR_RE.test(trimmedRow)) {
+          const grid = `├${widths.map(w => '─'.repeat(w + 2)).join('┼')}┤`;
+          rows.push({ kind: 'table', pre: firstPre(base), text: sliceVisible(grid, Math.max(1, cols - base.length)) });
+        } else {
+          const cells = splitTableCells(trimmedRow).map((c, i) => c + ' '.repeat(Math.max(0, (widths[i] ?? 0) - visibleLength(displayedCell(c)))));
+          rows.push({ kind: 'table', pre: firstPre(base), text: sliceVisible(`│ ${cells.join(' │ ')} │`, Math.max(1, cols - base.length)) });
+        }
+        return;
+      }
+      const indent = /^\s*/.exec(rawLine)?.[0] ?? '';
+      wrapInto(paraKind, rawLine.slice(indent.length), firstPre(base + indent), base + indent);
+    };
+
+    // Pre-scan contiguous Markdown table blocks so every row of a table shares column widths.
+    const rawLines = this.transcript.split('\n');
+    const tableWidths = new Map<number, number[]>();
+    for (let i = 0; i < rawLines.length; i++) {
+      if (!isTableRow(rawLines[i])) continue;
+      let j = i;
+      const widths: number[] = [];
+      while (j < rawLines.length && isTableRow(rawLines[j])) {
+        const trimmedRow = rawLines[j].trim();
+        if (!TABLE_SEPARATOR_RE.test(trimmedRow)) {
+          splitTableCells(trimmedRow).forEach((c, k) => {
+            widths[k] = Math.max(widths[k] ?? 0, visibleLength(displayedCell(c)));
+          });
+        }
+        j++;
+      }
+      for (let k = i; k < j; k++) tableWidths.set(k, widths);
+      i = j - 1;
+    }
+
+    let block: 'normal' | 'answer' | 'reasoning' = 'normal';
+    let inCode = false;
+    let inDiff = false;
+    let answerFirst = false;
+    let lastWasUser = false;
+    let lineIndex = -1;
+
     for (const rawLine of rawLines) {
+      lineIndex++;
       const trimmed = rawLine.trim();
       if (rawLine === '[normal]') {
-        currentBlock = 'normal';
-        answerFirstLine = false;
+        block = 'normal';
+        inCode = false;
+        inDiff = false;
+        answerFirst = false;
         continue;
       }
       if (rawLine.startsWith('[reasoning')) {
-        currentBlock = 'reasoning';
-        if (!showReasoning) continue;
-        ensureBlankLine();
-        wrapped.push({ text: '• Thinking', block: 'reasoning' });
+        block = 'reasoning';
+        inCode = false;
+        inDiff = false;
+        if (showReasoning) {
+          blank();
+          rows.push({ kind: 'reasoningHead', pre: '', text: `${GLYPH.thinking} Thinking` });
+        }
         continue;
       }
       if (rawLine.startsWith('[answer]')) {
-        ensureBlankLine();
-        currentBlock = 'answer';
-        answerFirstLine = true;
+        blank();
+        block = 'answer';
+        inCode = false;
+        inDiff = false;
+        answerFirst = true;
         continue;
       }
-      if (trimmed.startsWith('```')) {
-        if (currentBlock === 'reasoning' && !showReasoning) continue;
-        const lang = trimmed.slice(3).trim();
-        if (currentBlock === 'code') {
-          currentBlock = preCodeBlock;
-          wrapped.push({ text: wrapTerminal('  ╰─', safeCols)[0], block: 'code' });
-        } else {
-          preCodeBlock = currentBlock === 'answer' ? 'answer' : 'normal';
-          answerFirstLine = false;
-          currentBlock = 'code';
-          wrapped.push({ text: wrapTerminal(`  ╭─ ${lang || 'code'}`, safeCols)[0], block: 'code' });
-        }
+      if (rawLine.startsWith(USER_MARK)) {
+        if (!lastWasUser) blank();
+        wrapInto('user', rawLine.slice(USER_MARK.length), lastWasUser ? '   ' : ` ${GLYPH.user} `, '   ');
+        lastWasUser = true;
+        block = 'normal';
+        inCode = false;
+        inDiff = false;
         continue;
       }
-      if (
-        rawLine.startsWith('• ') ||
-        rawLine.startsWith('> ') ||
-        rawLine.startsWith('› ') ||
-        rawLine.startsWith('[todo ') ||
-        rawLine.startsWith('[Plan ') ||
-        rawLine.startsWith('[agent ') ||
-        rawLine.startsWith('Allow ')
-      ) {
-        if (
-          /^• (?:Explored|Exploring|Read|Listed|Searched|Ran|Running|Failed|Edited|Added|Deleted|Allow |Resumed |Reverted )\b/.test(
-            rawLine,
-          ) ||
-          rawLine.startsWith('Allow ') ||
-          rawLine.startsWith('[todo ') ||
-          rawLine.startsWith('[Plan ') ||
-          rawLine.startsWith('[agent ')
-        ) {
-          ensureBlankLine();
-        }
-        if (currentBlock === 'reasoning' || currentBlock === 'diff' || currentBlock === 'answer') {
-          currentBlock = 'normal';
-        }
+      if (lastWasUser) {
+        lastWasUser = false;
+        blank();
       }
-      if (
-        rawLine.startsWith('--- a/') ||
-        rawLine.startsWith('+++ b/') ||
-        rawLine.startsWith('@@ ') ||
-        /^• (?:Edited|Added|Deleted) /.test(rawLine)
-      ) {
-        currentBlock = 'diff';
-      } else if (
-        currentBlock === 'diff' &&
-        trimmed &&
-        !rawLine.startsWith('+') &&
-        !rawLine.startsWith('-') &&
-        !/^\s*\d+\s+[+-]?\s*/.test(rawLine) &&
-        !trimmed.startsWith('⋮') &&
-        !trimmed.startsWith('…')
-      ) {
-        currentBlock = 'normal';
-      }
+      if (block === 'reasoning' && !showReasoning) continue;
 
-      const isUser = rawLine.startsWith('> ') || rawLine.startsWith('› ');
-      if (isUser) {
-        ensureBlankLine();
-        currentBlock = 'normal';
-        const cleanUser = rawLine.replace(/^>\s/, '› ');
-        for (const chunk of wrapWithIndent(cleanUser, safeCols, ' ', '   ')) {
-          wrapped.push({ text: chunk, block: 'user' });
+      if (trimmed.startsWith('```')) {
+        if (inCode) {
+          inCode = false;
+          rows.push({ kind: 'codeFoot', pre: '', text: '' });
+        } else {
+          inCode = true;
+          inDiff = false;
+          answerFirst = false;
+          rows.push({ kind: 'codeHead', pre: '', text: trimmed.slice(3).trim() || 'code' });
         }
-        ensureBlankLine();
+        continue;
+      }
+      if (inCode) {
+        wrapInto('code', rawLine.replace(/\t/g, '  ').trimEnd(), '   ', '   ', {}, false);
         continue;
       }
 
       if (!trimmed) {
-        if (currentBlock === 'reasoning') continue;
-        if (currentBlock === 'answer' && answerFirstLine) continue;
-        ensureBlankLine();
+        if (block === 'reasoning') continue;
+        if (block === 'answer' && answerFirst) continue;
+        blank();
         continue;
       }
 
-      const lineBlock = currentBlock;
-
-      if (lineBlock === 'reasoning') {
-        if (!showReasoning) continue;
-        for (const chunk of wrapWithIndent(rawLine, safeCols, '  ', '  ')) {
-          wrapped.push({ text: chunk, block: 'reasoning' });
-        }
+      if (block === 'reasoning') {
+        wrapInto('reasoning', rawLine.trimEnd(), '  ', '  ');
         continue;
       }
 
-      if (lineBlock === 'code') {
-        for (const chunk of wrapWithIndent(rawLine, safeCols, '    ', '    ')) {
-          wrapped.push({ text: chunk, block: 'code' });
-        }
+      if (block === 'answer') {
+        const lead = answerFirst ? `${GLYPH.answer} ` : undefined;
+        answerFirst = false;
+        pushMarkdown(rawLine.trimEnd(), '  ', lead, 'answer');
         continue;
       }
 
-      if (lineBlock === 'answer' || lineBlock === 'normal') {
-        const bulletMatch = /^(\s*)[-*]\s+(.*)$/.exec(rawLine);
-        if (bulletMatch) {
-          const indent = bulletMatch[1];
-          const content = bulletMatch[2];
-          if (lineBlock === 'answer' && answerFirstLine) {
-            answerFirstLine = false;
-          }
-          for (const chunk of wrapWithIndent(content, safeCols, `${indent}  • `, `${indent}    `)) {
-            wrapped.push({ text: chunk, block: lineBlock });
-          }
+      // ── normal block: tool cells, diffs, CLI output, banner ──
+      const cell = CELL_RE.exec(rawLine);
+      if (cell) {
+        blank();
+        inDiff = cell[1] === GLYPH.edit || /^(?:Edited|Added|Deleted|Wrote|Created|Updated)\b/.test(cell[2]);
+        wrapInto('cell', cell[2].trimEnd(), `${cell[1]} `, '  ', { glyph: cell[1] });
+        continue;
+      }
+      if (/^(?:--- |\+\+\+ |@@ )/.test(rawLine)) {
+        inDiff = true;
+        rows.push({ kind: 'diffMeta', pre: '  ', text: sliceVisible(rawLine.trimEnd(), Math.max(1, cols - 2)) });
+        continue;
+      }
+      if (inDiff) {
+        const numbered = /^ {4}([ \d]{4}) ([+\- ])(.*)$/.exec(rawLine);
+        const unified = numbered ? undefined : /^([+\- ])(.*)$/.exec(rawLine);
+        if (numbered || unified) {
+          const sign = (numbered ? numbered[2] : unified![1]) as '+' | '-' | ' ';
+          const code = (numbered ? numbered[3] : unified![2]).replace(/\t/g, '  ').trimEnd();
+          const pre = numbered ? `    ${numbered[1]} ${sign}` : `  ${sign}`;
+          wrapInto('diff', code, pre, ' '.repeat(visibleLength(pre)), { sign }, false);
           continue;
         }
-        if (lineBlock === 'answer') {
-          const firstPrefix = answerFirstLine ? '• ' : '  ';
-          answerFirstLine = false;
-          for (const chunk of wrapWithIndent(rawLine, safeCols, firstPrefix, '  ')) {
-            wrapped.push({ text: chunk, block: 'answer' });
-          }
+        if (/^\s*(?:⋮|… \+\d+ more|\.\.\. \(\+\d+ more)/.test(rawLine) || rawLine.startsWith('\\ No newline')) {
+          rows.push({ kind: 'diffMeta', pre: '    ', text: sliceVisible(trimmed, Math.max(1, cols - 4)) });
           continue;
         }
+        inDiff = false;
       }
 
-      for (const chunk of wrapTerminal(rawLine, safeCols)) {
-        wrapped.push({ text: chunk, block: lineBlock });
+      const prevKind = lastContentKind();
+      if ((prevKind === 'cell' || prevKind === 'child') && rawLine.startsWith('  ')) {
+        const child = /^ {2}(└ | {2})?(.*)$/.exec(rawLine.trimEnd());
+        const connector = child?.[1] === '└ ' ? '  └ ' : child?.[1] ? '    ' : '  ';
+        wrapInto('child', child?.[2] ?? trimmed, connector, '    ');
+        continue;
       }
+
+      if (/^[╭│╰]/.test(rawLine)) {
+        rows.push({ kind: 'box', pre: '', text: sliceVisible(rawLine.trimEnd(), cols) });
+        continue;
+      }
+      if (rawLine.startsWith('Type /help')) {
+        wrapInto('hint', rawLine.trimEnd(), '', '');
+        continue;
+      }
+      pushMarkdown(rawLine.trimEnd(), '', undefined, 'normal');
     }
 
-    if (!rich) return wrapped.map(w => w.text);
-    return wrapped.map(({ text: line, block }) => this.styleLine(line, block, safeCols));
+    return rows.map(row => (rich ? this.styleRow(row, cols) : plainRow(row, cols)));
   }
 
-  private styleLine(
-    line: string,
-    block: 'normal' | 'answer' | 'reasoning' | 'code' | 'diff' | 'user',
-    columns: number,
-  ): string {
-    if (line.startsWith('╭') || line.startsWith('╰') || line.startsWith('│') || line.startsWith('  >_ ')) {
-      return `\x1b[38;2;99;168;248m${line}\x1b[0m`;
-    }
-    if (line.startsWith('Type /help')) {
-      return `\x1b[2m${line}\x1b[0m`;
-    }
-    if (block === 'user') {
-      return padRightAnsi(`\x1b[1;97m${formatInlineMarkdown(line, '\x1b[1;97m\x1b[48;5;236m')}`, columns, '\x1b[48;5;236m');
-    }
-    if (line === '• Thinking') {
-      return `\x1b[2;35m${line}\x1b[0m`;
-    }
-    if (block === 'reasoning') {
-      return `\x1b[2;3m${formatInlineMarkdown(line, '\x1b[2;3m')}\x1b[0m`;
-    }
-    if (block === 'code') {
-      if (line.startsWith('  ╭─') || line.startsWith('  ╰─')) return `\x1b[2;36m${line}\x1b[0m`;
-      return `\x1b[38;2;180;210;255m${line}\x1b[0m`;
-    }
-    // Codex Explored / Read / Listed / Searched / Ran / Edited / Reverted cells
-    if (/^• (?:Explored|Exploring|Read|Listed|Searched|Resumed|Reverted)\b/.test(line)) {
-      return `\x1b[2m•\x1b[0m \x1b[1m${line.slice(2)}\x1b[0m`;
-    }
-    if (/^• (?:Ran|Running)\b/.test(line)) {
-      return `\x1b[1;32m•\x1b[0m \x1b[1mRan\x1b[0m\x1b[38;2;99;168;248m${line.slice(5)}\x1b[0m`;
-    }
-    if (/^• Failed\b/.test(line)) {
-      return `\x1b[1;31m•\x1b[0m \x1b[1;31m${line.slice(2)}\x1b[0m`;
-    }
-    if (/^• (?:Edited|Added|Deleted)\b/.test(line)) {
-      const coloredStats = line
-        .replace(/\(\+(\d+)/, '(\x1b[32m+$1\x1b[0m')
-        .replace(/-(\d+)\)/, '\x1b[31m-$1\x1b[0m)');
-      return `\x1b[2m•\x1b[0m \x1b[1m${coloredStats.slice(2)}\x1b[0m`;
-    }
-    if (line.startsWith('• Allow ') || line.startsWith('Allow ')) {
-      return `\x1b[1;33m${line}\x1b[0m`;
-    }
-    if (line.startsWith('  $ ')) {
-      return `  \x1b[2m$\x1b[0m \x1b[1;38;2;99;168;248m${line.slice(4)}\x1b[0m`;
-    }
-    if (block === 'answer' && line.startsWith('• ')) {
-      return `\x1b[2m•\x1b[0m ${formatInlineMarkdown(line.slice(2))}`;
-    }
-    if (/^\s*(?:└| )\s+(?:Read|List|Search)\b/.test(line)) {
-      return line
-        .replace(/^(\s*└\s+)/, '\x1b[2m$1\x1b[0m')
-        .replace(/\b(Read|List|Search)\b/, '\x1b[38;2;99;168;248m$1\x1b[0m');
-    }
-    if (line.startsWith('  └ ')) {
-      return `\x1b[2m${line}\x1b[0m`;
-    }
-    if (block === 'diff') {
-      if (line.startsWith('--- ') || line.startsWith('+++ ') || line.startsWith('@@ ')) {
-        return `\x1b[36m${line}\x1b[0m`;
-      }
-      if (/^\s*\d+\s+\+/.test(line) || (line.startsWith('+') && !line.startsWith('+++'))) {
-        return `\x1b[48;2;33;58;43m\x1b[32m${line}\x1b[0m`;
-      }
-      if (/^\s*\d+\s+-/.test(line) || (line.startsWith('-') && !line.startsWith('---'))) {
-        return `\x1b[48;2;74;34;29m\x1b[31m${line}\x1b[0m`;
-      }
-      if (line.trim().startsWith('⋮') || line.trim().startsWith('…')) {
-        return `\x1b[2m${line}\x1b[0m`;
-      }
-      return `\x1b[2m${line}\x1b[0m`;
-    }
-    if (line.startsWith('[todo ') || line.startsWith('[Plan ')) return `\x1b[1;36m${line}\x1b[0m`;
-    if (line.startsWith('  [x] ')) return `\x1b[2;32m  ✔ ${line.slice(6)}\x1b[0m`;
-    if (line.startsWith('  [>] ')) return `\x1b[1;38;2;99;168;248m  □ ${line.slice(6)}\x1b[0m`;
-    if (line.startsWith('  [ ] ')) return `\x1b[2m  □ ${line.slice(6)}\x1b[0m`;
-    if (line.startsWith('↺ Reverted')) return `\x1b[1;33m${line}\x1b[0m`;
-    if (line.startsWith('[agent ')) return `\x1b[33m${line}\x1b[0m`;
+  /** Paints one typed transcript row. Every branch preserves the row's visible width. */
+  private styleRow(row: Row, cols: number): string {
+    const T = THEME;
+    const R = T.reset;
+    const md = (text: string, base: string) => `${base}${formatInlineMarkdown(text, `${R}${base}`)}${R}`;
+    const prefix = (pre: string, tone: string) => (pre.trim() ? `${tone}${pre}${R}` : pre);
+    const answerPre = (pre: string) =>
+      pre.startsWith(GLYPH.answer) ? `${T.brandBold}${GLYPH.answer}${R}${prefix(pre.slice(1), T.bullet)}` : prefix(pre, T.bullet);
 
-    // Markdown headings
-    const headingMatch = /^(#{1,4})\s+(.*)$/.exec(line.trimStart());
-    if (headingMatch) {
-      const level = headingMatch[1].length;
-      const title = formatInlineMarkdown(headingMatch[2], '\x1b[1;38;2;99;168;248m');
-      return level === 1
-        ? `\x1b[1;4;38;2;99;168;248m${title}\x1b[0m`
-        : `\x1b[1;38;2;99;168;248m${title}\x1b[0m`;
-    }
-    // Markdown table rows
-    if (line.trimStart().startsWith('|') && line.trimEnd().endsWith('|')) {
-      if (/^\|[\s:|-]+\|$/.test(line.trim())) {
-        return `\x1b[2m  ${'─'.repeat(Math.min(columns - 4, line.trim().length))}\x1b[0m`;
+    switch (row.kind) {
+      case 'blank':
+        return '';
+      case 'user': {
+        const base = `${T.userBg}${T.strong}`;
+        const pre = row.pre.trim() ? `${T.userBg}${T.brandBold}${row.pre}${R}` : `${T.userBg}${row.pre}`;
+        return padRightAnsi(`${pre}${base}${formatInlineMarkdown(row.text, `${R}${base}`)}`, cols, T.userBg);
       }
-      const cells = line
-        .trim()
-        .slice(1, -1)
-        .split('|')
-        .map(c => formatInlineMarkdown(c.trim()));
-      return wrapTerminal(`  │ ${cells.join(' │ ')} │`, columns)[0];
+      case 'answer':
+        return `${answerPre(row.pre)}${md(row.text, T.text)}`;
+      case 'normal':
+        return `${prefix(row.pre, T.bullet)}${formatInlineMarkdown(row.text)}`;
+      case 'heading': {
+        const tone = row.level === 1 ? `${T.brandBold}\x1b[4m` : T.brandBold;
+        return `${answerPre(row.pre)}${md(row.text, tone)}`;
+      }
+      case 'quote': {
+        const pre = row.pre.startsWith(GLYPH.answer)
+          ? `${T.brandBold}${GLYPH.answer}${R}${T.faint}${row.pre.slice(1)}${R}`
+          : `${T.faint}${row.pre}${R}`;
+        return `${pre}${md(row.text, `${T.muted}\x1b[3m`)}`;
+      }
+      case 'rule':
+        return `${answerPre(row.pre)}${T.faint}${row.text}${R}`;
+      case 'table':
+        if (row.text.startsWith('├')) return `${answerPre(row.pre)}${T.faint}${row.text}${R}`;
+        return `${answerPre(row.pre)}${row.text
+          .split('│')
+          .map(cell => formatInlineMarkdown(cell))
+          .join(`${T.faint}│${R}`)}`;
+      case 'reasoningHead':
+        return `${T.thinking}\x1b[3m${row.text}${R}`;
+      case 'reasoning':
+        return `${row.pre}${md(row.text, `${T.faint}\x1b[3m`)}`;
+      case 'codeHead':
+        return `  ${padRightAnsi(`${T.faint} ${sliceVisible(row.text, Math.max(1, cols - 4))}`, cols - 2, T.codeBg)}`;
+      case 'code':
+        return `  ${padRightAnsi(`${T.codeText} ${row.text}`, cols - 2, T.codeBg)}`;
+      case 'codeFoot':
+        return `  ${padRightAnsi('', cols - 2, T.codeBg)}`;
+      case 'cell':
+        return this.styleCell(row);
+      case 'child':
+        return this.styleChild(row);
+      case 'diff': {
+        const bg = row.sign === '+' ? T.addBg : row.sign === '-' ? T.delBg : '';
+        const fg = row.sign === '+' ? T.addFg : row.sign === '-' ? T.delFg : T.muted;
+        const num = /^(\s*\d*)/.exec(row.pre)?.[1] ?? '';
+        const content = `${T.faint}${num}${R}${bg}${fg}${row.pre.slice(num.length)}${row.text}`;
+        return bg ? padRightAnsi(content, cols, bg) : `${content}${R}`;
+      }
+      case 'diffMeta':
+        return `${row.pre}${row.text.startsWith('@@') ? T.info : T.faint}${row.text}${R}`;
+      case 'box':
+        return styleBoxLine(row.text);
+      case 'hint':
+        return `${T.faint}${row.text}${R}`;
     }
-    return formatInlineMarkdown(line);
+  }
+
+  private styleCell(row: Row): string {
+    const T = THEME;
+    const R = T.reset;
+    const glyph = row.glyph ?? '•';
+    const tone = CELL_TONES[glyph] ?? T.muted;
+    const withDurations = (text: string, base: string) =>
+      text
+        .replace(/\((?:\d+m )?\d+s\)/g, m => `${T.faint}${m}${R}${base}`)
+        .replace(/\(\+(\d+) -(\d+)\)/g, (_, a: string, d: string) => `${T.faint}(${R}${T.ok}+${a}${R} ${T.err}-${d}${R}${T.faint})${R}${base}`);
+    if (!row.pre.trim()) return `${row.pre}${T.muted}${withDurations(row.text, T.muted)}${R}`;
+    const match = /^(\S+)(.*)$/.exec(row.text);
+    const verb = match?.[1] ?? row.text;
+    const rest = match?.[2] ?? '';
+    const glyphOut = `${tone}\x1b[1m${glyph}${R} `;
+    if (glyph === GLYPH.allow) return `${glyphOut}${T.warn}\x1b[1m${row.text}${R}`;
+    if (glyph === GLYPH.compact) return `${glyphOut}${T.faint}${row.text}${R}`;
+    if (glyph === GLYPH.prompt) return `${glyphOut}${T.brandBold}${row.text}${R}`;
+    const verbTone = glyph === GLYPH.failed ? `${T.err}\x1b[1m` : T.strong;
+    const restBase = glyph === GLYPH.ran ? T.info : glyph === GLYPH.edit ? T.text : T.muted;
+    return `${glyphOut}${verbTone}${verb}${R}${restBase}${withDurations(rest, restBase)}${R}`;
+  }
+
+  private styleChild(row: Row): string {
+    const T = THEME;
+    const R = T.reset;
+    const pre = row.pre.includes('└') ? `${T.faint}${row.pre}${R}` : row.pre;
+    const text = row.text;
+    const explored = /^(Read|List|Search)\b(.*)$/.exec(text);
+    if (explored) return `${pre}${T.info}${explored[1]}${R}${T.text}${explored[2]}${R}`;
+    if (text.startsWith('✓ ')) return `${pre}${T.ok}✓${R} ${T.faint}${text.slice(2)}${R}`;
+    if (text.startsWith('▸ ')) return `${pre}${T.brandBold}▸ ${text.slice(2)}${R}`;
+    if (text.startsWith('○ ')) return `${pre}${T.faint}○${R} ${T.text}${text.slice(2)}${R}`;
+    if (text.startsWith('$ ')) return `${pre}${T.faint}$${R} ${T.info}\x1b[1m${text.slice(2)}${R}`;
+    if (/^… \+\d+/.test(text)) return `${pre}${T.faint}${text}${R}`;
+    const option = /^(\d{1,2})\. (.*)$/.exec(text);
+    if (option) return `${pre}${T.brandBold}${option[1]}.${R} ${formatInlineMarkdown(option[2])}`;
+    return `${pre}${T.muted}${text}${R}`;
   }
 
   /**
@@ -1592,20 +1844,64 @@ export class TerminalUI {
     this.target.write(diffFrame);
   }
 
+  /**
+   * Builds a full-width header/footer band: left segments are clipped last, right groups are dropped
+   * (front first) when the terminal is too narrow, so the band never exceeds `cols` visible columns.
+   */
+  private band(left: Seg[], right: Seg[][], cols: number, rich: boolean): string {
+    const T = THEME;
+    const sep: Seg = [' · ', T.faint];
+    const flatten = (groups: Seg[][]): Seg[] => groups.flatMap((g, i) => (i === 0 ? g : [sep, ...g]));
+    const plainWidth = (segs: Seg[]) => visibleLength(segs.map(s => s[0]).join(''));
+    const leftMin = Math.min(plainWidth(left), 12);
+    const groups = right.filter(g => g.length > 0);
+    while (groups.length && leftMin + plainWidth(flatten(groups)) + 2 > cols) groups.shift();
+    const rightSegs = flatten(groups);
+    if (rightSegs.length) rightSegs.push([' ', '']);
+    const rightWidth = plainWidth(rightSegs);
+    const leftAvail = Math.max(0, cols - rightWidth - (rightWidth ? 1 : 0));
+    const paint = (text: string, sgr: string) => (rich && sgr ? `${sgr}${text}${T.reset}${T.bandBg}` : text);
+    let used = 0;
+    let leftOut = '';
+    for (const [text, sgr] of left) {
+      const room = leftAvail - used;
+      if (room <= 0) break;
+      const piece = visibleLength(text) > room ? sliceVisible(text, room) : text;
+      leftOut += paint(piece, sgr);
+      used += visibleLength(piece);
+    }
+    const gap = ' '.repeat(Math.max(0, cols - used - rightWidth));
+    const rightOut = rightSegs.map(([text, sgr]) => paint(text, sgr)).join('');
+    return rich ? `${T.bandBg}${leftOut}${gap}${rightOut}${T.reset}` : `${leftOut}${gap}${rightOut}`.trimEnd();
+  }
+
+  private contextGroup(): Seg[] {
+    if (!this.contextWindow || this.contextUsed === undefined) return [];
+    const T = THEME;
+    const pct = Math.max(0, Math.min(100, Math.round((this.contextUsed / this.contextWindow) * 100)));
+    const cells = 8;
+    const filled = Math.min(cells, Math.round((pct / 100) * cells));
+    const tone = pct >= 90 ? T.err : pct >= 70 ? T.warn : T.brand;
+    return [
+      ['ctx ', T.faint],
+      ['▰'.repeat(filled), tone],
+      ['▱'.repeat(cells - filled), T.faint],
+      [` ${pct}%`, pct >= 70 ? tone : T.muted],
+    ];
+  }
+
   private render() {
     if (this.closed) return;
+    const T = THEME;
     const columns = Math.max(4, this.target.columns || 80);
     const rows = Math.max(8, this.target.rows || 24);
     const safeCols = Math.max(3, columns - 1);
     const clip = (s: string) => wrapTerminal(s, safeCols)[0];
     const currentInput = this.input.join('');
-    const slashMatches = currentInput.startsWith('/')
-      ? SLASH_COMMANDS.filter(c => c.startsWith(currentInput.trim().split(/\s+/)[0]))
-      : [];
     const busy = this.status === 'Running' || this.status === 'Connecting MCP' || this.status === 'Compacting';
     const indicator = busy ? SPINNER[this.spinTick % SPINNER.length] : '●';
     const rich = columns >= 48 && rows >= 12;
-    const todoBadge = this.todoLabel ? ` · ${this.todoLabel}` : '';
+    const asking = this.label !== 'goon> ';
 
     const titleParts = this.title.split(' · ');
     const modelName = titleParts[0] || this.title;
@@ -1619,12 +1915,17 @@ export class TerminalUI {
     }
     this.lastBodyTotalLines = all.length;
 
-    // Codex Full-Screen Transcript Overlay Mode (Ctrl+T or /transcript)
+    const todoGroup: Seg[] = this.todoLabel ? [[`${GLYPH.todo} `, T.brand], [this.todoLabel, T.muted]] : [];
+    const brandSegs: Seg[] = [[' ', ''], [GLYPH.brand, T.brandBold], [' goon', T.strong]];
+
+    // Full-screen Transcript overlay (Ctrl+T or /transcript)
     if (this.inTranscriptOverlay) {
-      const txHeaderRaw = clip(`>_ goon · T R A N S C R I P T · ${sessionLabel}${todoBadge}`);
-      const txHeader = rich
-        ? `\x1b[1;38;2;99;168;248m>_\x1b[0m \x1b[1mgoon\x1b[0m · \x1b[1;35mT R A N S C R I P T\x1b[0m\x1b[2m · ${clip(`${sessionLabel}${todoBadge}`)}\x1b[0m`
-        : txHeaderRaw;
+      const txHeader = this.band(
+        [...brandSegs, [' · ', T.faint], ['TRANSCRIPT', T.brandBold], [' · ', T.faint], [sessionLabel, T.muted]],
+        [todoGroup],
+        safeCols,
+        rich,
+      );
       const height = Math.max(2, rows - 2);
       this.maxScroll = Math.max(0, all.length - height);
       this.scroll = Math.min(this.scroll, this.maxScroll);
@@ -1632,26 +1933,110 @@ export class TerminalUI {
       const body = all.slice(Math.max(0, end - height), end);
       while (body.length < height) body.push('');
 
-      const livePart = busy ? `${indicator} Working (${elapsedStr}esc to interrupt) · ` : '';
-      const linePos = `Line ${Math.max(1, end)}/${Math.max(1, all.length)}`;
-      const txFooterRaw = clip(
-        ` T R A N S C R I P T  │  ${livePart}${linePos}  │  ↑↓/PgUp/PgDn/Wheel scroll · Home/End · Ctrl+T or Esc to return `,
+      const live: Seg[] = busy
+        ? [[`${indicator} `, T.brand], ['Working', T.strong], [` (${elapsedStr}esc to interrupt)`, T.faint], [' · ', T.faint]]
+        : [];
+      const txFooter = this.band(
+        [[' ', ''], ...live, [`line ${Math.max(1, end)}/${Math.max(1, all.length)}`, T.muted]],
+        [[['↑↓ PgUp/PgDn scroll · Home/End · q / Esc / Ctrl+T back', T.faint]]],
+        safeCols,
+        rich,
       );
-      const txFooter = rich
-        ? padRightAnsi(`\x1b[1;97m${txFooterRaw}`, safeCols, '\x1b[48;5;236m')
-        : txFooterRaw;
-      const screenLines = [txHeader, ...body, txFooter];
-      this.flushScreenLines(screenLines, columns, rows, '');
+      this.flushScreenLines([txHeader, ...body, txFooter], columns, rows, '');
       return;
     }
 
-    // Top Codex Bar (without model name or effort, since those live in the bottom composer box)
-    const headerRaw = clip(`>_ goon · ${sessionLabel}${todoBadge}`);
-    const header = rich
-      ? `\x1b[1;38;2;99;168;248m>_\x1b[0m \x1b[1mgoon\x1b[0m\x1b[2m${headerRaw.slice(7)}\x1b[0m`
-      : clip(`goon · ${sessionLabel}`);
+    // Header band: brand · workspace · branch · session  ……  todo · context meter
+    const leftHeader: Seg[] = [...brandSegs];
+    if (this.workspaceName) leftHeader.push([' · ', T.faint], [this.workspaceName, T.text]);
+    if (this.branch) leftHeader.push([' · ', T.faint], [this.branch, T.info]);
+    leftHeader.push([' · ', T.faint], [sessionLabel, T.muted]);
+    const header = rich ? this.band(leftHeader, [todoGroup, this.contextGroup()], safeCols, rich) : clip(`goon · ${sessionLabel}`);
 
-    const chromeRows = rich ? 7 : 4;
+    // Live status row (Working / scroll / esc hints / attachments / notices)
+    let statusLine = '';
+    if (this.scroll > 0) {
+      const text = clip(`↑ Scrolled up ${this.scroll}/${this.maxScroll} lines · wheel/↑↓ scroll · ctrl+t transcript · End/Esc bottom`);
+      statusLine = rich ? `${T.info}${text}${T.reset}` : text;
+    } else if (this.escPrimed === 'backtrack' || this.escPrimed === 'clear') {
+      const text = clip(this.escPrimed === 'backtrack' ? 'Press Esc again to rewind & edit previous prompt' : 'Press Esc again to clear input');
+      statusLine = rich ? `${T.warn}${text}${T.reset}` : text;
+    } else if (this.attachedImages.size > 0 && !busy) {
+      const items = [...this.attachedImages.entries()].map(([k, p]) => `${k}: ${basename(p)}`).join(' · ');
+      const text = clip(`📎 Attached ${items} (Enter to send · Backspace to remove)`);
+      statusLine = rich ? `${T.info}${text}${T.reset}` : text;
+    } else if (busy) {
+      const toolsText = `• Working (${elapsedStr}esc to interrupt · ctrl+t transcript)`;
+      const body = wrapTerminal(toolsText.slice(2), Math.max(1, safeCols - 2))[0];
+      statusLine = rich
+        ? `${T.brandBold}${indicator}${T.reset} ${T.strong}${body.slice(0, 7)}${T.reset}${T.faint}${body.slice(7)}${T.reset}`
+        : clip(toolsText);
+    } else if (this.statusNotice) {
+      const text = clip(this.statusNotice);
+      statusLine = rich ? `${T.muted}${text}${T.reset}` : text;
+    } else if (!(currentInput.startsWith('/') && !/\s/.test(currentInput))) {
+      const text = clip([...this.toolStates.values()].slice(-2).join(' | '));
+      statusLine = rich && text ? `${T.faint}${text}${T.reset}` : text;
+    }
+
+    if (!rich) {
+      // Compact fallback for tiny (<48x12) terminals
+      const footer = clip(`${this.status} · ${this.tokens} tokens · Ctrl+C cancel · PgUp/PgDn scroll`);
+      const height = Math.max(2, rows - 4);
+      this.maxScroll = Math.max(0, all.length - height);
+      this.scroll = Math.min(this.scroll, this.maxScroll);
+      const end = all.length - this.scroll;
+      const body = all.slice(Math.max(0, end - height), end);
+      while (body.length < height) body.push('');
+      const label = clip(this.label);
+      const labelCols = visibleLength(label);
+      const inputAvailCols = Math.max(1, safeCols - labelCols);
+      let visibleBeforeCursor = this.input.slice(0, this.cursor).join('');
+      while (visibleBeforeCursor && visibleLength(visibleBeforeCursor) >= inputAvailCols) {
+        visibleBeforeCursor = [...visibleBeforeCursor].slice(1).join('');
+      }
+      const afterCursor = this.input.slice(this.cursor).join('');
+      const shownInput = wrapTerminal(visibleBeforeCursor + afterCursor, inputAvailCols)[0];
+      const prompt = wrapTerminal(label + shownInput, safeCols)[0];
+      const cursorColumn = Math.min(columns, labelCols + visibleLength(visibleBeforeCursor) + 1);
+      const screenLines = [header, ...body, statusLine, footer, prompt];
+      const cursorSeq = this.pending ? `\x1b[${screenLines.length};${cursorColumn}H\x1b[?25h` : '';
+      this.flushScreenLines(screenLines, columns, rows, cursorSeq);
+      return;
+    }
+
+    // Queued follow-ups (shown without a 'Queue' label)
+    const queueLines =
+      this.queuedPrompts.length > 0
+        ? [`${T.faint}\x1b[3m${clip(`  ↳ ${this.queuedPrompts.join(' · ')} (Alt+↑ edit)`)}${T.reset}`]
+        : [];
+
+    // Slash-command popup: live-filtered list with descriptions above the composer
+    const fixedRows = 1 + 1 + 1 + queueLines.length + 3; // header + gap + status + queue + composer box
+    const popupLines: string[] = [];
+    const typedCommand = currentInput.startsWith('/') && !/\s/.test(currentInput) && !asking ? currentInput : '';
+    if (typedCommand) {
+      const matches = SLASH_COMMANDS.filter(c => c.startsWith(typedCommand));
+      const room = Math.max(0, Math.min(6, rows - fixedRows - 3));
+      const shownCount = matches.length > room ? Math.max(0, room - 1) : matches.length;
+      const nameCols = Math.max(8, ...matches.slice(0, shownCount).map(c => c.length)) + 2;
+      for (const [idx, cmd] of matches.slice(0, shownCount).entries()) {
+        const desc = SLASH_DESCRIPTIONS[cmd] ?? '';
+        const marker = idx === 0 ? '› ' : '  ';
+        const plain = clip(`  ${marker}${cmd.padEnd(nameCols)}${desc}`);
+        const nameEnd = 4 + nameCols;
+        popupLines.push(
+          idx === 0
+            ? `${T.brandBold}${plain.slice(0, nameEnd)}${T.reset}${T.muted}${plain.slice(nameEnd)}${T.reset}`
+            : `${T.text}${plain.slice(0, nameEnd)}${T.reset}${T.faint}${plain.slice(nameEnd)}${T.reset}`,
+        );
+      }
+      if (matches.length > shownCount && room > 0) {
+        popupLines.push(`${T.faint}${clip(`    … +${matches.length - shownCount} more · Tab completes`)}${T.reset}`);
+      }
+    }
+
+    const chromeRows = fixedRows + popupLines.length;
     const height = Math.max(2, rows - chromeRows);
     this.maxScroll = Math.max(0, all.length - height);
     this.scroll = Math.min(this.scroll, this.maxScroll);
@@ -1659,114 +2044,65 @@ export class TerminalUI {
     const body = all.slice(Math.max(0, end - height), end);
     while (body.length < height) body.push('');
 
-    // Codex Live Status Indicator / Slash Command / Attached Images / Scroll Indicator Bar
-    let toolsText = '';
-    if (this.scroll > 0) {
-      toolsText = `↑ Scrolled up ${this.scroll}/${this.maxScroll} lines (Wheel / ↑↓ scroll · Ctrl+T transcript · End / Esc to bottom)`;
-    } else if (this.escPrimed === 'backtrack') {
-      toolsText = 'Press Esc again to rewind & edit previous prompt';
-    } else if (this.escPrimed === 'clear') {
-      toolsText = 'Press Esc again to clear input';
-    } else if (slashMatches.length) {
-      const firstCmd = slashMatches[0];
-      const desc = SLASH_DESCRIPTIONS[firstCmd] ? ` (${SLASH_DESCRIPTIONS[firstCmd]})` : '';
-      toolsText = `Commands (Tab): ${slashMatches.slice(0, 6).join('  ')}${desc}`;
-    } else if (this.attachedImages.size > 0 && !busy) {
-      const items = [...this.attachedImages.entries()].map(([k, p]) => `${k}: ${basename(p)}`).join(' · ');
-      toolsText = `📎 Attached ${items} (Enter to send · Backspace to remove)`;
-    } else if (busy) {
-      toolsText = `• Working (${elapsedStr}esc to interrupt · ctrl+t transcript)`;
-    } else if (this.statusNotice) {
-      toolsText = this.statusNotice;
-    } else {
-      toolsText = [...this.toolStates.values()].slice(-2).join(' | ');
-    }
+    // Composer box ─ border color carries state: brand (idle), faint (working), amber (awaiting an answer)
+    const borderColor = asking && this.pending ? T.warn : busy ? T.faint : T.brand;
+    const promptLabel = asking ? clip(this.label) : '› ';
+    const labelCols = visibleLength(promptLabel);
+    const boxInnerCols = Math.max(1, safeCols - 4 - labelCols);
 
-    const toolsLine = rich && toolsText
-      ? this.scroll > 0
-        ? `\x1b[1;36m${clip(toolsText)}\x1b[0m`
-        : busy
-          ? `\x1b[1;38;2;99;168;248m${indicator}\x1b[0m \x1b[1m${clip(toolsText.slice(2))}\x1b[0m`
-          : this.escPrimed || this.statusNotice
-            ? `\x1b[2;36m${clip(toolsText)}\x1b[0m`
-            : `\x1b[33m${clip(toolsText)}\x1b[0m`
-      : clip(toolsText);
-
-    if (rich) {
-      // Rounded Composer Text Box with guaranteed spacer gap + queued messages row (no 'Queue' label)
-      const gapLine = '';
-      const queueLine =
-        this.queuedPrompts.length > 0
-          ? `\x1b[2;3m${clip(`  ↳ ${this.queuedPrompts.join(' · ')} (Alt+↑ edit)`)}\x1b[0m`
-          : '';
-
-      const boxPromptLabel = this.label === 'goon> ' ? '› ' : clip(this.label);
-      const boxLabelCols = visibleLength(boxPromptLabel);
-      const tokenBadge = ` ${this.tokens} tokens`;
-      const tokenCols = visibleLength(tokenBadge);
-      const boxInnerCols = Math.max(1, safeCols - 4 - boxLabelCols - tokenCols);
-
-      let visibleBeforeCursor = this.input.slice(0, this.cursor).join('');
-      while (visibleBeforeCursor && visibleLength(visibleBeforeCursor) >= boxInnerCols) {
-        visibleBeforeCursor = [...visibleBeforeCursor].slice(1).join('');
-      }
-      const afterCursor = this.input.slice(this.cursor).join('');
-      const shownInput = wrapTerminal(visibleBeforeCursor + afterCursor, boxInnerCols)[0];
-      const isEmptyInput = this.input.length === 0 && this.label === 'goon> ';
-      const placeholderText = busy
-        ? 'Run /command now or type to queue · Ctrl+T transcript'
-        : 'Ask anything... (Shift+Tab mode · Ctrl+T transcript)';
-      const placeholder = isEmptyInput
-        ? wrapTerminal(placeholderText, boxInnerCols)[0]
-        : '';
-      const innerContent = placeholder
-        ? `\x1b[2m${placeholder}\x1b[0m`
-        : formatInlineMarkdown(shownInput);
-      const innerPadSpaces = ' '.repeat(Math.max(0, boxInnerCols - visibleLength(placeholder || shownInput)));
-
-      const borderColor = busy ? '\x1b[2m' : '\x1b[38;2;99;168;248m';
-      const displayMode = this.modeLabel === 'auto' ? 'auto-approve' : this.modeLabel;
-      const viewBadge = this.viewMode === 'transcript' ? ' · view:transcript' : '';
-      const topMeta = clip(` ${displayMode} · ${modelName} · effort:${this.effortLabel}${viewBadge} `);
-      const topDashes = '─'.repeat(Math.max(1, safeCols - 3 - visibleLength(topMeta)));
-      const styledTopMeta =
-        displayMode === 'auto-approve'
-          ? topMeta.replace('auto-approve', '\x1b[1;32mauto-approve\x1b[1;36m')
-          : topMeta;
-      const boxTop = `${borderColor}╭─\x1b[0m\x1b[1;36m${styledTopMeta}\x1b[0m${borderColor}${topDashes}╮\x1b[0m`;
-
-      const boxMid =
-        `${borderColor}│\x1b[0m \x1b[1;38;2;99;168;248m${boxPromptLabel}\x1b[0m` +
-        `${innerContent}${innerPadSpaces}\x1b[2m${tokenBadge}\x1b[0m ${borderColor}│\x1b[0m`;
-
-      const botDashes = '─'.repeat(Math.max(1, safeCols - 2));
-      const boxBot = `${borderColor}╰${botDashes}╯\x1b[0m`;
-
-      const screenLines = [header, ...body, gapLine, toolsLine, queueLine, boxTop, boxMid, boxBot];
-      const boxMidRow = screenLines.length - 1;
-      const boxCursorCol = Math.min(safeCols - 1, 2 + boxLabelCols + visibleLength(visibleBeforeCursor) + 1);
-      const cursorSeq =
-        this.pending || this.input.length > 0 ? `\x1b[${boxMidRow};${boxCursorCol}H\x1b[?25h` : '';
-      this.flushScreenLines(screenLines, columns, rows, cursorSeq);
-      return;
-    }
-
-    // Compact fallback for tiny (<48x12) terminals
-    const footer = clip(`${this.status} · ${this.tokens} tokens · Ctrl+C cancel · PgUp/PgDn scroll`);
-    const label = clip(this.label);
-    const labelCols = visibleLength(label);
-    const inputAvailCols = Math.max(1, safeCols - labelCols);
     let visibleBeforeCursor = this.input.slice(0, this.cursor).join('');
-    while (visibleBeforeCursor && visibleLength(visibleBeforeCursor) >= inputAvailCols) {
+    while (visibleBeforeCursor && visibleLength(visibleBeforeCursor) >= boxInnerCols) {
       visibleBeforeCursor = [...visibleBeforeCursor].slice(1).join('');
     }
     const afterCursor = this.input.slice(this.cursor).join('');
-    const shownInput = wrapTerminal(visibleBeforeCursor + afterCursor, inputAvailCols)[0];
-    const prompt = wrapTerminal(label + shownInput, safeCols)[0];
-    const cursorColumn = Math.min(columns, labelCols + visibleLength(visibleBeforeCursor) + 1);
+    const shownInput = wrapTerminal(visibleBeforeCursor + afterCursor, boxInnerCols)[0];
+    const isEmptyInput = this.input.length === 0 && !asking;
+    const placeholderText = busy
+      ? 'Type to queue a follow-up · /commands run immediately'
+      : 'Ask anything · / commands · @ files · $ skills · ! shell';
+    const placeholder = isEmptyInput ? wrapTerminal(placeholderText, boxInnerCols)[0] : '';
+    const innerContent = placeholder ? `${T.faint}${placeholder}${T.reset}` : formatInlineMarkdown(shownInput);
+    const innerPad = ' '.repeat(Math.max(0, boxInnerCols - visibleLength(placeholder || shownInput)));
 
-    const screenLines = [header, ...body, toolsLine, footer, prompt];
-    const cursorSeq = this.pending ? `\x1b[${screenLines.length};${cursorColumn}H\x1b[?25h` : '';
+    const displayMode = this.modeLabel === 'auto' ? 'auto-approve' : this.modeLabel;
+    const modeTone =
+      displayMode === 'auto-approve' ? T.ok : displayMode === 'plan' ? T.warn : displayMode === 'readonly' ? T.muted : T.info;
+    const viewBadge = this.viewMode === 'transcript' ? ' · view:transcript' : '';
+    const metaPlain = sliceVisible(` ${displayMode} · ${modelName} · effort:${this.effortLabel}${viewBadge} `, Math.max(1, safeCols - 5));
+    const topDashes = '─'.repeat(Math.max(1, safeCols - 3 - visibleLength(metaPlain)));
+    let metaStyled = `${T.muted}${metaPlain}${T.reset}`;
+    if (metaPlain.startsWith(` ${displayMode}`)) {
+      const afterMode = metaPlain.slice(displayMode.length + 1);
+      const modelPart = afterMode.startsWith(` · ${modelName}`) ? ` · ${modelName}` : '';
+      metaStyled =
+        ` ${modeTone}\x1b[1m${displayMode}${T.reset}` +
+        (modelPart ? `${T.faint} · ${T.reset}${T.strong}${modelName}${T.reset}` : '') +
+        `${T.muted}${afterMode.slice(modelPart.length)}${T.reset}`;
+    }
+    const boxTop = `${borderColor}╭─${T.reset}${metaStyled}${borderColor}${topDashes}╮${T.reset}`;
+
+    const labelStyled = asking ? `${T.warn}\x1b[1m${promptLabel}${T.reset}` : `${T.brandBold}${promptLabel}${T.reset}`;
+    const boxMid = `${borderColor}│${T.reset} ${labelStyled}${innerContent}${innerPad} ${borderColor}│${T.reset}`;
+
+    const tokenBadge = ` ${formatTokenCount(this.tokens)} tokens `;
+    const hintText = asking
+      ? ' enter submit · esc cancel '
+      : busy
+        ? ' enter queues · esc interrupt '
+        : ' shift+tab mode · ctrl+o copy · ctrl+t transcript ';
+    let hint = hintText;
+    let badge = tokenBadge;
+    if (safeCols - 4 - visibleLength(hint) - visibleLength(badge) < 1) hint = '';
+    if (safeCols - 4 - visibleLength(hint) - visibleLength(badge) < 1) badge = '';
+    const botDashes = '─'.repeat(Math.max(1, safeCols - 4 - visibleLength(hint) - visibleLength(badge)));
+    const boxBot =
+      `${borderColor}╰─${T.reset}${T.faint}${hint}${T.reset}${borderColor}${botDashes}${T.reset}` +
+      `${T.muted}${badge}${T.reset}${borderColor}─╯${T.reset}`;
+
+    const screenLines = [header, ...body, '', statusLine, ...popupLines, ...queueLines, boxTop, boxMid, boxBot];
+    const boxMidRow = screenLines.length - 1;
+    const boxCursorCol = Math.min(safeCols - 1, 2 + labelCols + visibleLength(visibleBeforeCursor) + 1);
+    const cursorSeq = this.pending || this.input.length > 0 ? `\x1b[${boxMidRow};${boxCursorCol}H\x1b[?25h` : '';
     this.flushScreenLines(screenLines, columns, rows, cursorSeq);
   }
 

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { PassThrough } from 'node:stream';
-import { TerminalUI, terminalText, wrapTerminal } from '../dist/tui.js';
+import { TerminalUI, THEME, terminalText, wrapTerminal } from '../dist/tui.js';
 
 function terminal(t) {
   const input = new PassThrough(), output = new PassThrough();
@@ -89,7 +89,7 @@ test('TUI separates opt-in reasoning from answers and consumes compact child pro
   tty.ui.event({ type: 'subagent', id: 'child123', state: 'done' });
   await new Promise(resolve => setTimeout(resolve, 40));
   const frame = tty.ui.renderedFrame();
-  assert.equal(frame.split('• Thinking').length - 1, 2);
+  assert.equal(frame.split('∴ Thinking').length - 1, 2);
   assert(!frame.includes('[reasoning'), 'Must not render raw [reasoning] tags');
   assert(!frame.includes('[answer]'), 'Must not render raw [answer] header');
   assert.match(frame, /Visible answer\./);
@@ -229,11 +229,11 @@ test('Codex TUI renders Markdown bullets without false-positive red diff colorin
   const lines = lastFrame.split('\r\n');
   const todoBulletLine = lines.find(l => l.includes('Todo list:'));
   assert(todoBulletLine, 'Should find rendered Todo list bullet line');
-  assert(!todoBulletLine.includes('\x1b[31m'), 'Markdown bullet list item must NOT be colored red as a diff deletion');
+  assert(!todoBulletLine.includes(THEME.delFg), 'Markdown bullet list item must NOT be colored as a diff deletion');
 
   const diffRemovedLine = lines.find(l => l.includes('const oldVal = 1;'));
   assert(diffRemovedLine, 'Should find rendered diff deletion line');
-  assert(diffRemovedLine.includes('\x1b[31m'), 'Real diff deletion line must be colored red');
+  assert(diffRemovedLine.includes(THEME.delFg) && diffRemovedLine.includes(THEME.delBg), 'Real diff deletion line must use the deletion colors');
 });
 
 test('Codex TUI collapses pasted ScreenClip image paths into [Image #1], prevents line-wrap cursor drift, and scrolls with mouse wheel and Up/Down', async t => {
@@ -339,13 +339,13 @@ test('Codex TUI renders rounded composer text box with spacer gap, pipe-free thi
   await new Promise(resolve => setTimeout(resolve, 25));
 
   // Verify 'Type /help for commands...' is dimmed with \x1b[2m
-  assert(tty.ui.renderedFrame().includes('\x1b[2mType /help for commands'), 'Type /help line must be styled dim');
+  assert(tty.ui.renderedFrame().includes(`${THEME.faint}Type /help for commands`), 'Type /help line must be styled faint');
 
   // Verify transient approval prompt appears while waiting and is removed once answered
-  const approvalPromise = tty.ui.askTransient('\n• Allow bash?\n  $ npm test\n', '[y/N/a(lways)] ');
+  const approvalPromise = tty.ui.askTransient('\n▲ Allow bash?\n  $ npm test\n', '[y/N/a(lways)] ');
   await new Promise(resolve => setTimeout(resolve, 25));
   let frame = stripVTControlCharacters(tty.ui.renderedFrame());
-  assert.match(frame, /• Allow bash\?/);
+  assert.match(frame, /▲ Allow bash\?/);
   assert.match(frame, /\$ npm test/);
 
   tty.key('y', 'y');
@@ -355,19 +355,19 @@ test('Codex TUI renders rounded composer text box with spacer gap, pipe-free thi
 
   frame = stripVTControlCharacters(tty.ui.renderedFrame());
   assert(!frame.includes('Allow bash?'), 'Transient approval prompt should be removed from transcript after answer');
-  assert.match(frame, /• Thinking/);
+  assert.match(frame, /∴ Thinking/);
   assert.match(frame, /  Checking files without vertical bars/);
-  assert.match(frame, /• Direct bullet answer without \[answer\] tag\./);
+  assert.match(frame, /◆ Direct bullet answer without \[answer\] tag\./);
 
   // Top header should NOT contain model name or effort
   const topHeaderLine = frame.split('\r\n')[0];
   assert(!topHeaderLine.includes('test-model'), 'Top header should not repeat model name');
   assert(!topHeaderLine.includes('effort:'), 'Top header should not repeat effort');
 
-  // Box top border has mode + model + effort; Box middle row has Ask anything... and 0 tokens on the same row
+  // Box top border has mode + model + effort; middle row is the input; token badge lives in the bottom border
   assert.match(frame, /╭─ ask · test-model · effort:default ─/);
-  assert.match(frame, /│ › Ask anything\.\.\..*0 tokens │/);
-  assert.match(frame, /╰──/);
+  assert.match(frame, /│ › Ask anything · \/ commands.*│/);
+  assert.match(frame, /╰─.* 0 tokens ─╯/);
   assert(!frame.includes('Ready ·'), 'Bottom border should not contain Ready footer text');
   assert(!frame.includes('Queue'), 'Must not render Queue label when empty');
 
@@ -442,9 +442,9 @@ test('Codex TUI backtrack/revert removes reverted turns from screen, restores pr
   assert(!frame.includes('Upstream provider returned HTTP 500:'), 'Failed turn error must be removed from screen');
   // Turn 1 is still intact on screen
   assert.match(frame, /› first prompt/);
-  assert.match(frame, /• First answer\./);
+  assert.match(frame, /◆ First answer\./);
   // And the reverted prompt 'can u play valorant' is restored inside the Composer Input Box!
-  assert.match(frame, /│ › can u play valorant.*0 tokens │/);
+  assert.match(frame, /│ › can u play valorant\s*│/);
 
   // Pressing Esc Esc again while restored prompt is untouched in composer triggers another /revert!
   tty.key('', 'escape');
@@ -460,7 +460,7 @@ test('welcomeBanner aligns all box borders to 69 visible columns with NFD Vietna
   const nfdWorkspace = 'D:\\Th\u01B0 mu\u0323c m\u01A1\u0301i (2)';
   const banner = welcomeBanner('gpt-5.4', 'openai', 'https://api.ezaiapi.com/v1', 'max', nfdWorkspace, '0f40f011-0000-4000-8000-000000000000', 'ask');
   const lines = banner.trim().split('\n');
-  assert.equal(lines.length, 6);
+  assert.equal(lines.length, 10);
   for (const line of lines) {
     assert.equal(visibleLength(line), 69, `Expected 69 visible columns for line: ${line}`);
   }
@@ -477,9 +477,9 @@ test('welcomeBanner aligns all box borders to 69 visible columns with NFD Vietna
   await new Promise(resolve => setTimeout(resolve, 25));
 
   let frame = stripVTControlCharacters(tty.ui.renderedFrame());
-  assert(!frame.includes('• Thinking'), 'In normal view mode, thinking blocks must be hidden');
+  assert(!frame.includes('∴ Thinking'), 'In normal view mode, thinking blocks must be hidden');
   assert(!frame.includes('Internal chain of thought step 1.'), 'In normal view mode, reasoning text must be hidden');
-  assert.match(frame, /• Final visible answer\./);
+  assert.match(frame, /◆ Final visible answer\./);
 
   // Switch to verbose view mode -> thinking block immediately appears
   tty.ui.setViewMode('verbose');
@@ -487,9 +487,9 @@ test('welcomeBanner aligns all box borders to 69 visible columns with NFD Vietna
   await new Promise(resolve => setTimeout(resolve, 25));
 
   frame = stripVTControlCharacters(tty.ui.renderedFrame());
-  assert.match(frame, /• Thinking/);
+  assert.match(frame, /∴ Thinking/);
   assert.match(frame, /Internal chain of thought step 1\./);
-  assert.match(frame, /• Final visible answer\./);
+  assert.match(frame, /◆ Final visible answer\./);
 
   // Verify computeUnifiedDiff and TUI do NOT cap >60 line writes at +60
   const { computeUnifiedDiff } = await import('../dist/index.js');
@@ -546,8 +546,8 @@ test('TerminalUI Ctrl+T toggles Codex Transcript Mode, auto-approve mode, and im
   await new Promise(resolve => setTimeout(resolve, 25));
   assert.equal(tty.ui.isTranscriptOverlay(), true);
   let frame = stripVTControlCharacters(tty.ui.renderedFrame());
-  assert.match(frame, /T R A N S C R I P T/);
-  assert.match(frame, /• Thinking/);
+  assert.match(frame, /TRANSCRIPT/);
+  assert.match(frame, /∴ Thinking/);
   assert.match(frame, /Hidden reasoning visible in Ctrl\+T\./);
 
   // Press q (or Ctrl+T / Esc) -> exits Transcript Mode back to normal Composer view immediately
@@ -579,5 +579,172 @@ test('TerminalUI Ctrl+T toggles Codex Transcript Mode, auto-approve mode, and im
   assert.match(frame, /do next task after this/);
 });
 
+test('redesign: Markdown blockquotes in answers never render as user turns, and cells after an unterminated answer are not answer text', async t => {
+  const { stripVTControlCharacters } = await import('node:util');
+  const tty = terminal(t);
+  tty.output.columns = 90;
+  tty.output.rows = 24;
 
+  tty.ui.markTurnStart();
+  tty.ui.write('\n> real user prompt\n');
+  tty.ui.event({ type: 'text', text: 'Answer intro\n> quoted model text\nAnswer without trailing newline' });
+  tty.ui.event({ type: 'tool', id: 'b1', name: 'bash', state: 'done', meta: { kind: 'exec', summary: 'npm test', durationMs: 1000, outputPreview: ['ok'] } });
+  await new Promise(resolve => setTimeout(resolve, 30));
 
+  const raw = tty.ui.renderedFrame();
+  const plain = stripVTControlCharacters(raw);
+  // Exactly one user band: the real prompt. The blockquote renders as a quote bar.
+  assert.equal(raw.split(THEME.userBg).length > 1, true);
+  const userRows = raw.split('\r\n').filter(l => l.includes(THEME.userBg));
+  assert.equal(userRows.length, 1, `expected one user row, got ${userRows.length}`);
+  assert.match(stripVTControlCharacters(userRows[0]), /› real user prompt/);
+  assert.match(plain, /▎ quoted model text/);
+  assert(!/› quoted model text/.test(plain), 'blockquote must not be rendered as a user turn');
+  // The tool cell after an unterminated answer is a real cell (status-colored glyph), not answer prose.
+  const ranRow = raw.split('\r\n').find(l => stripVTControlCharacters(l).startsWith('● Ran npm test'));
+  assert(ranRow, 'Ran cell row must start at column 0 with its glyph');
+  assert(ranRow.startsWith(`${THEME.ok}\x1b[1m●`), 'Ran glyph must use the success tone');
+  assert.match(plain, /Answer without trailing newline/);
+});
+
+test('redesign: header band shows workspace, branch and a provider-reported context meter without repeating the model', async t => {
+  const { stripVTControlCharacters } = await import('node:util');
+  const tty = terminal(t);
+  tty.output.columns = 100;
+  tty.output.rows = 20;
+  tty.ui.setWorkspace('D:\\work\\testcli', 'feature/redesign');
+  tty.ui.setContextWindow(200_000);
+  await new Promise(resolve => setTimeout(resolve, 25));
+  let header = stripVTControlCharacters(tty.ui.renderedFrame().split('\r\n')[0]);
+  assert.match(header, /◆ goon · testcli · feature\/redesign/);
+  assert(!header.includes('ctx'), 'meter stays hidden until occupancy is known');
+  assert(!header.includes('test-model'), 'header must not repeat the model name');
+
+  // 60k prompt + 8k completion of the latest request = 68k / 200k = 34%
+  tty.ui.event({ type: 'usage', input: 60_000, output: 8_000, total: 68_000 });
+  // Subagent usage must not move the parent's context meter.
+  tty.ui.event({ type: 'subagent', id: 'kid', state: 'progress', event: { type: 'usage', input: 150_000, output: 1, total: 150_001 } });
+  await new Promise(resolve => setTimeout(resolve, 25));
+  header = stripVTControlCharacters(tty.ui.renderedFrame().split('\r\n')[0]);
+  assert.match(header, /ctx ▰▰▰▱▱▱▱▱ 34%/);
+  assert.match(stripVTControlCharacters(tty.ui.renderedFrame()), /218k tokens/);
+
+  // Compaction invalidates the measurement until the next provider report.
+  tty.ui.event({ type: 'compaction', count: 1 });
+  await new Promise(resolve => setTimeout(resolve, 25));
+  header = stripVTControlCharacters(tty.ui.renderedFrame().split('\r\n')[0]);
+  assert(!header.includes('ctx'), 'meter must hide after compaction');
+  assert.match(stripVTControlCharacters(tty.ui.renderedFrame()), /◌ Context compacted #1/);
+
+  // >= 90% switches the meter to the error tone.
+  tty.ui.event({ type: 'usage', input: 185_000, output: 0, total: 185_000 });
+  await new Promise(resolve => setTimeout(resolve, 25));
+  const rawHeader = tty.ui.renderedFrame().split('\r\n')[0];
+  assert.match(stripVTControlCharacters(rawHeader), /93%/);
+  assert(rawHeader.includes(`${THEME.err}▰▰▰▰▰▰▰`), 'critical occupancy must use the error tone');
+});
+
+test('redesign: slash popup lists matching commands with descriptions and Tab still completes the first match', async t => {
+  const { stripVTControlCharacters } = await import('node:util');
+  const tty = terminal(t);
+  tty.output.columns = 100;
+  tty.output.rows = 24;
+  const q = tty.ui.question('goon> ', undefined, true);
+  tty.key('/rev', undefined);
+  await new Promise(resolve => setTimeout(resolve, 25));
+  const frame = stripVTControlCharacters(tty.ui.renderedFrame());
+  assert.match(frame, /› \/revert\s+rewind turn\(s\)/);
+  assert.match(frame, /\/review\s+run code review/);
+  assert(!/\/resume/.test(frame), 'non-matching commands must be filtered out');
+  tty.key('', 'tab');
+  tty.key('', 'return');
+  assert.equal((await q).trim(), '/revert');
+  await new Promise(resolve => setTimeout(resolve, 25));
+  assert(!/rewind turn\(s\)/.test(stripVTControlCharacters(tty.ui.renderedFrame())), 'popup closes after submit');
+});
+
+test('redesign: Markdown tables align columns across rows', async t => {
+  const { stripVTControlCharacters } = await import('node:util');
+  const tty = terminal(t);
+  tty.output.columns = 100;
+  tty.output.rows = 24;
+  tty.ui.event({ type: 'text', text: 'Summary:\n| file | change |\n|---|---|\n| src/tui.ts | **meter** |\n| a | b |\n' });
+  await new Promise(resolve => setTimeout(resolve, 25));
+  const rows = stripVTControlCharacters(tty.ui.renderedFrame()).split('\r\n').filter(l => /[│├]/.test(l) && !/[╭╰]/.test(l) && !l.includes('›'));
+  assert.equal(rows.length, 4, rows.join('\n'));
+  const barColumns = row => [...row].map((c, i) => (c === '│' || c === '┼' || c === '├' || c === '┤' ? i : -1)).filter(i => i >= 0);
+  const expected = barColumns(rows[0]);
+  for (const row of rows) assert.deepEqual(barColumns(row), expected, `misaligned row: ${row}`);
+});
+
+test('redesign: no rendered row exceeds the terminal width at any size, across every cell kind', async t => {
+  const { stripVTControlCharacters } = await import('node:util');
+  const { visibleLength, welcomeBanner } = await import('../dist/index.js');
+  for (const columns of [48, 57, 64, 80, 101, 132]) {
+    const tty = terminal(t);
+    tty.output.columns = columns;
+    tty.output.rows = 60;
+    tty.ui.setWorkspace('/home/user/a-very-long-workspace-directory-name-for-testing', 'feature/an-extremely-long-branch-name');
+    tty.ui.setContextWindow(100_000);
+    tty.ui.setContextUsage(42_000);
+    tty.ui.setTokens(123_456);
+    tty.ui.write(welcomeBanner('model-with-a-really-long-identifier-v1', 'openai-compatible', 'https://gateway.example.com/v1', 'max', '/home/user/project', '0f40f011-0000-4000-8000-000000000000', 'auto'));
+    tty.ui.write('\n> ' + 'long user prompt words '.repeat(12) + '\n');
+    tty.ui.event({ type: 'reasoning', source: 'provider', text: 'reasoning words '.repeat(30) + '\n' });
+    tty.ui.event({ type: 'tool', id: 'r', name: 'read_file', state: 'done', meta: { kind: 'read', summary: 'src/' + 'deep/'.repeat(20) + 'file.ts' } });
+    tty.ui.event({ type: 'tool', id: 'b', name: 'bash', state: 'done', meta: { kind: 'exec', summary: 'echo ' + 'x'.repeat(200), durationMs: 65_000, outputPreview: ['y'.repeat(300)] } });
+    tty.ui.event({ type: 'tool', id: 'e', name: 'edit_file', state: 'done', meta: { kind: 'edit', verb: 'Edited', summary: 'src/app.ts', added: 1, removed: 1, diff: `@@ -1,1 +1,1 @@\n-${'old '.repeat(60)}\n+${'new '.repeat(60)}` } });
+    tty.ui.event({ type: 'todo', todos: [{ content: 'todo item '.repeat(20), status: 'in_progress' }] });
+    tty.ui.event({ type: 'subagent', id: 'abcdef123456', state: 'start', task: 'task words '.repeat(30) });
+    tty.ui.event({ type: 'text', text: '# ' + 'Heading '.repeat(20) + '\n- ' + 'bullet '.repeat(40) + '\n> ' + 'quote '.repeat(40) + '\n```js\n' + 'const z = 1; '.repeat(30) + '\n```\n| ' + 'c '.repeat(80) + '| d |\n|---|---|\n| e | f |\n' });
+    tty.ui.setStatus('Running');
+    tty.ui.question('goon> ', undefined, true).catch(() => {});
+    tty.key('/re', undefined);
+    await new Promise(resolve => setTimeout(resolve, 40));
+    for (const line of tty.ui.renderedFrame().split('\r\n')) {
+      const width = visibleLength(line);
+      assert(width <= columns - 1, `cols=${columns}: row is ${width} wide: ${JSON.stringify(stripVTControlCharacters(line))}`);
+    }
+    tty.ui.close();
+  }
+});
+
+test('redesign: formatTokenCount and readGitBranch agree with independent oracles', async t => {
+  const { formatTokenCount, readGitBranch } = await import('../dist/index.js');
+  assert.equal(formatTokenCount(0), '0');
+  assert.equal(formatTokenCount(999), '999');
+  assert.equal(formatTokenCount(1000), '1k');
+  assert.equal(formatTokenCount(1250), '1.3k');
+  assert.equal(formatTokenCount(48_210), '48k');
+  assert.equal(formatTokenCount(2_500_000), '2.5M');
+
+  const { mkdtemp, mkdir, writeFile, rm } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const root = await mkdtemp(join(tmpdir(), 'goon-branch-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  // Normal repo, nested cwd.
+  await mkdir(join(root, 'repo', '.git'), { recursive: true });
+  await mkdir(join(root, 'repo', 'src', 'deep'), { recursive: true });
+  await writeFile(join(root, 'repo', '.git', 'HEAD'), 'ref: refs/heads/feature/x\n');
+  assert.equal(readGitBranch(join(root, 'repo', 'src', 'deep')), 'feature/x');
+  // Detached HEAD.
+  await writeFile(join(root, 'repo', '.git', 'HEAD'), '7869954a1b2c3d4e5f60718293a4b5c6d7e8f901\n');
+  assert.equal(readGitBranch(join(root, 'repo')), '7869954');
+  // Worktree: .git is a file pointing at the real gitdir.
+  await mkdir(join(root, 'wt-gitdir'), { recursive: true });
+  await writeFile(join(root, 'wt-gitdir', 'HEAD'), 'ref: refs/heads/wt-branch\n');
+  await mkdir(join(root, 'wt'), { recursive: true });
+  await writeFile(join(root, 'wt', '.git'), `gitdir: ${join(root, 'wt-gitdir')}\n`);
+  assert.equal(readGitBranch(join(root, 'wt')), 'wt-branch');
+  // Garbage HEAD is not reported as a branch.
+  await writeFile(join(root, 'repo', '.git', 'HEAD'), 'not a ref\n');
+  assert.equal(readGitBranch(join(root, 'repo')), undefined);
+
+  // Real git is the oracle for this repository when available.
+  const { spawnSync } = await import('node:child_process');
+  const git = spawnSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: process.cwd(), encoding: 'utf8' });
+  if (git.status === 0 && git.stdout.trim() && git.stdout.trim() !== 'HEAD') {
+    assert.equal(readGitBranch(process.cwd()), git.stdout.trim());
+  }
+});

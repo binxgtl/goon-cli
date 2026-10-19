@@ -108,7 +108,8 @@ export class SessionStore {
         ?? wsList[0]?.id
         ?? list.find(s => sameWorkspace(s.cwd, input.cwd) && (s.messagesCount ?? 0) > 0)?.id
         ?? list.find(s => sameWorkspace(s.cwd, input.cwd))?.id;
-    } else if (id && /^\d+$/.test(id)) {
+    } else if (id && /^\d{1,3}$/.test(id)) {
+      // List index (goon resume 3). Longer all-digit input is an ID prefix: ~2.3% of UUIDs start with 8 digits.
       const idx = Number(id) - 1;
       const list = await SessionStore.list(root);
       const wsNonEmpty = list.filter(s => sameWorkspace(s.cwd, input.cwd) && (s.messagesCount ?? 0) > 0 && s.id !== excludeId);

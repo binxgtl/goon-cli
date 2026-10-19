@@ -5,6 +5,26 @@ import { join } from 'node:path';
 import { SessionStore, repairInterrupted } from '../dist/session.js';
 import { fixture } from './helpers.mjs';
 
+test('an all-digit 8-char session ID prefix resumes by prefix instead of being treated as a list index', async t => {
+  const f = await fixture(t), root = join(f.root, 'sessions');
+  const input = { cwd: f.cwd, provider: 'test', model: 'model', baseUrl: 'http://localhost/v1' };
+  const seed = await SessionStore.open(root, input);
+  seed.session.messages.push({ role: 'user', content: 'digit-prefixed session' });
+  await seed.save();
+  const digitId = '12345678-aaaa-4bbb-8ccc-dddddddddddd';
+  const raw = JSON.parse(await readFile(join(root, `${seed.session.id}.json`), 'utf8'));
+  await writeFile(join(root, `${digitId}.json`), JSON.stringify({ ...raw, id: digitId }));
+  await seed.close();
+
+  const byDigits = await SessionStore.open(root, input, '12345678');
+  assert.equal(byDigits.session.id, digitId);
+  await byDigits.close();
+  // Small numbers keep their list-index meaning (goon resume 1).
+  const byIndex = await SessionStore.open(root, input, '1');
+  assert.ok([digitId, seed.session.id].includes(byIndex.session.id));
+  await byIndex.close();
+});
+
 test('session lock prevents two owners and resume retains message history', async t => {
   const f = await fixture(t), root = join(f.root, 'sessions');
   const input = { cwd: f.cwd, provider: 'test', model: 'model', baseUrl: 'http://localhost/v1' };
