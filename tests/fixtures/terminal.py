@@ -4,6 +4,7 @@ import fcntl
 import json
 import os
 import pty
+import re
 import select
 import struct
 import subprocess
@@ -11,6 +12,7 @@ import sys
 import termios
 import time
 
+ANSI_RE = re.compile(rb'\x1b\[[0-9;?]*[A-Za-z]')
 master, slave = pty.openpty()
 fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 24, 72, 0, 0))
 child = subprocess.Popen(sys.argv[1:], stdin=slave, stdout=slave, stderr=slave, env={**os.environ, 'TERM': 'xterm-256color'})
@@ -18,8 +20,9 @@ output = bytearray()
 
 def wait_for(needle):
     deadline = time.monotonic() + 12
+    target = needle.encode()
     while time.monotonic() < deadline:
-        if needle.encode() in output:
+        if target in output or target in ANSI_RE.sub(b'', output):
             return
         ready, _, _ = select.select([master], [], [], 0.1)
         if ready:
