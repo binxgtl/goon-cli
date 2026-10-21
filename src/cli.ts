@@ -775,7 +775,6 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         renderResumedHistory();
       }
       else display(`goon · ${runtime.model} · session ${store.session.id}\n`);
-      const MAX_GOAL_CONTINUATION_TURNS = 25;
       let goalContinuationDeferred = false;
 
       const runTurn = async (
@@ -833,7 +832,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       const continueGoalIfIdle = async () => {
         if (controller || exiting || terminating || denied || tools.planMode) return;
         let consecutiveEmptyTurns = 0;
-        for (let step = 1; step <= MAX_GOAL_CONTINUATION_TURNS; step++) {
+        for (let step = 1; ; step++) {
           if (exiting || terminating || denied || tools.planMode || goalContinuationDeferred) break;
           if (tui?.hasQueuedPrompts()) break;
           const g = store.session.goal;
