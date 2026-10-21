@@ -1,12 +1,12 @@
 {
   "name": "goon-cli",
-  "version": "0.2.23",
+  "version": "0.2.24",
   "lockfileVersion": 3,
   "requires": true,
   "packages": {
     "": {
       "name": "goon-cli",
-      "version": "0.2.23",
+      "version": "0.2.24",
       "license": "MIT",
       "dependencies": {
         "@ai-sdk/anthropic": "3.0.81",
