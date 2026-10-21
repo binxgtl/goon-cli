@@ -225,8 +225,8 @@ function padRightAnsi(str: string, cols: number, bgAnsi = ''): string {
 /** Format inline Markdown (**bold**, `code`, [label](url), ~~strike~~) into ANSI spans. */
 export function formatInlineMarkdown(raw: string, baseSgr = '\x1b[0m'): string {
   let out = raw;
-  // [Image #N] attachment pills
-  out = out.replace(/(\[Image #\d+[^\]]*\])/g, `${THEME.brandBold}$1${baseSgr}`);
+  // [Image #N] and [Pasted text #N ...] attachment pills
+  out = out.replace(/(\[(?:Image #\d+|Pasted text #\d+)[^\]]*\])/g, `${THEME.brandBold}$1${baseSgr}`);
   // Inline code `...`
   out = out.replace(/`([^`\n]+)`/g, `${THEME.info}$1${baseSgr}`);
   // Markdown links [label](url)
@@ -396,6 +396,10 @@ function formatCompactDiff(diffText: string, maxLines = 20): string[] {
 const LOCAL_IMAGE_PATH_REGEX =
   /(?:"((?:[A-Za-z]:[\\/]|\\\\|\/)[^"\r\n]+?\.(?:png|jpe?g|webp|gif))"|'((?:[A-Za-z]:[\\/]|\\\\|\/)[^'\r\n]+?\.(?:png|jpe?g|webp|gif))'|((?:[A-Za-z]:[\\/]|\\\\|\/)[^\s"']+?\.(?:png|jpe?g|webp|gif)))/gi;
 
+const LARGE_PASTE_CHAR_THRESHOLD = 150;
+const ATOMIC_PLACEHOLDER_END_RE = /(\[(?:Image #\d+|Pasted text #\d+[^\]]*)\]\s?)$/;
+const ATOMIC_PLACEHOLDER_START_RE = /^(\[(?:Image #\d+|Pasted text #\d+[^\]]*)\]\s?)/;
+
 /** Rejection reason when the user presses Esc on a question opened with `escCancels`. */
 export class InputCancelledError extends Error {
   constructor() {
@@ -450,10 +454,20 @@ export class TerminalUI {
   private lastBodyTotalLines = 0;
   private needsFullClear = true;
   private inBracketedPaste = false;
+  private bracketedPasteBuffer = '';
+  private suppressKeypressChunk = false;
+  private pendingRawPasteChunk = '';
+  private lastPasteToken?: string;
+  private lastPasteAt = 0;
   private inSgrMouse = false;
   private sgrMouseBuf = '';
   private attachedImages = new Map<string, string>();
+  private imageArchive = new Map<string, string>();
   private nextImageIdx = 1;
+  private pastedTexts = new Map<string, string>();
+  private pasteArchive = new Map<string, string>();
+  private recentExpandedPastes: Array<{ placeholder: string; content: string }> = [];
+  private nextPasteIdx = 1;
   private queuedPrompts: string[] = [];
   private popupIndex = 0;
   private popupFor = '';
@@ -483,10 +497,12 @@ export class TerminalUI {
     readonly target: WriteStream = process.stdout,
   ) {
     this.oldRaw = source.isRaw;
+    source.on('data', this.beforeRawData);
     emitKeypressEvents(source);
     source.setRawMode(true);
     source.resume();
     source.on('keypress', this.keypress);
+    source.on('data', this.afterRawData);
     source.on('end', this.ended);
     target.on('resize', this.resize);
     // Enter Alternate Screen (\x1b[?1049h), ensure mouse click capture is OFF (\x1b[?1000l\x1b[?1006l) so native
@@ -561,23 +577,37 @@ export class TerminalUI {
    * Restores a user prompt into the Composer Input Box for in-place editing or immediate Enter resend (Codex pattern).
    */
   setInput(text: string, fromRevert = false) {
-    const clean = terminalText(text).replace(/\r?\n/g, ' ');
-    this.input = [...clean];
-    this.cursor = this.input.length;
+    this.input = [];
+    this.cursor = 0;
     this.inputRestoredFromRevert = fromRevert;
     this.attachedImages.clear();
     this.nextImageIdx = 1;
+    this.pastedTexts.clear();
+    this.nextPasteIdx = 1;
+    let restored = text;
+    for (const [placeholder, content] of this.pasteArchive.entries()) {
+      if (content && restored.includes(content)) {
+        restored = restored.replace(content, () => placeholder);
+        this.pastedTexts.set(placeholder, content);
+        const m = /^\[Pasted text #(\d+)/.exec(placeholder);
+        if (m) this.nextPasteIdx = Math.max(this.nextPasteIdx, Number(m[1]) + 1);
+      }
+    }
+    const normalized = terminalText(restored.replace(/\r\n/g, '\n').replace(/\r/g, '\n'));
+    if (normalized.includes('\n') || [...normalized].length > LARGE_PASTE_CHAR_THRESHOLD) {
+      this.handlePaste(normalized);
+      this.inputRestoredFromRevert = fromRevert;
+      return;
+    }
+    this.input = [...normalized];
+    this.cursor = this.input.length;
+    this.rehydratePlaceholdersInInput();
     this.collapsePastedImagePathsInInput();
     this.schedule(0);
   }
 
   insertText(text: string) {
-    const clean = terminalText(text).replace(/\r?\n/g, ' ');
-    const chars = [...clean];
-    this.input.splice(this.cursor, 0, ...chars);
-    this.cursor += chars.length;
-    this.collapsePastedImagePathsInInput();
-    this.schedule(0);
+    this.handlePaste(text);
   }
 
   setNotice(notice: string | undefined) {
@@ -703,10 +733,17 @@ export class TerminalUI {
     const isUserPrompt = trimmedStart.startsWith('> ') || trimmedStart.startsWith('› ');
     if (isUserPrompt) {
       this.flushExploreGroup();
+      // Collapse any expanded large/multiline pastes back to their [Pasted text #N ...] pills in the transcript echo
+      for (const { placeholder, content } of this.recentExpandedPastes) {
+        if (content && cleaned.includes(content)) {
+          cleaned = cleaned.replace(content, () => placeholder);
+        }
+      }
       // Only a CLI write that starts with "> " is a user turn. Mark every line of it with a private-use
       // code point so streamed Markdown blockquotes ("> quote") in answers can never render as user turns.
-      const lead = cleaned.slice(0, cleaned.length - trimmedStart.length);
-      const body = trimmedStart
+      const currentTrimmedStart = cleaned.trimStart();
+      const lead = cleaned.slice(0, cleaned.length - currentTrimmedStart.length);
+      const body = currentTrimmedStart
         .slice(2)
         .split('\n')
         .map(line => (line.trim() ? `${USER_MARK}${line}` : line))
@@ -730,9 +767,13 @@ export class TerminalUI {
     const savedInput = [...this.input];
     const savedCursor = this.cursor;
     const savedImages = new Map(this.attachedImages);
+    const savedNextImageIdx = this.nextImageIdx;
+    const savedPastes = new Map(this.pastedTexts);
+    const savedNextPasteIdx = this.nextPasteIdx;
     this.input = [];
     this.cursor = 0;
     this.attachedImages.clear();
+    this.pastedTexts.clear();
     this.appendTranscript(this.blockReset() + previewBlock, true);
     try {
       return await this.question(label, signal, false, opts);
@@ -742,6 +783,9 @@ export class TerminalUI {
       this.input = savedInput;
       this.cursor = savedCursor;
       this.attachedImages = savedImages;
+      this.nextImageIdx = savedNextImageIdx;
+      this.pastedTexts = savedPastes;
+      this.nextPasteIdx = savedNextPasteIdx;
       this.schedule(16);
     }
   }
@@ -955,7 +999,7 @@ export class TerminalUI {
     this.escCancels = Boolean(opts.escCancels);
     this.escHint = opts.escHint ?? (opts.escCancels ? 'cancel' : /y\/N/.test(label) ? 'deny' : 'skip');
     if (remember && this.queuedPrompts.length > 0) {
-      const nextQueued = this.queuedPrompts.shift()!;
+      const nextQueued = this.expandInputPlaceholders(this.queuedPrompts.shift()!);
       this.schedule(0);
       return Promise.resolve(nextQueued);
     }
@@ -964,6 +1008,8 @@ export class TerminalUI {
       this.cursor = 0;
       this.attachedImages.clear();
       this.nextImageIdx = 1;
+      this.pastedTexts.clear();
+      this.nextPasteIdx = 1;
     }
     this.historyIndex = this.history.length;
     this.remember = remember;
@@ -982,6 +1028,180 @@ export class TerminalUI {
     pending?.cleanup();
     pending?.reject(error);
     this.schedule();
+  }
+
+  private recordImageArchive(placeholder: string, fullPath: string) {
+    this.imageArchive.set(placeholder, fullPath);
+    if (this.imageArchive.size > 100) {
+      const firstKey = this.imageArchive.keys().next().value;
+      if (firstKey !== undefined) this.imageArchive.delete(firstKey);
+    }
+  }
+
+  private recordPasteArchive(placeholder: string, content: string) {
+    this.pasteArchive.set(placeholder, content);
+    if (this.pasteArchive.size > 100) {
+      const firstKey = this.pasteArchive.keys().next().value;
+      if (firstKey !== undefined) this.pasteArchive.delete(firstKey);
+    }
+  }
+
+  /**
+   * Rehydrates `[Image #N]` and `[Pasted text #N ...]` maps when recalling history (`↑`/`↓`)
+   * or popping a queued prompt (`Alt+↑`) so atomic Backspace and Enter expansion still work.
+   */
+  private rehydratePlaceholdersInInput() {
+    const current = this.input.join('');
+    this.attachedImages.clear();
+    this.pastedTexts.clear();
+    for (const m of current.matchAll(/\[Image #(\d+)\]/g)) {
+      const token = m[0];
+      const archived = this.imageArchive.get(token);
+      if (archived) {
+        this.attachedImages.set(token, archived);
+        this.nextImageIdx = Math.max(this.nextImageIdx, Number(m[1]) + 1);
+      }
+    }
+    for (const m of current.matchAll(/\[Pasted text #(\d+)[^\]]*\]/g)) {
+      const token = m[0];
+      const archived = this.pasteArchive.get(token);
+      if (archived !== undefined) {
+        this.pastedTexts.set(token, archived);
+        this.nextPasteIdx = Math.max(this.nextPasteIdx, Number(m[1]) + 1);
+      }
+    }
+  }
+
+  /**
+   * Expands any `[Image #N]` and `[Pasted text #N ...]` placeholders in `rawInput` back to their
+   * full file mentions / multi-line text payloads in a single pass (Codex `expand_pending_pastes` pattern).
+   */
+  private expandInputPlaceholders(rawInput: string): string {
+    let value = rawInput;
+    value = value.replace(/\[Image #\d+\]/g, token => {
+      const fullPath = this.attachedImages.get(token) ?? this.imageArchive.get(token);
+      return fullPath ? `@"${fullPath}"` : token;
+    });
+    // Strip the auto-appended trailing space if the input ends right after a paste placeholder
+    value = value.replace(/(\[Pasted text #\d+[^\]]*\]) $/, '$1');
+    value = value.replace(/(\[Pasted text #\d+[^\]]*\])( ?)/g, (full, token: string, trailingSpace: string) => {
+      const content = this.pastedTexts.get(token) ?? this.pasteArchive.get(token);
+      if (content === undefined) return full;
+      this.recentExpandedPastes.push({ placeholder: token, content });
+      if (this.recentExpandedPastes.length > 20) this.recentExpandedPastes.shift();
+      if (trailingSpace && content.includes('\n') && !content.endsWith('\n')) {
+        return `${content}\n`;
+      }
+      return `${content}${trailingSpace}`;
+    });
+    return value;
+  }
+
+  /**
+   * Integrates pasted text (from bracketed paste, OS clipboard, or non-bracketed burst) into the composer.
+   * Collapses multi-line or long pastes into atomic `[Pasted text #1 +N lines]` / `[Pasted text #1 (N chars)]`
+   * placeholders (Codex `apply_paste` pattern) so the composer never floods or lags.
+   */
+  private handlePaste(rawText: string, allowCoalesce = false) {
+    const normalized = terminalText(rawText.replace(/\r\n/g, '\n').replace(/\r/g, '\n'));
+    const cleaned =
+      !normalized.slice(0, -1).includes('\n') && normalized.endsWith('\n')
+        ? normalized.slice(0, -1)
+        : normalized;
+    if (!cleaned) return;
+    this.inputRestoredFromRevert = false;
+    this.scroll = 0;
+
+    // 1. Check if the pasted text is a single existing local image path
+    const trimmed = cleaned.trim();
+    const unquoted =
+      (trimmed.startsWith('"') && trimmed.endsWith('"')) || (trimmed.startsWith("'") && trimmed.endsWith("'"))
+        ? trimmed.slice(1, -1).trim()
+        : trimmed;
+    if (
+      !unquoted.includes('\n') &&
+      /\.(?:png|jpe?g|webp|gif)$/i.test(unquoted) &&
+      (/^[A-Za-z]:[\\/]/.test(unquoted) || unquoted.startsWith('\\\\') || unquoted.startsWith('/')) &&
+      existsSync(unquoted)
+    ) {
+      if (this.attachedImages.size === 0 && this.queuedPrompts.length === 0) this.nextImageIdx = 1;
+      const placeholder = `[Image #${this.nextImageIdx++}]`;
+      this.attachedImages.set(placeholder, unquoted);
+      this.recordImageArchive(placeholder, unquoted);
+      const chars = [...`${placeholder} `];
+      this.input.splice(this.cursor, 0, ...chars);
+      this.cursor += chars.length;
+      this.schedule(0);
+      return;
+    }
+
+    // 2. Coalesce consecutive non-bracketed paste chunks arriving within 25ms
+    if (
+      allowCoalesce &&
+      this.lastPasteToken &&
+      Date.now() - this.lastPasteAt <= 25 &&
+      this.pastedTexts.has(this.lastPasteToken)
+    ) {
+      const prevContent = this.pastedTexts.get(this.lastPasteToken)!;
+      const merged = `${prevContent}${cleaned}`;
+      const matchIdx = /^\[Pasted text #(\d+)/.exec(this.lastPasteToken);
+      const idx = matchIdx ? Number(matchIdx[1]) : 1;
+      const mergedLines = merged.split('\n').length;
+      const mergedChars = [...merged].length;
+      const newToken =
+        mergedLines >= 2
+          ? `[Pasted text #${idx} +${mergedLines} lines]`
+          : `[Pasted text #${idx} (${mergedChars} chars)]`;
+      const currentStr = this.input.join('');
+      if (currentStr.includes(this.lastPasteToken)) {
+        this.pastedTexts.delete(this.lastPasteToken);
+        this.pasteArchive.delete(this.lastPasteToken);
+        this.pastedTexts.set(newToken, merged);
+        this.recordPasteArchive(newToken, merged);
+        const nextStr = currentStr.replace(this.lastPasteToken, () => newToken);
+        const delta = [...newToken].length - [...this.lastPasteToken].length;
+        this.input = [...nextStr];
+        this.cursor = Math.max(0, Math.min(this.input.length, this.cursor + delta));
+        this.lastPasteToken = newToken;
+        this.lastPasteAt = Date.now();
+        this.schedule(0);
+        return;
+      }
+    }
+
+    // 3. Collapse multi-line pastes (>= 2 lines) or long single-line pastes (> 150 chars) into atomic placeholder
+    const lineCount = cleaned.split('\n').length;
+    const charCount = [...cleaned].length;
+    const isTransientPrompt = Boolean(this.pending && !this.remember);
+    const shouldCollapse =
+      lineCount >= 2 ||
+      (charCount > LARGE_PASTE_CHAR_THRESHOLD && (!isTransientPrompt || charCount > 500));
+
+    if (shouldCollapse) {
+      if (this.pastedTexts.size === 0 && this.queuedPrompts.length === 0) this.nextPasteIdx = 1;
+      const idx = this.nextPasteIdx++;
+      const placeholder =
+        lineCount >= 2
+          ? `[Pasted text #${idx} +${lineCount} lines]`
+          : `[Pasted text #${idx} (${charCount} chars)]`;
+      this.pastedTexts.set(placeholder, cleaned);
+      this.recordPasteArchive(placeholder, cleaned);
+      const suffix = this.input[this.cursor] === ' ' ? '' : ' ';
+      const chars = [...`${placeholder}${suffix}`];
+      this.input.splice(this.cursor, 0, ...chars);
+      this.cursor += chars.length;
+      this.lastPasteToken = placeholder;
+      this.lastPasteAt = Date.now();
+      this.schedule(0);
+      return;
+    }
+
+    // 4. Short single-line paste: insert inline and check for embedded image paths
+    const chars = [...cleaned];
+    this.input.splice(this.cursor, 0, ...chars);
+    this.cursor += chars.length;
+    this.collapsePastedImagePathsInInput();
+    this.schedule(0);
   }
 
   /**
@@ -1004,8 +1224,10 @@ export class TerminalUI {
       (/^[A-Za-z]:[\\/]/.test(unquoted) || unquoted.startsWith('\\\\') || unquoted.startsWith('/')) &&
       existsSync(unquoted)
     ) {
+      if (this.attachedImages.size === 0 && this.queuedPrompts.length === 0) this.nextImageIdx = 1;
       const placeholder = `[Image #${this.nextImageIdx++}]`;
       this.attachedImages.set(placeholder, unquoted);
+      this.recordImageArchive(placeholder, unquoted);
       const next = `${placeholder} `;
       this.input = [...next];
       this.cursor = this.input.length;
@@ -1017,8 +1239,10 @@ export class TerminalUI {
       const candidate = (qDouble || qSingle || bare || '').trim();
       if (!candidate || !existsSync(candidate)) return fullMatch;
       changed = true;
+      if (this.attachedImages.size === 0 && this.queuedPrompts.length === 0) this.nextImageIdx = 1;
       const placeholder = `[Image #${this.nextImageIdx++}]`;
       this.attachedImages.set(placeholder, candidate);
+      this.recordImageArchive(placeholder, candidate);
       return `${placeholder} `;
     });
 
@@ -1070,12 +1294,14 @@ export class TerminalUI {
         timeoutMs: 4000,
       });
       if (res.code !== 0 || !res.output.trim() || this.closed) return;
-      const out = res.output.trim();
+      const out = res.output.replace(/\r?\n$/, '');
       if (out.startsWith('IMG:') || out.startsWith('FILE:')) {
         const filePath = out.replace(/^(?:IMG|FILE):/, '').trim();
         if (/\.(?:png|jpe?g|webp|gif)$/i.test(filePath) && existsSync(filePath)) {
+          if (this.attachedImages.size === 0 && this.queuedPrompts.length === 0) this.nextImageIdx = 1;
           const placeholder = `[Image #${this.nextImageIdx++}]`;
           this.attachedImages.set(placeholder, filePath);
+          this.recordImageArchive(placeholder, filePath);
           const chars = [...`${placeholder} `];
           this.input.splice(this.cursor, 0, ...chars);
           this.cursor += chars.length;
@@ -1084,12 +1310,7 @@ export class TerminalUI {
         }
       }
       if (out.startsWith('TXT:')) {
-        const txt = terminalText(out.slice(4)).replace(/\r?\n/g, ' ');
-        const chars = [...txt];
-        this.input.splice(this.cursor, 0, ...chars);
-        this.cursor += chars.length;
-        this.collapsePastedImagePathsInInput();
-        this.schedule(0);
+        this.handlePaste(out.slice(4));
       }
     } catch {
       // Ignore clipboard helper errors
@@ -1122,7 +1343,39 @@ export class TerminalUI {
     this.schedule(0);
   }
 
+  /**
+   * Intercepts non-bracketed multi-line or large paste bursts on raw `source` data chunks BEFORE
+   * Node's `emitKeypressEvents` splits them into hundreds of per-character keypress/return events.
+   */
+  private beforeRawData = (chunk: Buffer | string) => {
+    if (this.closed || this.inBracketedPaste) return;
+    const raw = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
+    if (raw.includes('\x1b')) return;
+    const withoutTrailingNewline = raw.replace(/\r?\n$/, '').replace(/\r$/, '');
+    const isMultiLine = /[\r\n]/.test(withoutTrailingNewline);
+    const isLargeChunk = [...withoutTrailingNewline].length > LARGE_PASTE_CHAR_THRESHOLD;
+    const isBurstContinuation =
+      this.lastPasteToken !== undefined &&
+      Date.now() - this.lastPasteAt <= 25 &&
+      withoutTrailingNewline.length > 1;
+    if (isMultiLine || isLargeChunk || isBurstContinuation) {
+      this.suppressKeypressChunk = true;
+      this.pendingRawPasteChunk = raw;
+    }
+  };
+
+  private afterRawData = () => {
+    if (!this.suppressKeypressChunk) return;
+    this.suppressKeypressChunk = false;
+    const raw = this.pendingRawPasteChunk;
+    this.pendingRawPasteChunk = '';
+    if (raw) {
+      this.handlePaste(raw, true);
+    }
+  };
+
   private keypress = (text: string | undefined, key: Key = {}) => {
+    if (this.suppressKeypressChunk) return;
     // 1. Filter SGR mouse sequences (\x1b[<btn;col;rowM/m) so mouse events never leak into input
     if (key.sequence === '\x1b[<') {
       this.inSgrMouse = true;
@@ -1150,12 +1403,14 @@ export class TerminalUI {
     // 2. Bracketed paste mode boundaries (\x1b[200~ ... \x1b[201~)
     if (key.name === 'paste-start') {
       this.inBracketedPaste = true;
+      this.bracketedPasteBuffer = '';
       return;
     }
     if (key.name === 'paste-end') {
       this.inBracketedPaste = false;
-      this.collapsePastedImagePathsInInput();
-      this.schedule(0);
+      const pasted = this.bracketedPasteBuffer;
+      this.bracketedPasteBuffer = '';
+      this.handlePaste(pasted);
       return;
     }
 
@@ -1233,6 +1488,7 @@ export class TerminalUI {
               this.cursor = 0;
               this.inputRestoredFromRevert = false;
               this.attachedImages.clear();
+              this.pastedTexts.clear();
               pending.resolve('/revert');
               this.schedule(0);
               return;
@@ -1258,6 +1514,9 @@ export class TerminalUI {
               this.cursor = 0;
               this.inputRestoredFromRevert = false;
               this.attachedImages.clear();
+              this.nextImageIdx = 1;
+              this.pastedTexts.clear();
+              this.nextPasteIdx = 1;
               this.schedule(0);
               return;
             }
@@ -1279,6 +1538,7 @@ export class TerminalUI {
           this.input = [];
           this.cursor = 0;
           this.attachedImages.clear();
+          this.pastedTexts.clear();
           if (this.escCancels) pending.reject(new InputCancelledError());
           else pending.resolve('');
           this.schedule(0);
@@ -1299,6 +1559,7 @@ export class TerminalUI {
         this.input = [...popped];
         this.cursor = this.input.length;
         this.inputRestoredFromRevert = false;
+        this.rehydratePlaceholdersInInput();
         this.schedule(0);
         return;
       }
@@ -1403,31 +1664,26 @@ export class TerminalUI {
         this.cursor = this.input.length;
       }
       this.collapsePastedImagePathsInInput();
-      let value = this.input.join('');
-      // Expand any [Image #N] placeholders to @"<path>" so expandFileMentions attaches them
-      for (const [placeholder, fullPath] of this.attachedImages.entries()) {
-        if (value.includes(placeholder)) {
-          value = value.split(placeholder).join(`@"${fullPath}"`);
-        }
-      }
+      const rawJoined = this.input.join('');
+      const value = this.expandInputPlaceholders(rawJoined);
       if (!this.pending) {
         const trimmed = value.trim();
         if (trimmed) {
-          this.history.push(this.input.join(''));
+          this.history.push(rawJoined.trimEnd());
           if (this.history.length > 100) this.history.shift();
           this.input = [];
           this.cursor = 0;
           this.inputRestoredFromRevert = false;
           this.attachedImages.clear();
-          this.nextImageIdx = 1;
+          this.pastedTexts.clear();
           // Execute slash commands (/auto, /mode, /view, /transcript, /status, etc.) and !<cmd> immediately even while working!
           if ((trimmed.startsWith('/') || trimmed.startsWith('!')) && this.onImmediateCommand) {
             this.schedule(0);
             void this.onImmediateCommand(trimmed);
             return;
           }
-          // Otherwise queue user prompts for the next turn
-          this.queuedPrompts.push(value);
+          // Otherwise queue user prompts for the next turn (keeping compact placeholders for queue preview & Alt+Up)
+          this.queuedPrompts.push(rawJoined.trimEnd());
           this.schedule(0);
         }
         return;
@@ -1436,7 +1692,7 @@ export class TerminalUI {
       this.pending = undefined;
       pending.cleanup();
       if (this.remember && value.trim()) {
-        this.history.push(this.input.join(''));
+        this.history.push(rawJoined.trimEnd());
         if (this.history.length > 100) this.history.shift();
       }
       this.input = [];
@@ -1444,6 +1700,11 @@ export class TerminalUI {
       this.inputRestoredFromRevert = false;
       this.scroll = 0;
       this.attachedImages.clear();
+      this.pastedTexts.clear();
+      if (this.queuedPrompts.length === 0) {
+        this.nextImageIdx = 1;
+        this.nextPasteIdx = 1;
+      }
       pending.resolve(value);
       this.schedule();
       return;
@@ -1451,9 +1712,25 @@ export class TerminalUI {
 
     if (!this.inBracketedPaste) {
       if (key.name === 'left') {
-        this.cursor = Math.max(0, this.cursor - 1);
+        if (this.cursor > 0) {
+          const before = this.input.slice(0, this.cursor).join('');
+          const tokenMatch = ATOMIC_PLACEHOLDER_END_RE.exec(before);
+          if (tokenMatch) {
+            this.cursor = Math.max(0, this.cursor - [...tokenMatch[1]].length);
+          } else {
+            this.cursor = Math.max(0, this.cursor - 1);
+          }
+        }
       } else if (key.name === 'right') {
-        this.cursor = Math.min(this.input.length, this.cursor + 1);
+        if (this.cursor < this.input.length) {
+          const after = this.input.slice(this.cursor).join('');
+          const tokenMatch = ATOMIC_PLACEHOLDER_START_RE.exec(after);
+          if (tokenMatch) {
+            this.cursor = Math.min(this.input.length, this.cursor + [...tokenMatch[1]].length);
+          } else {
+            this.cursor = Math.min(this.input.length, this.cursor + 1);
+          }
+        }
       } else if (key.name === 'home' || (key.ctrl && key.name === 'a')) {
         this.cursor = 0;
       } else if (key.name === 'end' || (key.ctrl && key.name === 'e')) {
@@ -1465,13 +1742,16 @@ export class TerminalUI {
       } else if (key.name === 'backspace') {
         this.inputRestoredFromRevert = false;
         if (this.cursor > 0) {
-          // Atomic deletion of [Image #N] placeholder if cursor is right after it
+          // Atomic deletion of [Image #N] or [Pasted text #N ...] placeholder if cursor is right after it
           const before = this.input.slice(0, this.cursor).join('');
-          const imgMatch = /(\[Image #\d+\]\s?)$/.exec(before);
-          if (imgMatch) {
-            const token = imgMatch[1].trim();
+          const tokenMatch = ATOMIC_PLACEHOLDER_END_RE.exec(before);
+          if (tokenMatch) {
+            const token = tokenMatch[1].trim();
             this.attachedImages.delete(token);
-            const delLen = [...imgMatch[1]].length;
+            this.pastedTexts.delete(token);
+            if (this.attachedImages.size === 0 && this.queuedPrompts.length === 0) this.nextImageIdx = 1;
+            if (this.pastedTexts.size === 0 && this.queuedPrompts.length === 0) this.nextPasteIdx = 1;
+            const delLen = [...tokenMatch[1]].length;
             this.input.splice(this.cursor - delLen, delLen);
             this.cursor -= delLen;
           } else {
@@ -1480,11 +1760,38 @@ export class TerminalUI {
         }
       } else if (key.name === 'delete') {
         this.inputRestoredFromRevert = false;
-        this.input.splice(this.cursor, 1);
+        if (this.cursor < this.input.length) {
+          const after = this.input.slice(this.cursor).join('');
+          const tokenMatch = ATOMIC_PLACEHOLDER_START_RE.exec(after);
+          if (tokenMatch) {
+            const token = tokenMatch[1].trim();
+            this.attachedImages.delete(token);
+            this.pastedTexts.delete(token);
+            if (this.attachedImages.size === 0 && this.queuedPrompts.length === 0) this.nextImageIdx = 1;
+            if (this.pastedTexts.size === 0 && this.queuedPrompts.length === 0) this.nextPasteIdx = 1;
+            const delLen = [...tokenMatch[1]].length;
+            this.input.splice(this.cursor, delLen);
+          } else {
+            this.input.splice(this.cursor, 1);
+          }
+        }
       } else if (key.ctrl && key.name === 'w') {
         this.inputRestoredFromRevert = false;
-        while (this.cursor > 0 && this.input[this.cursor - 1] === ' ') this.input.splice(--this.cursor, 1);
-        while (this.cursor > 0 && this.input[this.cursor - 1] !== ' ') this.input.splice(--this.cursor, 1);
+        const before = this.input.slice(0, this.cursor).join('');
+        const tokenMatch = ATOMIC_PLACEHOLDER_END_RE.exec(before);
+        if (tokenMatch) {
+          const token = tokenMatch[1].trim();
+          this.attachedImages.delete(token);
+          this.pastedTexts.delete(token);
+          if (this.attachedImages.size === 0 && this.queuedPrompts.length === 0) this.nextImageIdx = 1;
+          if (this.pastedTexts.size === 0 && this.queuedPrompts.length === 0) this.nextPasteIdx = 1;
+          const delLen = [...tokenMatch[1]].length;
+          this.input.splice(this.cursor - delLen, delLen);
+          this.cursor -= delLen;
+        } else {
+          while (this.cursor > 0 && this.input[this.cursor - 1] === ' ') this.input.splice(--this.cursor, 1);
+          while (this.cursor > 0 && this.input[this.cursor - 1] !== ' ') this.input.splice(--this.cursor, 1);
+        }
       } else if (
         (key.name === 'up' || key.name === 'down' || (key.ctrl && (key.name === 'p' || key.name === 'n'))) &&
         this.remember
@@ -1494,18 +1801,33 @@ export class TerminalUI {
         this.historyIndex = Math.min(this.history.length, Math.max(0, this.historyIndex + delta));
         this.input = [...(this.history[this.historyIndex] ?? '')];
         this.cursor = this.input.length;
+        this.rehydratePlaceholdersInInput();
       } else if (key.ctrl && key.name === 'u') {
         this.inputRestoredFromRevert = false;
         if (this.input.length > 0) {
           this.input = [];
           this.cursor = 0;
           this.attachedImages.clear();
+          this.pastedTexts.clear();
+          if (this.queuedPrompts.length === 0) {
+            this.nextImageIdx = 1;
+            this.nextPasteIdx = 1;
+          }
         } else {
           this.scrollBy(5);
         }
       } else if (text && !key.ctrl && !key.meta && this.input.length < 16_000) {
         this.inputRestoredFromRevert = false;
-        const chars = [...terminalText(text).replace(/\n/g, ' ')];
+        const normalizedText = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+        const trimmedTrailing =
+          !normalizedText.slice(0, -1).includes('\n') && normalizedText.endsWith('\n')
+            ? normalizedText.slice(0, -1)
+            : normalizedText;
+        if (trimmedTrailing.includes('\n') || [...trimmedTrailing].length > LARGE_PASTE_CHAR_THRESHOLD) {
+          this.handlePaste(text);
+          return;
+        }
+        const chars = [...terminalText(trimmedTrailing).replace(/\n/g, ' ')];
         this.input.splice(this.cursor, 0, ...chars);
         this.cursor += chars.length;
         this.scroll = 0;
@@ -1518,11 +1840,17 @@ export class TerminalUI {
       return;
     }
 
-    // Inside bracketed paste: buffer characters rapidly
-    if (text && this.input.length < 16_000) {
-      const chars = [...terminalText(text).replace(/\r?\n/g, ' ')];
-      this.input.splice(this.cursor, 0, ...chars);
-      this.cursor += chars.length;
+    // Inside bracketed paste: accumulate raw text & newlines in O(1) without mutating this.input until paste-end
+    if (this.bracketedPasteBuffer.length < 512_000) {
+      if (text) {
+        this.bracketedPasteBuffer += text;
+      } else if (key.name === 'return') {
+        this.bracketedPasteBuffer += '\r';
+      } else if (key.name === 'enter') {
+        this.bracketedPasteBuffer += '\n';
+      } else if (key.name === 'tab') {
+        this.bracketedPasteBuffer += '\t';
+      }
     }
   };
 
@@ -2040,8 +2368,10 @@ export class TerminalUI {
     } else if (this.escPrimed === 'backtrack' || this.escPrimed === 'clear') {
       const text = clip(this.escPrimed === 'backtrack' ? 'Press Esc again to rewind & edit previous prompt' : 'Press Esc again to clear input');
       statusLine = rich ? `${T.warn}${text}${T.reset}` : text;
-    } else if (this.attachedImages.size > 0 && !busy) {
-      const items = [...this.attachedImages.entries()].map(([k, p]) => `${k}: ${basename(p)}`).join(' · ');
+    } else if ((this.attachedImages.size > 0 || this.pastedTexts.size > 0) && !busy) {
+      const imgItems = [...this.attachedImages.entries()].map(([k, p]) => `${k}: ${basename(p)}`);
+      const pasteItems = [...this.pastedTexts.keys()];
+      const items = [...imgItems, ...pasteItems].join(' · ');
       const text = clip(`📎 Attached ${items} (Enter to send · Backspace to remove)`);
       statusLine = rich ? `${T.info}${text}${T.reset}` : text;
     } else if (busy) {
@@ -2070,12 +2400,7 @@ export class TerminalUI {
       const label = clip(this.label);
       const labelCols = visibleLength(label);
       const inputAvailCols = Math.max(1, safeCols - labelCols);
-      let visibleBeforeCursor = this.input.slice(0, this.cursor).join('');
-      while (visibleBeforeCursor && visibleLength(visibleBeforeCursor) >= inputAvailCols) {
-        visibleBeforeCursor = [...visibleBeforeCursor].slice(1).join('');
-      }
-      const afterCursor = this.input.slice(this.cursor).join('');
-      const shownInput = wrapTerminal(visibleBeforeCursor + afterCursor, inputAvailCols)[0];
+      const { visibleBeforeCursor, shownInput } = this.sliceInputWindow(inputAvailCols);
       const prompt = wrapTerminal(label + shownInput, safeCols)[0];
       const cursorColumn = Math.min(columns, labelCols + visibleLength(visibleBeforeCursor) + 1);
       const screenLines = [header, ...body, statusLine, footer, prompt];
@@ -2132,12 +2457,7 @@ export class TerminalUI {
     const labelCols = visibleLength(promptLabel);
     const boxInnerCols = Math.max(1, safeCols - 4 - labelCols);
 
-    let visibleBeforeCursor = this.input.slice(0, this.cursor).join('');
-    while (visibleBeforeCursor && visibleLength(visibleBeforeCursor) >= boxInnerCols) {
-      visibleBeforeCursor = [...visibleBeforeCursor].slice(1).join('');
-    }
-    const afterCursor = this.input.slice(this.cursor).join('');
-    const shownInput = wrapTerminal(visibleBeforeCursor + afterCursor, boxInnerCols)[0];
+    const { visibleBeforeCursor, shownInput } = this.sliceInputWindow(boxInnerCols);
     const isEmptyInput = this.input.length === 0 && !asking;
     const placeholderText = busy
       ? 'Type to queue a follow-up · /commands run immediately'
@@ -2188,6 +2508,27 @@ export class TerminalUI {
     this.flushScreenLines(screenLines, columns, rows, cursorSeq);
   }
 
+  /**
+   * Computes the visible composer slice around `this.cursor` in O(availCols) time by walking backwards
+   * from the cursor instead of O(input.length^2) prefix slicing.
+   */
+  private sliceInputWindow(availCols: number): { visibleBeforeCursor: string; shownInput: string } {
+    const maxBeforeCols = Math.max(0, availCols - 1);
+    let startIdx = this.cursor;
+    let usedBefore = 0;
+    while (startIdx > 0) {
+      const ch = this.input[startIdx - 1];
+      const w = width(ch);
+      if (usedBefore + w > maxBeforeCols) break;
+      usedBefore += w;
+      startIdx--;
+    }
+    const visibleBeforeCursor = this.input.slice(startIdx, this.cursor).join('');
+    const afterCursor = this.input.slice(this.cursor, this.cursor + availCols + 4).join('');
+    const shownInput = wrapTerminal(visibleBeforeCursor + afterCursor, availCols)[0];
+    return { visibleBeforeCursor, shownInput };
+  }
+
   close() {
     if (this.closed) return;
     this.closed = true;
@@ -2199,7 +2540,9 @@ export class TerminalUI {
       this.spinTimer = undefined;
     }
     this.reject(new Error('Terminal closed.'));
+    this.source.removeListener('data', this.beforeRawData);
     this.source.removeListener('keypress', this.keypress);
+    this.source.removeListener('data', this.afterRawData);
     this.source.removeListener('end', this.ended);
     this.target.removeListener('resize', this.resize);
     this.source.setRawMode(this.oldRaw);

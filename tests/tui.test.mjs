@@ -852,3 +852,69 @@ test('setup: cancelling the wizard mid-way persists neither the API key nor the 
   }
   assert(!(await walk(f.config)).some(p => p.endsWith('config.json')), 'config must not be written on cancel');
 });
+
+test('Codex paste handling collapses multi-line and long pastes into [Pasted text #1 +N lines], supports atomic Backspace, and expands on submit', async t => {
+  const { stripVTControlCharacters } = await import('node:util');
+  const tty = terminal(t);
+  tty.output.columns = 100;
+  tty.output.rows = 24;
+
+  // 1. Bracketed paste of 25 lines via real stream write (emits per-char + return/enter events)
+  const q1 = tty.ui.question('goon> ', undefined, true);
+  const lines25 = Array.from({ length: 25 }, (_, i) => `line ${i + 1}: const value_${i + 1} = ${i + 1};`).join('\r\n');
+  tty.input.write(`\x1b[200~${lines25}\x1b[201~`);
+  await new Promise(resolve => setTimeout(resolve, 25));
+
+  let frame = stripVTControlCharacters(tty.ui.renderedFrame());
+  assert.match(frame, /\[Pasted text #1 \+25 lines\]/);
+  assert.match(frame, /📎 Attached \[Pasted text #1 \+25 lines\]/);
+  assert(!frame.includes('const value_15'), 'Composer must NOT show raw pasted lines');
+
+  // Type follow-up comment after the pill and submit
+  tty.key('sửa goon thành paste nội dung dài', undefined);
+  tty.key('', 'return');
+  const submitted1 = await q1;
+  const expectedLines25 = lines25.replace(/\r\n/g, '\n');
+  assert.equal(submitted1, `${expectedLines25}\nsửa goon thành paste nội dung dài`);
+
+  // Echoing the submitted prompt to transcript keeps the compact [Pasted text #1 +25 lines] pill
+  tty.ui.write(`\n> ${submitted1}\n`);
+  await new Promise(resolve => setTimeout(resolve, 25));
+  frame = stripVTControlCharacters(tty.ui.renderedFrame());
+  assert.match(frame, /› \[Pasted text #1 \+25 lines\]/);
+  assert(!frame.includes('const value_15'), 'Transcript echo must collapse expanded paste back to pill');
+
+  // 2. Long single-line paste (> 150 chars), atomic Backspace, and multiple pastes (#1, #2)
+  const q2 = tty.ui.question('goon> ', undefined, true);
+  const longSingleLine = 'x'.repeat(200);
+  tty.input.write(`\x1b[200~${longSingleLine}\x1b[201~`);
+  await new Promise(resolve => setTimeout(resolve, 25));
+  frame = stripVTControlCharacters(tty.ui.renderedFrame());
+  assert.match(frame, /\[Pasted text #1 \(200 chars\)\]/);
+
+  // Single Backspace deletes the entire [Pasted text #1 (200 chars)] pill and resets counter to #1
+  tty.key('', 'backspace');
+  await new Promise(resolve => setTimeout(resolve, 25));
+  frame = stripVTControlCharacters(tty.ui.renderedFrame());
+  assert(!frame.includes('[Pasted text #1 (200 chars)]'), 'Atomic Backspace should remove entire paste pill');
+  assert(!frame.includes('📎 Attached'), 'Status bar attachment notice should disappear after Backspace');
+
+  // Non-bracketed multi-line paste burst on raw stream does NOT prematurely submit on \r\n
+  tty.input.write('alpha line\r\nbeta line\r\ngamma line');
+  await new Promise(resolve => setTimeout(resolve, 25));
+  frame = stripVTControlCharacters(tty.ui.renderedFrame());
+  assert.match(frame, /\[Pasted text #1 \+3 lines\]/);
+
+  tty.key('', 'return');
+  const submitted2 = await q2;
+  assert.equal(submitted2, 'alpha line\nbeta line\ngamma line');
+
+  // 3. Up-arrow history recall and setInput (from /revert) rehydrate paste placeholders and expand on submit
+  const q3 = tty.ui.question('goon> ', undefined, true);
+  tty.key('', 'up');
+  await new Promise(resolve => setTimeout(resolve, 25));
+  frame = stripVTControlCharacters(tty.ui.renderedFrame());
+  assert.match(frame, /\[Pasted text #1 \+3 lines\]/);
+  tty.key('', 'return');
+  assert.equal(await q3, 'alpha line\nbeta line\ngamma line');
+});
