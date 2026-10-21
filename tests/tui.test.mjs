@@ -918,3 +918,188 @@ test('Codex paste handling collapses multi-line and long pastes into [Pasted tex
   tty.key('', 'return');
   assert.equal(await q3, 'alpha line\nbeta line\ngamma line');
 });
+
+test('Codex /goal system: formatting, draft parsing, get_goal/create_goal/update_goal tools, token budget steering, and TUI goal indicators', async t => {
+  const { stripVTControlCharacters } = await import('node:util');
+  const { join } = await import('node:path');
+  const {
+    SessionStore,
+    formatGoalElapsedSeconds,
+    formatGoalTokensCompact,
+    formatGoalStatusIndicator,
+    formatGoalSummaryLines,
+    parseGoalDraftArgs,
+  } = await import('../dist/session.js');
+  const {
+    buildGoalContinuationPrompt,
+    buildGoalBudgetLimitPrompt,
+    buildGoalObjectiveUpdatedPrompt,
+    buildUserGoalContextMessage,
+  } = await import('../dist/context.js');
+  const { ToolRegistry } = await import('../dist/tools.js');
+  const { Harness } = await import('../dist/harness.js');
+  const { fixture, provider, sse } = await import('./helpers.mjs');
+
+  // 1. Formatting & draft argument parsing
+  assert.equal(formatGoalElapsedSeconds(45), '45s');
+  assert.equal(formatGoalElapsedSeconds(125), '2m');
+  assert.equal(formatGoalElapsedSeconds(3720), '1h 2m');
+  assert.equal(formatGoalTokensCompact(950), '950');
+  assert.equal(formatGoalTokensCompact(12_500), '12.5K');
+  assert.equal(formatGoalTokensCompact(1_500_000), '1.5M');
+
+  assert.deepEqual(parseGoalDraftArgs('--budget 50k Fix all failing tests'), {
+    objective: 'Fix all failing tests',
+    tokenBudget: 50_000,
+  });
+  assert.deepEqual(parseGoalDraftArgs('--token-budget=1.5m Ship v1'), {
+    objective: 'Ship v1',
+    tokenBudget: 1_500_000,
+  });
+  assert('error' in parseGoalDraftArgs('--budget invalid Fix tests'));
+
+  const now = new Date().toISOString();
+  const sampleGoal = {
+    goalId: 'goal_test1',
+    objective: 'Refactor parser and pass tests',
+    status: 'active',
+    createdAt: now,
+    updatedAt: now,
+    tokensAtStart: 0,
+    tokensUsed: 12_500,
+    timeUsedSeconds: 180,
+    tokenBudget: 50_000,
+  };
+  assert.equal(formatGoalStatusIndicator(sampleGoal), 'Pursuing goal (12.5K / 50K)');
+  assert.equal(formatGoalStatusIndicator({ ...sampleGoal, status: 'paused' }), 'Goal paused (/goal resume)');
+  assert.equal(formatGoalStatusIndicator({ ...sampleGoal, status: 'blocked' }), 'Goal stalled (/goal resume)');
+  assert.equal(formatGoalStatusIndicator({ ...sampleGoal, status: 'complete' }), 'Goal achieved (12.5K tokens)');
+  assert.match(formatGoalSummaryLines(sampleGoal), /Status: active/);
+  assert.match(formatGoalSummaryLines(sampleGoal), /Token budget: 50K/);
+
+  // 2. Codex goal steering XML templates
+  const contXml = buildGoalContinuationPrompt(sampleGoal, true);
+  assert.match(contXml, /<codex_internal_context source="goal">/);
+  assert.match(contXml, /Completion audit:/);
+  assert.match(contXml, /update_goal/);
+  assert.match(buildGoalBudgetLimitPrompt(sampleGoal), /The active thread goal has reached its token budget/);
+  assert.match(buildGoalObjectiveUpdatedPrompt(sampleGoal), /The active thread goal objective was edited by the user/);
+  assert.match(buildUserGoalContextMessage({ objective: 'New obj', status: 'active' }), /<codex_internal_context source="user_goal">/);
+
+  // 3. TUI renders goal indicator in header and status bar
+  const tty = terminal(t);
+  tty.output.columns = 110;
+  tty.output.rows = 24;
+  tty.ui.setGoal(sampleGoal);
+  await new Promise(resolve => setTimeout(resolve, 25));
+  let frame = stripVTControlCharacters(tty.ui.renderedFrame());
+  assert.match(frame, /Pursuing goal \(12\.5K \/ 50K\)/);
+
+  tty.ui.event({ type: 'goal', goal: { ...sampleGoal, status: 'complete' } });
+  await new Promise(resolve => setTimeout(resolve, 25));
+  frame = stripVTControlCharacters(tty.ui.renderedFrame());
+  assert.match(frame, /Goal achieved \(12\.5K tokens\)/);
+
+  // 4. Harness + ToolRegistry execute create_goal, get_goal, and update_goal({ status: "complete" })
+  const f = await fixture(t);
+  let turnStep = 0;
+  const p = await provider(t, (_, response) => {
+    turnStep++;
+    if (turnStep === 1) {
+      return sse(response, {
+        calls: [{ id: 'cg1', name: 'create_goal', input: { objective: 'Verify goal tools end-to-end' } }],
+      });
+    }
+    if (turnStep === 2) {
+      return sse(response, {
+        calls: [
+          { id: 'gg1', name: 'get_goal', input: {} },
+          { id: 'ug1', name: 'update_goal', input: { status: 'complete' } },
+        ],
+      });
+    }
+    return sse(response, { text: 'Goal completed and verified.' });
+  });
+
+  const config = {
+    cwd: f.cwd,
+    provider: 'openai-compatible',
+    model: 'test-model',
+    baseUrl: p.url,
+    apiKey: 'fake',
+    contextWindow: 128_000,
+    maxOutputTokens: 4096,
+    runTokenBudget: 0,
+    timeoutMs: 5000,
+    inlineReasoning: 'leading-think',
+    showReasoning: false,
+  };
+  const store = await SessionStore.open(join(f.root, 'sessions'), config);
+  t.after(() => store.close());
+  const reg = new ToolRegistry(f.cwd, async () => true, false);
+  const events = [];
+  const harness = new Harness(config, store, reg, ev => events.push(ev));
+  const out = await harness.run('Create and complete a session goal.', new AbortController().signal);
+  assert.equal(out, 'Goal completed and verified.');
+  assert.equal(store.session.goal?.objective, 'Verify goal tools end-to-end');
+  assert.equal(store.session.goal?.status, 'complete');
+  assert(events.some(e => e.type === 'goal' && e.goal?.status === 'complete'));
+
+  // 5. CLI autonomous continuation loop pursues active goal across turns until update_goal(complete)
+  const { main } = await import('../dist/cli.js');
+  let cliStep = 0;
+  let sawContinuationXml = false;
+  const p2 = await provider(t, (body, response) => {
+    cliStep++;
+    const lastUser = [...(body.messages ?? [])].reverse().find(m => m.role === 'user');
+    const lastText = typeof lastUser?.content === 'string' ? lastUser.content : JSON.stringify(lastUser?.content ?? '');
+    if (lastText.includes('<codex_internal_context source="goal">')) {
+      sawContinuationXml = true;
+    }
+    if (cliStep === 1) {
+      return sse(response, {
+        calls: [{ id: 'cg_cli', name: 'create_goal', input: { objective: 'Autonomous multi-turn goal' } }],
+      });
+    }
+    if (cliStep === 2) {
+      // Finish Turn 1 while goal is still active -> CLI must auto-trigger continuation Turn 2!
+      return sse(response, { text: 'Step 1 progress done; continuing next turn.' });
+    }
+    if (cliStep === 3) {
+      // Turn 2 (automatic continuation): mark goal complete
+      return sse(response, {
+        calls: [{ id: 'ug_cli', name: 'update_goal', input: { status: 'complete' } }],
+      });
+    }
+    return sse(response, { text: 'All requirements verified and goal completed.' });
+  });
+
+  const oldKey = process.env.GOON_API_KEY;
+  const oldCfg = process.env.XDG_CONFIG_HOME;
+  const oldData = process.env.XDG_DATA_HOME;
+  process.env.GOON_API_KEY = 'fake-goal-key';
+  process.env.XDG_CONFIG_HOME = f.config;
+  process.env.XDG_DATA_HOME = f.data;
+  try {
+    await main([
+      '--cwd', f.cwd,
+      '--provider', 'openai-compatible',
+      '--base-url', p2.url,
+      '--model', 'test-model',
+      '--yes',
+      '--no-mcp',
+      '--no-subagents',
+      '--json',
+      '-p', 'Start autonomous goal',
+    ]);
+  } finally {
+    if (oldKey === undefined) delete process.env.GOON_API_KEY;
+    else process.env.GOON_API_KEY = oldKey;
+    if (oldCfg === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = oldCfg;
+    if (oldData === undefined) delete process.env.XDG_DATA_HOME;
+    else process.env.XDG_DATA_HOME = oldData;
+  }
+  assert.equal(cliStep, 4, 'CLI should run Turn 1 (2 model calls) + automatic Continuation Turn 2 (2 model calls)');
+  assert.equal(sawContinuationXml, true, 'Continuation turn must include Codex goal continuation XML');
+});

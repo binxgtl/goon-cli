@@ -1,10 +1,10 @@
 import { streamText, type LanguageModel, type ModelMessage, type ToolResultPart } from 'ai';
 import type { RuntimeConfig } from './config.js';
-import { SessionStore, repairInterrupted, type TodoItem, type TurnCheckpoint } from './session.js';
+import { SessionStore, repairInterrupted, type SessionGoal, type TodoItem, type TurnCheckpoint } from './session.js';
 import { ToolRegistry, normalizeToolInput, normalizeToolName, type ToolCall, type RunBudget } from './tools.js';
 import { buildProviderOptions, createModel, resolveModelCapabilities } from './provider.js';
 import { safeError } from './errors.js';
-import { compactIfNeeded, compactNow, estimatedTokens, expandFileMentions, recapSession, systemPrompt } from './context.js';
+import { buildGoalBudgetLimitPrompt, compactIfNeeded, compactNow, estimatedTokens, expandFileMentions, recapSession, systemPrompt } from './context.js';
 import { AnswerProjection, visibleAnswer, withReasoningReplay, type AnswerPart } from './reasoning.js';
 
 export interface ToolEventMeta {
@@ -27,6 +27,7 @@ export type HarnessEvent =
   | { type: 'usage'; input: number; output: number; total: number }
   | { type: 'compaction'; count: number }
   | { type: 'todo'; todos: TodoItem[] }
+  | { type: 'goal'; goal?: SessionGoal }
   | { type: 'plan_exit'; plan: string }
   | { type: 'retry'; attempt: number; maxRetries: number; message: string }
   | { type: 'stopped'; reason: string };
@@ -127,6 +128,17 @@ function buildToolMeta(toolName: string, rawInput: unknown): ToolEventMeta {
     const count = Array.isArray(rec.plan) ? rec.plan.length : 0;
     return { kind: 'other', summary: `${count} step(s)` };
   }
+  if (canonical === 'get_goal') {
+    return { kind: 'other', summary: 'inspect active goal' };
+  }
+  if (canonical === 'create_goal') {
+    const obj = typeof rec.objective === 'string' ? rec.objective.trim().slice(0, 80) : 'new goal';
+    return { kind: 'other', summary: obj };
+  }
+  if (canonical === 'update_goal') {
+    const st = typeof rec.status === 'string' ? rec.status : 'status';
+    return { kind: 'other', summary: `status -> ${st}` };
+  }
   if (canonical === 'request_user_input') {
     const count = Array.isArray(rec.questions) ? rec.questions.length : 1;
     return { kind: 'other', summary: `${count} question(s)` };
@@ -204,6 +216,10 @@ export class Harness {
   private readonly model: LanguageModel;
   private lastCallSig = '';
   private repeatCount = 0;
+  private consecutiveGoalExecFailureTurns = 0;
+  private turnHadSuccessfulTool = false;
+  private turnHadFailedExec = false;
+  private flushGoalProgressHook?: (allowStopped?: boolean) => void;
   constructor(readonly config: RuntimeConfig, readonly store: SessionStore, readonly tools: ToolRegistry,
     readonly emit: (event: HarnessEvent) => void = () => {}, model?: LanguageModel) {
     this.model = model ?? createModel(config, this.store.session.id);
@@ -214,6 +230,22 @@ export class Harness {
       this.store.session.todos = todos;
       this.emit({ type: 'todo', todos });
     };
+    if (!this.tools.readOnly) {
+      this.tools.getGoal = () => this.store.session.goal;
+      this.tools.onGoalUpdate = async nextGoal => {
+        this.flushGoalProgressHook?.(true);
+        if (nextGoal && nextGoal.tokensAtStart === 0 && nextGoal.tokensUsed === 0) {
+          nextGoal.tokensAtStart = this.store.session.tokens;
+        }
+        if (nextGoal && this.store.session.goal) {
+          nextGoal.tokensUsed = this.store.session.goal.tokensUsed ?? nextGoal.tokensUsed ?? 0;
+          nextGoal.timeUsedSeconds = this.store.session.goal.timeUsedSeconds ?? nextGoal.timeUsedSeconds ?? 0;
+        }
+        this.store.session.goal = nextGoal;
+        await this.store.save();
+        this.emit({ type: 'goal', goal: nextGoal });
+      };
+    }
     this.tools.onPlanExit = plan => {
       this.emit({ type: 'plan_exit', plan });
     };
@@ -338,6 +370,30 @@ export class Harness {
     const messageIndexBeforeTurn = session.messages.length;
     const tokensBeforeTurn = session.tokens;
     const turnStartedAt = new Date().toISOString();
+    let lastGoalAccountMs = Date.now();
+    let lastGoalAccountTokens = session.tokens;
+    let budgetLimitSteered = false;
+    this.turnHadSuccessfulTool = false;
+    this.turnHadFailedExec = false;
+    const flushGoalTurnProgress = (allowStopped = false) => {
+      const goal = session.goal;
+      if (!goal || this.tools.planMode) return;
+      if (goal.status !== 'active' && !allowStopped) return;
+      const nowMs = Date.now();
+      const deltaSec = Math.max(0, Math.floor((nowMs - lastGoalAccountMs) / 1000));
+      const deltaTokens = Math.max(0, session.tokens - lastGoalAccountTokens);
+      lastGoalAccountMs = nowMs;
+      lastGoalAccountTokens = session.tokens;
+      if (deltaSec === 0 && deltaTokens === 0) return;
+      goal.timeUsedSeconds = (goal.timeUsedSeconds ?? 0) + deltaSec;
+      goal.tokensUsed = (goal.tokensUsed ?? 0) + deltaTokens;
+      goal.updatedAt = new Date(nowMs).toISOString();
+      if (goal.status === 'active' && goal.tokenBudget !== undefined && goal.tokensUsed >= goal.tokenBudget) {
+        goal.status = 'budget_limited';
+      }
+      this.emit({ type: 'goal', goal });
+    };
+    this.flushGoalProgressHook = flushGoalTurnProgress;
     this.tools.files.beginTurn();
     try {
       signal.throwIfAborted();
@@ -434,6 +490,7 @@ export class Harness {
             const output = usage.outputTokens ?? Math.ceil(JSON.stringify(assistantMessages).length / 2);
             const tokens = usage.totalTokens ?? input + output;
             account(tokens); session.tokens += tokens; measuredInput = input;
+            flushGoalTurnProgress();
             this.emit({ type: 'usage', input, output, total: tokens });
             session.messages.push(...assistantMessages);
             text += stepText;
@@ -465,21 +522,52 @@ export class Harness {
         if (!calls.length) return text;
         const outcome = await this.executeBatch(calls, signal);
         if (outcome.denied) { this.emit({ type: 'stopped', reason: 'Permission denied.' }); return text; }
+        flushGoalTurnProgress();
+        if (session.goal?.status === 'budget_limited' && !budgetLimitSteered) {
+          budgetLimitSteered = true;
+          session.messages.push({
+            role: 'user',
+            content: buildGoalBudgetLimitPrompt(session.goal),
+          });
+          await this.store.save();
+        }
       }
     } catch (error) {
+      flushGoalTurnProgress();
+      if (!signal.aborted && session.goal && (session.goal.status === 'active' || session.goal.status === 'budget_limited')) {
+        const errMsg = error instanceof Error ? error.message : String(error);
+        const isUsageLimit = /\b(?:429|rate[_\s-]?limit|usage[_\s-]?limit|insufficient_quota|quota|token budget reached)\b/i.test(errMsg);
+        if (session.goal.status === 'active' || isUsageLimit) {
+          session.goal.status = isUsageLimit ? 'usage_limited' : 'blocked';
+          session.goal.updatedAt = new Date().toISOString();
+          this.emit({ type: 'goal', goal: session.goal });
+        }
+      }
       // Failed streams execute no tools. If cancellation happens after a tool
       // declaration, pair every uncompleted call before the next resume.
       repairInterrupted(session.messages);
       await this.store.save();
       throw error;
     } finally {
+      this.flushGoalProgressHook = undefined;
+      flushGoalTurnProgress();
+      if (session.goal?.status === 'active' && !signal.aborted) {
+        if (this.turnHadFailedExec && !this.turnHadSuccessfulTool) {
+          this.consecutiveGoalExecFailureTurns++;
+          if (this.consecutiveGoalExecFailureTurns >= 3) {
+            session.goal.status = 'blocked';
+            session.goal.updatedAt = new Date().toISOString();
+            this.emit({ type: 'goal', goal: session.goal });
+          }
+        }
+      }
       const files = this.tools.files.takeTurnBackups();
       session.checkpoints ??= [];
       const nextId = (session.checkpoints.at(-1)?.id ?? 0) + 1;
       const cp: TurnCheckpoint = {
         id: nextId,
         createdAt: turnStartedAt,
-        prompt,
+        prompt: prompt.startsWith('<codex_internal_context source="goal">') ? (session.goal ? `[goal] ${session.goal.objective}` : '[goal continuation]') : prompt,
         messageIndex: messageIndexBeforeTurn,
         tokensBefore: tokensBeforeTurn,
         files,
@@ -517,6 +605,15 @@ export class Harness {
         const result = await this.tools.execute(call, signal);
         denied ||= result.denied === true;
         meta.durationMs = Date.now() - startedMs;
+        if (!result.denied) {
+          const isFailedBash = meta.kind === 'exec' && /^Exit code:\s*(?!0\b)\d+/m.test(result.text);
+          if (isFailedBash) {
+            this.turnHadFailedExec = true;
+          } else {
+            this.turnHadSuccessfulTool = true;
+            this.consecutiveGoalExecFailureTurns = 0;
+          }
+        }
         if (meta.kind === 'exec' && result.text) {
           const allLines = result.text.split(/\r?\n/).map(l => l.trimEnd()).filter(Boolean);
           meta.outputPreview = allLines.slice(0, 80);

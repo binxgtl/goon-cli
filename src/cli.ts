@@ -382,7 +382,16 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       if (!bash || !config.model || !resolvedKey) process.exitCode = 1;
       return;
     }
-    const { SessionStore, sameWorkspace } = await import('./session.js');
+    const {
+      SessionStore,
+      sameWorkspace,
+      GOAL_USAGE,
+      goalStatusLabel,
+      formatGoalUsageSummary,
+      formatGoalStatusIndicator,
+      formatGoalSummaryLines,
+      parseGoalDraftArgs,
+    } = await import('./session.js');
     if (positionals[0] === 'sessions') {
       const list = await SessionStore.list(join(dataDir(), 'sessions'));
       stdout.write(values.json ? JSON.stringify(list) + '\n' : list.map(s => `${s.id}  ${s.updatedAt}  ${s.model}${s.title ? `  [${s.title}]` : ''}  ${s.cwd}`).join('\n') + '\n');
@@ -481,11 +490,17 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         tui.setTokens(store.session.tokens);
       } else if (stdin.isTTY) rl = createInterface({ input: stdin, output: stderr, terminal: true });
       rl?.on('SIGINT', stop);
-      const { estimatedTokens } = await import('./context.js');
+      const {
+        estimatedTokens,
+        buildGoalContinuationPrompt,
+        buildGoalObjectiveUpdatedPrompt,
+        buildUserGoalContextMessage,
+      } = await import('./context.js');
       const syncTuiHeader = (resetContext = false) => {
         if (!tui) return;
         tui.setWorkspace(runtime.cwd, readGitBranch(runtime.cwd));
         tui.setContextWindow(runtime.contextWindow);
+        tui.setGoal(store.session.goal);
         if (resetContext) {
           tui.setContextUsage(store.session.messages.length ? estimatedTokens(store.session.messages, '') : undefined);
         }
@@ -522,6 +537,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         else if (event.type === 'subagent' && event.state !== 'progress') stderr.write(`\n[agent ${event.id.slice(0, 8)}: ${event.state}]\n`);
         else if (event.type === 'tool' && event.state === 'start') stderr.write(`\n[${event.name}]\n`);
         else if (event.type === 'todo') stderr.write(`\n[todo: ${event.todos.filter(t => t.status === 'completed').length}/${event.todos.length} completed]\n`);
+        else if (event.type === 'goal') stderr.write(`\n[${event.goal ? formatGoalStatusIndicator(event.goal) : 'Goal cleared'}]\n`);
         else if (event.type === 'plan_exit') stderr.write('\n[Plan approved — exited plan mode]\n');
         else if (event.type === 'compaction') stderr.write('\n[Context compacted; original history archived.]\n');
         else if (event.type === 'stopped') stderr.write(`\n${event.reason}\n`);
@@ -693,6 +709,9 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
                 : Array.isArray(m.content)
                   ? m.content.map(p => ('text' in p && typeof p.text === 'string' ? p.text : p.type === 'image' ? '[Image]' : '')).filter(Boolean).join(' ')
                   : '';
+              if (rawText.startsWith('<codex_internal_context source="')) {
+                continue;
+              }
               const cleaned = rawText
                 .replace(/<referenced_file\s+path="([^"]+)"[\s\S]*?<\/referenced_file>/g, '[@$1]')
                 .replace(/\r?\n/g, ' ')
@@ -737,6 +756,9 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             : Array.isArray(m.content)
               ? m.content.map(p => ('text' in p && typeof p.text === 'string' ? p.text : p.type === 'tool-call' ? `[tool:${p.toolName}]` : '')).filter(Boolean).join(' ')
               : '';
+          if (text.startsWith('<codex_internal_context source="')) {
+            continue;
+          }
           const cleaned = text.replace(/<referenced_file[\s\S]*?<\/referenced_file>/g, '[attached file]').replace(/\s+/g, ' ').trim();
           if (cleaned) {
             lines.push(`  ${m.role === 'user' ? '▸ You' : '◆ Goon'}: ${cleaned.slice(0, 140)}${cleaned.length > 140 ? '…' : ''}`);
@@ -753,30 +775,114 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         renderResumedHistory();
       }
       else display(`goon · ${runtime.model} · session ${store.session.id}\n`);
-      const run = async (input: string) => {
+      const MAX_GOAL_CONTINUATION_TURNS = 25;
+      let goalContinuationDeferred = false;
+
+      const runTurn = async (
+        input: string,
+        opts?: { isGoalContinuation?: boolean; continuationStep?: number },
+      ): Promise<{ aborted: boolean; hadError: boolean; text: string }> => {
         if (Buffer.byteLength(input) > 1024 * 1024) throw new Error('Prompt exceeds 1 MiB.');
         denied = false;
+        let aborted = false;
+        let hadError = false;
+        let outText = '';
         controller = new AbortController();
         tui?.setStatus('Running');
         if (tui) {
           tui.markTurnStart();
-          tui.write(`\n> ${input}\n`);
+          if (opts?.isGoalContinuation) {
+            const g = store.session.goal;
+            const stepLabel = opts.continuationStep && opts.continuationStep > 1 ? ` · turn ${opts.continuationStep}` : '';
+            const statusInd = g ? formatGoalStatusIndicator(g) : 'Pursuing goal';
+            tui.write(`\n◆ ${statusInd}${stepLabel}${g ? ` — ${g.objective}` : ''}\n`);
+          } else {
+            tui.write(`\n> ${input}\n`);
+          }
+        } else if (opts?.isGoalContinuation && !jsonOutput) {
+          const g = store.session.goal;
+          const stepLabel = opts.continuationStep && opts.continuationStep > 1 ? ` · turn ${opts.continuationStep}` : '';
+          display(`\n[◆ Pursuing goal${stepLabel}${g ? `: ${g.objective}` : ''}]\n`);
         }
         try {
-          const text = await harness.run(input, controller.signal);
-          if (jsonOutput) stdout.write(JSON.stringify({ type: 'done', text, denied, sessionId: store.session.id }) + '\n');
+          outText = await harness.run(input, controller.signal);
+          if (jsonOutput) stdout.write(JSON.stringify({ type: 'done', text: outText, denied, sessionId: store.session.id }) + '\n');
           else if (tui) tui.write('\n'); else stdout.write('\n');
           if (denied && !interactive) process.exitCode = 2;
         } catch (error) {
-          if (!interactive) process.exitCode = controller.signal.aborted ? terminating ? 143 : 130 : 1;
+          aborted = controller.signal.aborted;
+          hadError = true;
+          if (!interactive) process.exitCode = aborted ? terminating ? 143 : 130 : 1;
           const message = safeError(error, apiKey);
           if (jsonOutput) stdout.write(JSON.stringify({ type: 'error', message }) + '\n');
           else display(`\n${message}\n`);
+          if (aborted && !exiting && !terminating && store.session.goal?.status === 'active') {
+            goalContinuationDeferred = true;
+            if (tui) tui.setNotice('Goal continuation paused after interrupt — run /goal resume to continue.');
+            else display('[Goal continuation paused after interrupt — run /goal resume to continue.]\n');
+          }
         } finally {
           controller = undefined;
           tui?.setStatus('Ready');
           syncTuiHeader();
           if (tui) void tools.files.listWorkspaceFiles().then(files => tui?.setWorkspaceFiles(files)).catch(() => {});
+        }
+        return { aborted, hadError, text: outText };
+      };
+
+      const continueGoalIfIdle = async () => {
+        if (controller || exiting || terminating || denied || tools.planMode) return;
+        let consecutiveEmptyTurns = 0;
+        for (let step = 1; step <= MAX_GOAL_CONTINUATION_TURNS; step++) {
+          if (exiting || terminating || denied || tools.planMode || goalContinuationDeferred) break;
+          if (tui?.hasQueuedPrompts()) break;
+          const g = store.session.goal;
+          if (!g || g.status !== 'active') break;
+          if (g.tokenBudget !== undefined && (g.tokensUsed ?? 0) >= g.tokenBudget) {
+            g.status = 'budget_limited';
+            g.updatedAt = new Date().toISOString();
+            await store.save();
+            syncTuiHeader();
+            const summary = formatGoalStatusIndicator(g);
+            if (tui) tui.setNotice(summary);
+            else if (!jsonOutput) display(`\n[${summary}]\n`);
+            break;
+          }
+          const contPrompt = buildGoalContinuationPrompt(g, !tools.planMode && !tools.readOnly);
+          const res = await runTurn(contPrompt, { isGoalContinuation: true, continuationStep: step });
+          if (res.aborted || res.hadError || denied) break;
+          const afterGoal = store.session.goal;
+          if (!afterGoal || afterGoal.status !== 'active') {
+            if (afterGoal) {
+              const summary = formatGoalStatusIndicator(afterGoal);
+              if (tui) tui.setNotice(summary);
+              if (!jsonOutput) display(`\n[${summary} — ${afterGoal.objective}]\n`);
+            }
+            break;
+          }
+          if (!res.text.trim()) {
+            consecutiveEmptyTurns++;
+            if (consecutiveEmptyTurns >= 3) {
+              afterGoal.status = 'blocked';
+              afterGoal.updatedAt = new Date().toISOString();
+              await store.save();
+              syncTuiHeader();
+              const summary = formatGoalStatusIndicator(afterGoal);
+              if (tui) tui.setNotice(summary);
+              if (!jsonOutput) display(`\n[${summary} — stalled after 3 empty continuation turns]\n`);
+              break;
+            }
+          } else {
+            consecutiveEmptyTurns = 0;
+          }
+        }
+      };
+
+      const run = async (input: string) => {
+        goalContinuationDeferred = false;
+        const res = await runTurn(input);
+        if (!res.aborted && !res.hadError && !denied && store.session.goal?.status === 'active') {
+          await continueGoalIfIdle();
         }
       };
 
@@ -803,7 +909,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             '  /view [normal|verbose|transcript] Switch view: normal (hide thinking) | verbose | transcript\n' +
             '  /copy [last|code|<N>]             Copy last response, code block, or Nth response (or press Ctrl+O)\n' +
             '  /btw <question>, /side <question> Ask an ephemeral side question without modifying history\n' +
-            '  /goal [<objective>|pause|resume|complete|clear] Set or inspect session goal & token usage\n' +
+            '  /goal [--budget <N>] [<obj>|edit|pause|resume|complete|clear] Autonomous goal loop (Codex /goal)\n' +
             '  /recap                            Generate a live summary of current session progress\n' +
             '  /skills [list|<name>]             List or inspect SKILL.md skills (use $skill-name in prompt)\n' +
             '  /memories [list|add <text>|rm <id>|clear] Manage persistent user memories across sessions\n' +
@@ -889,50 +995,170 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
           if (!arg) {
             const g = store.session.goal;
             if (!g) {
-              display('No active session goal. Set one with: /goal <objective>\n');
+              display(`No active session goal.\n${GOAL_USAGE}\n`);
             } else {
-              const elapsedSec = Math.max(0, Math.floor((Date.now() - Date.parse(g.createdAt)) / 1000));
-              const mins = Math.floor(elapsedSec / 60);
-              const secs = elapsedSec % 60;
-              const spentTokens = Math.max(0, store.session.tokens - (g.tokensAtStart ?? 0));
-              display(
-                `\nSession Goal [${g.status.toUpperCase()}]:\n` +
-                `  Objective : ${g.objective}\n` +
-                `  Elapsed   : ${mins > 0 ? `${mins}m ${secs}s` : `${secs}s`} (since ${g.createdAt.slice(11, 19)})\n` +
-                `  Tokens    : ${spentTokens} tokens used since goal start\n`
-              );
+              display(`\n${formatGoalSummaryLines(g, store.session.tokens)}\n`);
             }
             return true;
           }
           if (lower === 'clear' || lower === 'off' || lower === 'none') {
+            if (!store.session.goal) {
+              display('No active session goal.\n');
+              return true;
+            }
             store.session.goal = undefined;
+            store.session.messages.push({
+              role: 'user',
+              content: buildUserGoalContextMessage({ cleared: true }),
+            });
             await store.save();
-            if (tui) tui.setNotice('Cleared session goal.');
-            display('Cleared session goal.\n');
+            syncTuiHeader();
+            if (tui) tui.setNotice('Goal cleared.');
+            display('Goal cleared.\n');
             return true;
           }
           if (lower === 'pause' || lower === 'resume' || lower === 'complete' || lower === 'done') {
-            if (!store.session.goal) {
-              display('No session goal set yet. Use: /goal <objective>\n');
+            const g = store.session.goal;
+            if (!g) {
+              display(`No session goal set yet.\n${GOAL_USAGE}\n`);
               return true;
             }
-            store.session.goal.status =
+            const nextStatus =
               lower === 'pause' ? 'paused' : lower === 'resume' ? 'active' : 'complete';
-            store.session.goal.updatedAt = now;
+            if (nextStatus === 'active' && g.status === 'budget_limited' && g.tokenBudget !== undefined && (g.tokensUsed ?? 0) >= g.tokenBudget) {
+              g.tokenBudget = undefined;
+            }
+            g.status = nextStatus;
+            g.updatedAt = now;
+            if (nextStatus === 'active') goalContinuationDeferred = false;
+            store.session.messages.push({
+              role: 'user',
+              content: buildUserGoalContextMessage({ status: nextStatus }),
+            });
             await store.save();
-            display(`Session goal status updated to: ${store.session.goal.status} (${store.session.goal.objective})\n`);
+            syncTuiHeader();
+            const indicator = formatGoalStatusIndicator(g);
+            if (tui) tui.setNotice(indicator);
+            display(`\n${formatGoalSummaryLines(g, store.session.tokens)}\n`);
+            if (nextStatus === 'active' && !controller) {
+              if (mode === 'plan') {
+                display('Note: Plan mode is active. Switch to ask or auto mode (/mode ask or /auto) to pursue the goal autonomously.\n');
+              } else {
+                await continueGoalIfIdle();
+              }
+            }
             return true;
           }
+          if (lower === 'edit' || lower.startsWith('edit ')) {
+            const g = store.session.goal;
+            if (!g) {
+              display(`No session goal set yet.\n${GOAL_USAGE}\n`);
+              return true;
+            }
+            const editRest = arg.slice(4).trim();
+            if (!editRest) {
+              if (controller) {
+                display('Usage while working: /goal edit <objective>\n');
+                return true;
+              }
+              return false;
+            }
+            const parsedEdit = parseGoalDraftArgs(editRest);
+            if ('error' in parsedEdit) {
+              display(`${parsedEdit.error}\n`);
+              return true;
+            }
+            if (parsedEdit.tokenBudget !== undefined) {
+              g.tokenBudget = parsedEdit.tokenBudget;
+              if (g.status === 'budget_limited' && (g.tokensUsed ?? 0) < parsedEdit.tokenBudget) {
+                g.status = 'active';
+              }
+            }
+            if (parsedEdit.objective) {
+              g.objective = parsedEdit.objective;
+            }
+            g.updatedAt = now;
+            store.session.messages.push({
+              role: 'user',
+              content: buildUserGoalContextMessage({
+                ...(parsedEdit.objective ? { objective: g.objective } : {}),
+                status: g.status,
+              }),
+            });
+            if (parsedEdit.objective) {
+              store.session.messages.push({
+                role: 'user',
+                content: buildGoalObjectiveUpdatedPrompt(g),
+              });
+            }
+            await store.save();
+            syncTuiHeader();
+            if (tui) tui.setNotice(formatGoalStatusIndicator(g));
+            display(`\n${formatGoalSummaryLines(g, store.session.tokens)}\n`);
+            if (g.status === 'active' && !controller && mode !== 'plan') {
+              goalContinuationDeferred = false;
+              await continueGoalIfIdle();
+            }
+            return true;
+          }
+          const parsed = parseGoalDraftArgs(arg);
+          if ('error' in parsed) {
+            display(`${parsed.error}\n`);
+            return true;
+          }
+          if (!parsed.objective) {
+            if (parsed.tokenBudget !== undefined && store.session.goal) {
+              const g = store.session.goal;
+              g.tokenBudget = parsed.tokenBudget;
+              if (g.status === 'budget_limited' && (g.tokensUsed ?? 0) < parsed.tokenBudget) {
+                g.status = 'active';
+              }
+              g.updatedAt = now;
+              await store.save();
+              syncTuiHeader();
+              if (tui) tui.setNotice(formatGoalStatusIndicator(g));
+              display(`\n${formatGoalSummaryLines(g, store.session.tokens)}\n`);
+              if (g.status === 'active' && !controller && mode !== 'plan') {
+                goalContinuationDeferred = false;
+                await continueGoalIfIdle();
+              }
+              return true;
+            }
+            display(`${GOAL_USAGE}\n`);
+            return true;
+          }
+          const hadExistingGoal = Boolean(store.session.goal);
           store.session.goal = {
-            objective: arg,
+            goalId: `goal_${Date.now().toString(36)}`,
+            objective: parsed.objective,
             status: 'active',
             createdAt: now,
             updatedAt: now,
             tokensAtStart: store.session.tokens,
+            tokensUsed: 0,
+            timeUsedSeconds: 0,
+            ...(parsed.tokenBudget !== undefined ? { tokenBudget: parsed.tokenBudget } : {}),
           };
+          goalContinuationDeferred = false;
+          store.session.messages.push({
+            role: 'user',
+            content: buildUserGoalContextMessage({ objective: parsed.objective, status: 'active' }),
+          });
+          if (controller && hadExistingGoal) {
+            store.session.messages.push({
+              role: 'user',
+              content: buildGoalObjectiveUpdatedPrompt(store.session.goal),
+            });
+          }
           await store.save();
-          if (tui) tui.setNotice(`Goal active: ${arg.slice(0, 60)}`);
-          display(`Active session goal set: ${arg}\n`);
+          syncTuiHeader();
+          if (tui) tui.setNotice(formatGoalStatusIndicator(store.session.goal));
+          display(`\n${formatGoalSummaryLines(store.session.goal, store.session.tokens)}\n`);
+          if (mode === 'plan') {
+            display('Note: Plan mode is active. Switch to ask or auto mode (/mode ask or /auto) to pursue the goal autonomously.\n');
+          } else if (!controller) {
+            await continueGoalIfIdle();
+          }
           return true;
         }
         if (cmdInput === '/pwd' || cmdInput === '/cwd') {
@@ -1327,11 +1553,10 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
           return true;
         }
         if (cmdInput === '/status') {
-          const { estimatedTokens } = await import('./context.js');
           const usedEst = estimatedTokens(store.session.messages, '');
           const pct = Math.min(100, Math.round((usedEst / runtime.contextWindow) * 100));
           const goalLine = store.session.goal
-            ? `Goal           [${store.session.goal.status}] ${store.session.goal.objective}\n`
+            ? `Goal           [${goalStatusLabel(store.session.goal.status)}] ${store.session.goal.objective} (${formatGoalUsageSummary(store.session.goal)})\n`
             : '';
           display(
             `Session        ${store.session.id}${store.session.title ? ` (${store.session.title})` : ''}\n` +
@@ -1441,6 +1666,25 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
           if (!input) continue;
           if (await executeImmediateCommand(input)) {
             if (exiting) break;
+            continue;
+          }
+
+          if (input.toLowerCase() === '/goal edit') {
+            const g = store.session.goal;
+            if (!g) {
+              display(`No session goal set yet.\n${GOAL_USAGE}\n`);
+              continue;
+            }
+            const promptBlock = `\n◇ Edit Goal Objective\n  Current: ${g.objective}\n`;
+            const nextObj = tui
+              ? (await tui.askTransient(promptBlock, 'New objective (Enter to cancel): ', undefined, { escHint: 'cancel' })).trim()
+              : (display(promptBlock), (await question('New objective (Enter to cancel): ')).trim());
+            if (!nextObj) {
+              if (tui) tui.setNotice('Cancelled /goal edit.');
+              else display('Cancelled /goal edit.\n');
+              continue;
+            }
+            await executeImmediateCommand(`/goal edit ${nextObj}`);
             continue;
           }
 
@@ -2142,7 +2386,6 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             continue;
           }
           if (input === '/status') {
-            const { estimatedTokens } = await import('./context.js');
             const usedEst = estimatedTokens(store.session.messages, '');
             const pct = Math.min(100, Math.round((usedEst / runtime.contextWindow) * 100));
             display(

@@ -4,6 +4,7 @@ import { emitKeypressEvents, type Key } from 'node:readline';
 import type { ReadStream, WriteStream } from 'node:tty';
 import { stripVTControlCharacters } from 'node:util';
 import type { HarnessEvent, ToolEventMeta } from './harness.js';
+import { formatGoalStatusIndicator, type SessionGoal } from './session.js';
 import type { SubagentEvent } from './subagents.js';
 
 const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -484,6 +485,7 @@ export class TerminalUI {
   private branch = '';
   private contextWindow = 0;
   private contextUsed?: number;
+  private goal?: SessionGoal;
   onToggleMode?: () => void;
   onCycleEffort?: (direction: 1 | -1) => void;
   onToggleTranscript?: (active: boolean) => void;
@@ -689,6 +691,15 @@ export class TerminalUI {
     this.schedule();
   }
 
+  setGoal(goal: SessionGoal | undefined) {
+    this.goal = goal;
+    this.schedule();
+  }
+
+  hasQueuedPrompts(): boolean {
+    return this.queuedPrompts.length > 0;
+  }
+
   private flushExploreGroup() {
     if (!this.exploreGroup.length) return;
     const reads = this.exploreGroup.filter(e => e.kind === 'read').map(e => e.summary);
@@ -856,6 +867,8 @@ export class TerminalUI {
     } else if (event.type === 'plan_exit') {
       this.flushExploreGroup();
       this.appendCell(`\n${GLYPH.todo} Plan approved — exited plan mode\n`);
+    } else if (event.type === 'goal') {
+      this.goal = event.goal;
     } else if (event.type === 'usage') {
       this.tokens += event.total;
       // Prompt + completion of the latest request is the provider's own measure of context occupancy.
@@ -2322,6 +2335,17 @@ export class TerminalUI {
     }
     this.lastBodyTotalLines = all.length;
 
+    const activeTurnSec = this.turnStartedAt ? (Date.now() - this.turnStartedAt) / 1000 : 0;
+    const goalIndicator = this.goal ? formatGoalStatusIndicator(this.goal, activeTurnSec) : '';
+    const goalTone =
+      this.goal?.status === 'active'
+        ? T.brand
+        : this.goal?.status === 'complete'
+          ? T.ok
+          : this.goal?.status === 'paused'
+            ? T.muted
+            : T.warn;
+    const goalGroup: Seg[] = goalIndicator ? [[goalIndicator, goalTone]] : [];
     const todoGroup: Seg[] = this.todoLabel ? [[`${GLYPH.todo} `, T.brand], [this.todoLabel, T.muted]] : [];
     const brandSegs: Seg[] = [[' ', ''], [GLYPH.brand, T.brandBold], [' goon', T.strong]];
 
@@ -2329,7 +2353,7 @@ export class TerminalUI {
     if (this.inTranscriptOverlay) {
       const txHeader = this.band(
         [...brandSegs, [' · ', T.faint], ['TRANSCRIPT', T.brandBold], [' · ', T.faint], [sessionLabel, T.muted]],
-        [todoGroup],
+        [goalGroup, todoGroup],
         safeCols,
         rich,
       );
@@ -2353,12 +2377,12 @@ export class TerminalUI {
       return;
     }
 
-    // Header band: brand · workspace · branch · session  ……  todo · context meter
+    // Header band: brand · workspace · branch · session  ……  goal · todo · context meter
     const leftHeader: Seg[] = [...brandSegs];
     if (this.workspaceName) leftHeader.push([' · ', T.faint], [this.workspaceName, T.text]);
     if (this.branch) leftHeader.push([' · ', T.faint], [this.branch, T.info]);
     leftHeader.push([' · ', T.faint], [sessionLabel, T.muted]);
-    const header = rich ? this.band(leftHeader, [todoGroup, this.contextGroup()], safeCols, rich) : clip(`goon · ${sessionLabel}`);
+    const header = rich ? this.band(leftHeader, [goalGroup, todoGroup, this.contextGroup()], safeCols, rich) : clip(`goon · ${sessionLabel}`);
 
     // Live status row (Working / scroll / esc hints / attachments / notices)
     let statusLine = '';
@@ -2383,6 +2407,9 @@ export class TerminalUI {
     } else if (this.statusNotice) {
       const text = clip(this.statusNotice);
       statusLine = rich ? `${T.muted}${text}${T.reset}` : text;
+    } else if (this.goal && this.goal.status !== 'complete') {
+      const text = clip(`◆ ${goalIndicator} · ${this.goal.objective}`);
+      statusLine = rich ? `${goalTone}${text}${T.reset}` : text;
     } else if (!(currentInput.startsWith('/') && !/\s/.test(currentInput))) {
       const text = clip([...this.toolStates.values()].slice(-2).join(' | '));
       statusLine = rich && text ? `${T.faint}${text}${T.reset}` : text;

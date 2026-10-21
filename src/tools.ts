@@ -1,10 +1,11 @@
 import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { tool, jsonSchema, type FlexibleSchema, type ToolSet } from 'ai';
 import { Ajv } from 'ajv';
 import { z } from 'zod';
 import { WorkspaceFiles, limitText, unlinkSafe } from './files.js';
 import { runCommand } from './process.js';
-import { todoItemSchema, type TodoItem } from './session.js';
+import { todoItemSchema, type SessionGoal, type TodoItem } from './session.js';
 
 export function sanitizeBashCommand(command: string, platform = process.platform): string {
   if (platform !== 'win32') return command;
@@ -273,6 +274,16 @@ export function normalizeToolInput(toolName: string, input: unknown): unknown {
       delete obj.header;
     }
   }
+  if (toolName === 'create_goal') {
+    if (obj.objective === undefined && typeof obj.goal === 'string') {
+      obj.objective = obj.goal;
+      delete obj.goal;
+    }
+    if (obj.token_budget === undefined && typeof obj.tokenBudget === 'number') {
+      obj.token_budget = obj.tokenBudget;
+      delete obj.tokenBudget;
+    }
+  }
   return obj;
 }
 
@@ -282,6 +293,8 @@ export class ToolRegistry {
   planMode = false;
   todos: TodoItem[] = [];
   onTodoUpdate?: (todos: TodoItem[]) => void;
+  getGoal?: () => SessionGoal | undefined;
+  onGoalUpdate?: (goal: SessionGoal | undefined) => Promise<void> | void;
   onPlanExit?: (plan: string) => void;
   askUser?: (questions: UserInputQuestion[], signal: AbortSignal) => Promise<Record<string, string[]>>;
   pendingImages: Array<{ path: string; mimeType: string; bytes: Uint8Array }> = [];
@@ -345,6 +358,123 @@ export class ToolRegistry {
         this.onTodoUpdate?.(this.todos);
         const header = input.explanation ? `Plan updated (${input.explanation}).` : 'Plan updated.';
         return `${header}\n${formatTodos(this.todos)}`;
+      },
+    });
+    this.register('get_goal', {
+      description:
+        'Get the current goal for this thread, including status, budgets, token and elapsed-time usage, and remaining token budget.',
+      schema: z.object({}),
+      readOnly: true,
+      execute: async () => {
+        const goal = this.getGoal?.();
+        const remainingTokens =
+          goal?.tokenBudget !== undefined
+            ? Math.max(0, goal.tokenBudget - (goal.tokensUsed ?? 0))
+            : null;
+        return JSON.stringify({
+          goal: goal ?? null,
+          remainingTokens,
+          completionBudgetReport: null,
+        });
+      },
+    });
+    this.register('create_goal', {
+      description:
+        'Create a goal only when explicitly requested by the user or system/developer instructions; do not infer goals from ordinary tasks. Set token_budget only when an explicit token budget is requested. Fails if an unfinished goal exists; use update_goal only for status.',
+      schema: z.object({
+        objective: z
+          .string()
+          .min(1)
+          .describe(
+            'Required. The concrete objective to start pursuing. This starts a new active goal when no goal exists or replaces the current goal when it is complete.',
+          ),
+        token_budget: z
+          .number()
+          .int()
+          .positive()
+          .optional()
+          .describe('Positive token budget for the new goal. Omit unless explicitly requested.'),
+      }),
+      readOnly: true,
+      execute: async input => {
+        if (!this.getGoal || !this.onGoalUpdate) {
+          throw new Error('Goal tools require a persistent thread.');
+        }
+        const existing = this.getGoal();
+        if (existing && existing.status !== 'complete') {
+          throw new Error(
+            'cannot create a new goal because this thread has an unfinished goal; complete the existing goal first',
+          );
+        }
+        const objective = input.objective.trim();
+        if (!objective) {
+          throw new Error('Goal objective must not be empty.');
+        }
+        const now = new Date().toISOString();
+        const goal: SessionGoal = {
+          goalId: randomUUID(),
+          objective,
+          status: 'active',
+          createdAt: now,
+          updatedAt: now,
+          tokensAtStart: 0,
+          tokensUsed: 0,
+          timeUsedSeconds: 0,
+          ...(input.token_budget !== undefined ? { tokenBudget: input.token_budget } : {}),
+        };
+        await this.onGoalUpdate(goal);
+        const updated = this.getGoal() ?? goal;
+        const remainingTokens =
+          updated.tokenBudget !== undefined
+            ? Math.max(0, updated.tokenBudget - (updated.tokensUsed ?? 0))
+            : null;
+        return JSON.stringify({
+          goal: updated,
+          remainingTokens,
+          completionBudgetReport: null,
+        });
+      },
+    });
+    this.register('update_goal', {
+      description:
+        'Update the existing goal. Set status to `paused` only at the user\'s explicit request to pause this goal, never on your own initiative. Set status to `complete` only when the objective has actually been achieved and no required work remains. Set status to `blocked` only when the same blocking condition has repeated for at least three consecutive goal turns and the agent cannot make meaningful progress without user input or an external-state change. Do not mark a goal complete merely because its budget is nearly exhausted or because you are stopping work.',
+      schema: z.object({
+        status: z
+          .enum(['complete', 'blocked', 'paused'])
+          .describe(
+            'Required. `paused` requires an explicit user request. Set to `complete` only when the objective is achieved and no required work remains. Set to `blocked` only after the same blocking condition has recurred for at least three consecutive goal turns and the agent is at an impasse.',
+          ),
+      }),
+      readOnly: true,
+      execute: async input => {
+        if (!this.getGoal || !this.onGoalUpdate) {
+          throw new Error('Goal tools require a persistent thread.');
+        }
+        const existing = this.getGoal();
+        if (!existing) {
+          throw new Error('cannot update goal because this thread has no goal');
+        }
+        const now = new Date().toISOString();
+        const nextGoal: SessionGoal = {
+          ...existing,
+          status: input.status,
+          updatedAt: now,
+        };
+        await this.onGoalUpdate(nextGoal);
+        const updated = this.getGoal() ?? nextGoal;
+        const remainingTokens =
+          updated.tokenBudget !== undefined
+            ? Math.max(0, updated.tokenBudget - (updated.tokensUsed ?? 0))
+            : null;
+        const completionBudgetReport =
+          input.status === 'complete' && updated.tokenBudget !== undefined
+            ? `Consumed ${updated.tokensUsed ?? 0} of ${updated.tokenBudget} budgeted tokens in ${updated.timeUsedSeconds ?? 0}s.`
+            : null;
+        return JSON.stringify({
+          goal: updated,
+          remainingTokens,
+          completionBudgetReport,
+        });
       },
     });
     this.register('request_user_input', {
@@ -472,11 +602,12 @@ export class ToolRegistry {
   schemas(): ToolSet {
     const collabTools = new Set([
       'spawn_agent', 'wait_agent', 'send_input', 'close_agent', 'resume_agent', 'list_agents',
-      'update_plan', 'request_user_input', 'view_image',
+      'update_plan', 'get_goal', 'create_goal', 'update_goal', 'request_user_input', 'view_image',
       'list_mcp_resources', 'list_mcp_resource_templates', 'read_mcp_resource',
     ]);
     return Object.fromEntries([...this.definitions].filter(([name, d]) => {
       if (name === 'exit_plan_mode' && !this.planMode) return false;
+      if ((name === 'get_goal' || name === 'create_goal' || name === 'update_goal') && (!this.getGoal || this.planMode)) return false;
       if ((name === 'todo_write' || name === 'todo_read' || collabTools.has(name)) && this.readOnly && !this.planMode) return false;
       return !this.effectiveReadOnly || d.readOnly;
     }).map(([name, d]) => [name, tool({ description: d.description, inputSchema: d.schema })]));
@@ -487,6 +618,8 @@ export class ToolRegistry {
       canonical === 'exit_plan_mode' ||
       canonical === 'todo_write' ||
       canonical === 'update_plan' ||
+      canonical === 'create_goal' ||
+      canonical === 'update_goal' ||
       canonical === 'request_user_input' ||
       canonical === 'wait_agent' ||
       canonical === 'send_input' ||
