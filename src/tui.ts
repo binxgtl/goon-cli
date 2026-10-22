@@ -77,6 +77,33 @@ const CELL_TONES: Record<string, string> = {
 
 /** Private-use code point marking user-turn lines inside the plain-text transcript. */
 const USER_MARK = '\uE000';
+const TRANSCRIPT_MAX_CHARS = 160_000;
+const TRANSCRIPT_KEEP_CHARS = 120_000;
+
+/** Parser state carried from one transcript line to the next (see renderStyledBodyLines). */
+interface ParseState {
+  block: 'normal' | 'answer' | 'reasoning';
+  inCode: boolean;
+  inDiff: boolean;
+  answerFirst: boolean;
+  lastWasUser: boolean;
+}
+const initialParseState = (): ParseState => ({ block: 'normal', inCode: false, inDiff: false, answerFirst: false, lastWasUser: false });
+
+/**
+ * Rows already produced for a transcript prefix. While a turn streams, the transcript only grows,
+ * so each frame parses just the new tail instead of re-wrapping and re-styling the whole session.
+ */
+interface BodyCache {
+  cols: number;
+  rich: boolean;
+  showReasoning: boolean;
+  /** Transcript prefix (ending right after a newline) whose rows are cached. */
+  source: string;
+  state: ParseState;
+  rows: Row[];
+  styled: string[];
+}
 
 type Seg = [text: string, sgr: string];
 type RowKind =
@@ -98,8 +125,8 @@ export function formatTokenCount(n: number): string {
   return `${(n / 1_000_000).toFixed(1).replace(/\.0$/, '')}M`;
 }
 export const SLASH_COMMANDS = [
-  '/help', '/setup', '/model', '/effort', '/mode', '/auto', '/yolo', '/view', '/transcript',
-  '/copy', '/btw', '/side', '/goal', '/recap', '/skills', '/memories', '/presets', '/mention',
+  '/help', '/setup', '/key', '/model', '/effort', '/mode', '/auto', '/yolo', '/view', '/transcript',
+  '/copy', '/btw', '/side', '/goal', '/recap', '/skills', '/prompts', '/memories', '/presets', '/mention',
   '/cd', '/pwd', '/mcp', '/subagents', '/agent', '/plan', '/revert', '/undo',
   '/checkpoints', '/todo', '/resume', '/new', '/delete', '/compact', '/diff', '/review', '/fork', '/rename',
   '/export', '/init', '/status', '/tools', '/sessions', '/debug-config', '/warnings', '/doctor', '/clear', '/exit',
@@ -143,6 +170,8 @@ const SLASH_DESCRIPTIONS: Record<string, string> = {
   '/status': 'show session & token status',
   '/doctor': 'verify environment & gateway /models',
   '/setup': 'run the provider / model setup wizard',
+  '/key': 'replace the stored API key (input hidden)',
+  '/prompts': 'list custom prompt files (.goon/prompts/*.md); run with /prompts:<name>',
   '/todo': 'show or clear the todo checklist',
   '/fork': 'fork this session into a new one',
   '/rename': 'rename the current session',
@@ -164,12 +193,26 @@ export function terminalText(value: string): string {
     .replace(CONTROL_CHARS_RE, '');
 }
 
-const width = (c: string) =>
+const slowWidth = (c: string) =>
   /\p{Mark}/u.test(c)
     ? 0
     : /[\p{Extended_Pictographic}\u1100-\u115f\u2e80-\ua4cf\uac00-\ud7a3\uf900-\ufaff\ufe10-\ufe6f\uff01-\uff60]/u.test(c)
       ? 2
       : 1;
+// Column width per BMP code point, filled lazily (stored as width + 1; 0 = not computed yet).
+// Rendering measures every character of the transcript, so two Unicode regex tests per character
+// were the dominant cost of a frame.
+const widthCache = new Uint8Array(0x10000);
+const width = (c: string) => {
+  const code = c.charCodeAt(0);
+  if (code < 0x300) return 1; // ASCII and Latin-1/Extended-A/B: never wide, never combining
+  if (c.length !== 1) return slowWidth(c); // astral plane (emoji): rare
+  const cached = widthCache[code];
+  if (cached) return cached - 1;
+  const w = slowWidth(c);
+  widthCache[code] = w + 1;
+  return w;
+};
 
 export function wrapTerminal(text: string, columns: number): string[] {
   const maxCols = Math.max(1, columns);
@@ -475,6 +518,7 @@ export class TerminalUI {
   private escCancels = false;
   private escHint = 'skip';
   private turnSnapshots: string[] = [];
+  private masked = false;
   private inputRestoredFromRevert = false;
   private escPrimed?: 'backtrack' | 'clear';
   private escPrimeTimer?: NodeJS.Timeout;
@@ -629,7 +673,9 @@ export class TerminalUI {
       const pending = this.pending;
       this.pending = undefined;
       pending.cleanup();
-      pending.resolve('a');
+      // Approve this one request only. Answering "always" would keep the tool auto-approved after
+      // the user cycles on to plan/readonly/ask (Shift+Tab passes through auto on the way).
+      pending.resolve('y');
     }
     this.schedule();
   }
@@ -696,6 +742,13 @@ export class TerminalUI {
     this.schedule();
   }
 
+  /** Queues input (prompt or command) to be returned by the next main-prompt question(). */
+  queuePrompt(text: string) {
+    if (!text.trim()) return;
+    this.queuedPrompts.push(text);
+    this.schedule(0);
+  }
+
   hasQueuedPrompts(): boolean {
     return this.queuedPrompts.length > 0;
   }
@@ -717,7 +770,17 @@ export class TerminalUI {
 
   private appendTranscript(text: string, forceBottom = false) {
     const wasAtBottom = this.scroll === 0;
-    this.transcript = (this.transcript + terminalText(text)).slice(-120_000);
+    let next = this.transcript + terminalText(text);
+    if (next.length > TRANSCRIPT_MAX_CHARS) {
+      // Trim in large steps (so the incremental renderer rarely has to start over) and only at a
+      // block boundary: cutting inside a code fence used to render the rest of the session as code.
+      const from = next.length - TRANSCRIPT_KEEP_CHARS;
+      const boundary = next.indexOf('\n[normal]\n', from);
+      const lineBreak = next.indexOf('\n', from);
+      const cut = boundary >= 0 && boundary < next.length - 1 ? boundary + 1 : lineBreak >= 0 ? lineBreak + 1 : from;
+      next = next.slice(cut);
+    }
+    this.transcript = next;
     if (forceBottom || wasAtBottom) this.scroll = 0;
     this.schedule(16);
   }
@@ -1003,12 +1066,14 @@ export class TerminalUI {
     label = 'goon> ',
     signal?: AbortSignal,
     remember = false,
-    opts: { escCancels?: boolean; escHint?: string } = {},
+    opts: { escCancels?: boolean; escHint?: string; mask?: boolean } = {},
   ): Promise<string> {
     if (this.closed) return Promise.reject(new Error('Terminal closed.'));
     if (this.pending) return Promise.reject(new Error('A terminal question is already active.'));
     signal?.throwIfAborted();
     this.label = terminalText(label);
+    // Secrets (API keys) render as bullets and never enter the prompt history.
+    this.masked = Boolean(opts.mask) && !remember;
     this.escCancels = Boolean(opts.escCancels);
     this.escHint = opts.escHint ?? (opts.escCancels ? 'cancel' : /y\/N/.test(label) ? 'deny' : 'skip');
     if (remember && this.queuedPrompts.length > 0) {
@@ -1028,7 +1093,14 @@ export class TerminalUI {
     this.remember = remember;
     const result = new Promise<string>((resolve, reject) => {
       const abort = () => this.reject(new Error('Input cancelled.'));
-      this.pending = { resolve, reject, cleanup: () => signal?.removeEventListener('abort', abort) };
+      this.pending = {
+        resolve,
+        reject,
+        cleanup: () => {
+          this.masked = false;
+          signal?.removeEventListener('abort', abort);
+        },
+      };
       signal?.addEventListener('abort', abort, { once: true });
     });
     this.schedule();
@@ -1893,10 +1965,29 @@ export class TerminalUI {
    * rows, wraps every row to `columns` BEFORE styling (prefixes included), then paints each row.
    * No emitted row can exceed the terminal width, so soft-wrap cursor drift is impossible.
    */
+  private bodyCache?: BodyCache;
+
   private renderStyledBodyLines(columns: number, rich: boolean): string[] {
     const cols = Math.max(4, columns);
     const showReasoning = this.viewMode !== 'normal' || this.inTranscriptOverlay;
-    const rows: Row[] = [];
+    const transcript = this.transcript;
+    const cache = this.bodyCache;
+    const reuse = cache !== undefined
+      && cache.cols === cols && cache.rich === rich && cache.showReasoning === showReasoning
+      && transcript.length >= cache.source.length && transcript.startsWith(cache.source);
+    const st: ParseState = reuse ? { ...cache!.state } : initialParseState();
+    const rows: Row[] = reuse ? cache!.rows.slice() : [];
+    const baseStyled = reuse ? cache!.styled : [];
+    const baseSource = reuse ? cache!.source : '';
+    const rawLines = transcript.slice(baseSource.length).split('\n');
+
+    // Checkpoint for the next frame: the start of the last (possibly still streaming) line, moved
+    // back past any table rows because a growing table changes the column widths of earlier rows.
+    let checkpoint = rawLines.length - 1;
+    while (checkpoint > 0 && isTableRow(rawLines[checkpoint - 1])) checkpoint--;
+    let checkpointRows = rows.length;
+    let checkpointState: ParseState = { ...st };
+
     const lastKind = (): RowKind | undefined => rows[rows.length - 1]?.kind;
     const lastContentKind = (): RowKind | undefined => {
       for (let i = rows.length - 1; i >= 0; i--) if (rows[i].kind !== 'blank') return rows[i].kind;
@@ -1909,6 +2000,27 @@ export class TerminalUI {
       const chunks = wrapChunks(text, cols - visibleLength(first), cols - visibleLength(cont), words);
       chunks.forEach((chunk, i) => rows.push({ kind, pre: i === 0 ? first : cont, text: chunk, ...extra }));
     };
+
+    // Pre-scan contiguous Markdown table blocks so every row of a table shares column widths.
+    const tableWidths = new Map<number, number[]>();
+    for (let i = 0; i < rawLines.length; i++) {
+      if (!isTableRow(rawLines[i])) continue;
+      let j = i;
+      const widths: number[] = [];
+      while (j < rawLines.length && isTableRow(rawLines[j])) {
+        const trimmedRow = rawLines[j].trim();
+        if (!TABLE_SEPARATOR_RE.test(trimmedRow)) {
+          splitTableCells(trimmedRow).forEach((c, k) => {
+            widths[k] = Math.max(widths[k] ?? 0, visibleLength(displayedCell(c)));
+          });
+        }
+        j++;
+      }
+      for (let k = i; k < j; k++) tableWidths.set(k, widths);
+      i = j - 1;
+    }
+
+    let lineIndex = -1;
 
     /** Markdown-aware paragraph row. `base` is the indent every row starts with; `lead` replaces it on the first row. */
     const pushMarkdown = (rawLine: string, base: string, lead: string | undefined, paraKind: RowKind) => {
@@ -1955,47 +2067,24 @@ export class TerminalUI {
       wrapInto(paraKind, rawLine.slice(indent.length), firstPre(base + indent), base + indent);
     };
 
-    // Pre-scan contiguous Markdown table blocks so every row of a table shares column widths.
-    const rawLines = this.transcript.split('\n');
-    const tableWidths = new Map<number, number[]>();
-    for (let i = 0; i < rawLines.length; i++) {
-      if (!isTableRow(rawLines[i])) continue;
-      let j = i;
-      const widths: number[] = [];
-      while (j < rawLines.length && isTableRow(rawLines[j])) {
-        const trimmedRow = rawLines[j].trim();
-        if (!TABLE_SEPARATOR_RE.test(trimmedRow)) {
-          splitTableCells(trimmedRow).forEach((c, k) => {
-            widths[k] = Math.max(widths[k] ?? 0, visibleLength(displayedCell(c)));
-          });
-        }
-        j++;
-      }
-      for (let k = i; k < j; k++) tableWidths.set(k, widths);
-      i = j - 1;
-    }
-
-    let block: 'normal' | 'answer' | 'reasoning' = 'normal';
-    let inCode = false;
-    let inDiff = false;
-    let answerFirst = false;
-    let lastWasUser = false;
-    let lineIndex = -1;
-
     for (const rawLine of rawLines) {
       lineIndex++;
+      if (lineIndex === checkpoint) {
+        checkpointRows = rows.length;
+        checkpointState = { ...st };
+      }
       const trimmed = rawLine.trim();
       if (rawLine === '[normal]') {
-        block = 'normal';
-        inCode = false;
-        inDiff = false;
-        answerFirst = false;
+        st.block = 'normal';
+        st.inCode = false;
+        st.inDiff = false;
+        st.answerFirst = false;
         continue;
       }
       if (rawLine.startsWith('[reasoning')) {
-        block = 'reasoning';
-        inCode = false;
-        inDiff = false;
+        st.block = 'reasoning';
+        st.inCode = false;
+        st.inDiff = false;
         if (showReasoning) {
           blank();
           rows.push({ kind: 'reasoningHead', pre: '', text: `${GLYPH.thinking} Thinking` });
@@ -2004,59 +2093,59 @@ export class TerminalUI {
       }
       if (rawLine.startsWith('[answer]')) {
         blank();
-        block = 'answer';
-        inCode = false;
-        inDiff = false;
-        answerFirst = true;
+        st.block = 'answer';
+        st.inCode = false;
+        st.inDiff = false;
+        st.answerFirst = true;
         continue;
       }
       if (rawLine.startsWith(USER_MARK)) {
-        if (!lastWasUser) blank();
-        wrapInto('user', rawLine.slice(USER_MARK.length), lastWasUser ? '   ' : ` ${GLYPH.user} `, '   ');
-        lastWasUser = true;
-        block = 'normal';
-        inCode = false;
-        inDiff = false;
+        if (!st.lastWasUser) blank();
+        wrapInto('user', rawLine.slice(USER_MARK.length), st.lastWasUser ? '   ' : ` ${GLYPH.user} `, '   ');
+        st.lastWasUser = true;
+        st.block = 'normal';
+        st.inCode = false;
+        st.inDiff = false;
         continue;
       }
-      if (lastWasUser) {
-        lastWasUser = false;
+      if (st.lastWasUser) {
+        st.lastWasUser = false;
         blank();
       }
-      if (block === 'reasoning' && !showReasoning) continue;
+      if (st.block === 'reasoning' && !showReasoning) continue;
 
       if (trimmed.startsWith('```')) {
-        if (inCode) {
-          inCode = false;
+        if (st.inCode) {
+          st.inCode = false;
           rows.push({ kind: 'codeFoot', pre: '', text: '' });
         } else {
-          inCode = true;
-          inDiff = false;
-          answerFirst = false;
+          st.inCode = true;
+          st.inDiff = false;
+          st.answerFirst = false;
           rows.push({ kind: 'codeHead', pre: '', text: trimmed.slice(3).trim() || 'code' });
         }
         continue;
       }
-      if (inCode) {
+      if (st.inCode) {
         wrapInto('code', rawLine.replace(/\t/g, '  ').trimEnd(), '   ', '   ', {}, false);
         continue;
       }
 
       if (!trimmed) {
-        if (block === 'reasoning') continue;
-        if (block === 'answer' && answerFirst) continue;
+        if (st.block === 'reasoning') continue;
+        if (st.block === 'answer' && st.answerFirst) continue;
         blank();
         continue;
       }
 
-      if (block === 'reasoning') {
+      if (st.block === 'reasoning') {
         wrapInto('reasoning', rawLine.trimEnd(), '  ', '  ');
         continue;
       }
 
-      if (block === 'answer') {
-        const lead = answerFirst ? `${GLYPH.answer} ` : undefined;
-        answerFirst = false;
+      if (st.block === 'answer') {
+        const lead = st.answerFirst ? `${GLYPH.answer} ` : undefined;
+        st.answerFirst = false;
         pushMarkdown(rawLine.trimEnd(), '  ', lead, 'answer');
         continue;
       }
@@ -2065,16 +2154,16 @@ export class TerminalUI {
       const cell = CELL_RE.exec(rawLine);
       if (cell) {
         blank();
-        inDiff = cell[1] === GLYPH.edit || /^(?:Edited|Added|Deleted|Wrote|Created|Updated)\b/.test(cell[2]);
+        st.inDiff = cell[1] === GLYPH.edit || /^(?:Edited|Added|Deleted|Wrote|Created|Updated)\b/.test(cell[2]);
         wrapInto('cell', cell[2].trimEnd(), `${cell[1]} `, '  ', { glyph: cell[1] });
         continue;
       }
       if (/^(?:--- |\+\+\+ |@@ )/.test(rawLine)) {
-        inDiff = true;
+        st.inDiff = true;
         rows.push({ kind: 'diffMeta', pre: '  ', text: sliceVisible(rawLine.trimEnd(), Math.max(1, cols - 2)) });
         continue;
       }
-      if (inDiff) {
+      if (st.inDiff) {
         const numbered = /^ {4}([ \d]{4}) ([+\- ])(.*)$/.exec(rawLine);
         const unified = numbered ? undefined : /^([+\- ])(.*)$/.exec(rawLine);
         if (numbered || unified) {
@@ -2088,7 +2177,7 @@ export class TerminalUI {
           rows.push({ kind: 'diffMeta', pre: '    ', text: sliceVisible(trimmed, Math.max(1, cols - 4)) });
           continue;
         }
-        inDiff = false;
+        st.inDiff = false;
       }
 
       const prevKind = lastContentKind();
@@ -2110,7 +2199,24 @@ export class TerminalUI {
       pushMarkdown(rawLine.trimEnd(), '', undefined, 'normal');
     }
 
-    return rows.map(row => (rich ? this.styleRow(row, cols) : plainRow(row, cols)));
+    const cachedRowCount = reuse ? cache!.rows.length : 0;
+    const styled = baseStyled.slice(0, cachedRowCount);
+    for (let i = cachedRowCount; i < rows.length; i++) {
+      styled.push(rich ? this.styleRow(rows[i], cols) : plainRow(rows[i], cols));
+    }
+    // Remember everything before the checkpoint line for the next frame.
+    let consumed = 0;
+    for (let i = 0; i < checkpoint; i++) consumed += rawLines[i].length + 1;
+    this.bodyCache = {
+      cols,
+      rich,
+      showReasoning,
+      source: transcript.slice(0, baseSource.length + consumed),
+      state: checkpointState,
+      rows: rows.slice(0, checkpointRows),
+      styled: styled.slice(0, checkpointRows),
+    };
+    return styled;
   }
 
   /** Paints one typed transcript row. Every branch preserves the row's visible width. */
@@ -2541,17 +2647,18 @@ export class TerminalUI {
    */
   private sliceInputWindow(availCols: number): { visibleBeforeCursor: string; shownInput: string } {
     const maxBeforeCols = Math.max(0, availCols - 1);
+    const chars = this.masked ? this.input.map(() => '•') : this.input;
     let startIdx = this.cursor;
     let usedBefore = 0;
     while (startIdx > 0) {
-      const ch = this.input[startIdx - 1];
+      const ch = chars[startIdx - 1];
       const w = width(ch);
       if (usedBefore + w > maxBeforeCols) break;
       usedBefore += w;
       startIdx--;
     }
-    const visibleBeforeCursor = this.input.slice(startIdx, this.cursor).join('');
-    const afterCursor = this.input.slice(this.cursor, this.cursor + availCols + 4).join('');
+    const visibleBeforeCursor = chars.slice(startIdx, this.cursor).join('');
+    const afterCursor = chars.slice(this.cursor, this.cursor + availCols + 4).join('');
     const shownInput = wrapTerminal(visibleBeforeCursor + afterCursor, availCols)[0];
     return { visibleBeforeCursor, shownInput };
   }

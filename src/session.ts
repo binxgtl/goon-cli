@@ -1,4 +1,4 @@
-import { open, mkdir, readFile, readdir, unlink, realpath } from 'node:fs/promises';
+import { open, mkdir, readFile, readdir, unlink, realpath, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { modelMessageSchema, type ModelMessage, type ToolResultPart } from 'ai';
@@ -11,6 +11,8 @@ export const fileBackupSchema = z.object({
   content: z.string().optional(),
   mode: z.number().int().optional(),
   afterHash: z.string().optional(),
+  /** Content dropped to keep the session file bounded (see pruneCheckpointBackups). */
+  pruned: z.boolean().optional(),
 });
 export type FileBackup = z.infer<typeof fileBackupSchema>;
 
@@ -219,11 +221,11 @@ export type SessionSummary = Pick<Session, 'id' | 'cwd' | 'updatedAt' | 'model' 
 
 function firstUserPreview(messages: ModelMessage[]): string | undefined {
   for (const m of messages) {
-    if (m.role !== 'user') continue;
+    if (!m || typeof m !== 'object' || m.role !== 'user') continue;
     const raw = typeof m.content === 'string'
       ? m.content
       : Array.isArray(m.content)
-        ? m.content.map(p => ('text' in p && typeof p.text === 'string' ? p.text : '')).join(' ')
+        ? m.content.map(p => (p && typeof p === 'object' && 'text' in p && typeof p.text === 'string' ? p.text : '')).join(' ')
         : '';
     const cleaned = raw.startsWith('<codex_internal_context source="goal">')
       ? ''
@@ -233,6 +235,53 @@ function firstUserPreview(messages: ModelMessage[]): string | undefined {
     if (cleaned) return cleaned.slice(0, 72);
   }
   return undefined;
+}
+
+/**
+ * Sessions written before images were stored as base64 contain a Buffer serialized by JSON
+ * (`{"type":"Buffer","data":[…]}`) or a Uint8Array serialized as `{"0":…,"1":…}`. Neither passes
+ * the message schema, which made such sessions disappear from listings and impossible to resume.
+ * This converts those payloads back to base64 in place before validation.
+ */
+export function repairBinaryPayloads(raw: unknown): boolean {
+  if (!raw || typeof raw !== 'object') return false;
+  const messages = (raw as { messages?: unknown }).messages;
+  if (!Array.isArray(messages)) return false;
+  let changed = false;
+  const toBase64 = (value: unknown): string | undefined => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+    const record = value as Record<string, unknown>;
+    if (record.type === 'Buffer' && Array.isArray(record.data)) {
+      return Buffer.from(record.data as number[]).toString('base64');
+    }
+    const keys = Object.keys(record);
+    if (keys.length > 0 && keys.every((k, i) => k === String(i)) && keys.every(k => typeof record[k] === 'number')) {
+      return Buffer.from(keys.map(k => record[k] as number)).toString('base64');
+    }
+    return undefined;
+  };
+  for (const message of messages) {
+    const content = (message as { content?: unknown })?.content;
+    if (!Array.isArray(content)) continue;
+    for (const part of content as Array<Record<string, unknown>>) {
+      if (!part || typeof part !== 'object') continue;
+      const key = part.type === 'image' ? 'image' : part.type === 'file' ? 'data' : undefined;
+      if (!key) continue;
+      const repaired = toBase64(part[key]);
+      if (repaired !== undefined) {
+        part[key] = repaired;
+        changed = true;
+      }
+    }
+  }
+  return changed;
+}
+
+/** Parses and validates a stored session, repairing legacy binary payloads first. */
+export function parseSession(text: string): Session {
+  const raw = JSON.parse(text) as unknown;
+  repairBinaryPayloads(raw);
+  return sessionSchema.parse(raw);
 }
 
 export function repairInterrupted(messages: ModelMessage[]): boolean {
@@ -325,7 +374,7 @@ export class SessionStore {
       // Copy an explicit allowlist, never the caller's runtime configuration:
       // structural typing permits extra fields such as credentials at runtime.
       const route = { cwd: input.cwd, provider: input.provider, model: input.model, baseUrl: input.baseUrl };
-      const session: Session = resume ? sessionSchema.parse(JSON.parse(await readFile(join(root, `${id}.json`), 'utf8'))) : {
+      const session: Session = resume ? parseSession(await readFile(join(root, `${id}.json`), 'utf8')) : {
         version: 1, id, ...route, createdAt: now, updatedAt: now, messages: [], tokens: 0, compactions: 0,
       };
       if (session.id !== id || !sameWorkspace(await realpath(session.cwd), input.cwd)) throw new Error('Session belongs to a different workspace.');
@@ -337,46 +386,83 @@ export class SessionStore {
       return store;
     } catch (error) { await unlink(lock); throw error; }
   }
+  /**
+   * Lists session summaries. Summaries are cached in `.index.json` keyed by file size and mtime,
+   * so only new or changed sessions are read; a listing no longer re-parses every message of
+   * every saved session (hundreds of MB for long-time users).
+   */
   static async list(root: string): Promise<SessionSummary[]> {
     let names: string[];
     try { names = await readdir(root); } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []; throw error; }
-    const results: SessionSummary[] = [];
-    for (const name of names.filter(n => /^[0-9a-f-]{36}\.json$/.test(n))) {
-      try {
-        const s = sessionSchema.parse(JSON.parse(await readFile(join(root, name), 'utf8')));
-        const preview = firstUserPreview(s.messages);
-        results.push({
-          id: s.id,
-          cwd: s.cwd,
-          updatedAt: s.updatedAt,
-          model: s.model,
-          messagesCount: s.messages.length,
-          ...(s.title ? { title: s.title } : {}),
-          ...(preview ? { preview } : {}),
-        });
-      } catch { /* Invalid/incomplete entries never become resumable sessions. */ }
+    const indexPath = join(root, SESSION_INDEX_FILE);
+    let index: SessionIndex = { version: SESSION_INDEX_VERSION, entries: {} };
+    try {
+      const parsed = JSON.parse(await readFile(indexPath, 'utf8')) as SessionIndex;
+      if (parsed?.version === SESSION_INDEX_VERSION && parsed.entries && typeof parsed.entries === 'object') index = parsed;
+    } catch { /* missing or corrupt cache: rebuild */ }
+    const nextEntries: SessionIndex['entries'] = {};
+    let dirty = false;
+    const sessionNames = names.filter(n => /^[0-9a-f-]{36}\.json$/.test(n));
+    const summaries = await mapLimit(sessionNames, 8, async name => {
+      const file = join(root, name);
+      let info;
+      try { info = await stat(file); } catch { return undefined; }
+      const cached = index.entries[name];
+      // Files modified in the last few seconds are always re-read: coarse filesystem timestamps
+      // (FAT/exFAT storage, some network mounts) could otherwise hide a same-size rewrite.
+      const settled = Date.now() - info.mtimeMs > 3_000;
+      if (cached && settled && cached.size === info.size && cached.mtimeMs === info.mtimeMs) {
+        nextEntries[name] = cached;
+        return cached.summary ?? undefined;
+      }
+      dirty = true;
+      const summary = await summarizeSessionFile(file);
+      nextEntries[name] = { size: info.size, mtimeMs: info.mtimeMs, summary: summary ?? null };
+      return summary;
+    });
+    if (dirty || Object.keys(index.entries).length !== Object.keys(nextEntries).length) {
+      await atomicJson(indexPath, { version: SESSION_INDEX_VERSION, entries: nextEntries }, { compact: true }).catch(() => {});
     }
-    return results.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    return summaries.filter((s): s is SessionSummary => !!s).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   }
   static async deleteSession(root: string, idOrPrefix: string): Promise<string | undefined> {
     const trimmed = idOrPrefix.trim().toLowerCase();
     if (!trimmed) return undefined;
     const list = await SessionStore.list(root);
-    const match = list.find(s => s.id.toLowerCase() === trimmed || s.id.toLowerCase().startsWith(trimmed));
-    if (!match) return undefined;
+    const exact = list.find(s => s.id.toLowerCase() === trimmed);
+    const matches = exact ? [exact] : list.filter(s => s.id.toLowerCase().startsWith(trimmed));
+    if (!matches.length) return undefined;
+    // Deleting is irreversible: an ambiguous prefix must never pick a session at random.
+    if (matches.length > 1) {
+      throw new Error(`Session prefix "${idOrPrefix.trim()}" is ambiguous (${matches.length} matches: ${matches.slice(0, 4).map(m => m.id.slice(0, 8)).join(', ')}${matches.length > 4 ? ', ...' : ''}). Use more characters.`);
+    }
+    const match = matches[0];
+    const lock = join(root, `${match.id}.lock`);
+    // A live owner keeps writing this session; removing its lock would let two processes share it.
+    try {
+      const pid = Number(await readFile(lock, 'utf8'));
+      if (Number.isSafeInteger(pid) && pid > 0) {
+        let alive = true;
+        try { process.kill(pid, 0); } catch (e) { alive = (e as NodeJS.ErrnoException).code !== 'ESRCH'; }
+        if (alive) throw new Error(`Session ${match.id.slice(0, 8)} is open in another goon process (pid ${pid}).`);
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
     try {
       await unlink(join(root, `${match.id}.json`));
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     }
     try {
-      await unlink(join(root, `${match.id}.lock`));
+      await unlink(lock);
     } catch {
       // ignore
     }
     return match.id;
   }
   async forkToNewFile(title?: string): Promise<string> {
+    pruneCheckpointBackups(this.session);
     const forkedId = randomUUID();
     const now = new Date().toISOString();
     const forked: Session = {
@@ -386,12 +472,32 @@ export class SessionStore {
       updatedAt: now,
       ...(title ? { title } : this.session.title ? { title: `${this.session.title} (fork)` } : {}),
     };
-    await atomicJson(join(this.root, `${forkedId}.json`), forked);
+    await atomicJson(join(this.root, `${forkedId}.json`), forked, { compact: true });
     return forkedId;
   }
-  async save() {
+  /**
+   * Saves are serialized: overlapping callers (tool batches, goal updates, UI commands) share one
+   * in-flight write and at most one queued follow-up, so the latest state always lands last and a
+   * burst of saves never rewrites a multi-MB file once per caller.
+   */
+  async save(): Promise<void> {
+    if (this.saving) {
+      this.saveQueued ??= this.saving.catch(() => {}).then(() => {
+        this.saveQueued = undefined;
+        return this.writeNow();
+      });
+      return this.saveQueued;
+    }
+    return this.writeNow();
+  }
+  private saving?: Promise<void>;
+  private saveQueued?: Promise<void>;
+  private async writeNow(): Promise<void> {
     this.session.updatedAt = new Date().toISOString();
-    await atomicJson(join(this.root, `${this.session.id}.json`), this.session);
+    pruneCheckpointBackups(this.session);
+    const write = atomicJson(join(this.root, `${this.session.id}.json`), this.session, { compact: true });
+    this.saving = write;
+    try { await write; } finally { if (this.saving === write) this.saving = undefined; }
   }
   async discardIfEmpty() {
     if (this.session.messages.length === 0 && !this.session.title) {
@@ -407,4 +513,80 @@ export class SessionStore {
   }
 }
 
+const SESSION_INDEX_FILE = '.index.json';
+const SESSION_INDEX_VERSION = 1;
+interface SessionIndex {
+  version: number;
+  entries: Record<string, { size: number; mtimeMs: number; summary: SessionSummary | null }>;
+}
 
+const summaryHeaderSchema = z.object({
+  version: z.literal(1), id: z.string().uuid(), cwd: z.string(), title: z.string().optional(),
+  updatedAt: z.string().datetime(), model: z.string(), messages: z.array(z.unknown()),
+});
+
+/**
+ * Builds a listing summary without validating every message: only the fields a listing shows are
+ * checked. A session that cannot be resumed still fails loudly in `SessionStore.open`.
+ */
+async function summarizeSessionFile(file: string): Promise<SessionSummary | undefined> {
+  try {
+    const parsed = summaryHeaderSchema.safeParse(JSON.parse(await readFile(file, 'utf8')));
+    if (!parsed.success) return undefined;
+    const s = parsed.data;
+    const preview = firstUserPreview(s.messages as ModelMessage[]);
+    return {
+      id: s.id,
+      cwd: s.cwd,
+      updatedAt: s.updatedAt,
+      model: s.model,
+      messagesCount: s.messages.length,
+      ...(s.title ? { title: s.title } : {}),
+      ...(preview ? { preview } : {}),
+    };
+  } catch {
+    return undefined; // Invalid/incomplete entries never become resumable sessions.
+  }
+}
+
+async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const results: R[] = Array.from({ length: items.length });
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const index = next++;
+      results[index] = await fn(items[index]);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+
+/** Total bytes of file content kept for /undo across all checkpoints of one session. */
+export const MAX_CHECKPOINT_BACKUP_BYTES = 32 * 1024 * 1024;
+
+/**
+ * Every turn stores the pre-edit content of each file it changed, and every save rewrites the
+ * session file. Without a bound a long session grows by megabytes per turn. Beyond the budget the
+ * oldest checkpoints lose their file contents (newest turns stay fully revertible); a pruned
+ * backup is marked so /revert reports it instead of silently skipping it.
+ */
+export function pruneCheckpointBackups(session: Session, maxBytes = MAX_CHECKPOINT_BACKUP_BYTES): number {
+  const checkpoints = session.checkpoints;
+  if (!checkpoints?.length) return 0;
+  let total = 0;
+  for (const cp of checkpoints) for (const f of cp.files) total += f.content?.length ?? 0;
+  if (total <= maxBytes) return 0;
+  let pruned = 0;
+  for (const cp of checkpoints) {
+    if (total <= maxBytes) break;
+    for (const f of cp.files) {
+      if (f.content === undefined) continue;
+      total -= f.content.length;
+      delete f.content;
+      f.pruned = true;
+      pruned++;
+    }
+  }
+  return pruned;
+}

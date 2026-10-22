@@ -1,4 +1,6 @@
 import { realpath, stat, readFile, readdir, mkdir, open, rename, unlink } from 'node:fs/promises';
+import { realpathSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { dirname, resolve, relative, isAbsolute, join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import type { FileBackup } from './session.js';
@@ -38,6 +40,23 @@ export async function unlinkSafe(absPath: string): Promise<void> {
   } catch (err) {
     if ((err as { code?: string })?.code !== 'ENOENT') throw err;
   }
+}
+
+/**
+ * Replaces the first literal occurrence of `search`. Unlike `String.prototype.replace`, the
+ * replacement is inserted verbatim: `$&`, `$'`, `` $` `` and `$$` are NOT expanded, so edits to
+ * shell scripts, regexes, PHP or jQuery code are never corrupted.
+ */
+export function replaceFirstLiteral(text: string, search: string, replacement: string): string {
+  const index = text.indexOf(search);
+  if (index < 0) return text;
+  return text.slice(0, index) + replacement + text.slice(index + search.length);
+}
+
+/** True when `candidate` (an absolute, already-resolved path) lies inside `root`. */
+export function isWithinRoot(root: string, candidate: string): boolean {
+  const rel = relative(root, candidate);
+  return !(rel === '..' || rel.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`) || isAbsolute(rel));
 }
 
 export const limitText = (text: string, limit = 32_000): string => {
@@ -139,7 +158,7 @@ export interface PatchHunk {
 export type PatchOperation =
   | { kind: 'add'; path: string; content: string }
   | { kind: 'delete'; path: string }
-  | { kind: 'update'; path: string; hunks: PatchHunk[] };
+  | { kind: 'update'; path: string; hunks: PatchHunk[]; moveTo?: string };
 
 export function parsePatchText(rawPatch: string): PatchOperation[] {
   const lines = rawPatch.replace(/\r\n/g, '\n').split('\n');
@@ -160,10 +179,15 @@ export function parsePatchText(rawPatch: string): PatchOperation[] {
       i++;
       const added: string[] = [];
       while (i < lines.length && !lines[i].startsWith('*** ')) {
-        added.push(lines[i].startsWith('+') ? lines[i].slice(1) : lines[i]);
+        added.push(lines[i]);
         i++;
       }
-      ops.push({ kind: 'add', path, content: added.join('\n') });
+      // Bare blank lines between the last "+" line and the next header are patch formatting,
+      // not file content. Every "+" line is a complete line (Codex apply_patch semantics), so a
+      // non-empty added file always ends with a newline.
+      while (added.length && added[added.length - 1] === '') added.pop();
+      const content = added.map(l => `${l.startsWith('+') ? l.slice(1) : l}\n`).join('');
+      ops.push({ kind: 'add', path, content });
       continue;
     }
     if (line.startsWith('*** Delete File: ')) {
@@ -175,7 +199,11 @@ export function parsePatchText(rawPatch: string): PatchOperation[] {
     if (line.startsWith('*** Update File: ')) {
       const path = line.slice('*** Update File: '.length).trim();
       i++;
-      if (i < lines.length && lines[i].startsWith('*** Move to: ')) i++;
+      let moveTo: string | undefined;
+      if (i < lines.length && lines[i].startsWith('*** Move to: ')) {
+        moveTo = lines[i].slice('*** Move to: '.length).trim() || undefined;
+        i++;
+      }
       const hunks: PatchHunk[] = [];
       let oldLines: string[] = [];
       let newLines: string[] = [];
@@ -215,7 +243,7 @@ export function parsePatchText(rawPatch: string): PatchOperation[] {
         i++;
       }
       flushHunk();
-      ops.push({ kind: 'update', path, hunks });
+      ops.push({ kind: 'update', path, hunks, ...(moveTo && moveTo !== path ? { moveTo } : {}) });
       continue;
     }
     throw new Error(`Invalid patch header line: ${line}`);
@@ -264,7 +292,14 @@ export function applyHunksToContent(current: string, hunks: PatchHunk[], path: s
 export class WorkspaceFiles {
   private revisions = new Map<string, string>();
   private activeBackups = new Map<string, FileBackup>();
-  constructor(readonly root: string) {}
+  /** Canonical (symlink-free) workspace root, so containment checks agree with realpath results. */
+  readonly root: string;
+  constructor(root: string) {
+    const absolute = resolve(root);
+    let canonical = absolute;
+    try { canonical = realpathSync(absolute); } catch { /* not created yet: keep the lexical path */ }
+    this.root = canonical;
+  }
   beginTurn() {
     this.activeBackups.clear();
   }
@@ -317,8 +352,7 @@ export class WorkspaceFiles {
     }
   }
   private assertWithin(file: string) {
-    const rel = relative(this.root, file);
-    if (rel === '..' || rel.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`) || isAbsolute(rel)) {
+    if (!isWithinRoot(this.root, file)) {
       throw new Error('File path escapes the workspace.');
     }
   }
@@ -351,6 +385,9 @@ export class WorkspaceFiles {
   private async writeRaw(file: string, content: string, mode: number, existing: boolean) {
     this.assertNotWindowsReserved(file);
     await mkdir(dirname(file), { recursive: true });
+    // Re-check containment after creating parents: a directory swapped for a symlink between the
+    // path check and this write must never redirect the write outside the workspace.
+    this.assertWithin(await realpath(dirname(file)));
     const temporary = join(dirname(file), `.goon-${randomUUID()}.tmp`);
     const handle = await open(temporary, 'wx', mode);
     try {
@@ -412,71 +449,127 @@ export class WorkspaceFiles {
       if (trimmed.count > 1) count = trimmed.count;
     }
     if (!count || (!replaceAll && count !== 1)) throw new Error(`Expected one exact match; found ${count}. Use replaceAll explicitly for multiple matches.`);
-    return this.write(path, replaceAll ? current.split(targetOld).join(targetNew) : current.replace(targetOld, targetNew));
+    return this.write(path, replaceAll ? current.split(targetOld).join(targetNew) : replaceFirstLiteral(current, targetOld, targetNew));
   }
+  /**
+   * Plans every operation against a virtual view of the files it touches (so a later operation sees
+   * the result of an earlier one, e.g. two Update blocks for one file, or Update + Move to), validates
+   * the whole patch, and only then writes. A patch that fails validation changes nothing.
+   */
   async applyPatch(patchText: string): Promise<string> {
     const ops = parsePatchText(patchText);
-    const planned: Array<{
-      op: PatchOperation;
+    interface Slot {
       file: string;
       relPath: string;
-      existing: boolean;
-      beforeContent?: string;
+      existed: boolean;
+      before?: string;
       mode: number;
-      afterContent?: string;
-    }> = [];
-
-    for (const op of ops) {
-      const file = await this.path(op.path);
-      const relPath = relative(this.root, file);
-      if (op.kind === 'add') {
-        this.assertNotWindowsReserved(file);
-        let existing = false;
-        let beforeContent: string | undefined;
-        let mode = 0o644;
+      /** undefined = untouched, null = deleted by this patch, string = new content. */
+      after?: string | null;
+    }
+    const slots = new Map<string, Slot>();
+    const order: Slot[] = [];
+    const slotFor = async (requested: string, forWrite: boolean): Promise<Slot> => {
+      const file = await this.path(requested);
+      if (forWrite) this.assertNotWindowsReserved(file);
+      let slot = slots.get(file);
+      if (!slot) {
+        slot = { file, relPath: relative(this.root, file), existed: false, mode: 0o644 };
         try {
-          beforeContent = await this.text(file);
-          mode = (await stat(file)).mode & 0o777;
-          existing = true;
+          slot.before = await this.text(file);
+          slot.mode = (await stat(this.statTarget(file))).mode & 0o777;
+          slot.existed = true;
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
         }
-        planned.push({ op, file, relPath, existing, beforeContent, mode, afterContent: op.content });
+        slots.set(file, slot);
+        order.push(slot);
+      }
+      return slot;
+    };
+    const currentOf = (slot: Slot): string | undefined =>
+      slot.after === undefined ? slot.before : slot.after ?? undefined;
+
+    const summary: string[] = [];
+    for (const op of ops) {
+      if (op.kind === 'add') {
+        const slot = await slotFor(op.path, true);
+        summary.push(`${currentOf(slot) === undefined ? 'Added' : 'Updated'} ${op.path}`);
+        slot.after = op.content;
       } else if (op.kind === 'delete') {
-        const target = process.platform === 'win32' && WINDOWS_RESERVED_DEVICE_RE.test(op.path.split(/[\\/]/).pop() ?? '')
-          ? toWinExtendedPath(file)
-          : file;
-        const beforeContent = await this.text(file);
-        const mode = (await stat(target)).mode & 0o777;
-        planned.push({ op, file, relPath, existing: true, beforeContent, mode });
+        const slot = await slotFor(op.path, false);
+        if (currentOf(slot) === undefined) throw new Error(`Cannot delete ${op.path}: file does not exist.`);
+        slot.after = null;
+        summary.push(`Deleted ${op.path}`);
       } else {
-        this.assertNotWindowsReserved(file);
-        const beforeContent = await this.text(file);
-        const mode = (await stat(file)).mode & 0o777;
-        const afterContent = applyHunksToContent(beforeContent, op.hunks, op.path);
-        planned.push({ op, file, relPath, existing: true, beforeContent, mode, afterContent });
+        const slot = await slotFor(op.path, true);
+        const current = currentOf(slot);
+        if (current === undefined) throw new Error(`Cannot update ${op.path}: file does not exist.`);
+        const next = applyHunksToContent(current, op.hunks, op.path);
+        if (op.moveTo) {
+          const destination = await slotFor(op.moveTo, true);
+          if (destination !== slot) {
+            if (currentOf(destination) !== undefined) throw new Error(`Cannot move ${op.path} to ${op.moveTo}: destination exists.`);
+            destination.mode = slot.mode;
+            destination.after = next;
+            slot.after = null;
+            summary.push(`Moved ${op.path} -> ${op.moveTo}`);
+            continue;
+          }
+        }
+        slot.after = next;
+        summary.push(`Updated ${op.path}`);
       }
     }
 
-    const summary: string[] = [];
-    for (const item of planned) {
-      this.recordBackup(item.relPath, item.existing, item.beforeContent, item.existing ? item.mode : undefined, item.afterContent);
-      if (item.op.kind === 'delete') {
-        await unlinkSafe(item.file);
-        this.revisions.delete(item.file);
-        summary.push(`Deleted ${item.op.path}`);
+    for (const slot of order) {
+      if (slot.after === undefined) continue;
+      if (slot.after === null && !slot.existed) continue; // created and removed within this patch
+      this.recordBackup(slot.relPath, slot.existed, slot.before, slot.existed ? slot.mode : undefined, slot.after ?? undefined);
+      if (slot.after === null) {
+        await unlinkSafe(slot.file);
+        this.revisions.delete(slot.file);
       } else {
-        await this.writeRaw(item.file, item.afterContent!, item.mode, item.existing);
-        summary.push(`${item.op.kind === 'add' && !item.existing ? 'Added' : 'Updated'} ${item.op.path}`);
+        await this.writeRaw(slot.file, slot.after, slot.mode, slot.existed);
       }
     }
     return summary.join('\n');
   }
-  async restoreBackups(backups: FileBackup[]): Promise<{ restored: string[]; deleted: string[] }> {
+  private statTarget(file: string): string {
+    return process.platform === 'win32' && WINDOWS_RESERVED_DEVICE_RE.test(file.split(/[\\/]/).pop() ?? '')
+      ? toWinExtendedPath(file)
+      : file;
+  }
+  /**
+   * Restores turn backups. A file whose current content no longer matches what the agent left
+   * behind (`afterHash`) was edited afterwards, by the user or another tool; it is reported as a
+   * conflict and left untouched unless `force` is set, so a rewind never destroys newer work.
+   */
+  async restoreBackups(
+    backups: FileBackup[],
+    options: { force?: boolean } = {},
+  ): Promise<{ restored: string[]; deleted: string[]; conflicts: string[]; pruned: string[] }> {
     const restored: string[] = [];
     const deleted: string[] = [];
+    const conflicts: string[] = [];
+    const pruned: string[] = [];
     for (const b of backups) {
       const file = await this.path(b.path);
+      if (!options.force) {
+        let current: string | undefined;
+        let readable = true;
+        try { current = await this.text(file); }
+        catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') readable = false;
+        }
+        // Without an afterHash (deletions, legacy backups) there is nothing to compare against.
+        const conflict = b.afterHash !== undefined
+          && (!readable || (current !== undefined && this.digest(current) !== b.afterHash));
+        if (conflict) {
+          conflicts.push(b.path);
+          continue;
+        }
+      }
       if (!b.existed) {
         await unlinkSafe(file).catch(() => {});
         this.revisions.delete(file);
@@ -484,9 +577,11 @@ export class WorkspaceFiles {
       } else if (b.content !== undefined) {
         await this.writeRaw(file, b.content, b.mode ?? 0o644, true);
         restored.push(b.path);
+      } else if (b.pruned) {
+        pruned.push(b.path);
       }
     }
-    return { restored, deleted };
+    return { restored, deleted, conflicts, pruned };
   }
   async listWorkspaceFiles(maxFiles = 500): Promise<string[]> {
     const files: string[] = [];
@@ -505,18 +600,18 @@ export class WorkspaceFiles {
     }
     return files.sort();
   }
-  async readImage(userPath: string, maxBytes = 5 * 1024 * 1024): Promise<{ buffer: Buffer; mediaType: string; resolvedPath: string }> {
+  /** Resolves an image path the way `readImage` does and reports whether it lies inside the workspace. */
+  async locateImage(userPath: string): Promise<{ resolvedPath: string; inside: boolean }> {
+    const { file } = await this.resolveImagePath(userPath, true);
+    return { resolvedPath: file, inside: isWithinRoot(this.root, file) };
+  }
+  private async resolveImagePath(userPath: string, allowOutside: boolean): Promise<{ file: string; mediaType: string }> {
     let cleaned = userPath.trim();
     if ((cleaned.startsWith('"') && cleaned.endsWith('"')) || (cleaned.startsWith("'") && cleaned.endsWith("'"))) {
       cleaned = cleaned.slice(1, -1).trim();
     }
     if (cleaned.startsWith('file://')) {
-      try {
-        const { fileURLToPath } = await import('node:url');
-        cleaned = fileURLToPath(cleaned);
-      } catch {
-        // Keep cleaned if URL conversion fails
-      }
+      try { cleaned = fileURLToPath(cleaned); } catch { /* keep the raw value */ }
     }
     const ext = cleaned.toLowerCase().match(/\.(png|jpe?g|webp|gif)$/)?.[1];
     if (!ext) throw new Error('Unsupported image extension.');
@@ -525,17 +620,31 @@ export class WorkspaceFiles {
       : ext === 'webp' ? 'image/webp'
       : ext === 'gif' ? 'image/gif'
       : 'image/jpeg';
-    let file: string;
     const isAbsWinOrPosix = isAbsolute(cleaned) || /^[A-Za-z]:[\\/]/.test(cleaned) || cleaned.startsWith('\\\\');
+    let file: string;
     if (isAbsWinOrPosix) {
       file = await realpath(resolve(cleaned));
+      if (!allowOutside) this.assertWithin(file);
+    } else if (!allowOutside) {
+      file = await this.path(cleaned);
     } else {
-      try {
-        file = await this.path(cleaned);
-      } catch {
-        file = await realpath(resolve(this.root, cleaned));
-      }
+      try { file = await this.path(cleaned); }
+      catch { file = await realpath(resolve(this.root, cleaned)); }
     }
+    // The extension check above applies to the requested name; a symlink must also point at an image.
+    if (!/\.(png|jpe?g|webp|gif)$/i.test(file)) throw new Error('Unsupported image extension.');
+    return { file, mediaType };
+  }
+  /**
+   * Reads an image. User-typed attachments may come from anywhere on disk; model-initiated reads
+   * (`allowOutside: false`) are confined to the workspace like every other file tool.
+   */
+  async readImage(
+    userPath: string,
+    maxBytes = 5 * 1024 * 1024,
+    options: { allowOutside?: boolean } = {},
+  ): Promise<{ buffer: Buffer; mediaType: string; resolvedPath: string }> {
+    const { file, mediaType } = await this.resolveImagePath(userPath, options.allowOutside ?? true);
     const info = await stat(file);
     if (!info.isFile() || info.size > maxBytes) {
       throw new Error('Expected a regular image file no larger than 5 MiB.');
@@ -554,17 +663,34 @@ export class WorkspaceFiles {
       if (normalizedTool === 'apply_patch' && typeof raw.patch === 'string') {
         const ops = parsePatchText(raw.patch);
         const diffs: string[] = [];
+        // Mirror applyPatch: later operations see the content produced by earlier ones.
+        const virtual = new Map<string, string>();
+        const contentOf = async (path: string) => {
+          const file = await this.path(path);
+          if (virtual.has(file)) return { file, text: virtual.get(file)! };
+          let text = '';
+          try { text = await this.text(file); } catch { text = ''; }
+          return { file, text };
+        };
         for (const op of ops) {
-          const file = await this.path(op.path);
-          let before = '';
-          try { before = await this.text(file); } catch { before = ''; }
+          const { file, text: before } = await contentOf(op.path);
           if (op.kind === 'add') {
             diffs.push(computeUnifiedDiff(op.path, before, op.content));
+            virtual.set(file, op.content);
           } else if (op.kind === 'delete') {
             diffs.push(computeUnifiedDiff(op.path, before, ''));
+            virtual.set(file, '');
           } else {
             const after = applyHunksToContent(before, op.hunks, op.path);
-            diffs.push(computeUnifiedDiff(op.path, before, after));
+            if (op.moveTo) {
+              const destination = await this.path(op.moveTo);
+              diffs.push(computeUnifiedDiff(`${op.path} -> ${op.moveTo}`, before, after));
+              virtual.set(file, '');
+              virtual.set(destination, after);
+            } else {
+              diffs.push(computeUnifiedDiff(op.path, before, after));
+              virtual.set(file, after);
+            }
           }
         }
         return diffs.join('\n');
@@ -585,7 +711,7 @@ export class WorkspaceFiles {
           targetNew = targetNew.replace(/\r?\n/g, '\r\n');
         }
         if (before.includes(targetOld)) {
-          const after = replaceAll ? before.split(targetOld).join(targetNew) : before.replace(targetOld, targetNew);
+          const after = replaceAll ? before.split(targetOld).join(targetNew) : replaceFirstLiteral(before, targetOld, targetNew);
           return computeUnifiedDiff(pathVal, before, after);
         }
         const trimmed = matchTrimmedLines(before, oldVal, newVal);

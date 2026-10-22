@@ -3,6 +3,21 @@ import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 
 export interface CommandResult { code: number; output: string; truncated: boolean }
+
+/**
+ * Environment variables that hold goon's own provider credentials. They are removed from every
+ * child process (bash tool, `!cmd`, ripgrep, git) so a command (or a prompt-injected model asking
+ * for `env` / `curl ...$GOON_API_KEY`) can never read or exfiltrate the key.
+ */
+const secretEnvNames = new Set<string>(['GOON_API_KEY']);
+export function protectSecretEnv(...names: Array<string | undefined>): void {
+  for (const name of names) if (name) secretEnvNames.add(name);
+}
+export function childEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const env = { ...base };
+  for (const name of secretEnvNames) delete env[name];
+  return env;
+}
 const OUTPUT_LIMIT = 64 * 1024;
 const HARD_OUTPUT_LIMIT = 4 * 1024 * 1024;
 
@@ -27,7 +42,7 @@ export async function runCommand(command: string, args: string[], options: {
   const resolvedCommand = resolveExecutable(command);
   return new Promise((resolve, reject) => {
     const child = spawn(resolvedCommand, args, {
-      cwd: options.cwd, env: process.env, stdio: ['ignore', 'pipe', 'pipe'],
+      cwd: options.cwd, env: childEnv(), stdio: ['ignore', 'pipe', 'pipe'],
       detached: process.platform !== 'win32', windowsHide: true,
     });
     let first = Buffer.alloc(0), tail = Buffer.alloc(0), bytes = 0;

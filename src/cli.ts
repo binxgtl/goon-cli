@@ -1,7 +1,7 @@
 import { parseArgs } from 'node:util';
 import { createInterface } from 'node:readline/promises';
 import { stdin, stdout, stderr } from 'node:process';
-import { existsSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, fstatSync, readFileSync, statSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import {
   DEFAULT_GATEWAY_URL,
@@ -18,55 +18,15 @@ import {
 } from './config.js';
 import { safeError } from './errors.js';
 import { VERSION } from './version.js';
+import { HELP } from './help.js';
 import type { HarnessEvent } from './harness.js';
 import type { SubagentEvent } from './subagents.js';
 import { InputCancelledError, padEndVisible, sliceVisible, terminalText as cleanTerminal, TerminalUI, visibleLength } from './tui.js';
 import type { McpManager } from './mcp.js';
 import { EFFORT_DESCRIPTIONS, parseEffortInput, runSetupWizard } from './setup.js';
 import { discoverModels, formatModelBadge, resolveModelCapabilities, type DiscoveredModel } from './provider.js';
+import { bashApprovalPrefix, isApprovedBashPrefix } from './approval.js';
 
-const HELP = `goon cli ${VERSION} — independent coding harness
-
-Usage: goon [options] [prompt]
-       goon resume [ID|latest|number]
-       goon setup
-       goon init --provider openai-compatible --base-url URL --model MODEL [--effort LEVEL]
-       goon doctor | sessions
-       goon mcp list | check [name] | get <name> | add <name> ... | remove <name> | import-codex [name...]
-
-Options:
-  -p, --prompt TEXT          Run one task (or pipe a prompt on stdin)
-  -C, --cwd DIRECTORY        Workspace (defaults to current directory)
-      --provider NAME        openai-compatible | openai-responses | anthropic
-      --base-url URL         Provider API root, usually ending in /v1
-      --model NAME           Exact model ID from your provider
-      --effort LEVEL         Reasoning effort: low | medium | high | xhigh | max
-      --key-env NAME         Credential variable (default GOON_API_KEY)
-      --resume ID|latest     Resume a saved session in this workspace
-      --yes                 Approve file changes and shell commands automatically
-      --read-only           Read tools and research agents; no writes or shell
-      --json                Emit NDJSON events instead of terminal output
-      --no-tui              Use plain readline instead of the full-screen UI
-      --no-mcp              Disable configured MCP servers for this run
-      --no-subagents        Disable delegation tools for this run
-      --inline-reasoning MODE leading-think (default) | off
-      --show-reasoning      Separate reasoning events / labeled stderr output
-      --context-window N    Actual model context window (default 128000)
-      --max-output-tokens N  Per-request output limit (default 16384)
-      --run-token-budget N   Run token budget (default 0 = unlimited)
-      --timeout-ms N        Model request deadline (default 300000)
-  -h, --help                Show help
-  -v, --version             Show version
-
-Interactive commands:
-  /help, /setup, /model, /effort, /mode, /auto, /view, /transcript, /copy, /btw,
-  /goal, /recap, /skills, /memories, /presets, /mention, /cd, /pwd, /mcp, /subagents,
-  /plan, /revert, /undo, /checkpoints, /todo, /compact, /diff, /review, /fork, /rename,
-  /delete, /export, /init, /status, /tools, /sessions, /debug-config, /warnings, /doctor, /clear, /exit, or !<cmd>.
-Shortcuts: Shift+Tab mode, Ctrl+T transcript, Ctrl+O copy, Alt+. / Alt+, effort, Tab autocomplete, Esc Esc rewind, Ctrl+C cancel.
-API keys are read from environment variables or ~/.config/goon/credentials.json.
-Shell commands run as your OS user; approvals are not an OS sandbox.
-`;
 
 type PermissionMode = 'ask' | 'plan' | 'auto' | 'readonly';
 
@@ -183,31 +143,109 @@ export function extractCopyableFromMessages(
   return { text: assistantOutputs[assistantOutputs.length - 1], label: 'last response' };
 }
 
+/** Clipboard helpers in preference order for the current platform (Termux, Wayland, X11, macOS, Windows). */
+export function clipboardCandidates(platform = process.platform, env: NodeJS.ProcessEnv = process.env): Array<{ bin: string; args: string[] }> {
+  if (platform === 'win32') {
+    return [{ bin: 'powershell.exe', args: ['-NoProfile', '-NonInteractive', '-Command', '[Console]::InputEncoding = [System.Text.Encoding]::UTF8; Set-Clipboard -Value ([Console]::In.ReadToEnd())'] }];
+  }
+  if (platform === 'darwin') return [{ bin: 'pbcopy', args: [] }];
+  const candidates: Array<{ bin: string; args: string[] }> = [];
+  if (env.TERMUX_VERSION || env.PREFIX?.includes('com.termux')) candidates.push({ bin: 'termux-clipboard-set', args: [] });
+  if (env.WAYLAND_DISPLAY) candidates.push({ bin: 'wl-copy', args: [] });
+  candidates.push({ bin: 'xclip', args: ['-selection', 'clipboard'] }, { bin: 'xsel', args: ['--clipboard', '--input'] });
+  return candidates;
+}
+
 async function copyTextToClipboard(text: string): Promise<boolean> {
   let copied = false;
   if (stdout.isTTY && text.length <= 100_000) {
+    // OSC 52 works over SSH and in most modern terminals, even without a clipboard helper.
     const b64 = Buffer.from(text, 'utf8').toString('base64');
     stdout.write(`\x1b]52;c;${b64}\x07`);
     copied = true;
   }
-  try {
-    const { spawn } = await import('node:child_process');
-    const cmd =
-      process.platform === 'win32'
-        ? { bin: 'powershell.exe', args: ['-NoProfile', '-NonInteractive', '-Command', '[Console]::InputEncoding = [System.Text.Encoding]::UTF8; Set-Clipboard -Value ([Console]::In.ReadToEnd())'] }
-        : process.platform === 'darwin'
-          ? { bin: 'pbcopy', args: [] }
-          : { bin: 'xclip', args: ['-selection', 'clipboard'] };
-    await new Promise<void>((resolve, reject) => {
-      const child = spawn(cmd.bin, cmd.args, { stdio: ['pipe', 'ignore', 'ignore'], windowsHide: true });
-      child.on('error', reject);
-      child.on('close', code => (code === 0 ? resolve() : reject(new Error(`exit ${code}`))));
-      child.stdin.end(text, 'utf8');
-    });
-    return true;
-  } catch {
-    return copied;
+  const { spawn } = await import('node:child_process');
+  const { childEnv } = await import('./process.js');
+  for (const cmd of clipboardCandidates()) {
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const child = spawn(cmd.bin, cmd.args, { stdio: ['pipe', 'ignore', 'ignore'], windowsHide: true, env: childEnv() });
+        const timer = setTimeout(() => { child.kill(); reject(new Error('clipboard helper timed out')); }, 3000);
+        child.on('error', error => { clearTimeout(timer); reject(error); });
+        child.on('close', code => { clearTimeout(timer); if (code === 0) resolve(); else reject(new Error(`exit ${code}`)); });
+        child.stdin.on('error', () => {});
+        child.stdin.end(text, 'utf8');
+      });
+      return true;
+    } catch {
+      // try the next helper
+    }
   }
+  return copied;
+}
+
+/**
+ * Piped data is read only from a real pipe or file (`cmd | goon -p ...`, `goon -p ... < file`).
+ * Sockets and inherited descriptors that never close (IDE/agent spawns, CI runners) are ignored so
+ * `-p` can never hang waiting for an EOF that does not come.
+ */
+function pipedStdin(): boolean {
+  if (stdin.isTTY) return false;
+  try {
+    const info = fstatSync(0);
+    return info.isFIFO() || info.isFile();
+  } catch {
+    return false;
+  }
+}
+
+async function readStdinLimited(limit: number): Promise<string> {
+  let bytes = 0;
+  const chunks: Buffer[] = [];
+  for await (const chunk of stdin) {
+    const buffer = Buffer.from(chunk);
+    bytes += buffer.length;
+    if (bytes > limit) throw new Error(`Piped input exceeds ${Math.round(limit / 1024)} KiB.`);
+    chunks.push(buffer);
+  }
+  return Buffer.concat(chunks).toString('utf8');
+}
+
+/** Environment problems `goon doctor` reports in addition to its pass/fail checks. */
+async function doctorWarnings(config: Config, baseUrl: string, modelIds: string[]): Promise<string[]> {
+  const warnings: string[] = [];
+  const [major, minor] = process.versions.node.split('.').map(Number);
+  if (major < 22 || (major === 22 && minor < 16)) warnings.push(`Node ${process.version} is older than the supported 22.16.`);
+  const insecure = insecureBaseUrlWarning(baseUrl);
+  if (insecure) warnings.push(insecure);
+  if (config.model && modelIds.length > 0 && !modelIds.includes(config.model)) {
+    warnings.push(`Model "${config.model}" is not listed by ${baseUrl}/models.`);
+  }
+  if (process.platform !== 'win32') {
+    const { credentialsPath } = await import('./config.js');
+    try {
+      const mode = statSync(credentialsPath()).mode & 0o777;
+      if (mode & 0o077) warnings.push(`${credentialsPath()} is readable by other users (mode ${mode.toString(8)}); run: chmod 600 "${credentialsPath()}"`);
+    } catch {
+      // no stored credentials
+    }
+  }
+  return warnings;
+}
+
+/** API keys sent over plain HTTP are readable by anyone on the network path (except loopback). */
+export function insecureBaseUrlWarning(baseUrl: string | undefined): string | undefined {
+  if (!baseUrl) return undefined;
+  try {
+    const url = new URL(baseUrl);
+    const loopback = ['localhost', '127.0.0.1', '[::1]', '::1'].includes(url.hostname) || url.hostname.endsWith('.localhost');
+    if (url.protocol === 'http:' && !loopback) {
+      return `Warning: ${url.host} uses plain http; your API key is sent unencrypted. Use https:// unless this is a trusted local network.`;
+    }
+  } catch {
+    // invalid URLs are rejected by config validation
+  }
+  return undefined;
 }
 
 export async function main(argv = process.argv.slice(2)): Promise<void> {
@@ -289,6 +327,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       'inline-reasoning': { type: 'string' }, 'show-reasoning': { type: 'boolean' },
       'context-window': { type: 'string' }, 'max-output-tokens': { type: 'string' },
       'run-token-budget': { type: 'string' }, 'timeout-ms': { type: 'string' },
+      'output-last-message': { type: 'string', short: 'o' },
     } });
     jsonOutput = values.json === true;
     if (values.help) { stdout.write(HELP); return; }
@@ -374,11 +413,12 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       const discovered = await discoverModels(targetUrl, resolvedKey ?? '', config.provider);
       const modelIds = discovered.map((m) => m.id);
       const modelAvailable = config.model ? (modelIds.length === 0 || modelIds.includes(config.model)) : false;
+      const warnings = await doctorWarnings(config, targetUrl, modelIds);
       stdout.write(JSON.stringify({ version: VERSION, node: process.version, platform: process.platform, arch: process.arch,
         config: configPath(), provider: config.provider, model: config.model ?? null, effort: config.effort ?? 'default',
         baseUrl: config.baseUrl ?? 'provider default', credentialVariable: config.keyEnv, credentialPresent: Boolean(resolvedKey),
-        bash, ripgrep: rg, searchFallback: !rg, data: dataDir(), networkTested: true,
-        discoveredModels: modelIds, modelAvailable }, null, 2) + '\n');
+        bash, ripgrep: rg, searchFallback: !rg, data: dataDir(), networkTested: true, gatewayReachable: modelIds.length > 0,
+        discoveredModels: modelIds, modelAvailable, warnings }, null, 2) + '\n');
       if (!bash || !config.model || !resolvedKey) process.exitCode = 1;
       return;
     }
@@ -412,6 +452,11 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     }
     if (values.prompt && promptPositionals.length) throw new Error('Use either --prompt or positional prompt text.');
     let prompt = values.prompt ?? (promptPositionals.length ? promptPositionals.join(' ') : undefined);
+    if (prompt && pipedStdin()) {
+      // `git diff | goon -p "review"` / `goon -p "explain" < log`: attach piped data as context.
+      const piped = await readStdinLimited(1024 * 1024);
+      if (piped.trim()) prompt = `${prompt}\n\n<stdin>\n${piped.replace(/\s+$/, '')}\n</stdin>`;
+    }
     if (!prompt && !stdin.isTTY) {
       let bytes = 0; const chunks: Buffer[] = [];
       for await (const chunk of stdin) {
@@ -427,6 +472,8 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       config = await runSetupWizard(config);
     }
     const interactive = !prompt;
+    const outputLastMessage = typeof values['output-last-message'] === 'string' ? values['output-last-message'] : undefined;
+    if (outputLastMessage && interactive) throw new Error('--output-last-message requires a prompt (-p or piped input).');
     let viewMode: 'normal' | 'verbose' | 'transcript' =
       config.viewMode ?? (config.showReasoning ? 'verbose' : 'normal');
     if (interactive && !jsonOutput) {
@@ -434,6 +481,8 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     }
     let runtime = await resolveRuntime(config, values.cwd ?? process.cwd());
     apiKey = runtime.apiKey;
+    const insecureWarning = insecureBaseUrlWarning(runtime.baseUrl);
+    if (insecureWarning && !jsonOutput) stderr.write(`goon: ${insecureWarning}\n`);
     const sessionsRootDir = join(runtime.dataDir, 'sessions');
     if (launchResumePicker && !resumeTarget) {
       const existingList = await SessionStore.list(sessionsRootDir);
@@ -462,6 +511,13 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     let prePlanMode: PermissionMode = values.yes || config.approvalMode === 'auto' ? 'auto' : 'ask';
 
     const sessionAllowedTools = new Set<string>();
+    const sessionAllowedBashPrefixes = new Set<string>();
+    // Terminal bell when goon needs the user (approval, question) or a long turn finishes, so a
+    // developer who switched windows notices. Disable with GOON_NOTIFY=0.
+    const notifyEnabled = process.env.GOON_NOTIFY !== '0' && process.env.GOON_NOTIFY !== 'off';
+    const notifyAttention = () => {
+      if (notifyEnabled && stdout.isTTY && !jsonOutput) stdout.write('\x07');
+    };
     const stop = () => {
       if (starting) process.exitCode = 130;
       if (controller && !controller.signal.aborted) controller.abort(new Error('Cancelled by user.'));
@@ -509,6 +565,16 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       const display = (text: string) => tui ? tui.write(text) : stderr.write(cleanTerminal(text));
       const question = (label: string, signal?: AbortSignal, remember = false) => tui ? tui.question(label, signal, remember)
         : rl ? rl.question(label, { signal }) : Promise.reject(new Error('Input requires a TTY.'));
+      // Plain readline mode: read a secret without echoing it.
+      const questionHidden = async (label: string): Promise<string> => {
+        if (!rl) return question(label);
+        const writer = rl as unknown as { _writeToOutput: (text: string) => void };
+        const original = writer._writeToOutput;
+        stderr.write(label);
+        writer._writeToOutput = (text: string) => { if (/^[\r\n]+$/.test(text)) original.call(rl, text); };
+        try { return await rl.question(''); }
+        finally { writer._writeToOutput = original; }
+      };
       let reasoningSource: 'inline' | 'provider' | undefined;
       const emit = (event: HarnessEvent | SubagentEvent) => {
         if (event.type === 'stopped') denied = true;
@@ -546,9 +612,12 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       const { Subagents } = await import('./subagents.js');
       const { Harness } = await import('./harness.js');
 
-      const buildHarness = async (currentMode: PermissionMode) => {
+      const buildHarness = async (currentMode: PermissionMode, options: { reconnectMcp?: boolean } = {}) => {
         const reg = new ToolRegistry(runtime.cwd, async request => {
-          if (mode === 'auto' || currentMode === 'auto' || sessionAllowedTools.has(request.tool)) return true;
+          // Only the live mode counts. The mode captured when this harness was built must not keep
+          // auto-approving after the user switches back to ask/plan (Shift+Tab, /mode, /auto off).
+          if (mode === 'auto' || sessionAllowedTools.has(request.tool)) return true;
+          if (request.tool === 'bash' && isApprovedBashPrefix(request.input, sessionAllowedBashPrefixes)) return true;
           if (!rl && !tui) return false;
           if (request.tool === 'exit_plan_mode' && request.input && typeof request.input === 'object' && 'plan' in request.input) {
             const planStr = String((request.input as { plan: unknown }).plan);
@@ -572,12 +641,20 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             rawPreview = JSON.stringify(request.input, null, 2);
           }
           const preview = cleanTerminal(rawPreview.split(runtime.apiKey).join('[REDACTED]').slice(0, 8000));
-          const approvalBlock = `\n▲ Allow ${request.tool}?\n${preview}\n`;
+          const prefix = request.tool === 'bash' ? bashApprovalPrefix(request.input) : undefined;
+          const prefixHint = prefix ? `\n  p = always allow commands starting with "${prefix}" (no ; & | \` $ < > in them)` : '';
+          const approvalBlock = `\n▲ Allow ${request.tool}?\n${preview}${prefixHint}\n`;
+          const label = prefix ? '[y/N/p(refix)/a(lways)] ' : '[y/N/a(lways)] ';
+          notifyAttention();
           const reply = tui
-            ? (await tui.askTransient(approvalBlock, '[y/N/a(lways)] ', request.signal)).trim().toLowerCase()
-            : (display(approvalBlock), (await question('[y/N/a(lways)] ', request.signal)).trim().toLowerCase());
+            ? (await tui.askTransient(approvalBlock, label, request.signal)).trim().toLowerCase()
+            : (display(approvalBlock), (await question(label, request.signal)).trim().toLowerCase());
           if (reply === 'a' || reply === 'always') {
             sessionAllowedTools.add(request.tool);
+            return true;
+          }
+          if (prefix && (reply === 'p' || reply === 'prefix')) {
+            sessionAllowedBashPrefixes.add(prefix);
             return true;
           }
           return reply === 'y' || reply === 'yes';
@@ -607,11 +684,16 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             return out;
           };
         }
-        if (!values['no-mcp'] && manager) {
+        // Running MCP servers are reused across harness rebuilds (effort, model, session switches);
+        // they restart only when asked to (/mcp reload) or when the workspace directory changed.
+        const reuseMcp = !values['no-mcp'] && manager?.connected && !options.reconnectMcp && manager.cwd === runtime.cwd;
+        if (reuseMcp) {
+          manager!.attach(reg);
+        } else if (!values['no-mcp'] && manager) {
           await manager.close();
           manager = undefined;
         }
-        if (!values['no-mcp']) {
+        if (!values['no-mcp'] && !reuseMcp) {
           const { loadMcpConfig, McpManager } = await import('./mcp.js');
           controller = new AbortController();
           try {
@@ -659,6 +741,40 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       };
 
       let { tools, harness } = await buildHarness(mode);
+      let rebuildPending = false;
+      const rebuildHarness = async (options: { reconnectMcp?: boolean } = {}) => {
+        const built = await buildHarness(mode, options);
+        tools = built.tools;
+        harness = built.harness;
+      };
+      // Rebuilding closes the MCP servers and subagents the running turn uses, so while a turn is
+      // active the rebuild waits until it ends (the new settings apply from the next turn).
+      const requestRebuild = async (): Promise<boolean> => {
+        if (controller || harness.busy) {
+          rebuildPending = true;
+          return false;
+        }
+        rebuildPending = false;
+        await rebuildHarness();
+        return true;
+      };
+      const applyPendingRebuild = async () => {
+        if (rebuildPending && !controller && !harness.busy) {
+          rebuildPending = false;
+          await rebuildHarness();
+        }
+      };
+      const applyEffort = async (next: EffortLevel | undefined) => {
+        config = await loadConfig({ ...config, effort: next });
+        await saveConfig(config);
+        runtime = await resolveRuntime(config, runtime.cwd);
+        tui?.setEffort(runtime.effort);
+        syncTuiHeader();
+        const applied = await requestRebuild();
+        const suffix = applied ? '' : ' (applies from the next turn)';
+        if (tui) tui.setNotice(`Reasoning effort: ${runtime.effort ?? 'default'}${suffix}`);
+        display(`\n[Reasoning effort set to: ${runtime.effort ?? 'default'}${suffix}]\n`);
+      };
       if (tui) {
         void tools.files.listWorkspaceFiles().then(files => tui?.setWorkspaceFiles(files)).catch(() => {});
         tui.onCopy = async () => {
@@ -684,17 +800,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
           const ring: (EffortLevel | undefined)[] = [undefined, ...EFFORT_LEVELS];
           const curIdx = ring.indexOf(runtime.effort);
           const nextEffort = ring[(curIdx + direction + ring.length) % ring.length];
-          void (async () => {
-            config = await loadConfig({ ...config, effort: nextEffort });
-            await saveConfig(config);
-            runtime = await resolveRuntime(config, runtime.cwd);
-            tui?.setEffort(runtime.effort);
-            syncTuiHeader();
-            const built = await buildHarness(mode);
-            tools = built.tools;
-            harness = built.harness;
-            display(`\n[Reasoning effort set to: ${runtime.effort ?? 'default'}]\n`);
-          })();
+          void applyEffort(nextEffort).catch(error => display(`\n[Effort change failed: ${safeError(error, apiKey)}]\n`));
         };
       }
       const renderResumedHistory = (showBanner = true) => {
@@ -782,10 +888,12 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         opts?: { isGoalContinuation?: boolean; continuationStep?: number },
       ): Promise<{ aborted: boolean; hadError: boolean; text: string }> => {
         if (Buffer.byteLength(input) > 1024 * 1024) throw new Error('Prompt exceeds 1 MiB.');
+        await applyPendingRebuild();
         denied = false;
         let aborted = false;
         let hadError = false;
         let outText = '';
+        const turnStarted = Date.now();
         controller = new AbortController();
         tui?.setStatus('Running');
         if (tui) {
@@ -805,6 +913,10 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         }
         try {
           outText = await harness.run(input, controller.signal);
+          if (outputLastMessage) {
+            const { writeFile } = await import('node:fs/promises');
+            await writeFile(resolve(outputLastMessage), outText.endsWith('\n') ? outText : `${outText}\n`, 'utf8');
+          }
           if (jsonOutput) stdout.write(JSON.stringify({ type: 'done', text: outText, denied, sessionId: store.session.id }) + '\n');
           else if (tui) tui.write('\n'); else stdout.write('\n');
           if (denied && !interactive) process.exitCode = 2;
@@ -822,6 +934,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
           }
         } finally {
           controller = undefined;
+          if (interactive && Date.now() - turnStarted >= 15_000) notifyAttention();
           tui?.setStatus('Ready');
           syncTuiHeader();
           if (tui) void tools.files.listWorkspaceFiles().then(files => tui?.setWorkspaceFiles(files)).catch(() => {});
@@ -916,7 +1029,9 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             '  /mention <filepath>               Insert @filepath mention into the composer\n' +
             '  /cd <dir>, /pwd                   Change or show active workspace directory\n' +
             '  /mode [ask|auto|plan|readonly]    Switch approval mode (or press Shift+Tab)\n' +
-            '  /setup, /config                   Interactive provider, URL, key, model & effort setup\n' +
+            '  /setup, /config, /provider        Interactive provider, URL, key, model & effort setup\n' +
+            '  /key                              Replace the stored API key (input hidden)\n' +
+            '  /prompts [show <name>]            List custom prompt files; run one with /prompts:<name> [args]\n' +
             '  /model [id] [--effort=<level>]    Discover/pick model from /models or set model ID\n' +
             '  /effort [low|medium|high|xhigh|max|default] Switch reasoning effort (or Alt+./Alt+,)\n' +
             '  /plan [off|execute|<prompt>]      Enter/exit Plan Mode or execute approved plan\n' +
@@ -1006,7 +1121,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
               return true;
             }
             store.session.goal = undefined;
-            store.session.messages.push({
+            harness.addContextMessage({
               role: 'user',
               content: buildUserGoalContextMessage({ cleared: true }),
             });
@@ -1030,7 +1145,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             g.status = nextStatus;
             g.updatedAt = now;
             if (nextStatus === 'active') goalContinuationDeferred = false;
-            store.session.messages.push({
+            harness.addContextMessage({
               role: 'user',
               content: buildUserGoalContextMessage({ status: nextStatus }),
             });
@@ -1077,7 +1192,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
               g.objective = parsedEdit.objective;
             }
             g.updatedAt = now;
-            store.session.messages.push({
+            harness.addContextMessage({
               role: 'user',
               content: buildUserGoalContextMessage({
                 ...(parsedEdit.objective ? { objective: g.objective } : {}),
@@ -1085,7 +1200,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
               }),
             });
             if (parsedEdit.objective) {
-              store.session.messages.push({
+              harness.addContextMessage({
                 role: 'user',
                 content: buildGoalObjectiveUpdatedPrompt(g),
               });
@@ -1139,12 +1254,12 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             ...(parsed.tokenBudget !== undefined ? { tokenBudget: parsed.tokenBudget } : {}),
           };
           goalContinuationDeferred = false;
-          store.session.messages.push({
+          harness.addContextMessage({
             role: 'user',
             content: buildUserGoalContextMessage({ objective: parsed.objective, status: 'active' }),
           });
           if (controller && hadExistingGoal) {
-            store.session.messages.push({
+            harness.addContextMessage({
               role: 'user',
               content: buildGoalObjectiveUpdatedPrompt(store.session.goal),
             });
@@ -1162,6 +1277,22 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         }
         if (cmdInput === '/pwd' || cmdInput === '/cwd') {
           display(`Workspace directory: ${runtime.cwd}\n`);
+          return true;
+        }
+        if (cmdInput === '/prompts' || cmdInput === '/prompts list' || cmdInput.startsWith('/prompts show ')) {
+          const { discoverPrompts } = await import('./prompts.js');
+          const prompts = await discoverPrompts(runtime.cwd);
+          if (cmdInput.startsWith('/prompts show ')) {
+            const name = cmdInput.slice('/prompts show '.length).trim().replace(/^prompts:/, '');
+            const found = prompts.find(p => p.name.toLowerCase() === name.toLowerCase());
+            display(found ? `\n/prompts:${found.name} (${found.path}):\n${found.body.slice(0, 4000)}\n` : `Prompt "${name}" not found. Run /prompts to list them.\n`);
+            return true;
+          }
+          if (!prompts.length) {
+            display('No prompt files found. Create e.g. .goon/prompts/review.md or ~/.config/goon/prompts/review.md,\nthen run /prompts:review [args] ($ARGUMENTS and $1..$9 are substituted).\n');
+          } else {
+            display(`Custom prompts (${prompts.length}) — run with /prompts:<name> [args]:\n${prompts.map(p => `  /prompts:${p.name.padEnd(20)} [${p.scope}] ${p.description}`).join('\n')}\n`);
+          }
           return true;
         }
         if (cmdInput === '/skills' || cmdInput.startsWith('/skills ')) {
@@ -1429,11 +1560,8 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             display(`Invalid effort "${arg}". Choose from: low, medium, high, xhigh, max, default.\n`);
             return true;
           }
-          config = await loadConfig({ ...config, effort: isClear ? undefined : parsed });
-          await saveConfig(config);
-          runtime = await resolveRuntime(config, runtime.cwd);
-          tui?.setEffort(runtime.effort);
-          display(`Reasoning effort set to: ${runtime.effort ?? 'default'}\n`);
+          // Previously only the saved config changed; the running harness kept the old effort.
+          await applyEffort(isClear ? undefined : parsed);
           return true;
         }
         if (cmdInput === '/todo' || cmdInput.startsWith('/todo ')) {
@@ -1619,16 +1747,22 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
           const cmd = sanitizeBashCommand(rawShell);
           const { runCommand } = await import('./process.js');
           display(`\n$ ${cmd}\n`);
+          // When idle, Ctrl+C cancels this command instead of quitting goon.
+          const shellController = new AbortController();
+          const ownsController = !controller;
+          if (ownsController) controller = shellController;
           try {
-            const res = await runCommand('bash', ['-c', cmd], { cwd: runtime.cwd, signal: AbortSignal.timeout(60_000), timeoutMs: 60_000 });
+            const res = await runCommand('bash', ['-c', cmd], { cwd: runtime.cwd, signal: AbortSignal.any([shellController.signal, AbortSignal.timeout(600_000)]), timeoutMs: 600_000 });
             display(`${res.output || '(no output)'}\n[Exit code: ${res.code}]\n`);
-            store.session.messages.push({
+            harness.addContextMessage({
               role: 'user',
               content: `<user_shell_command>\n<command>${cmd}</command>\n<result>\nExit code: ${res.code}\n${res.output.slice(0, 8000)}\n</result>\n</user_shell_command>`,
             });
             await store.save();
           } catch (error) {
             display(`Shell command failed: ${safeError(error, apiKey)}\n`);
+          } finally {
+            if (ownsController && controller === shellController) controller = undefined;
           }
           return true;
         }
@@ -1643,6 +1777,8 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             if (cmd.startsWith('/revert') || cmd.startsWith('/undo') || cmd === '/checkpoints') {
               controller?.abort(new Error('Interrupted for revert.'));
             }
+            // Previously only the notice was shown and the command was silently dropped.
+            tui?.queuePrompt(cmd);
             tui?.setNotice(`Queued command "${cmd}" to run as soon as current step finishes.`);
           }
         };
@@ -1663,6 +1799,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             catch { break; }
           }
           if (!input) continue;
+          await applyPendingRebuild();
           if (await executeImmediateCommand(input)) {
             if (exiting) break;
             continue;
@@ -1687,12 +1824,44 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             continue;
           }
 
-          if (input === '/setup' || input === '/config') {
+          if (input === '/key') {
+            const { saveCredential } = await import('./config.js');
+            const entered = (tui
+              ? await tui.question(`New API key for ${runtime.keyEnv} (hidden, Esc to cancel): `, undefined, false, { escCancels: true, mask: true }).catch(() => '')
+              : await questionHidden(`New API key for ${runtime.keyEnv} (hidden): `)).trim();
+            if (!entered) {
+              display('API key unchanged.\n');
+              continue;
+            }
+            await saveCredential(runtime.keyEnv, entered);
+            if (process.env[runtime.keyEnv]?.trim()) {
+              display(`Saved to credentials.json, but ${runtime.keyEnv} is set in the environment and takes precedence.\n`);
+            }
+            runtime = await resolveRuntime(config, runtime.cwd);
+            apiKey = runtime.apiKey;
+            await rebuildHarness();
+            display(`API key for ${runtime.keyEnv} updated (${entered.slice(0, 4)}…${entered.slice(-2)}).\n`);
+            continue;
+          }
+          if (input.startsWith('/prompts:')) {
+            const { discoverPrompts, expandPromptTemplate } = await import('./prompts.js');
+            const match = /^\/prompts:([A-Za-z0-9][A-Za-z0-9_.-]*)\s*([\s\S]*)$/.exec(input);
+            const prompts = await discoverPrompts(runtime.cwd);
+            const found = match ? prompts.find(p => p.name.toLowerCase() === match[1].toLowerCase()) : undefined;
+            if (!found) {
+              display(`Prompt "${match?.[1] ?? input.slice(9)}" not found. Run /prompts to list them.\n`);
+              continue;
+            }
+            await run(expandPromptTemplate(found.body, match![2]));
+            continue;
+          }
+          if (input === '/setup' || input === '/config' || input === '/provider') {
             try {
               config = await runSetupWizard(config, {
                 write: text => display(text),
                 // Esc cancels the whole wizard (nothing is persisted until the final step).
                 ask: label => (tui ? tui.question(label, undefined, false, { escCancels: true }) : question(label)),
+                askSecret: label => (tui ? tui.question(label, undefined, false, { escCancels: true, mask: true }) : questionHidden(label)),
               });
             } catch (error) {
               if (error instanceof InputCancelledError) {
@@ -1710,9 +1879,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             tui?.setTitle(`${runtime.model} · ${store.session.id.slice(0, 8)}`);
             tui?.setEffort(runtime.effort);
             syncTuiHeader();
-            const built = await buildHarness(mode);
-            tools = built.tools;
-            harness = built.harness;
+            await rebuildHarness();
             continue;
           }
           if (input === '/model' || input.startsWith('/model ')) {
@@ -1774,9 +1941,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             tui?.setTitle(`${runtime.model} · ${store.session.id.slice(0, 8)}`);
             tui?.setEffort(runtime.effort);
             syncTuiHeader();
-            const built = await buildHarness(mode);
-            tools = built.tools;
-            harness = built.harness;
+            await rebuildHarness();
             display(`Active model: ${runtime.model} (ctx: ${Math.round(runtime.contextWindow / 1024)}k · out: ${Math.round(runtime.maxOutputTokens / 1000)}k · ${caps.supportsVision === false ? 'text-only' : 'vision'} · effort: ${runtime.effort ?? 'default'})\n`);
             continue;
           }
@@ -1803,9 +1968,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             runtime = await resolveRuntime(config, runtime.cwd);
             tui?.setEffort(runtime.effort);
             syncTuiHeader();
-            const built = await buildHarness(mode);
-            tools = built.tools;
-            harness = built.harness;
+            await rebuildHarness();
             display(`Reasoning effort set to: ${runtime.effort ?? 'default'}\n`);
             continue;
           }
@@ -1893,9 +2056,11 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             const parts = raw ? raw.split(/\s+/) : [];
             let scope: 'both' | 'code' | 'messages' = 'both';
             let steps = 1;
+            let force = false;
             for (const p of parts) {
               const lp = p.toLowerCase();
-              if (lp === 'code' || lp === 'files' || lp === 'file' || lp === 'source') scope = 'code';
+              if (lp === '--force' || lp === '-f' || lp === 'force') force = true;
+              else if (lp === 'code' || lp === 'files' || lp === 'file' || lp === 'source') scope = 'code';
               else if (lp === 'msg' || lp === 'messages' || lp === 'chat') scope = 'messages';
               else if (lp === 'both' || lp === 'all') scope = 'both';
               else {
@@ -1904,7 +2069,15 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
               }
             }
             try {
-              const res = await harness.revert({ steps, scope });
+              const res = await harness.revert({ steps, scope, force });
+              // Files edited after the agent's turn are never overwritten silently.
+              const keptNote = res.conflictFiles.length
+                ? `\n⚠ Kept ${res.conflictFiles.length} file(s) changed after that turn: ${res.conflictFiles.join(', ')} (use /revert ${steps} ${scope} --force to overwrite)\n`
+                : '';
+              const lostNote = res.unrecoverableFiles.length
+                ? `\n⚠ Backup pruned (session size limit), not restored: ${res.unrecoverableFiles.join(', ')}\n`
+                : '';
+              if (keptNote || lostNote) display(keptNote + lostNote);
               if (tui) {
                 tui.setTokens(store.session.tokens);
                 syncTuiHeader(true);
@@ -1951,25 +2124,6 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             }
             continue;
           }
-          if (input === '/todo' || input.startsWith('/todo ')) {
-            const arg = input.slice(5).trim().toLowerCase();
-            if (arg === 'clear' || arg === 'reset') {
-              tools.todos = [];
-              store.session.todos = [];
-              await store.save();
-              tui?.event({ type: 'todo', todos: [] });
-              display('Cleared todo checklist.\n');
-            } else {
-              display(`\n${formatTodos(tools.todos)}\n`);
-            }
-            continue;
-          }
-          if (input === '/fork' || input.startsWith('/fork ')) {
-            const title = input.slice(5).trim() || undefined;
-            const forkedId = await store.forkToNewFile(title);
-            display(`Forked current session (${store.session.messages.length} messages) -> new session ID: ${forkedId}\nSwitch to it now with: /resume ${forkedId.slice(0, 8)} (or goon --resume ${forkedId.slice(0, 8)})\n`);
-            continue;
-          }
           if (input === '/new' || input.startsWith('/new ')) {
             const newTitle = input.slice(4).trim() || undefined;
             const sessionsRoot = join(runtime.dataDir, 'sessions');
@@ -1982,9 +2136,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             store = newStore;
             await oldStore.discardIfEmpty();
             await oldStore.close();
-            const built = await buildHarness(mode);
-            tools = built.tools;
-            harness = built.harness;
+            await rebuildHarness();
             tui?.clear();
             tui?.setTitle(store.session.title ? `${runtime.model} · ${store.session.title}` : `${runtime.model} · ${store.session.id.slice(0, 8)}`);
             tui?.setTokens(0);
@@ -2050,9 +2202,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
               store = newStore;
               await oldStore.discardIfEmpty();
               await oldStore.close();
-              const built = await buildHarness(mode);
-              tools = built.tools;
-              harness = built.harness;
+              await rebuildHarness();
               if (tui) {
                 tui.clear();
                 display(welcomeBanner(runtime.model, runtime.provider, runtime.baseUrl, runtime.effort, runtime.cwd, store.session.id, mode));
@@ -2067,56 +2217,6 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
               }
             } catch (error) {
               display(`Failed to resume session: ${safeError(error, apiKey)}\n`);
-            }
-            continue;
-          }
-          if (input.startsWith('/rename ')) {
-            const newTitle = input.slice(8).trim();
-            if (newTitle) {
-              store.session.title = newTitle;
-              await store.save();
-              tui?.setTitle(`${runtime.model} · ${newTitle}`);
-              display(`Session renamed to: ${newTitle}\n`);
-            }
-            continue;
-          }
-          if (input === '/export' || input.startsWith('/export ')) {
-            const { writeFile } = await import('node:fs/promises');
-            const outName = input.slice(7).trim() || `goon-session-${store.session.id.slice(0, 8)}.md`;
-            const targetFile = await tools.files.path(outName);
-            const lines: string[] = [
-              `# Goon Session ${store.session.title ?? store.session.id}`,
-              `- **Model**: ${runtime.model} (${runtime.provider})`,
-              `- **Updated**: ${store.session.updatedAt}`,
-              '',
-            ];
-            for (const m of store.session.messages) {
-              lines.push(`## ${m.role.toUpperCase()}`);
-              lines.push(typeof m.content === 'string' ? m.content : JSON.stringify(m.content, null, 2));
-              lines.push('');
-            }
-            await writeFile(targetFile, lines.join('\n'), 'utf8');
-            display(`Exported session transcript to ${outName}\n`);
-            continue;
-          }
-          if (input.startsWith('!')) {
-            const cmd = input.slice(1).trim();
-            if (!cmd) {
-              display('Usage: !<command> (runs a shell command directly in workspace and records output in session context)\n');
-              continue;
-            }
-            const { runCommand } = await import('./process.js');
-            display(`\n$ ${cmd}\n`);
-            try {
-              const res = await runCommand('bash', ['-c', cmd], { cwd: runtime.cwd, signal: AbortSignal.timeout(60_000), timeoutMs: 60_000 });
-              display(`${res.output || '(no output)'}\n[Exit code: ${res.code}]\n`);
-              store.session.messages.push({
-                role: 'user',
-                content: `<user_shell_command>\n<command>${cmd}</command>\n<result>\nExit code: ${res.code}\n${res.output.slice(0, 8000)}\n</result>\n</user_shell_command>`,
-              });
-              await store.save();
-            } catch (error) {
-              display(`Shell command failed: ${safeError(error, apiKey)}\n`);
             }
             continue;
           }
@@ -2171,9 +2271,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
               runtime = { ...runtime, cwd: real };
               store.session.cwd = real;
               await store.save();
-              const built = await buildHarness(mode);
-              tools = built.tools;
-              harness = built.harness;
+              await rebuildHarness({ reconnectMcp: true });
               if (tui) {
                 void tools.files.listWorkspaceFiles().then(files => tui?.setWorkspaceFiles(files)).catch(() => {});
                 syncTuiHeader();
@@ -2194,9 +2292,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
               store = await SessionStore.open(sessionsRoot, runtime);
               await oldStore.close();
               await SessionStore.deleteSession(sessionsRoot, oldId);
-              const built = await buildHarness(mode);
-              tools = built.tools;
-              harness = built.harness;
+              await rebuildHarness();
               tui?.clear();
               tui?.setTitle(`${runtime.model} · ${store.session.id.slice(0, 8)}`);
               tui?.setTokens(0);
@@ -2271,9 +2367,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             const sub = (subArgs[0] ?? 'list').toLowerCase();
             const { loadMcpConfig, saveMcpConfig, importCodexMcpServers } = await import('./mcp.js');
             if (sub === 'reload' || sub === 'reconnect') {
-              const built = await buildHarness(mode);
-              tools = built.tools;
-              harness = built.harness;
+              await rebuildHarness({ reconnectMcp: true });
               display(`Reloaded MCP servers (${manager?.tools.length ?? 0} MCP tools active).\n`);
               continue;
             }
@@ -2284,9 +2378,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
                   display(`No matching MCP servers found in ~/.codex/config.toml (target: ${res.path}).\n`);
                 } else {
                   display(`Imported ${res.imported.length} MCP server(s) into ${res.path}: ${res.imported.join(', ')}\n`);
-                  const built = await buildHarness(mode);
-                  tools = built.tools;
-                  harness = built.harness;
+                  await rebuildHarness({ reconnectMcp: true });
                   display(`Active MCP tools: ${manager?.tools.length ?? 0}\n`);
                 }
               } catch (error) {
@@ -2307,16 +2399,12 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
               }
               delete cfg.servers[target];
               await saveMcpConfig(cfg);
-              const built = await buildHarness(mode);
-              tools = built.tools;
-              harness = built.harness;
+              await rebuildHarness({ reconnectMcp: true });
               display(`Removed MCP server "${target}" (${manager?.tools.length ?? 0} MCP tools active).\n`);
               continue;
             }
             if (sub === 'check') {
-              const built = await buildHarness(mode);
-              tools = built.tools;
-              harness = built.harness;
+              await rebuildHarness({ reconnectMcp: true });
               for (const st of manager?.statuses ?? []) {
                 display(`  ${st.name}: ${st.status}${st.status === 'ok' ? ` (${st.toolCount} tools)` : st.error ? ` — ${st.error}` : ''}\n`);
               }
@@ -2346,61 +2434,6 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
               continue;
             }
             await run(`Use a subagent (spawn_agent + wait_agent, or delegate_task / delegate_edit as appropriate) to execute the following task and report the result:\n\n${rest}`);
-            continue;
-          }
-          if (input === '/tools') {
-            const names = Object.keys(tools.schemas());
-            display(names.map(n => `  ${tools.isReadOnly(n) ? '● [read]' : '◆ [exec]'} ${n}`).join('\n') + '\n');
-            continue;
-          }
-          if (input === '/sessions') {
-            const list = await SessionStore.list(join(runtime.dataDir, 'sessions'));
-            display((list.length ? list.map(s => {
-              const cur = s.id === store.session.id ? ' [current]' : '';
-              const label = s.title ? ` [${s.title}]` : s.preview ? ` "${s.preview}"` : '';
-              return `  ${s.id.slice(0, 8)}${cur}  (${s.messagesCount ?? 0} msgs)  ${s.updatedAt}  ${s.model}${label}  ${s.cwd}`;
-            }).join('\n') : '  No saved sessions.') + '\n');
-            continue;
-          }
-          if (input === '/doctor') {
-            const { runCommand } = await import('./process.js');
-            const ok = async (cmd: string) => {
-              try { return (await runCommand(cmd, ['--version'], { cwd: runtime.cwd, signal: AbortSignal.timeout(5000), timeoutMs: 5000 })).code === 0; }
-              catch { return false; }
-            };
-            const [b, r, discovered] = await Promise.all([
-              ok('bash'),
-              ok('rg'),
-              discoverModels(runtime.baseUrl, runtime.apiKey, runtime.provider),
-            ]);
-            const modelInList = discovered.some((m) => m.id === runtime.model);
-            const gatewayStatus = discovered.length > 0
-              ? `OK (${discovered.length} models: ${discovered.map((m) => m.id).join(', ')} · active model ${modelInList ? 'verified' : 'NOT listed'})`
-              : 'Unreachable or no /models response';
-            display(
-              `Provider: ${runtime.provider} | Model: ${runtime.model} | Effort: ${runtime.effort ?? 'default'} | BaseURL: ${runtime.baseUrl}\n` +
-              `Bash: ${b ? 'OK' : 'Missing'} | Ripgrep: ${r ? 'OK' : 'JS fallback'} | API Key: Configured\n` +
-              `Gateway (/models): ${gatewayStatus}\n`,
-            );
-            continue;
-          }
-          if (input === '/status') {
-            const usedEst = estimatedTokens(store.session.messages, '');
-            const pct = Math.min(100, Math.round((usedEst / runtime.contextWindow) * 100));
-            display(
-              `Session        ${store.session.id}${store.session.title ? ` (${store.session.title})` : ''}\n` +
-              `Provider       ${runtime.provider} (${runtime.baseUrl})\n` +
-              `Model          ${runtime.model}\n` +
-              `Effort         ${runtime.effort ?? 'default'}\n` +
-              `Mode           ${mode}\n` +
-              `View           ${viewMode}\n` +
-              `Workspace      ${runtime.cwd}\n` +
-              `Checkpoints    ${store.session.checkpoints?.length ?? 0} turn(s)\n` +
-              `Context usage  ~${usedEst} / ${runtime.contextWindow} tokens (${pct}%)\n` +
-              `Compactions    ${store.session.compactions}\n` +
-              `Session tokens ${store.session.tokens}\n` +
-              `MCP tools      ${manager?.tools.length ?? 0}\n`
-            );
             continue;
           }
           await run(input);

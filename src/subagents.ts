@@ -459,11 +459,14 @@ export class Subagents {
         },
         managed.readOnly || this.registry.readOnly,
       );
-      await new Harness(childConfig, store, tools, event => {
+      const childHarness = new Harness(childConfig, store, tools, event => {
         if (event.type !== 'text' && event.type !== 'reasoning' && event.type !== 'tool_stream') {
           this.emit({ type: 'subagent', id: managed.id, state: 'progress', event });
         }
-      }).run(prompt, signal, budget);
+      });
+      // The task text was written by the parent model, not typed by the user.
+      childHarness.untrustedPrompts = true;
+      await childHarness.run(prompt, signal, budget);
       if (denied) throw new PermissionDeniedError('Permission denied in a subagent. Stop this run.');
       const answer = lastAssistantAnswer(store.session.messages, childConfig.inlineReasoning);
       managed.lastOutput = limitText(answer, 12_000);
@@ -783,13 +786,15 @@ export class Subagents {
       );
       // No delegation tools are registered in children: depth is exactly one.
       const config = { ...this.config };
-      await new Harness(config, store, tools, event => {
+      const childHarness = new Harness(config, store, tools, event => {
         // Parent progress is a control channel. The complete text/reasoning
         // belongs to the child transcript, never a per-token parent mirror.
         if (event.type !== 'text' && event.type !== 'reasoning' && event.type !== 'tool_stream') {
           this.emit({ type: 'subagent', id, state: 'progress', event });
         }
-      }).run(
+      });
+      childHarness.untrustedPrompts = true;
+      await childHarness.run(
         `You are a delegated agent. Complete this task and return a concise report with evidence. Do not ask other agents.\n\n${task}`,
         signal,
         budget,

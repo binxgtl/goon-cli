@@ -1,4 +1,4 @@
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { tool, jsonSchema, type FlexibleSchema, type ToolSet } from 'ai';
 import { Ajv } from 'ajv';
@@ -12,6 +12,8 @@ export function sanitizeBashCommand(command: string, platform = process.platform
   return command.replace(/((?:^|[\s;&|()])(?:\d+|&)?>>?\s*)(?:nul|\/dev\/nul)(?=$|[\s;&|()><])/gi, '$1/dev/null');
 }
 
+export { bashApprovalPrefix, isApprovedBashPrefix } from './approval.js';
+
 export interface Approval { tool: string; input: unknown; signal: AbortSignal }
 export type Approve = (request: Approval) => Promise<boolean>;
 export interface ToolCall { toolCallId: string; toolName: string; input: unknown }
@@ -21,6 +23,11 @@ export interface ToolDefinition<Input = unknown> {
 }
 export interface RunBudget { spent: number; limit: number }
 export class PermissionDeniedError extends Error {}
+const COLLAB_TOOLS = new Set([
+  'spawn_agent', 'wait_agent', 'send_input', 'close_agent', 'resume_agent', 'list_agents',
+  'update_plan', 'get_goal', 'create_goal', 'update_goal', 'request_user_input', 'view_image',
+  'list_mcp_resources', 'list_mcp_resource_templates', 'read_mcp_resource',
+]);
 interface RegisteredTool {
   description: string; schema: FlexibleSchema<unknown>; readOnly: boolean;
   parse: (input: unknown) => unknown;
@@ -316,10 +323,16 @@ export class ToolRegistry {
       schema: z.object({ query: z.string().min(1), path: z.string().default('.') }), readOnly: true,
       execute: async (input, signal) => {
         const path = await this.files.path(input.path);
+        // Search relative to the workspace root so every hit is a short, directly usable path
+        // (absolute paths cost tokens on every match line).
+        const target = relative(this.files.root, path) || '.';
         try {
-          const result = await runCommand('rg', ['--fixed-strings', '--line-number', '--hidden', '--glob', '!.git', '--glob', '!node_modules', '--max-count', '50', '--max-columns', '1000', '--max-columns-preview', '--', input.query, path], { cwd, signal, timeoutMs: 30_000 });
-          if (result.code > 1) throw new Error(result.output || 'ripgrep failed.');
-          return limitText(result.output || 'No matches found.');
+          const result = await runCommand('rg', ['--fixed-strings', '--line-number', '--hidden', '--glob', '!.git', '--glob', '!node_modules', '--max-count', '50', '--max-columns', '1000', '--max-columns-preview', '--', input.query, target], { cwd: this.files.root, signal, timeoutMs: 30_000 });
+          // Exit 2 also covers partial failures (an unreadable file, a broken symlink) while other
+          // files still matched; keep those matches instead of discarding the whole search.
+          if (result.code > 1 && !/^[^\n]+:\d+:/m.test(result.output)) throw new Error(result.output || 'ripgrep failed.');
+          const note = result.code > 1 ? '\n[ripgrep reported errors for some paths; results may be incomplete.]' : '';
+          return limitText(result.output || 'No matches found.') + note;
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
           signal.throwIfAborted();
@@ -504,8 +517,14 @@ export class ToolRegistry {
         detail: z.enum(['high', 'original']).optional().describe('Optional detail override.'),
       }),
       readOnly: true,
-      execute: async input => {
-        const img = await this.files.readImage(input.path);
+      execute: async (input, signal) => {
+        // The model chooses this path. Inside the workspace it is an ordinary read; anything else
+        // on disk (photos, other projects, screenshots) needs the user's explicit approval.
+        const located = await this.files.locateImage(input.path);
+        if (!located.inside && !await this.approve({ tool: 'view_image', input: { path: located.resolvedPath, outsideWorkspace: true }, signal })) {
+          throw new PermissionDeniedError('Permission denied: reading an image outside the workspace. Stop this run.');
+        }
+        const img = await this.files.readImage(input.path, undefined, { allowOutside: !located.inside });
         this.pendingImages.push({ path: img.resolvedPath, mimeType: img.mediaType, bytes: img.buffer });
         return `Attached image ${img.resolvedPath} (${img.mediaType}, ${img.buffer.byteLength} bytes).`;
       },
@@ -567,8 +586,9 @@ export class ToolRegistry {
   }
   private ajv = new Ajv({ strict: false, validateFormats: false, allowUnionTypes: true });
   register<Input>(name: string, definition: ToolDefinition<Input>) {
+    // execute() always receives the output of parse(); validating twice only costs time.
     return this.add(name, { ...definition, parse: input => definition.schema.parse(input),
-      execute: (input, signal) => definition.execute(definition.schema.parse(input), signal) });
+      execute: (input, signal) => definition.execute(input as Input, signal) });
   }
   registerJson(name: string, definition: Omit<ToolDefinition, 'schema'> & { schema: Record<string, unknown> }) {
     const cleanSchema = { ...definition.schema };
@@ -599,18 +619,16 @@ export class ToolRegistry {
   resolveToolName(name: string): string {
     return normalizeToolName(name, n => this.definitions.has(n));
   }
+  /** Whether a tool is offered to the model in the current mode. execute() enforces the same rule. */
+  private isExposed(name: string, d: RegisteredTool): boolean {
+    if (name === 'exit_plan_mode' && !this.planMode) return false;
+    if ((name === 'get_goal' || name === 'create_goal' || name === 'update_goal') && (!this.getGoal || this.planMode)) return false;
+    if ((name === 'todo_write' || name === 'todo_read' || COLLAB_TOOLS.has(name)) && this.readOnly && !this.planMode) return false;
+    return !this.effectiveReadOnly || d.readOnly;
+  }
   schemas(): ToolSet {
-    const collabTools = new Set([
-      'spawn_agent', 'wait_agent', 'send_input', 'close_agent', 'resume_agent', 'list_agents',
-      'update_plan', 'get_goal', 'create_goal', 'update_goal', 'request_user_input', 'view_image',
-      'list_mcp_resources', 'list_mcp_resource_templates', 'read_mcp_resource',
-    ]);
-    return Object.fromEntries([...this.definitions].filter(([name, d]) => {
-      if (name === 'exit_plan_mode' && !this.planMode) return false;
-      if ((name === 'get_goal' || name === 'create_goal' || name === 'update_goal') && (!this.getGoal || this.planMode)) return false;
-      if ((name === 'todo_write' || name === 'todo_read' || collabTools.has(name)) && this.readOnly && !this.planMode) return false;
-      return !this.effectiveReadOnly || d.readOnly;
-    }).map(([name, d]) => [name, tool({ description: d.description, inputSchema: d.schema })]));
+    return Object.fromEntries([...this.definitions].filter(([name, d]) => this.isExposed(name, d))
+      .map(([name, d]) => [name, tool({ description: d.description, inputSchema: d.schema })]));
   }
   isReadOnly(name: string) {
     const canonical = this.resolveToolName(name);
@@ -634,8 +652,11 @@ export class ToolRegistry {
     signal.throwIfAborted();
     const canonicalName = this.resolveToolName(call.toolName);
     const definition = this.definitions.get(canonicalName);
-    if (!definition || (this.effectiveReadOnly && !definition.readOnly)) {
-      throw new Error(`Tool is not available in ${this.planMode ? 'plan' : 'read-only'} mode: ${call.toolName}`);
+    if (!definition) throw new Error(`Unknown tool: ${call.toolName}`);
+    // A model can name a tool that is not in its current tool list (hallucinated or remembered from
+    // an earlier mode). Hidden tools are not callable; exit_plan_mode answers harmlessly by itself.
+    if (canonicalName !== 'exit_plan_mode' && !this.isExposed(canonicalName, definition)) {
+      throw new Error(`Tool is not available in ${this.planMode ? 'plan' : this.effectiveReadOnly ? 'read-only' : 'the current'} mode: ${call.toolName}`);
     }
     const normalizedInput = normalizeToolInput(canonicalName, call.input);
     const input = definition.parse(normalizedInput);

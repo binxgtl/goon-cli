@@ -147,7 +147,8 @@ test('applyPatch supports Add/Update/Delete and restoreBackups reverts modified,
 
   await files.applyPatch(patch);
   assert.equal(await readFile(join(f.cwd, 'keep.txt'), 'utf8'), 'line1\nline2_patched\nline3\n');
-  assert.equal(await readFile(join(f.cwd, 'added.txt'), 'utf8'), 'hello world');
+  // Codex apply_patch semantics: every "+" line is a complete line, so added files end with a newline.
+  assert.equal(await readFile(join(f.cwd, 'added.txt'), 'utf8'), 'hello world\n');
   await assert.rejects(readFile(join(f.cwd, 'remove-me.txt'), 'utf8'));
 
   const backups = files.takeTurnBackups();

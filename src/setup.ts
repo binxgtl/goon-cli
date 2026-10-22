@@ -85,6 +85,8 @@ export const EFFORT_DESCRIPTIONS: Record<EffortLevel, string> = {
 export interface SetupIO {
   write?: (text: string) => void;
   ask?: (prompt: string) => Promise<string>;
+  /** Like `ask`, but the typed value is not echoed (API keys). Defaults to `ask` when only that is given. */
+  askSecret?: (prompt: string) => Promise<string>;
   discover?: (baseUrl: string, apiKey?: string, provider?: Config['provider']) => Promise<DiscoveredModel[]>;
 }
 
@@ -110,6 +112,18 @@ export async function runSetupWizard(initialConfig?: Config, io?: SetupIO): Prom
   const ask = io?.ask ?? (async (prompt: string) => {
     if (!ownRl) ownRl = createInterface({ input: stdin, output: stderr, terminal: Boolean(stdin.isTTY) });
     return (await ownRl.question(prompt)).trim();
+  });
+  const askSecret = io?.askSecret ?? (io?.ask ? ask : async (prompt: string) => {
+    if (!ownRl) ownRl = createInterface({ input: stdin, output: stderr, terminal: Boolean(stdin.isTTY) });
+    if (!stdin.isTTY) return (await ownRl.question(prompt)).trim();
+    // Hide the key while it is typed (no echo, like ssh/sudo) so it never lands in scrollback,
+    // screen recordings or over-the-shoulder views. Only line breaks are passed through.
+    const rl = ownRl as unknown as { _writeToOutput: (text: string) => void };
+    const original = rl._writeToOutput;
+    stderr.write(prompt);
+    rl._writeToOutput = (text: string) => { if (/^[\r\n]+$/.test(text)) original.call(ownRl, text); };
+    try { return (await ownRl.question('')).trim(); }
+    finally { rl._writeToOutput = original; }
   });
   const discover = io?.discover ?? ((url, key, prov) => discoverModels(url, key, prov));
 
@@ -145,7 +159,7 @@ export async function runSetupWizard(initialConfig?: Config, io?: SetupIO): Prom
       ? `saved (${existingKey.slice(0, 4)}...${existingKey.slice(-2)}) — press Enter to keep`
       : `stored in ${credentialsPath()}`;
     write(`\nStep 3/5 · API Key (${current.keyEnv}, ${keyHint}):\n`);
-    const keyInput = (await ask(`API Key: `)).trim();
+    const keyInput = (await askSecret(`API Key (input hidden): `)).trim();
     // Persisted only after the final step so cancelling the wizard leaves credentials untouched.
     const activeKey = keyInput || existingKey;
 
@@ -163,17 +177,23 @@ export async function runSetupWizard(initialConfig?: Config, io?: SetupIO): Prom
       write(`  (Endpoint did not return a /models list — enter your exact model ID below)\n`);
     }
 
-    let model = current.model ?? '';
+    // Always ask: Enter keeps the configured model, but switching provider or gateway must be able
+    // to pick a different one (previously an existing model skipped this step entirely).
+    const fallbackModel = current.model ?? '';
+    if (fallbackModel && discovered.length > 0 && !discovered.some(d => d.id === fallbackModel)) {
+      write(`  ! Current model "${fallbackModel}" is not listed by this endpoint.\n`);
+    }
+    let model = '';
     while (!model) {
       const promptHint = discovered.length > 0
-        ? `Enter model ID or number [1-${Math.min(30, discovered.length)}]${current.model ? ` (default: ${current.model})` : ''}: `
-        : `Enter exact model ID${current.model ? ` (default: ${current.model})` : ''}: `;
+        ? `Enter model ID or number [1-${Math.min(30, discovered.length)}]${fallbackModel ? ` (Enter keeps ${fallbackModel})` : ''}: `
+        : `Enter exact model ID${fallbackModel ? ` (Enter keeps ${fallbackModel})` : ''}: `;
       const modelInput = (await ask(promptHint)).trim();
       const modelIdx = Number(modelInput) - 1;
       if (modelInput && Number.isInteger(modelIdx) && modelIdx >= 0 && modelIdx < Math.min(30, discovered.length)) {
         model = discovered[modelIdx].id;
       } else {
-        model = modelInput || current.model || '';
+        model = modelInput || fallbackModel;
       }
       if (!model) write(`  ! Model ID is required (no models are hardcoded).\n`);
     }

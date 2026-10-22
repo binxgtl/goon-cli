@@ -3,6 +3,7 @@ import { join, resolve } from 'node:path';
 import { readFile, mkdir, writeFile, rename, realpath } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
+import { protectSecretEnv } from './process.js';
 
 export const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
 export type EffortLevel = (typeof EFFORT_LEVELS)[number];
@@ -50,6 +51,7 @@ export async function saveCredential(keyEnv: string, apiKey: string): Promise<vo
 }
 
 export async function resolveApiKey(config: Config): Promise<string | undefined> {
+  protectSecretEnv(config.keyEnv);
   const fromEnv = process.env[config.keyEnv]?.trim();
   if (fromEnv) return fromEnv;
   const stored = await loadCredentials();
@@ -122,9 +124,12 @@ export async function resolveRuntime(config: Config, cwd: string): Promise<Runti
   return { ...config, model: config.model, baseUrl, apiKey, cwd: await realpath(resolve(cwd)), dataDir: dataDir() };
 }
 
-export async function atomicJson(file: string, value: unknown): Promise<void> {
+export async function atomicJson(file: string, value: unknown, options: { compact?: boolean } = {}): Promise<void> {
   const temporary = `${file}.${randomUUID()}.tmp`;
-  await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600, flag: 'wx' });
+  // Session files are machine-written and rewritten on every tool step: compact JSON is ~30%
+  // smaller and faster to serialize. Human-edited config files stay pretty-printed.
+  const body = options.compact ? JSON.stringify(value) : JSON.stringify(value, null, 2);
+  await writeFile(temporary, `${body}\n`, { mode: 0o600, flag: 'wx' });
   try { await rename(temporary, file); }
   catch (error) { const { unlink } = await import('node:fs/promises'); await unlink(temporary).catch(() => {}); throw error; }
 }

@@ -31,13 +31,18 @@ export function buildProviderOptions(config: Pick<Config, 'provider' | 'effort'>
   };
 }
 
-function isCompactionPayload(parsed: Record<string, unknown>): boolean {
-  if (parsed.tools) return false;
-  const raw = JSON.stringify(parsed.messages ?? parsed.system ?? parsed.input ?? '');
-  return raw.includes('Summarize coding session history');
+/**
+ * Per-request effort override. Auxiliary calls (compaction, /recap, /btw) set it to 'low'; the
+ * fetch wrapper applies it and strips the header before the request leaves the process.
+ */
+export const EFFORT_OVERRIDE_HEADER = 'x-goon-effort';
+
+/** Request headers selecting a lighter effort for an auxiliary call, or undefined when no effort is configured. */
+export function auxiliaryEffortHeaders(effort: EffortLevel | undefined): Record<string, string> | undefined {
+  return effort ? { [EFFORT_OVERRIDE_HEADER]: 'low' } : undefined;
 }
 
-function mergeSessionHeaders(initHeaders: RequestInit['headers'], sessionId?: string): Record<string, string> {
+function mergeSessionHeaders(initHeaders: RequestInit['headers'], sessionId?: string): { headers: Record<string, string>; override?: EffortLevel } {
   const merged: Record<string, string> = {};
   if (initHeaders instanceof Headers) {
     initHeaders.forEach((value, key) => { merged[key] = value; });
@@ -46,12 +51,36 @@ function mergeSessionHeaders(initHeaders: RequestInit['headers'], sessionId?: st
   } else if (initHeaders && typeof initHeaders === 'object') {
     Object.assign(merged, initHeaders as Record<string, string>);
   }
+  let override: EffortLevel | undefined;
+  for (const key of Object.keys(merged)) {
+    if (key.toLowerCase() !== EFFORT_OVERRIDE_HEADER) continue;
+    const value = merged[key].trim().toLowerCase();
+    if ((EFFORT_LEVELS as readonly string[]).includes(value)) override = value as EffortLevel;
+    delete merged[key];
+  }
   merged['x-request-id'] = randomUUID();
   if (sessionId) {
     merged['x-session-id'] = sessionId;
     merged['x-opencode-session'] = sessionId;
   }
-  return merged;
+  return { headers: merged, ...(override ? { override } : {}) };
+}
+
+/**
+ * True when the serialized body already carries `marker` as a top-level field, i.e. before the
+ * conversation payload starts. Message text cannot fake it: quotes inside JSON strings are escaped.
+ */
+function hasTopLevelMarker(body: string, marker: string): boolean {
+  const at = body.indexOf(marker);
+  if (at < 0) return false;
+  const payload = [body.indexOf('"messages":'), body.indexOf('"input":')].filter(i => i >= 0);
+  return payload.length > 0 && at < Math.min(...payload);
+}
+
+function effortMarker(provider: Config['provider'], effort: EffortLevel): string {
+  if (provider === 'anthropic') return `"output_config":{"effort":"${effort}"`;
+  if (provider === 'openai-responses') return `"reasoning":{"effort":"${effort}"`;
+  return `"reasoning_effort":"${effort}"`;
 }
 
 export function createEffortFetch(
@@ -61,11 +90,16 @@ export function createEffortFetch(
 ): typeof fetch | undefined {
   if (!effort && !sessionId) return undefined;
   return async (input, init) => {
-    const headers = mergeSessionHeaders(init?.headers, sessionId);
+    const { headers, override } = mergeSessionHeaders(init?.headers, sessionId);
     if (effort && init?.body && typeof init.body === 'string') {
+      const effectiveEffort: EffortLevel = override ?? effort;
+      // Fast path: the SDK already serialized the wanted effort (the common case). Skipping the
+      // parse/re-serialize round trip matters for multi-MB histories sent on every step.
+      if (hasTopLevelMarker(init.body, effortMarker(provider, effectiveEffort))) {
+        return fetch(input, { ...init, headers });
+      }
       try {
         const parsed = JSON.parse(init.body) as Record<string, unknown>;
-        const effectiveEffort: EffortLevel = isCompactionPayload(parsed) ? 'low' : effort;
         if (provider === 'anthropic') {
           const existing = parsed.output_config && typeof parsed.output_config === 'object'
             ? (parsed.output_config as Record<string, unknown>)

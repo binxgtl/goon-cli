@@ -32,7 +32,8 @@ test('bounded parallel reads drain before mutation and results keep model order'
     assert.equal(active, 0); order.push('mutate'); return 'mutated';
   } });
   await new Harness(config, store, registry).run('test', new AbortController().signal);
-  assert.equal(maximum, 2);
+  // All three consecutive reads run together (MAX_PARALLEL_READS), the mutation still waits for them.
+  assert.equal(maximum, 3);
   assert(order.indexOf('mutate') > order.indexOf('done:third_read'));
 });
 

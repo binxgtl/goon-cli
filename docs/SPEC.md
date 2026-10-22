@@ -11,7 +11,7 @@ tools and persistence. No ZCode runtime source is copied or loaded.
   Credentials are resolved at runtime through keyEnv and are never saved by init.
 - Harness owns ModelMessage history, token accounting, tool result pairing and
   compaction. A streamed response must complete before any tool executes. Reads
-  can run in consecutive batches of two; mutations execute in declaration order.
+  can run in consecutive batches of up to six; mutations execute in declaration order.
 - SessionStore owns atomic JSON checkpoints and a process lock. A session is
   bound to its real workspace. Loading repairs interrupted tool calls with error
   results; it never replays a side effect. A live lock is never stolen.
