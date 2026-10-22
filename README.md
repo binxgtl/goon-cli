@@ -87,10 +87,27 @@ Mã thoát: `0` thành công, `1` lỗi, `2` từ chối quyền, `130` Ctrl+C, 
 
 ## Giao diện TUI, Phím tắt & Slash Commands
 
-Khi chạy `goon` trong terminal, giao diện TUI toàn màn hình hiển thị:
-- **Header Band**: Phiên bản, model + mức `effort`, thư mục workspace, nhánh Git hiện tại và thanh đo ngữ cảnh trực tiếp (`ctx ▰▰▰▱▱▱▱▱ 34%`).
-- **Hội thoại & Bảng biểu**: Render Markdown, bảng kẻ khung căn cột tự động, khối diff màu trực quan (`+dòng thêm` xanh lá, `-dòng xoá` đỏ) và trạng thái tool/subagent thời gian thực.
-- **Khung nhập lệnh (Composer)**: Đổi màu viền theo chế độ (`ask` / `auto` / `plan` / `readonly`), hiển thị bộ đếm token trực tiếp ở cạnh dưới và popup gợi ý lệnh `/slash` kèm mô tả.
+Khi chạy `goon` trong terminal, giao diện TUI toàn màn hình tối giản: không khung viền, không
+nền tô màu, dùng màu mặc định của terminal (đẹp trên cả theme sáng lẫn tối).
+
+```
+› Sửa test checkout đang fail
+
+○ Explored
+  └ Read src/cart.ts
+● Ran npm test -- cart (2s)
+± Edited src/cart.ts (+1 -1)
+◆ Tổng tiền tính bằng số thực mà không làm tròn…
+
+⠋ Working  4s   esc to interrupt
+──────────────────────────────────────────────────────────────
+› Ask anything   / commands   @ files   $ skills   ! shell
+ask   glm-5.3-flash   effort max        shop-api (main)   ctx 34%   69k tokens
+```
+
+- **Hội thoại**: Markdown, bảng căn cột, diff màu (`+` xanh, `-` đỏ), khối code có lề mờ, trạng thái tool/subagent theo thời gian thực.
+- **Dòng nhập**: một đường kẻ (chuyển màu hổ phách khi goon đang chờ bạn trả lời/duyệt quyền), dòng nhập `›` và popup gợi ý `/slash` kèm mô tả.
+- **Dòng trạng thái**: chế độ (`auto-approve` hiện màu hổ phách vì là chế độ rủi ro), model, effort, workspace (nhánh git), todo, % ngữ cảnh do provider báo và tổng token.
 
 ### Phím tắt chính
 
