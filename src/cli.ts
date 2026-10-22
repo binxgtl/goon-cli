@@ -663,7 +663,11 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
           }
           const preview = cleanTerminal(rawPreview.split(runtime.apiKey).join('[REDACTED]').slice(0, 8000));
           const prefix = request.tool === 'bash' ? bashApprovalPrefix(request.input) : undefined;
-          const prefixHint = prefix ? `\n  p = always allow commands starting with "${prefix}" (no ; & | \` $ < > in them)` : '';
+          const fullCommand = request.input && typeof request.input === 'object' ? String((request.input as { command?: unknown }).command ?? '').trim().split(/\s+/).join(' ') : '';
+          const prefixHint = !prefix ? ''
+            : prefix === fullCommand
+              ? `\n  p = always allow exactly "${prefix}" in this session`
+              : `\n  p = always allow "${prefix} …" in this session (simple arguments inside the workspace only)`;
           const approvalBlock = `\n▲ Allow ${request.tool}?\n${preview}${prefixHint}\n`;
           const label = prefix ? '[y/N/p(refix)/a(lways)] ' : '[y/N/a(lways)] ';
           notifyAttention();

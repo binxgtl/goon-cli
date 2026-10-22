@@ -16,6 +16,7 @@ Phạm vi: toàn bộ `src/` (~11k dòng TypeScript), `bin/`, dependency và CI.
 | S6 | Thấp | API key hiện rõ khi gõ trong `goon setup`/`/setup`. | Nhập ẩn (readline và TUI), thêm `/key`. |
 | S7 | Thấp | `/delete <prefix>` xoá phiên khớp đầu tiên khi prefix mơ hồ và xoá cả lock của phiên đang mở ở tiến trình khác. | Từ chối prefix mơ hồ và phiên đang bị khoá bởi PID còn sống. |
 | S8 | Thấp | Base URL `http://` tới host không phải loopback gửi API key dạng rõ mà không cảnh báo. | Cảnh báo khi khởi động và trong `goon doctor`. |
+| S10 | Trung bình | (Phát hiện bởi review độc lập, trong tính năng mới) Duyệt theo tiền tố `npm install` sẽ tự duyệt cả `npm install <gói khác>`; `git diff` tự duyệt cả `git diff --output=/đường/dẫn`. | Lệnh cài gói, sửa/xoá file, mạng chỉ nhớ đúng nguyên câu lệnh; tham số thêm ra ngoài workspace hoặc bật ghi/chạy chương trình phải hỏi lại. |
 | S9 | Thấp–TB | `npm audit`: `@ai-sdk/provider-utils` (GHSA-866g-f22w-33x8), `ajv` ReDoS (GHSA-2g4f-4pwh-qvx6). | Nâng `ai` 6.0.312, providers, `ajv` 8.20.0, `zod` 4.6.7 → 0 lỗ hổng. |
 
 ## Lỗi chức năng

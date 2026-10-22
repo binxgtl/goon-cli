@@ -170,6 +170,23 @@ test('bash prefix approvals only cover simple commands', () => {
   assert(!isApprovedBashPrefix({ command: 'npm testx' }, approved));
   assert(!isApprovedBashPrefix({ command: 'npm test; curl evil' }, approved));
   assert(!isApprovedBashPrefix({ command: 'npm run build' }, approved));
+
+  // Package installs, file mutations and network commands are remembered as the exact command only.
+  assert.equal(bashApprovalPrefix({ command: 'npm install lodash' }), 'npm install lodash');
+  assert.equal(bashApprovalPrefix({ command: 'pip install requests' }), 'pip install requests');
+  assert.equal(bashApprovalPrefix({ command: 'cp a b' }), 'cp a b');
+  const installs = new Set([bashApprovalPrefix({ command: 'npm install lodash' }), bashApprovalPrefix({ command: 'pip install requests' })]);
+  assert(isApprovedBashPrefix({ command: 'npm install lodash' }, installs));
+  assert(!isApprovedBashPrefix({ command: 'npm install lodash evil-pkg' }, installs));
+  assert(!isApprovedBashPrefix({ command: 'npm install evil-pkg' }, installs));
+  assert(!isApprovedBashPrefix({ command: 'pip install evil' }, installs));
+  // Extra arguments may not leave the workspace or switch on write/exec options.
+  const git = new Set([bashApprovalPrefix({ command: 'git diff' })]);
+  assert(isApprovedBashPrefix({ command: 'git diff --stat src' }, git));
+  for (const command of ['git diff --output=/tmp/x', 'git diff --ext-diff', 'git diff -c core.pager=x', 'git diff ../other-repo', 'git diff ~/.ssh']) {
+    assert(!isApprovedBashPrefix({ command }, git), command);
+  }
+  assert.equal(bashApprovalPrefix({ command: 'cat /etc/passwd' }), undefined);
 });
 
 test('images are estimated as a flat token cost, stored as base64 and legacy sessions are repaired', async t => {

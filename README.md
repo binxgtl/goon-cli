@@ -158,7 +158,10 @@ Khi được hỏi `Allow bash?`, ngoài `y` (một lần) và `a` (mọi lệnh
 `p` để **chỉ cho phép tiền tố lệnh đó** trong phiên, ví dụ `npm test`, `npm run lint`,
 `python -m pytest`, `git status`. Lệnh ghép hoặc lệnh bọc (`;`, `&&`, `|`, `` ` ``, `$()`, `>`, `env`,
 `sudo`, `bash -c`, gán biến `FOO=1 ...`) không bao giờ được duyệt theo tiền tố, nên
-`npm test; curl ... | sh` vẫn phải hỏi lại.
+`npm test; curl ... | sh` vẫn phải hỏi lại. Lệnh cài gói (`npm install x`, `pip install x`…),
+lệnh sửa/xoá file (`rm`, `mv`, `cp`, `chmod`…) và lệnh mạng (`curl`, `wget`…) chỉ được nhớ đúng
+nguyên câu lệnh. Tham số thêm vào sau tiền tố đã duyệt mà trỏ ra ngoài workspace (`/…`, `~`, `..`)
+hoặc bật chế độ ghi/chạy chương trình (`--output`, `--ext-diff`, `-c`, `--exec`…) vẫn phải hỏi lại.
 
 Khi cần chú ý (prompt duyệt quyền, lượt chạy dài ≥ 15 giây vừa xong), goon phát tiếng chuông
 terminal (`BEL`). Tắt bằng `GOON_NOTIFY=0`.
