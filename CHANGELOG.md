@@ -10,6 +10,8 @@ Giao diện tối giản, vá bảo mật, sửa lỗi và tăng hiệu năng. C
   trạng thái (chế độ, model, effort … workspace (nhánh), todo, ctx %, token). Một màu nhấn duy nhất;
   màu khác chỉ xuất hiện khi mang trạng thái (diff, lỗi, duyệt quyền, auto-approve).
 - Banner, `/btw`, `/recap`, resume và `goon setup` là các khối chữ ngắn, tự xuống dòng ở mọi độ rộng.
+- `/resume` có 2 tab **This folder** / **All projects** (←→ hoặc Tab đổi tab, gõ để lọc); resume
+  phiên của dự án khác tự chuyển workspace. `goon resume` / `goon --resume ID` chạy được từ mọi thư mục.
 
 ### Bảo mật
 - Chuyển từ `auto`/`--yes` về `ask`/`plan` bật lại việc duyệt quyền ngay lập tức.

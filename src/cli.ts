@@ -85,6 +85,13 @@ export function readGitBranch(cwd: string): string | undefined {
   return undefined;
 }
 
+/** Short folder name for lists: the last path segment (home shown as ~). */
+function folderLabel(cwd: string): string {
+  const clean = cwd.replace(/[\\/]+$/, '');
+  if (process.env.HOME && clean === process.env.HOME) return '~';
+  return clean.split(/[\\/]/).pop() || clean;
+}
+
 function formatRelativeTime(isoDate: string): string {
   const ts = Date.parse(isoDate);
   if (!Number.isFinite(ts)) return isoDate.slice(0, 16).replace('T', ' ');
@@ -479,13 +486,33 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     if (insecureWarning && !jsonOutput) stderr.write(`goon: ${insecureWarning}\n`);
     const sessionsRootDir = join(runtime.dataDir, 'sessions');
     if (launchResumePicker && !resumeTarget) {
-      const existingList = await SessionStore.list(sessionsRootDir);
-      const wsNonEmpty = existingList.filter(s => sameWorkspace(s.cwd, runtime.cwd) && (s.messagesCount ?? 0) > 0);
-      const anyNonEmpty = existingList.filter(s => (s.messagesCount ?? 0) > 0);
-      const best = wsNonEmpty[0] ?? anyNonEmpty[0] ?? existingList.find(s => sameWorkspace(s.cwd, runtime.cwd));
-      if (best) {
-        resumeTarget = best.id;
-        if ((wsNonEmpty.length || anyNonEmpty.length) <= 1) launchResumePicker = false;
+      // `goon resume` works from any folder: with one saved session it resumes it directly,
+      // otherwise the picker opens (This folder / All projects) on a fresh, discardable session.
+      const resumable = (await SessionStore.list(sessionsRootDir)).filter(s => (s.messagesCount ?? 0) > 0 || Boolean(s.title));
+      if (resumable.length === 1) {
+        resumeTarget = resumable[0].id;
+        launchResumePicker = false;
+      } else if (!resumable.length) {
+        launchResumePicker = false;
+      }
+    }
+    if (resumeTarget && resumeTarget !== 'latest' && !values.cwd) {
+      // Resuming by ID from another folder switches to that session's workspace instead of failing
+      // with "belongs to a different workspace" (an explicit --cwd still wins).
+      const all = await SessionStore.list(sessionsRootDir);
+      const wanted = resumeTarget.toLowerCase();
+      const isIndex = /^\d{1,3}$/.test(wanted);
+      const match = all.find(s => s.id.toLowerCase() === wanted)
+        ?? (!isIndex && wanted.length >= 4
+          ? all.find(s => sameWorkspace(s.cwd, runtime.cwd) && s.id.toLowerCase().startsWith(wanted)) ?? all.find(s => s.id.toLowerCase().startsWith(wanted))
+          : undefined);
+      if (match && !sameWorkspace(match.cwd, runtime.cwd)) {
+        const { realpath } = await import('node:fs/promises');
+        const folder = await realpath(match.cwd).catch(() => undefined);
+        if (folder) {
+          runtime = await resolveRuntime(config, folder);
+          resumeTarget = match.id;
+        }
       }
     }
     let store = await SessionStore.open(sessionsRootDir, runtime, resumeTarget);
@@ -1031,7 +1058,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             '  /revert, /undo [code|msg|both] [N] Rewind last N turns & restore prompt to composer (or press Esc Esc)\n' +
             '  /checkpoints                      Interactive picker to rewind to any earlier turn checkpoint\n' +
             '  /todo [clear]                     View or clear the current task checklist\n' +
-            '  /resume [latest|<number>|<id>]    Interactive session picker or hot-swap to saved session\n' +
+            '  /resume [latest|<number>|<id>]    Pick a session from this folder or all projects (←→ / Tab switch)\n' +
             '  /new [title]                      Start a fresh session in this workspace\n' +
             '  /delete [<id>|current]            Delete a saved session or current session\n' +
             '  /compact [focus instructions]     Summarize & archive earlier context history\n' +
@@ -2138,69 +2165,108 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
           if (input === '/resume' || input.startsWith('/resume ')) {
             const sessionsRoot = join(runtime.dataDir, 'sessions');
             const allList = await SessionStore.list(sessionsRoot);
-            const wsList = allList.filter(s => sameWorkspace(s.cwd, runtime.cwd));
-            const rawPool = wsList.length ? wsList : allList;
-            const nonEmptyPool = rawPool.filter(s => (s.messagesCount ?? 0) > 0 || Boolean(s.title));
-            const candidates = nonEmptyPool.length ? nonEmptyPool : rawPool;
+            const resumable = (s: (typeof allList)[number]) => (s.messagesCount ?? 0) > 0 || Boolean(s.title);
+            const projectSessions = allList.filter(resumable);
+            const folderSessions = projectSessions.filter(s => sameWorkspace(s.cwd, runtime.cwd));
             let arg = input.slice(7).trim();
+            let targetId: string | undefined;
             if (!arg) {
-              if (!candidates.length) {
-                display('No saved sessions found.\n');
+              if (!projectSessions.length) {
+                display('No saved sessions yet. Sessions appear here after the first prompt.\n');
                 continue;
               }
-              const rows = candidates.slice(0, 15).map((s, idx) => {
-                const numStr = String(idx + 1).padStart(2, ' ');
-                const currentTag = s.id === store.session.id ? ' • current' : '';
-                const msgTag = `${s.messagesCount ?? 0} msgs`;
-                const ageTag = formatRelativeTime(s.updatedAt);
-                const rawLabel = s.title ? `[${s.title}] ${s.preview ?? ''}`.trim() : s.preview ? s.preview : '(empty session)';
-                const label = rawLabel.replace(/\s+/g, ' ').slice(0, 64);
-                return `  ${numStr}. ${s.id.slice(0, 8)} · ${ageTag.padEnd(8)} · ${msgTag.padEnd(8)} · ${label}${currentTag}`;
-              });
-              const pickerBlock = `\n◇ Resume saved session · ${candidates.length} in workspace\n${rows.join('\n')}\n`;
-              const promptText = `Resume [1-${Math.min(15, candidates.length)}, latest, ID prefix, or Esc/q to cancel]: `;
-              const choice = tui
-                ? (await tui.askTransient(pickerBlock, promptText, undefined, { escHint: 'cancel' })).trim()
-                : (display(pickerBlock), (await question(promptText)).trim());
-              if (!choice || choice.toLowerCase() === 'q' || choice.toLowerCase() === 'cancel' || choice === '0') {
-                if (tui) tui.setNotice('Cancelled /resume.');
-                else display('Cancelled /resume.\n');
-                continue;
+              if (tui) {
+                // Two tabs so a developer who does not remember the folder can still find a session.
+                const toItem = (s: (typeof allList)[number], showFolder: boolean) => ({
+                  id: s.id,
+                  label: `${s.id === store.session.id ? '(current) ' : ''}${s.title ? `${s.title}: ` : ''}${s.preview ?? '(no prompt yet)'}`,
+                  meta: [showFolder ? folderLabel(s.cwd) : '', formatRelativeTime(s.updatedAt), `${s.messagesCount ?? 0} msgs`].filter(Boolean).join('   '),
+                  detail: `${s.cwd}   ${s.id.slice(0, 8)}   ${s.model}`,
+                  search: `${s.cwd} ${s.model} ${s.title ?? ''}`,
+                });
+                const picked = await tui.pick('Resume', [
+                  { label: 'This folder', items: folderSessions.map(s => toItem(s, false)), empty: 'No sessions in this folder yet. Press → for all projects.' },
+                  { label: 'All projects', items: projectSessions.map(s => toItem(s, true)) },
+                ], { initialTab: folderSessions.length ? 0 : 1, action: 'resume' });
+                if (!picked) {
+                  tui.setNotice('Resume cancelled.');
+                  continue;
+                }
+                targetId = picked.item.id;
+              } else {
+                // Readline mode: a numbered list; "a" switches between this folder and all projects.
+                let showAll = folderSessions.length === 0;
+                for (;;) {
+                  const pool = showAll ? projectSessions : folderSessions;
+                  const rows = pool.slice(0, 20).map((s, idx) =>
+                    `  ${String(idx + 1).padStart(2)}  ${(s.title ?? s.preview ?? '(no prompt yet)').replace(/\s+/g, ' ').slice(0, 60)}   ${showAll ? `${folderLabel(s.cwd)}   ` : ''}${formatRelativeTime(s.updatedAt)}`);
+                  display(`\n${showAll ? 'All projects' : 'This folder'} (${pool.length})\n${rows.join('\n') || '  (none)'}\n`);
+                  const choice = (await question(`Resume [number, ID prefix, a = ${showAll ? 'this folder' : 'all projects'}, Enter = cancel]: `)).trim();
+                  if (choice.toLowerCase() === 'a') { showAll = !showAll; continue; }
+                  const n = Number(choice);
+                  targetId = Number.isInteger(n) && n >= 1 && n <= pool.length ? pool[n - 1].id : choice || undefined;
+                  break;
+                }
+                if (!targetId) {
+                  display('Resume cancelled.\n');
+                  continue;
+                }
               }
-              arg = choice;
-            }
-            const num = Number(arg);
-            if (Number.isInteger(num) && num >= 1 && num <= candidates.length) {
-              arg = candidates[num - 1].id;
+              arg = targetId;
             }
             try {
-              const targetMatch = arg === 'latest'
-                ? candidates.find(s => s.id !== store.session.id && (s.messagesCount ?? 0) > 0)?.id
-                  ?? candidates.find(s => s.id !== store.session.id)?.id
-                  ?? candidates[0]?.id
-                : candidates.find(s => s.id === arg || s.id.toLowerCase().startsWith(arg.toLowerCase()))?.id
-                  ?? allList.find(s => s.id === arg || s.id.toLowerCase().startsWith(arg.toLowerCase()))?.id
-                  ?? arg;
+              const candidates = folderSessions.length ? folderSessions : projectSessions;
+              const num = Number(arg);
+              const prefix = arg.toLowerCase();
+              const targetMatch = Number.isInteger(num) && num >= 1 && num <= candidates.length && !/^[0-9a-f]{4,}$/i.test(arg)
+                ? candidates[num - 1].id
+                : arg === 'latest'
+                  ? candidates.find(s => s.id !== store.session.id)?.id ?? candidates[0]?.id
+                  : allList.find(s => s.id.toLowerCase() === prefix)?.id
+                    ?? folderSessions.find(s => s.id.toLowerCase().startsWith(prefix))?.id
+                    ?? allList.find(s => s.id.toLowerCase().startsWith(prefix))?.id
+                    ?? arg;
               if (targetMatch === store.session.id) {
                 display(`Already in session ${store.session.id.slice(0, 8)}.\n`);
                 renderResumedHistory();
                 continue;
               }
-              const newStore = await SessionStore.open(sessionsRoot, runtime, targetMatch, store.session.id);
+              // A session from another project brings its workspace with it.
+              const target = allList.find(s => s.id === targetMatch);
+              const previousRuntime = runtime;
+              const switching = target !== undefined && !sameWorkspace(target.cwd, runtime.cwd);
+              if (switching) {
+                const { realpath } = await import('node:fs/promises');
+                const folder = await realpath(target!.cwd).catch(() => undefined);
+                if (!folder) {
+                  display(`Cannot resume: the session's folder no longer exists (${target!.cwd}).\n`);
+                  continue;
+                }
+                runtime = await resolveRuntime(config, folder);
+              }
+              let newStore;
+              try {
+                newStore = await SessionStore.open(sessionsRoot, runtime, targetMatch, store.session.id);
+              } catch (error) {
+                runtime = previousRuntime;
+                throw error;
+              }
               const oldStore = store;
               store = newStore;
               await oldStore.discardIfEmpty();
               await oldStore.close();
-              await rebuildHarness();
+              await rebuildHarness(switching ? { reconnectMcp: true } : {});
               if (tui) {
                 tui.clear();
                 display(welcomeBanner(runtime.model, runtime.provider, runtime.baseUrl, runtime.effort, runtime.cwd, store.session.id, mode));
+                if (switching) void tools.files.listWorkspaceFiles().then(files => tui?.setWorkspaceFiles(files)).catch(() => {});
               }
               tui?.setTitle(store.session.title ? `${runtime.model} · ${store.session.title}` : `${runtime.model} · ${store.session.id.slice(0, 8)}`);
               tui?.setTokens(store.session.tokens);
               syncTuiHeader(true);
               tui?.event({ type: 'todo', todos: store.session.todos ?? [] });
               renderResumedHistory();
+              if (switching) display(`Workspace switched to ${runtime.cwd}\n`);
               if (!store.session.messages.length) {
                 display(`Resumed session ${store.session.id.slice(0, 8)} (0 messages).\n`);
               }

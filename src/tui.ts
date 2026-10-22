@@ -170,7 +170,7 @@ const SLASH_DESCRIPTIONS: Record<string, string> = {
   '/compact': 'summarize history to free context',
   '/diff': 'show git diff in workspace (including untracked files)',
   '/review': 'run code review on current diff, branch, or commit',
-  '/resume': 'resume a saved session',
+  '/resume': 'resume a session: this folder or all projects (←→ to switch)',
   '/new': 'start a fresh session',
   '/delete': 'delete a saved session by id or current session',
   '/debug-config': 'show resolved config paths, model capabilities, and settings',
@@ -258,6 +258,24 @@ export function sliceVisible(str: string, maxCols: number): string {
     if (used + w > maxCols) break;
     out += c;
     used += w;
+  }
+  return out;
+}
+
+/** Clips a line that may contain SGR sequences to `cols` visible columns, keeping the styles. */
+export function sliceAnsiLine(line: string, cols: number): string {
+  if (visibleLength(line) <= cols) return line;
+  let out = '';
+  let used = 0;
+  // oxlint-disable-next-line no-control-regex
+  for (const part of line.split(/(\x1b\[[0-9;]*m)/)) {
+    if (part.startsWith('\x1b[')) { out += part; continue; }
+    for (const c of part) {
+      const w = width(c);
+      if (used + w > cols) return `${out}\x1b[0m`;
+      out += c;
+      used += w;
+    }
   }
   return out;
 }
@@ -447,6 +465,34 @@ const LARGE_PASTE_CHAR_THRESHOLD = 150;
 const ATOMIC_PLACEHOLDER_END_RE = /(\[(?:Image #\d+|Pasted text #\d+[^\]]*)\]\s?)$/;
 const ATOMIC_PLACEHOLDER_START_RE = /^(\[(?:Image #\d+|Pasted text #\d+[^\]]*)\]\s?)/;
 
+/** One selectable row of a tabbed picker (see TerminalUI.pick). */
+export interface PickerItem {
+  id: string;
+  /** Main text (left, clipped with an ellipsis). */
+  label: string;
+  /** Short right-aligned facts, e.g. folder, age, message count. */
+  meta?: string;
+  /** Extra line shown under the list for the selected row only (e.g. the full path). */
+  detail?: string;
+  /** Additional text matched by the type-to-filter box. */
+  search?: string;
+}
+export interface PickerTab {
+  label: string;
+  items: PickerItem[];
+  /** Shown when the tab (or the filter result) is empty. */
+  empty?: string;
+}
+interface PickerState {
+  title: string;
+  tabs: PickerTab[];
+  tab: number;
+  index: number;
+  filter: string;
+  action: string;
+  resolve: (value: { tab: number; item: PickerItem } | undefined) => void;
+}
+
 /** Rejection reason when the user presses Esc on a question opened with `escCancels`. */
 export class InputCancelledError extends Error {
   constructor() {
@@ -522,6 +568,7 @@ export class TerminalUI {
   private escHint = 'skip';
   private turnSnapshots: string[] = [];
   private masked = false;
+  private picker?: PickerState;
   private inputRestoredFromRevert = false;
   private escPrimed?: 'backtrack' | 'clear';
   private escPrimeTimer?: NodeJS.Timeout;
@@ -743,6 +790,114 @@ export class TerminalUI {
   setGoal(goal: SessionGoal | undefined) {
     this.goal = goal;
     this.schedule();
+  }
+
+  /**
+   * Shows a tabbed list above the prompt and resolves with the chosen row, or undefined on Esc.
+   * ←/→ or Tab switch tabs, ↑/↓ (PgUp/PgDn, Home/End) move, typing filters every tab, Enter picks.
+   */
+  pick(title: string, tabs: PickerTab[], options: { initialTab?: number; action?: string } = {}): Promise<{ tab: number; item: PickerItem } | undefined> {
+    if (this.closed) return Promise.resolve(undefined);
+    this.picker?.resolve(undefined);
+    return new Promise(resolve => {
+      this.picker = {
+        title: terminalText(title),
+        tabs: tabs.map(t => ({ ...t, label: terminalText(t.label) })),
+        tab: Math.max(0, Math.min(tabs.length - 1, options.initialTab ?? 0)),
+        index: 0,
+        filter: '',
+        action: options.action ?? 'select',
+        resolve: value => {
+          this.picker = undefined;
+          this.needsFullClear = true;
+          this.schedule(0);
+          resolve(value);
+        },
+      };
+      this.scroll = 0;
+      this.schedule(0);
+    });
+  }
+
+  isPicking(): boolean {
+    return this.picker !== undefined;
+  }
+
+  private pickerMatches(state: PickerState, tab = state.tab): PickerItem[] {
+    const items = state.tabs[tab]?.items ?? [];
+    const words = state.filter.trim().toLowerCase().split(/\s+/).filter(Boolean);
+    if (!words.length) return items;
+    return items.filter(item => {
+      const haystack = `${item.label} ${item.meta ?? ''} ${item.detail ?? ''} ${item.search ?? ''} ${item.id}`.toLowerCase();
+      return words.every(word => haystack.includes(word));
+    });
+  }
+
+  private pickerKey(text: string | undefined, key: Key): void {
+    const state = this.picker!;
+    const matches = this.pickerMatches(state);
+    const page = Math.max(3, (this.target.rows || 24) - 12);
+    const switchTab = (delta: number) => {
+      state.tab = (state.tab + delta + state.tabs.length) % state.tabs.length;
+      state.index = 0;
+    };
+    if (key.name === 'escape' || (key.ctrl && key.name === 'c')) state.resolve(undefined);
+    else if (key.name === 'return' || key.name === 'enter') {
+      const item = matches[state.index];
+      if (item) state.resolve({ tab: state.tab, item });
+    } else if (key.name === 'right' || (key.name === 'tab' && !key.shift)) switchTab(1);
+    else if (key.name === 'left' || (key.name === 'tab' && key.shift) || key.sequence === '\x1b[Z') switchTab(-1);
+    else if (key.name === 'up' || (key.ctrl && key.name === 'p')) state.index = Math.max(0, state.index - 1);
+    else if (key.name === 'down' || (key.ctrl && key.name === 'n')) state.index = Math.min(Math.max(0, matches.length - 1), state.index + 1);
+    else if (key.name === 'pageup') state.index = Math.max(0, state.index - page);
+    else if (key.name === 'pagedown') state.index = Math.min(Math.max(0, matches.length - 1), state.index + page);
+    else if (key.name === 'home') state.index = 0;
+    else if (key.name === 'end') state.index = Math.max(0, matches.length - 1);
+    else if (key.name === 'backspace') { state.filter = state.filter.slice(0, -1); state.index = 0; }
+    else if (key.ctrl && key.name === 'u') { state.filter = ''; state.index = 0; }
+    else if (text && !key.ctrl && !key.meta && !/[\r\n]/.test(text)) {
+      state.filter = (state.filter + terminalText(text)).slice(0, 120);
+      state.index = 0;
+    }
+    if (this.picker) this.schedule(0);
+  }
+
+  /** Picker rows rendered between the transcript and the prompt rule. */
+  private pickerLines(state: PickerState, cols: number, maxRows: number): string[] {
+    const T = THEME;
+    const R = T.reset;
+    const lines: string[] = [];
+    const tabsText = state.tabs.map((t, i) => {
+      const count = this.pickerMatches(state, i).length;
+      const label = `${t.label} ${count}`;
+      return i === state.tab ? `${T.brandBold}${label}${R}` : `${T.faint}${label}${R}`;
+    }).join('   ');
+    lines.push(sliceAnsiLine(`${T.strong}${state.title}${R}   ${tabsText}`, cols));
+    const matches = this.pickerMatches(state);
+    const listRows = Math.max(1, maxRows - 3);
+    if (!matches.length) {
+      const empty = state.filter ? `No match for "${state.filter}"` : state.tabs[state.tab]?.empty ?? 'Nothing here yet';
+      lines.push(`${T.faint}  ${sliceVisible(empty, Math.max(1, cols - 2))}${R}`);
+    } else {
+      state.index = Math.min(state.index, matches.length - 1);
+      const start = Math.min(Math.max(0, state.index - listRows + 1), Math.max(0, matches.length - listRows));
+      for (let i = start; i < Math.min(matches.length, start + listRows); i++) {
+        const item = matches[i];
+        const selected = i === state.index;
+        const meta = item.meta ? sliceVisible(terminalText(item.meta), Math.max(0, Math.floor(cols * 0.45))) : '';
+        const metaCols = visibleLength(meta);
+        const labelRoom = Math.max(4, cols - 2 - metaCols - (metaCols ? 3 : 0));
+        let label = terminalText(item.label).replace(/\s+/g, ' ');
+        if (visibleLength(label) > labelRoom) label = `${sliceVisible(label, labelRoom - 1)}…`;
+        const gap = ' '.repeat(Math.max(metaCols ? 3 : 0, cols - 2 - visibleLength(label) - metaCols));
+        lines.push(selected
+          ? `${T.brandBold}› ${R}${T.strong}${label}${R}${gap}${T.faint}${meta}${R}`
+          : `  ${label}${gap}${T.faint}${meta}${R}`);
+      }
+      const detail = matches[state.index]?.detail;
+      if (detail) lines.push(`${T.faint}  ${sliceVisible(terminalText(detail), Math.max(1, cols - 2))}${R}`);
+    }
+    return lines;
   }
 
   /** Queues input (prompt or command) to be returned by the next main-prompt question(). */
@@ -1191,6 +1346,13 @@ export class TerminalUI {
    * placeholders (Codex `apply_paste` pattern) so the composer never floods or lags.
    */
   private handlePaste(rawText: string, allowCoalesce = false) {
+    if (this.picker) {
+      // Pasting while a picker is open goes into its filter (first line only).
+      this.picker.filter = (this.picker.filter + terminalText(rawText.split(/\r?\n/)[0] ?? '')).slice(0, 120);
+      this.picker.index = 0;
+      this.schedule(0);
+      return;
+    }
     const normalized = terminalText(rawText.replace(/\r\n/g, '\n').replace(/\r/g, '\n'));
     const cleaned =
       !normalized.slice(0, -1).includes('\n') && normalized.endsWith('\n')
@@ -1499,6 +1661,10 @@ export class TerminalUI {
       const pasted = this.bracketedPasteBuffer;
       this.bracketedPasteBuffer = '';
       this.handlePaste(pasted);
+      return;
+    }
+    if (this.picker && !this.inBracketedPaste) {
+      this.pickerKey(text, key);
       return;
     }
 
@@ -2476,6 +2642,26 @@ export class TerminalUI {
     const todoGroup: Seg[] = this.todoLabel ? [[`todo ${this.todoLabel}`, T.faint]] : [];
     const tokenGroup: Seg[] = [[`${formatTokenCount(this.tokens)} tokens`, T.faint]];
 
+    // A picker (e.g. /resume) replaces the status/popup rows and turns the prompt into its filter.
+    if (this.picker) {
+      const state = this.picker;
+      const maxPickerRows = Math.max(4, Math.min(18, rows - 6));
+      const pickerLines = this.pickerLines(state, safeCols, maxPickerRows);
+      const height = Math.max(1, rows - pickerLines.length - 3);
+      this.maxScroll = Math.max(0, all.length - height);
+      this.scroll = 0;
+      const body = all.slice(Math.max(0, all.length - height));
+      while (body.length < height) body.push('');
+      const filter = sliceVisible(state.filter, Math.max(1, safeCols - 3));
+      const promptLine = `${T.brandBold}› ${T.reset}${filter || `${T.faint}type to filter${T.reset}`}`;
+      const hints = `←→ tabs   ↑↓ select   enter ${state.action}   esc cancel`;
+      const footer = rich ? `${T.faint}${clip(hints)}${T.reset}` : clip(hints);
+      const screenLines = [...body, ...pickerLines, `${T.faint}${'─'.repeat(safeCols)}${T.reset}`, promptLine, footer];
+      const cursorSeq = `\x1b[${screenLines.length - 1};${Math.min(safeCols, 3 + visibleLength(filter))}H\x1b[?25h`;
+      this.flushScreenLines(screenLines, columns, rows, cursorSeq);
+      return;
+    }
+
     // Full-screen transcript (Ctrl+T or /transcript): one dim line above and below the history.
     if (this.inTranscriptOverlay) {
       const txHeader = this.band(
@@ -2667,6 +2853,7 @@ export class TerminalUI {
       this.spinTimer = undefined;
     }
     this.reject(new Error('Terminal closed.'));
+    this.picker?.resolve(undefined);
     this.source.removeListener('data', this.beforeRawData);
     this.source.removeListener('keypress', this.keypress);
     this.source.removeListener('data', this.afterRawData);

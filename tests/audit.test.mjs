@@ -437,3 +437,83 @@ test('real TUI: approvals come back after switching from --yes (auto) to ask mod
   assert.deepEqual(JSON.parse(stdout), { code: 0, asked: true });
   await assert.rejects(stat(join(f.cwd, 'guarded.txt')), 'denied write must not happen');
 });
+
+test('TUI picker: tabs switch with ←/→ and Tab, ↑/↓ select, typing filters, Enter picks, Esc cancels', async t => {
+  const { stripVTControlCharacters } = await import('node:util');
+  const input = new PassThrough(), output = new PassThrough();
+  input.isRaw = false; input.setRawMode = value => { input.isRaw = value; };
+  output.columns = 90; output.rows = 24; output.on('data', () => {});
+  const ui = new TerminalUI('m', () => {}, input, output);
+  t.after(() => ui.close());
+  const key = (text, name, extra = {}) => input.emit('keypress', text, { name, ...extra });
+  const tabs = [
+    { label: 'This folder', items: [{ id: 'a', label: 'fix checkout', meta: '2h' }, { id: 'b', label: 'add retry', meta: '1d' }] },
+    { label: 'All projects', items: [{ id: 'c', label: 'docs site', meta: 'web   3d' }, { id: 'd', label: 'billing bug', meta: 'api   4d', detail: '/home/dev/api' }] },
+  ];
+  let picking = ui.pick('Resume', tabs, { action: 'resume' });
+  await delay(20);
+  let frame = stripVTControlCharacters(ui.renderedFrame());
+  assert.match(frame, /Resume {3}This folder 2 {3}All projects 2/);
+  assert.match(frame, /› fix checkout/);
+  assert.match(frame, /enter resume {3}esc cancel/);
+  key('', 'down');
+  key('\r', 'return');
+  assert.equal((await picking).item.id, 'b');
+
+  picking = ui.pick('Resume', tabs);
+  key('', 'right');
+  key('', 'down');
+  await delay(20);
+  frame = stripVTControlCharacters(ui.renderedFrame());
+  assert.match(frame, /› billing bug\s+api {3}4d/);
+  assert.match(frame, /\/home\/dev\/api/, 'detail of the selected row is shown');
+  key('', 'tab'); // wraps back to the first tab
+  key('', 'left'); // and left goes back to All projects
+  for (const ch of 'docs') key(ch, ch);
+  await delay(20);
+  frame = stripVTControlCharacters(ui.renderedFrame());
+  assert.match(frame, /All projects 1/);
+  assert.match(frame, /› docs/);
+  key('\r', 'return');
+  const chosen = await picking;
+  assert.deepEqual([chosen.tab, chosen.item.id], [1, 'c']);
+
+  picking = ui.pick('Resume', tabs);
+  key('', 'escape');
+  assert.equal(await picking, undefined);
+  assert.equal(ui.isPicking(), false);
+});
+
+test('resuming a session by ID or with `goon resume` from another folder switches to its workspace', async t => {
+  const { spawn } = await import('node:child_process');
+  const { realpath } = await import('node:fs/promises');
+  const f = await fixture(t);
+  const p = await provider(t, (_, response) => sse(response, { text: 'ok' }));
+  const first = await cli(f, p.url, ['--json', '-p', 'start work']).done;
+  assert.equal(first.code, 0, first.stderr);
+  const id = JSON.parse(first.stdout.split('\n')[0]).id;
+  const elsewhere = join(f.root, 'elsewhere');
+  await mkdir(elsewhere);
+  const run = (args, input = '') => new Promise((resolveRun, reject) => {
+    const child = spawn(process.execPath, [resolve(process.env.GOON_TEST_BIN ?? 'bin/goon.mjs'), '--base-url', p.url, '--model', 'test-model', ...args], {
+      cwd: elsewhere,
+      env: { ...process.env, XDG_CONFIG_HOME: f.config, XDG_DATA_HOME: f.data, GOON_API_KEY: 'k' },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    let stdout = '', stderr = '';
+    child.stdout.on('data', c => { stdout += c; });
+    child.stderr.on('data', c => { stderr += c; });
+    child.on('error', reject);
+    child.on('close', code => resolveRun({ code, stdout, stderr }));
+    child.stdin.end(input);
+  });
+  const byId = await run(['--json', '--resume', id.slice(0, 8), '-p', 'continue']);
+  assert.equal(byId.code, 0, byId.stderr);
+  const started = JSON.parse(byId.stdout.split('\n')[0]);
+  assert.equal(started.id, id);
+  assert.equal(started.cwd, await realpath(f.cwd));
+  // `goon resume` with a single saved session resumes it directly, whatever the current folder.
+  const plain = await run(['--json', 'resume'], 'one more');
+  assert.equal(plain.code, 0, plain.stderr);
+  assert.equal(JSON.parse(plain.stdout.split('\n')[0]).id, id);
+});

@@ -65,7 +65,7 @@ Goon giữ nguyên đường dẫn Base URL bạn cấu hình (chỉ tự độn
 
 ```bash
 goon                                              # Mở giao diện TUI toàn màn hình
-goon resume                                       # Tiếp tục phiên gần nhất có tin nhắn trong workspace
+goon resume                                       # Chọn phiên để tiếp tục (thư mục này / mọi dự án), chạy từ bất kỳ đâu
 goon --resume latest                              # Tương đương goon resume
 goon --resume SESSION_UUID -p 'Tiếp tục phần đang làm'
 goon -p 'Đọc repo, tìm nguyên nhân lỗi và sửa; chạy kiểm tra phù hợp'
@@ -139,7 +139,7 @@ Khi model đang suy nghĩ hoặc chạy tool:
 - `/transcript`: Bật/tắt chế độ xem Transcript toàn màn hình (giống `Ctrl+T`).
 - `/model [tên_model]` & `/models`: Đổi model hoặc quét trực tiếp danh sách model từ API.
 - `/effort [low|medium|high|xhigh|max|clear]`: Chỉnh mức độ suy luận (`reasoning_effort` / thinking budget).
-- `/resume [latest|số_thứ_tự|id_prefix]`: Mở menu chọn và khôi phục phiên làm việc cũ (tự động bỏ qua các phiên rỗng 0 tin nhắn).
+- `/resume [latest|số_thứ_tự|id_prefix]`: Mở bảng chọn phiên với 2 tab **This folder** / **All projects** (`←`/`→` hoặc `Tab` để đổi tab, `↑`/`↓` chọn, gõ để lọc theo nội dung, tên thư mục hoặc model, `Enter` để resume). Chọn phiên của dự án khác sẽ tự chuyển workspace sang thư mục đó, nên không cần nhớ phiên nằm ở thư mục nào. `goon resume` (hoặc `goon --resume ID`) cũng chạy được từ bất kỳ thư mục nào.
 - `/new`, `/clear`, `/fork [tên]`, `/rename <tiêu_đề>`: Tạo phiên mới, xoá màn hình, nhân bản nhánh hội thoại hoặc đặt tên phiên.
 - `/rewind [N]` & `/revert [N] [both|code|messages]`: Quay lui hội thoại và/hoặc khôi phục trạng thái file về trước lượt thứ `N`.
 - `/undo`: Hoàn tác các thay đổi file của lượt vừa chạy.
