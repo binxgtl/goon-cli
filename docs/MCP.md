@@ -48,6 +48,10 @@ HTTP redirects carrying credentials are rejected.
 paginated lists), prints original and stable namespaced names, then closes them.
 Neither command requires a model key. `check` does run configured stdio commands.
 Normal `goon` startup connects enabled servers before the first model request.
+Servers start concurrently (startup time is the slowest server, not the sum), and
+running servers are reused when the harness is rebuilt for a new effort, model or
+session; `/mcp reload`, `/mcp check` and `/cd` restart them. The MCP SDK is only
+loaded when at least one server is enabled.
 `--no-mcp` skips configuration loading and connection for that invocation.
 
 ## Permissions and lifetime

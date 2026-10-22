@@ -74,6 +74,9 @@ goon --read-only -p 'Đọc và giải thích kiến trúc repo'
 goon --yes -p 'Tự động duyệt mọi thao tác ghi file và bash'
 goon --json -p 'Kiểm tra dự án'
 printf '%s' 'Giải thích các file chính' | goon --read-only
+git diff | goon -p 'Review diff này'              # dữ liệu pipe vào stdin được đính kèm làm ngữ cảnh
+goon -p 'Giải thích lỗi' < build.log               # tương tự với file chuyển hướng
+goon -p 'Viết changelog' -o CHANGELOG.draft.md     # ghi câu trả lời cuối ra file (scripting/CI)
 goon sessions
 ```
 
@@ -128,8 +131,35 @@ Khi model đang suy nghĩ hoặc chạy tool:
 - `/init`, `/skills`, `/mention <path>`: Khởi tạo `AGENTS.md`, liệt kê `SKILL.md` (gọi qua `$skill-name`) hoặc đính kèm `@file`/ảnh.
 - `/diff`, `/git`, `/review`: Xem `git status` + `git diff`, hoặc yêu cầu model review toàn bộ thay đổi hiện tại.
 - `/compact [trọng_tâm]`: Chủ động nén ngữ cảnh hội thoại (có lưu archive đầy đủ trước khi nén).
-- `/setup`, `/provider`, `/key`, `/doctor`: Cấu hình lại provider (nhấn `Esc` để huỷ), đổi API key hoặc kiểm tra kết nối/môi trường.
+- `/setup` (hoặc `/provider`), `/key`, `/doctor`: Cấu hình lại provider (nhấn `Esc` để huỷ), đổi API key (nhập ẩn) hoặc kiểm tra kết nối/môi trường.
+- `/prompts`, `/prompts:<tên> [tham số]`: Liệt kê và chạy prompt tuỳ biến từ file Markdown (xem mục *Prompt tuỳ biến*).
 - `!<lệnh>`: Chạy nhanh lệnh shell trực tiếp ngay trong TUI (ví dụ `!git status`).
+
+### Duyệt quyền nhanh cho lệnh shell
+
+Khi được hỏi `Allow bash?`, ngoài `y` (một lần) và `a` (mọi lệnh bash trong phiên), có thể chọn
+`p` để **chỉ cho phép tiền tố lệnh đó** trong phiên, ví dụ `npm test`, `npm run lint`,
+`python -m pytest`, `git status`. Lệnh ghép hoặc lệnh bọc (`;`, `&&`, `|`, `` ` ``, `$()`, `>`, `env`,
+`sudo`, `bash -c`, gán biến `FOO=1 ...`) không bao giờ được duyệt theo tiền tố, nên
+`npm test; curl ... | sh` vẫn phải hỏi lại.
+
+Khi cần chú ý (prompt duyệt quyền, lượt chạy dài ≥ 15 giây vừa xong), goon phát tiếng chuông
+terminal (`BEL`). Tắt bằng `GOON_NOTIFY=0`.
+
+### Prompt tuỳ biến (custom slash commands)
+
+Tạo file Markdown trong `.goon/prompts/` hoặc `.agents/prompts/` (theo dự án),
+`~/.config/goon/prompts/` hoặc `~/.codex/prompts/` (theo người dùng):
+
+```markdown
+---
+description: Review một file theo checklist của team
+---
+Review $1 theo checklist bảo mật và hiệu năng. Ghi chú thêm: $ARGUMENTS
+```
+
+Chạy bằng `/prompts:review src/app.ts kiểm tra SQL injection`. `$ARGUMENTS` là toàn bộ phần sau
+tên lệnh, `$1`…`$9` là từng từ, `$$` là ký tự `$`.
 
 ## Harness, Công cụ & Hoàn tác (Checkpoint / Rewind)
 
@@ -140,7 +170,11 @@ Khi model đang suy nghĩ hoặc chạy tool:
   - **MCP Resources & Tools**: `list_mcp_resources`, `list_mcp_resource_templates`, `read_mcp_resource` cùng các tool động từ MCP server (`mcp__<server>__<tool>`).
 - **Cơ chế Checkpoint & Rollback nhẹ, chính xác (`/rewind`, `/revert`, `/undo`)**:
   - Chỉ các file được sửa trực tiếp qua bộ công cụ chỉnh sửa (`write_file`, `edit_file`, `apply_patch` — bao gồm cả subagent worker được uỷ quyền sửa file) mới được ghi nhận bản sao lưu trước lượt chạy (trạng thái tồn tại, nội dung gốc và file mode) để rollback tức thì 100% và không tốn I/O quét toàn bộ workspace khi chạy lệnh shell (`bash`).
-- **Tự động Retry API**: Khi gặp lỗi mạng hoặc lỗi upstream tạm thời (HTTP `5xx`, `429`, `408`, lỗi đóng stream/socket bất ngờ), Harness tự động thử lại tối đa **3 lần** với exponential backoff trước khi dừng.
+  - File bạn đã sửa tay **sau** lượt của agent sẽ không bị ghi đè khi revert: goon giữ nguyên và báo xung đột; dùng `/revert N --force` nếu thật sự muốn ghi đè.
+  - Tổng dung lượng bản sao lưu mỗi phiên giới hạn 32 MiB (các lượt cũ nhất bị lược nội dung trước và được báo rõ khi revert), để file phiên không phình to vô hạn.
+- **`apply_patch` đầy đủ định dạng Codex**: hỗ trợ `*** Move to:` (đổi tên/di chuyển), nhiều khối `Update File` cho cùng một file, file thêm mới luôn kết thúc bằng newline; patch chỉ được ghi khi **mọi** hunk đều khớp.
+- **Tự động Retry API**: Khi gặp lỗi mạng hoặc lỗi upstream tạm thời (HTTP `5xx`, `429`, `408`, lỗi đóng stream/socket bất ngờ), Harness tự động thử lại tối đa **3 lần** với exponential backoff + jitter, tôn trọng header `Retry-After` (tối đa 20 giây) trước khi dừng.
+- **Đọc song song**: tối đa 6 lời gọi tool chỉ-đọc liên tiếp (`read_file`, `search`, `list_files`, MCP read-only…) chạy đồng thời; thao tác ghi và shell vẫn tuần tự theo đúng thứ tự model yêu cầu.
 - **Hiển thị đầy đủ Unified Diff**: `computeUnifiedDiff` hiển thị trọn vẹn số dòng thêm/xoá thực tế (`+N -M`, hỗ trợ tới 5.000 dòng mỗi hunk).
 - **Bảo vệ chống lỗi file `nul` trên Windows**:
   - Tự động chuyển hướng `>nul`, `2>nul`, `>>NUL`, `>/dev/nul` trong lệnh `bash` trên Windows về `/dev/null` an toàn (`sanitizeBashCommand`).
@@ -149,6 +183,15 @@ Khi model đang suy nghĩ hoặc chạy tool:
 - **An toàn phiên & file**:
   - Lưu phiên atomic, lock tiến trình, tự động dọn phiên rỗng (`0 messages`) khi thoát hoặc đổi phiên.
   - Ghi file theo temporary file + `chmod` + `rename`, bảo toàn nguyên vẹn quyền file (`0755`, umask `027`/`007`).
+
+## Bảo mật
+
+- Approval chỉ dựa trên chế độ **hiện tại**: chuyển từ `auto`/`--yes` về `ask`/`plan` có hiệu lực ngay cho lời gọi tool kế tiếp.
+- API key của goon (`GOON_API_KEY` và biến trong `keyEnv`) bị loại khỏi môi trường của mọi tiến trình con (`bash`, `!cmd`, `rg`, `git`), nên model hoặc prompt-injection không thể `env`/`curl` để lấy key. Nếu dự án của bạn cần chính biến đó khi chạy test, hãy dùng một biến khác cho goon (`--key-env`).
+- Tool đọc ảnh do model gọi (`view_image`, `@ảnh` trong prompt của subagent) chỉ đọc trong workspace; ảnh ngoài workspace cần bạn duyệt. Ảnh bạn tự kéo/thả hoặc dán vẫn đọc được ở bất kỳ đâu.
+- Tool bị ẩn ở chế độ hiện tại (ví dụ `view_image`, subagent trong `--read-only`) không thể bị gọi "chui" bằng tên.
+- API key luôn nhập ẩn (`goon setup`, `/setup`, `/key`); `goon doctor` cảnh báo `credentials.json` có quyền quá rộng và base URL `http://` không phải loopback (key bị gửi dạng rõ).
+- Lưu ý: approval **không phải sandbox của hệ điều hành**; lệnh shell đã duyệt chạy với quyền của user hiện tại.
 
 ## Reasoning, Thinking Replay & Gateway Inline Think
 
@@ -218,7 +261,10 @@ goon --no-subagents -p 'Đọc repo và làm trực tiếp'
 
 Các biến môi trường hỗ trợ: `GOON_PROVIDER`, `GOON_BASE_URL`, `GOON_MODEL`, `GOON_EFFORT`,
 `GOON_KEY_ENV`, `GOON_API_KEY`, `GOON_CONTEXT_WINDOW`, `GOON_MAX_OUTPUT_TOKENS`,
-`GOON_TIMEOUT_MS`, `GOON_RUN_TOKEN_BUDGET`, `GOON_INLINE_REASONING`.
+`GOON_TIMEOUT_MS`, `GOON_RUN_TOKEN_BUDGET`, `GOON_INLINE_REASONING`, `GOON_NOTIFY` (`0` để tắt chuông).
+
+- Prompt tuỳ biến: `.goon/prompts/*.md`, `.agents/prompts/*.md`, `$XDG_CONFIG_HOME/goon/prompts/*.md`, `~/.codex/prompts/*.md`.
+- Chỉ mục phiên: `sessions/.index.json` (cache tóm tắt theo kích thước + mtime, tự dựng lại khi hỏng hoặc bị xoá).
 
 Context mặc định `128.000` token, output `16.384` token, timeout mỗi request `300.000` ms,
 và **không giới hạn token mỗi lượt chạy theo mặc định** (`runTokenBudget = 0`) để
@@ -246,8 +292,9 @@ npm install -g . --omit=dev
 | `src/harness.ts` | Agent loop, retry API, điều phối tool, checkpoint, `/btw`, usage, cancellation |
 | `src/provider.ts` | Chọn adapter API, quét `/models`, truyền `reasoningEffort` / thinking budget |
 | `src/setup.ts` | Setup wizard tương tác (`Esc` để huỷ), quét `/models` động, lưu `credentials.json` |
-| `src/tools.ts` | Registry, schema, alias chuẩn hoá, `sanitizeBashCommand` và approval |
-| `src/files.ts`, `src/process.ts` | File I/O, unified diff, patch, `snapshotWorkspace`, bảo vệ `nul` và subprocess |
+| `src/tools.ts`, `src/approval.ts` | Registry, schema, alias chuẩn hoá, `sanitizeBashCommand`, approval và duyệt theo tiền tố lệnh |
+| `src/prompts.ts`, `src/help.ts` | Prompt tuỳ biến `/prompts:<tên>`; nội dung `--help` (nạp nhanh, không kéo SDK) |
+| `src/files.ts`, `src/process.ts` | File I/O, unified diff, patch, backup cho /undo, bảo vệ `nul`, subprocess và lọc biến môi trường bí mật |
 | `src/session.ts` | Lock, checkpoint, rewind, resume và sửa lịch sử bị ngắt |
 | `src/context.ts` | System prompt, `AGENTS.md`, `SKILL.md`, `memories.json`, `presets.json` và compaction |
 | `src/cli.ts`, `src/tui.ts` | Flags, giao diện TUI, Transcript Mode (`Ctrl+T`), popup `/slash` |
