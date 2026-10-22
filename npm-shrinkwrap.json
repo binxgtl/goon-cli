@@ -9,13 +9,13 @@
       "version": "0.2.25",
       "license": "MIT",
       "dependencies": {
-        "@ai-sdk/anthropic": "3.0.81",
-        "@ai-sdk/openai": "3.0.58",
-        "@ai-sdk/openai-compatible": "2.0.60",
+        "@ai-sdk/anthropic": "3.0.135",
+        "@ai-sdk/openai": "3.0.131",
+        "@ai-sdk/openai-compatible": "2.0.87",
         "@modelcontextprotocol/sdk": "1.32.1",
-        "ai": "6.0.193",
-        "ajv": "8.17.1",
-        "zod": "4.6.5"
+        "ai": "6.0.312",
+        "ajv": "8.20.0",
+        "zod": "4.6.7"
       },
       "bin": {
         "goon": "bin/goon.mjs"
@@ -30,13 +30,13 @@
       }
     },
     "node_modules/@ai-sdk/anthropic": {
-      "version": "3.0.81",
-      "resolved": "https://registry.npmjs.org/@ai-sdk/anthropic/-/anthropic-3.0.81.tgz",
-      "integrity": "sha512-B1JDd9Ugq9R5AgIaW3674lhGCMMYJcPUxnrZh8fzbGojgg4QvHFRv6eZahGQAUsmGHbcf74G9bdSBDLWQGY2GA==",
+      "version": "3.0.135",
+      "resolved": "https://registry.npmjs.org/@ai-sdk/anthropic/-/anthropic-3.0.135.tgz",
+      "integrity": "sha512-lOMoKXRbQ0gQ9ctOBo8aOqqQQ8nZEEf9INT8PpAXLSuwIsZl26Jg0vDqkhUsBWBuS9oPtEx3VFqGt3AuAvkjgg==",
       "license": "Apache-2.0",
       "dependencies": {
-        "@ai-sdk/provider": "3.0.10",
-        "@ai-sdk/provider-utils": "4.0.27"
+        "@ai-sdk/provider": "3.0.19",
+        "@ai-sdk/provider-utils": "4.0.62"
       },
       "engines": {
         "node": ">=18"
@@ -46,13 +46,13 @@
       }
     },
     "node_modules/@ai-sdk/gateway": {
-      "version": "3.0.121",
-      "resolved": "https://registry.npmjs.org/@ai-sdk/gateway/-/gateway-3.0.121.tgz",
-      "integrity": "sha512-uY248djJRxa5W68MHiyqO8WLdOeKQoRClGg7PVX/VPhVW8SJNM7/l5DcrA5WAM3YfQrLyNkgZa2VOu8T0t8LUw==",
+      "version": "3.0.219",
+      "resolved": "https://registry.npmjs.org/@ai-sdk/gateway/-/gateway-3.0.219.tgz",
+      "integrity": "sha512-E5yCa/ccG1hdYlSLt62qIJID1EzD8n1S9rZAP4CwvXG1gQpGV0MvKQXbwggKz14d530kfA8lBrzP6QZL81p1WA==",
       "license": "Apache-2.0",
       "dependencies": {
-        "@ai-sdk/provider": "3.0.10",
-        "@ai-sdk/provider-utils": "4.0.27",
+        "@ai-sdk/provider": "3.0.19",
+        "@ai-sdk/provider-utils": "4.0.62",
         "@vercel/oidc": "3.2.0"
       },
       "engines": {
@@ -63,13 +63,13 @@
       }
     },
     "node_modules/@ai-sdk/openai": {
-      "version": "3.0.58",
-      "resolved": "https://registry.npmjs.org/@ai-sdk/openai/-/openai-3.0.58.tgz",
-      "integrity": "sha512-2+5xGMROmrBboJuoOwqLL3b/o3i56+NRdxXDNVAiTyYjLiBj6KzembeuyuBT217be1X+zkEfAqD1H0irJlGIyw==",
+      "version": "3.0.131",
+      "resolved": "https://registry.npmjs.org/@ai-sdk/openai/-/openai-3.0.131.tgz",
+      "integrity": "sha512-aiyMcWBF//Z73wCWn2oGsxGMxykioZZL5ACXQEzpkRmwcjVKOSg4/7tbxwvM/MdRkZI9TrqTUuDHu3+aXU2XXg==",
       "license": "Apache-2.0",
       "dependencies": {
-        "@ai-sdk/provider": "3.0.10",
-        "@ai-sdk/provider-utils": "4.0.26"
+        "@ai-sdk/provider": "3.0.19",
+        "@ai-sdk/provider-utils": "4.0.62"
       },
       "engines": {
         "node": ">=18"
@@ -79,59 +79,13 @@
       }
     },
     "node_modules/@ai-sdk/openai-compatible": {
-      "version": "2.0.60",
-      "resolved": "https://registry.npmjs.org/@ai-sdk/openai-compatible/-/openai-compatible-2.0.60.tgz",
-      "integrity": "sha512-803At7y2fQ/FT6vSedCFbcWlW9JsP2AZHUPZsAYUO9idiIePIgiqcLonhbIm/kMp6wRbVzPtmb8TeXOF/4bTdA==",
+      "version": "2.0.87",
+      "resolved": "https://registry.npmjs.org/@ai-sdk/openai-compatible/-/openai-compatible-2.0.87.tgz",
+      "integrity": "sha512-tge19iHFcU4r6QxlFmwIRU/ytd6RFjsXfMpEc9sLiS5+NnkUYLeh2mm4RzemdqrQS6uO0h0t4RD04CpbgjWXqw==",
       "license": "Apache-2.0",
       "dependencies": {
-        "@ai-sdk/provider": "3.0.14",
-        "@ai-sdk/provider-utils": "4.0.39"
-      },
-      "engines": {
-        "node": ">=18"
-      },
-      "peerDependencies": {
-        "zod": "^3.25.76 || ^4.1.8"
-      }
-    },
-    "node_modules/@ai-sdk/openai-compatible/node_modules/@ai-sdk/provider": {
-      "version": "3.0.14",
-      "resolved": "https://registry.npmjs.org/@ai-sdk/provider/-/provider-3.0.14.tgz",
-      "integrity": "sha512-5X1k57JBJ4H7H1QjX7CnJYAB1I19r/trVZTMcSms7/kLNZ8RaU4Nt2agcwZzv82Hfx6Q7/TOLU7agAKeFfc8cA==",
-      "license": "Apache-2.0",
-      "dependencies": {
-        "json-schema": "^0.4.0"
-      },
-      "engines": {
-        "node": ">=18"
-      }
-    },
-    "node_modules/@ai-sdk/openai-compatible/node_modules/@ai-sdk/provider-utils": {
-      "version": "4.0.39",
-      "resolved": "https://registry.npmjs.org/@ai-sdk/provider-utils/-/provider-utils-4.0.39.tgz",
-      "integrity": "sha512-XPR6o7561RYUkfYlLYouWsvm6Gv2tYIQy5pttGRkvML98u138ClPThn5yiQg5rMQutTtZLB+GUC8qFFCzDKQQQ==",
-      "license": "Apache-2.0",
-      "dependencies": {
-        "@ai-sdk/provider": "3.0.14",
-        "@standard-schema/spec": "^1.1.0",
-        "eventsource-parser": "^3.0.8"
-      },
-      "engines": {
-        "node": ">=18"
-      },
-      "peerDependencies": {
-        "zod": "^3.25.76 || ^4.1.8"
-      }
-    },
-    "node_modules/@ai-sdk/openai/node_modules/@ai-sdk/provider-utils": {
-      "version": "4.0.26",
-      "resolved": "https://registry.npmjs.org/@ai-sdk/provider-utils/-/provider-utils-4.0.26.tgz",
-      "integrity": "sha512-CsKNLKsOpvPujRlIYvoz+Ybw+kGn7J4/fIZa/58+R7iWLLfwn6ifE2G6Yq8K9XvH/I/3bzaDAJ3NhRwEMsLBKQ==",
-      "license": "Apache-2.0",
-      "dependencies": {
-        "@ai-sdk/provider": "3.0.10",
-        "@standard-schema/spec": "^1.1.0",
-        "eventsource-parser": "^3.0.8"
+        "@ai-sdk/provider": "3.0.19",
+        "@ai-sdk/provider-utils": "4.0.62"
       },
       "engines": {
         "node": ">=18"
@@ -141,9 +95,9 @@
       }
     },
     "node_modules/@ai-sdk/provider": {
-      "version": "3.0.10",
-      "resolved": "https://registry.npmjs.org/@ai-sdk/provider/-/provider-3.0.10.tgz",
-      "integrity": "sha512-Q3BZ27qfpYqnCYGvE3vt+Qi6LGOF9R5Nmzn+9JoM1lCRsD9mYaIhfJLkSunN48nfGXJ6n+XNV0J/XVpqGQl7Dw==",
+      "version": "3.0.19",
+      "resolved": "https://registry.npmjs.org/@ai-sdk/provider/-/provider-3.0.19.tgz",
+      "integrity": "sha512-5lWq7zSfRaU5ylDESn3sDQjgGl2AI1vjZKO/6JY3aFW70ct4zcP1kN+ZUYOuTXr28fVsYbyu2YFhddLdIgQFZQ==",
       "license": "Apache-2.0",
       "dependencies": {
         "json-schema": "^0.4.0"
@@ -153,17 +107,18 @@
       }
     },
     "node_modules/@ai-sdk/provider-utils": {
-      "version": "4.0.27",
-      "resolved": "https://registry.npmjs.org/@ai-sdk/provider-utils/-/provider-utils-4.0.27.tgz",
-      "integrity": "sha512-ubkAJ+xODouwtmN1tYlvTPphH1hPOBfZaEQe8U7skGvFAnIRs9PPpsq57bC2+Ky/MB4yzhd6YOsxTAx9sGpazw==",
+      "version": "4.0.62",
+      "resolved": "https://registry.npmjs.org/@ai-sdk/provider-utils/-/provider-utils-4.0.62.tgz",
+      "integrity": "sha512-+FXkZ2e169zASBHP5HAakP0Iai3Eoa8zgh7bnuZExsek3N9HgGt/c7l1Oibdxb79vvsn5Mrg2Sjam80mR6bL8A==",
       "license": "Apache-2.0",
       "dependencies": {
-        "@ai-sdk/provider": "3.0.10",
+        "@ai-sdk/provider": "3.0.19",
         "@standard-schema/spec": "^1.1.0",
-        "eventsource-parser": "^3.0.8"
+        "eventsource-parser": "^3.0.8",
+        "undici": "^6.28.0"
       },
       "engines": {
-        "node": ">=18"
+        "node": ">=18.17"
       },
       "peerDependencies": {
         "zod": "^3.25.76 || ^4.1.8"
@@ -592,14 +547,14 @@
       }
     },
     "node_modules/ai": {
-      "version": "6.0.193",
-      "resolved": "https://registry.npmjs.org/ai/-/ai-6.0.193.tgz",
-      "integrity": "sha512-VQOTOse8+X8kMtg61DNSXlYJzwOW4NjMLDJNk/qxClWsFe4oiyFJDHGGG1oezfGcFzuYuQe/8Z7r4kwiZWh2YQ==",
+      "version": "6.0.312",
+      "resolved": "https://registry.npmjs.org/ai/-/ai-6.0.312.tgz",
+      "integrity": "sha512-t5Qzz6EBS5SwdjXt+L72E4wA8AQ+2roS93sl4mBMgrKo1hxmTatrPHVL2aFkfVa8x/qg2WVNiqsM/KzgTZ3iZw==",
       "license": "Apache-2.0",
       "dependencies": {
-        "@ai-sdk/gateway": "3.0.121",
-        "@ai-sdk/provider": "3.0.10",
-        "@ai-sdk/provider-utils": "4.0.27",
+        "@ai-sdk/gateway": "3.0.219",
+        "@ai-sdk/provider": "3.0.19",
+        "@ai-sdk/provider-utils": "4.0.62",
         "@opentelemetry/api": "^1.9.0"
       },
       "engines": {
@@ -610,9 +565,9 @@
       }
     },
     "node_modules/ajv": {
-      "version": "8.17.1",
-      "resolved": "https://registry.npmjs.org/ajv/-/ajv-8.17.1.tgz",
-      "integrity": "sha512-B/gBuNg5SiMTrPkC+A2+cW0RszwxYmn6VYxB/inlBStS5nx6xHIt/ehKRhIMhqusl7a8LjQoZnjCs5vhwxOQ1g==",
+      "version": "8.20.0",
+      "resolved": "https://registry.npmjs.org/ajv/-/ajv-8.20.0.tgz",
+      "integrity": "sha512-Thbli+OlOj+iMPYFBVBfJ3OmCAnaSyNn4M1vz9T6Gka5Jt9ba/HIR56joy65tY6kx/FCF5VXNB819Y7/GUrBGA==",
       "license": "MIT",
       "dependencies": {
         "fast-deep-equal": "^3.1.3",
@@ -1756,6 +1711,15 @@
         "node": ">=14.17"
       }
     },
+    "node_modules/undici": {
+      "version": "6.29.1",
+      "resolved": "https://registry.npmjs.org/undici/-/undici-6.29.1.tgz",
+      "integrity": "sha512-EvRlUt/QqAEvXdQeRMYUfwOQsfzpDztykrG2owGEE/rBOBoYv9uF39ZzsNDh4lTFHhTr2XOZjKkYgueD12ZmGA==",
+      "license": "MIT",
+      "engines": {
+        "node": ">=18.17"
+      }
+    },
     "node_modules/undici-types": {
       "version": "6.21.0",
       "resolved": "https://registry.npmjs.org/undici-types/-/undici-types-6.21.0.tgz",
@@ -1803,9 +1767,9 @@
       "license": "ISC"
     },
     "node_modules/zod": {
-      "version": "4.6.5",
-      "resolved": "https://registry.npmjs.org/zod/-/zod-4.6.5.tgz",
-      "integrity": "sha512-v5l/aFXZQeai4awLbOpSoHecE9UiMrnfx75tEXLjNonXVARxQ5mOeipTjROUchszUNCqnE+hqAMujRsRHsut2Q==",
+      "version": "4.6.7",
+      "resolved": "https://registry.npmjs.org/zod/-/zod-4.6.7.tgz",
+      "integrity": "sha512-g8W2D2kU6a8untc053fX1uVBKzM7yqAxW/3zwk83+6RyF2+SKOuV+c0wBDhUwzV1PaGapmZH+rmcUzPf+3CGwg==",
       "license": "MIT",
       "funding": {
         "url": "https://github.com/sponsors/colinhacks"

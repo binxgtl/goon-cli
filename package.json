@@ -38,13 +38,13 @@
     "release:pack": "node scripts/pack-release.mjs"
   },
   "dependencies": {
-    "@ai-sdk/anthropic": "3.0.81",
-    "@ai-sdk/openai": "3.0.58",
-    "@ai-sdk/openai-compatible": "2.0.60",
+    "@ai-sdk/anthropic": "3.0.135",
+    "@ai-sdk/openai": "3.0.131",
+    "@ai-sdk/openai-compatible": "2.0.87",
     "@modelcontextprotocol/sdk": "1.32.1",
-    "ai": "6.0.193",
-    "ajv": "8.17.1",
-    "zod": "4.6.5"
+    "ai": "6.0.312",
+    "ajv": "8.20.0",
+    "zod": "4.6.7"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
