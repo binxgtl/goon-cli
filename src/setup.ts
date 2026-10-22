@@ -20,7 +20,6 @@ import {
   type DiscoveredModel,
 } from './provider.js';
 import { VERSION } from './version.js';
-import { padEndVisible, visibleLength } from './tui.js';
 
 export interface ProviderPreset {
   id: string;
@@ -128,13 +127,10 @@ export async function runSetupWizard(initialConfig?: Config, io?: SetupIO): Prom
   const discover = io?.discover ?? ((url, key, prov) => discoverModels(url, key, prov));
 
   try {
-    const setupTitle = `╭─── ✻ goon cli v${VERSION} · Interactive Setup `;
-    const setupTopDashes = '─'.repeat(Math.max(1, 70 - visibleLength(setupTitle)));
     write(
-      `\n${setupTitle}${setupTopDashes}╮\n` +
-      `│  Configure provider, endpoint, API key, model & reasoning effort    │\n` +
-      `╰─────────────────────────────────────────────────────────────────────╯\n\n` +
-      `Step 1/5 · Choose AI Provider Dialect / Endpoint Preset:\n`
+      `\n◆ goon v${VERSION} setup\n` +
+      `  Provider, endpoint, API key, model and reasoning effort. Esc cancels; nothing is saved until the end.\n\n` +
+      `Step 1/5 · Provider\n`
     );
 
     const defaultIndex = Math.max(
@@ -226,17 +222,16 @@ export async function runSetupWizard(initialConfig?: Config, io?: SetupIO): Prom
     await saveConfig(updated);
 
     const finalKey = await resolveApiKey(updated);
-    write(
-      `\n╭─── ✓ Setup Saved ───────────────────────────────────────────────────╮\n` +
-      `│  Provider : ${padEndVisible(updated.provider, 54)}│\n` +
-      `│  Base URL : ${padEndVisible(updated.baseUrl ?? 'default', 54)}│\n` +
-      `│  Model    : ${padEndVisible(updated.model ?? '', 54)}│\n` +
-      `│  Effort   : ${padEndVisible(updated.effort ?? 'default', 54)}│\n` +
-      `│  Context  : ${padEndVisible(`${updated.contextWindow} tokens (out: ${updated.maxOutputTokens})`, 54)}│\n` +
-      `│  API Key  : ${padEndVisible(finalKey ? 'Configured ✓' : `Missing (set ${updated.keyEnv})`, 54)}│\n` +
-      `│  Config   : ${padEndVisible(configPath(), 54)}│\n` +
-      `╰─────────────────────────────────────────────────────────────────────╯\n\n`
-    );
+    const rows: Array<[string, string]> = [
+      ['provider', updated.provider],
+      ['base URL', updated.baseUrl ?? 'default'],
+      ['model', updated.model ?? ''],
+      ['effort', updated.effort ?? 'default'],
+      ['context', `${updated.contextWindow} tokens (output ${updated.maxOutputTokens})`],
+      ['API key', finalKey ? 'configured' : `missing (set ${updated.keyEnv})`],
+      ['config', configPath()],
+    ];
+    write(`\n● Setup saved\n${rows.map(([label, value]) => `  ${label.padEnd(9)} ${value}`).join('\n')}\n\n`);
     return updated;
   } finally {
     ownRl?.close();

@@ -21,7 +21,7 @@ import { VERSION } from './version.js';
 import { HELP } from './help.js';
 import type { HarnessEvent } from './harness.js';
 import type { SubagentEvent } from './subagents.js';
-import { InputCancelledError, padEndVisible, sliceVisible, terminalText as cleanTerminal, TerminalUI, visibleLength } from './tui.js';
+import { InputCancelledError, terminalText as cleanTerminal, TerminalUI } from './tui.js';
 import type { McpManager } from './mcp.js';
 import { EFFORT_DESCRIPTIONS, parseEffortInput, runSetupWizard } from './setup.js';
 import { discoverModels, formatModelBadge, resolveModelCapabilities, type DiscoveredModel } from './provider.js';
@@ -30,6 +30,11 @@ import { bashApprovalPrefix, isApprovedBashPrefix } from './approval.js';
 
 type PermissionMode = 'ask' | 'plan' | 'auto' | 'readonly';
 
+/**
+ * Welcome lines shown when a session opens. Plain text (it is also printed in readline mode); the
+ * TUI recognises the `◆ goon v…` title and styles the block quietly. No box: lines wrap freely at
+ * any width, so long model IDs and paths never break an outline.
+ */
 export function welcomeBanner(
   model: string,
   provider: string,
@@ -39,26 +44,15 @@ export function welcomeBanner(
   sessionId: string,
   mode: PermissionMode,
 ): string {
-  const inner = 67;
-  const fit = (text: string, cols: number) =>
-    visibleLength(text) <= cols ? padEndVisible(text, cols) : padEndVisible(`${sliceVisible(text, cols - 1)}…`, cols);
-  const line = (content: string) => `│${fit(content, inner)}│`;
-  const field = (label: string, value: string) => line(`   ${label.padEnd(10)} ${value}`);
-  const left = ` ◆ goon  v${VERSION}`;
-  const right = `${mode === 'auto' ? 'auto-approve' : mode} · effort ${effort ?? 'default'} `;
-  const gap = Math.max(1, inner - visibleLength(left) - visibleLength(right));
   const host = baseUrl.replace(/^https?:\/\//, '').replace(/\/+$/, '');
+  const home = process.env.HOME;
+  const workspace = home && cwd.startsWith(`${home}/`) ? `~${cwd.slice(home.length)}` : cwd;
   return [
-    `╭${'─'.repeat(inner)}╮`,
-    line(`${left}${' '.repeat(gap)}${right}`),
-    line(''),
-    field('model', model),
-    field('gateway', `${host} · ${provider}`),
-    field('workspace', cwd),
-    field('session', sessionId.slice(0, 8)),
-    line(''),
-    line('   /help commands · @ files · $ skills · ! shell · shift+tab mode'),
-    `╰${'─'.repeat(inner)}╯`,
+    `◆ goon v${VERSION}`,
+    `  model ${model}   effort ${effort ?? 'default'}   mode ${mode === 'auto' ? 'auto-approve' : mode}`,
+    `  gateway ${host} (${provider})`,
+    `  workspace ${workspace}   session ${sessionId.slice(0, 8)}`,
+    '  /help commands   @ files   $ skills   ! shell   shift+tab mode',
     '',
   ].join('\n');
 }
@@ -853,7 +847,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
           return;
         }
         const lines: string[] = [
-          `\n╭─── Resumed Session ${store.session.id.slice(0, 8)}${store.session.title ? ` (${store.session.title})` : ''} · ${msgs.length} messages · ${store.session.checkpoints?.length ?? 0} checkpoints ───╮`,
+          `\n↻ Resumed session ${store.session.id.slice(0, 8)}${store.session.title ? ` (${store.session.title})` : ''}: ${msgs.length} messages, ${store.session.checkpoints?.length ?? 0} checkpoints`,
         ];
         const previewMsgs = msgs.filter(m => m.role === 'user' || m.role === 'assistant').slice(-6);
         for (const m of previewMsgs) {
@@ -867,11 +861,10 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
           }
           const cleaned = text.replace(/<referenced_file[\s\S]*?<\/referenced_file>/g, '[attached file]').replace(/\s+/g, ' ').trim();
           if (cleaned) {
-            lines.push(`  ${m.role === 'user' ? '▸ You' : '◆ Goon'}: ${cleaned.slice(0, 140)}${cleaned.length > 140 ? '…' : ''}`);
+            lines.push(`  ${m.role === 'user' ? '›' : '◆'} ${cleaned.slice(0, 140)}${cleaned.length > 140 ? '…' : ''}`);
           }
         }
-        lines.push('╰──────────────────────────────────────────────────────────────────────────────────╯\n');
-        display(lines.join('\n'));
+        display(`${lines.join('\n')}\n`);
       };
 
       starting = false;
@@ -1089,12 +1082,8 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
           void (async () => {
             try {
               const res = await harness.askSideQuestion(questionText, AbortSignal.timeout(runtime.timeoutMs));
-              display(
-                `\n╭─── Side Answer (/btw) ──────────────────────────────────────────╮\n` +
-                `  Q: ${questionText}\n` +
-                `  A: ${res.text.split('\n').join('\n     ')}\n` +
-                `╰─────────────────────────────────────────────────────────────────╯\n`
-              );
+              // A "◇" cell with indented lines renders as one quiet block in the TUI.
+              display(`\n◇ Side answer: ${questionText}\n${res.text.split('\n').map(line => `  ${line}`).join('\n')}\n`);
               if (tui) tui.setNotice('Side question (/btw) answered (history unchanged).');
             } catch (error) {
               display(`\n[Side question failed: ${safeError(error, apiKey)}]\n`);
@@ -2240,11 +2229,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             tui?.setStatus('Running');
             try {
               const res = await harness.recap(controller.signal);
-              display(
-                `\n╭─── Session Recap (/recap) ──────────────────────────────────────╮\n` +
-                `${res.text}\n` +
-                `╰─────────────────────────────────────────────────────────────────╯\n`
-              );
+              display(`\n◇ Session recap\n${res.text.split('\n').map(line => `  ${line}`).join('\n')}\n`);
             } catch (error) {
               display(`Recap failed: ${safeError(error, apiKey)}\n`);
             } finally {

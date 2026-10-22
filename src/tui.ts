@@ -10,34 +10,38 @@ import type { SubagentEvent } from './subagents.js';
 const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 const fg = (r: number, g: number, b: number) => `\x1b[38;2;${r};${g};${b}m`;
-const bgc = (r: number, g: number, b: number) => `\x1b[48;2;${r};${g};${b}m`;
 
 /**
- * goon palette (truecolor, tuned for dark terminals). Violet is the brand/assistant voice, sky marks
- * things you can act on (commands, paths, code), mint/rose/amber carry status, slate carries chrome.
+ * goon palette. Chrome uses the terminal's own default colour plus bold/dim, so it reads well on
+ * light and dark themes alike; nothing is drawn as a background fill. One accent (violet) marks
+ * goon's own voice: the prompt marker, the answer glyph, the spinner. Green/red/amber appear only
+ * where they carry status (diffs, failures, approvals, auto-approve), sky only for code and commands.
  */
+const DIM = '\x1b[2m';
+const BOLD = '\x1b[1m';
+const DEFAULT_FG = '\x1b[39m';
 export const THEME = {
   reset: '\x1b[0m',
   brand: fg(167, 139, 250),
-  brandBold: `\x1b[1m${fg(167, 139, 250)}`,
-  thinking: fg(150, 135, 200),
-  bullet: fg(129, 120, 190),
-  text: fg(226, 232, 240),
-  strong: `\x1b[1m${fg(241, 245, 249)}`,
-  muted: fg(148, 163, 184),
-  faint: fg(100, 116, 139),
+  brandBold: `${BOLD}${fg(167, 139, 250)}`,
+  thinking: DIM,
+  bullet: DIM,
+  text: DEFAULT_FG,
+  strong: BOLD,
+  muted: DIM,
+  faint: DIM,
   info: fg(125, 211, 252),
   ok: fg(74, 222, 128),
-  err: fg(251, 113, 133),
+  err: fg(248, 113, 113),
   warn: fg(251, 191, 36),
-  codeText: fg(203, 213, 225),
-  bandBg: bgc(24, 26, 36),
-  userBg: bgc(36, 38, 54),
-  codeBg: bgc(22, 24, 33),
-  addBg: bgc(18, 52, 35),
-  addFg: fg(134, 239, 172),
-  delBg: bgc(66, 24, 32),
-  delFg: fg(253, 164, 175),
+  codeText: DEFAULT_FG,
+  bandBg: '',
+  userBg: '',
+  codeBg: '',
+  addBg: '',
+  addFg: fg(74, 222, 128),
+  delBg: '',
+  delFg: fg(248, 113, 113),
 } as const;
 
 /** Single-column glyph vocabulary for transcript cells (none are Extended_Pictographic, so width() = 1). */
@@ -65,13 +69,13 @@ const CELL_TONES: Record<string, string> = {
   '○': THEME.muted,
   '●': THEME.ok,
   '✗': THEME.err,
-  '±': THEME.info,
+  '±': THEME.text,
   '◈': THEME.brand,
-  '≡': THEME.brand,
+  '≡': THEME.muted,
   '▲': THEME.warn,
   '◌': THEME.faint,
-  '↻': THEME.info,
-  '↺': THEME.warn,
+  '↻': THEME.muted,
+  '↺': THEME.muted,
   '◇': THEME.brand,
 };
 
@@ -87,8 +91,12 @@ interface ParseState {
   inDiff: boolean;
   answerFirst: boolean;
   lastWasUser: boolean;
+  inBanner: boolean;
 }
-const initialParseState = (): ParseState => ({ block: 'normal', inCode: false, inDiff: false, answerFirst: false, lastWasUser: false });
+const initialParseState = (): ParseState => ({ block: 'normal', inCode: false, inDiff: false, answerFirst: false, lastWasUser: false, inBanner: false });
+/** First line of the welcome banner (see welcomeBanner in cli.ts). */
+const BANNER_TITLE_RE = /^◆ goon v\S+\s*$/;
+const BANNER_LABEL_RE = /(^|\s)(model|effort|mode|gateway|workspace|session|branch)(?= )/g;
 
 /**
  * Rows already produced for a transcript prefix. While a turn streams, the transcript only grows,
@@ -109,7 +117,7 @@ type Seg = [text: string, sgr: string];
 type RowKind =
   | 'blank' | 'user' | 'answer' | 'normal' | 'heading' | 'quote' | 'rule' | 'table'
   | 'reasoningHead' | 'reasoning' | 'codeHead' | 'code' | 'codeFoot'
-  | 'cell' | 'child' | 'diff' | 'diffMeta' | 'box' | 'hint';
+  | 'cell' | 'child' | 'diff' | 'diffMeta' | 'box' | 'hint' | 'bannerTitle' | 'banner';
 interface Row {
   kind: RowKind;
   pre: string;
@@ -260,11 +268,6 @@ export function padEndVisible(str: string, cols: number): string {
   return `${sliced}${' '.repeat(Math.max(0, cols - vis))}`;
 }
 
-function padRightAnsi(str: string, cols: number, bgAnsi = ''): string {
-  const vis = visibleLength(str);
-  const pad = Math.max(0, cols - vis);
-  return `${bgAnsi}${str}${bgAnsi}${' '.repeat(pad)}\x1b[0m`;
-}
 
 /** Format inline Markdown (**bold**, `code`, [label](url), ~~strike~~) into ANSI spans. */
 export function formatInlineMarkdown(raw: string, baseSgr = '\x1b[0m'): string {
@@ -2079,6 +2082,7 @@ export class TerminalUI {
         st.inCode = false;
         st.inDiff = false;
         st.answerFirst = false;
+        st.inBanner = false;
         continue;
       }
       if (rawLine.startsWith('[reasoning')) {
@@ -2101,7 +2105,7 @@ export class TerminalUI {
       }
       if (rawLine.startsWith(USER_MARK)) {
         if (!st.lastWasUser) blank();
-        wrapInto('user', rawLine.slice(USER_MARK.length), st.lastWasUser ? '   ' : ` ${GLYPH.user} `, '   ');
+        wrapInto('user', rawLine.slice(USER_MARK.length), st.lastWasUser ? '  ' : `${GLYPH.user} `, '  ');
         st.lastWasUser = true;
         st.block = 'normal';
         st.inCode = false;
@@ -2117,7 +2121,7 @@ export class TerminalUI {
       if (trimmed.startsWith('```')) {
         if (st.inCode) {
           st.inCode = false;
-          rows.push({ kind: 'codeFoot', pre: '', text: '' });
+          blank();
         } else {
           st.inCode = true;
           st.inDiff = false;
@@ -2127,11 +2131,12 @@ export class TerminalUI {
         continue;
       }
       if (st.inCode) {
-        wrapInto('code', rawLine.replace(/\t/g, '  ').trimEnd(), '   ', '   ', {}, false);
+        wrapInto('code', rawLine.replace(/\t/g, '  ').trimEnd(), '    ', '    ', {}, false);
         continue;
       }
 
       if (!trimmed) {
+        st.inBanner = false;
         if (st.block === 'reasoning') continue;
         if (st.block === 'answer' && st.answerFirst) continue;
         blank();
@@ -2151,6 +2156,19 @@ export class TerminalUI {
       }
 
       // ── normal block: tool cells, diffs, CLI output, banner ──
+      if (BANNER_TITLE_RE.test(rawLine)) {
+        blank();
+        rows.push({ kind: 'bannerTitle', pre: '', text: trimmed });
+        st.inBanner = true;
+        continue;
+      }
+      if (st.inBanner) {
+        if (rawLine.startsWith('  ')) {
+          wrapInto('banner', trimmed, '  ', '    ');
+          continue;
+        }
+        st.inBanner = false;
+      }
       const cell = CELL_RE.exec(rawLine);
       if (cell) {
         blank();
@@ -2232,16 +2250,16 @@ export class TerminalUI {
       case 'blank':
         return '';
       case 'user': {
-        const base = `${T.userBg}${T.strong}`;
-        const pre = row.pre.trim() ? `${T.userBg}${T.brandBold}${row.pre}${R}` : `${T.userBg}${row.pre}`;
-        return padRightAnsi(`${pre}${base}${formatInlineMarkdown(row.text, `${R}${base}`)}`, cols, T.userBg);
+        // The user's turn: accent marker, bold text, no background bar.
+        const pre = row.pre.trim() ? `${T.brandBold}${row.pre}${R}` : row.pre;
+        return `${pre}${T.strong}${formatInlineMarkdown(row.text, `${R}${T.strong}`)}${R}`;
       }
       case 'answer':
         return `${answerPre(row.pre)}${md(row.text, T.text)}`;
       case 'normal':
         return `${prefix(row.pre, T.bullet)}${formatInlineMarkdown(row.text)}`;
       case 'heading': {
-        const tone = row.level === 1 ? `${T.brandBold}\x1b[4m` : T.brandBold;
+        const tone = row.level === 1 ? `${T.strong}\x1b[4m` : T.strong;
         return `${answerPre(row.pre)}${md(row.text, tone)}`;
       }
       case 'quote': {
@@ -2263,21 +2281,20 @@ export class TerminalUI {
       case 'reasoning':
         return `${row.pre}${md(row.text, `${T.faint}\x1b[3m`)}`;
       case 'codeHead':
-        return `  ${padRightAnsi(`${T.faint} ${sliceVisible(row.text, Math.max(1, cols - 4))}`, cols - 2, T.codeBg)}`;
+        return `  ${T.faint}${sliceVisible(row.text, Math.max(1, cols - 2))}${R}`;
       case 'code':
-        return `  ${padRightAnsi(`${T.codeText} ${row.text}`, cols - 2, T.codeBg)}`;
+        // A dim gutter instead of a background block: readable on any terminal theme.
+        return `  ${T.faint}│${R} ${row.text}`;
       case 'codeFoot':
-        return `  ${padRightAnsi('', cols - 2, T.codeBg)}`;
+        return '';
       case 'cell':
         return this.styleCell(row);
       case 'child':
         return this.styleChild(row);
       case 'diff': {
-        const bg = row.sign === '+' ? T.addBg : row.sign === '-' ? T.delBg : '';
-        const fg = row.sign === '+' ? T.addFg : row.sign === '-' ? T.delFg : T.muted;
+        const tone = row.sign === '+' ? `${T.addBg}${T.addFg}` : row.sign === '-' ? `${T.delBg}${T.delFg}` : T.muted;
         const num = /^(\s*\d*)/.exec(row.pre)?.[1] ?? '';
-        const content = `${T.faint}${num}${R}${bg}${fg}${row.pre.slice(num.length)}${row.text}`;
-        return bg ? padRightAnsi(content, cols, bg) : `${content}${R}`;
+        return `${T.faint}${num}${R}${tone}${row.pre.slice(num.length)}${row.text}${R}`;
       }
       case 'diffMeta':
         return `${row.pre}${row.text.startsWith('@@') ? T.info : T.faint}${row.text}${R}`;
@@ -2285,6 +2302,16 @@ export class TerminalUI {
         return styleBoxLine(row.text);
       case 'hint':
         return `${T.faint}${row.text}${R}`;
+      case 'bannerTitle': {
+        const [, version = ''] = /^◆ goon (v\S+)/.exec(row.text) ?? [];
+        return `${T.brandBold}${GLYPH.brand}${R} ${T.strong}goon${R} ${T.faint}${version}${R}`;
+      }
+      case 'banner': {
+        if (/^\/help\b/.test(row.text)) {
+          return `${row.pre}${T.faint}${row.text.replace(/(\/help|shift\+tab|(?:^|\s)[@$!](?= ))/g, tok => `${R}${tok}${T.faint}`)}${R}`;
+        }
+        return `${row.pre}${row.text.replace(BANNER_LABEL_RE, (_, lead: string, label: string) => `${lead}${T.faint}${label}${R}`)}`;
+      }
     }
   }
 
@@ -2371,22 +2398,22 @@ export class TerminalUI {
   }
 
   /**
-   * Builds a full-width header/footer band: left segments are clipped last, right groups are dropped
-   * (front first) when the terminal is too narrow, so the band never exceeds `cols` visible columns.
+   * Lays out one full-width line: left segments are clipped last, right groups are dropped
+   * (front first) when the terminal is too narrow, so the line never exceeds `cols` columns.
    */
   private band(left: Seg[], right: Seg[][], cols: number, rich: boolean): string {
     const T = THEME;
-    const sep: Seg = [' · ', T.faint];
+    const sep: Seg = ['   ', ''];
     const flatten = (groups: Seg[][]): Seg[] => groups.flatMap((g, i) => (i === 0 ? g : [sep, ...g]));
     const plainWidth = (segs: Seg[]) => visibleLength(segs.map(s => s[0]).join(''));
-    const leftMin = Math.min(plainWidth(left), 12);
+    // The left side (mode, model, effort) keeps up to 60% of the width before right groups are dropped.
+    const leftMin = Math.min(plainWidth(left), Math.floor(cols * 0.6));
     const groups = right.filter(g => g.length > 0);
     while (groups.length && leftMin + plainWidth(flatten(groups)) + 2 > cols) groups.shift();
     const rightSegs = flatten(groups);
-    if (rightSegs.length) rightSegs.push([' ', '']);
     const rightWidth = plainWidth(rightSegs);
-    const leftAvail = Math.max(0, cols - rightWidth - (rightWidth ? 1 : 0));
-    const paint = (text: string, sgr: string) => (rich && sgr ? `${sgr}${text}${T.reset}${T.bandBg}` : text);
+    const leftAvail = Math.max(0, cols - rightWidth - (rightWidth ? 2 : 0));
+    const paint = (text: string, sgr: string) => (rich && sgr ? `${sgr}${text}${T.reset}` : text);
     let used = 0;
     let leftOut = '';
     for (const [text, sgr] of left) {
@@ -2398,22 +2425,16 @@ export class TerminalUI {
     }
     const gap = ' '.repeat(Math.max(0, cols - used - rightWidth));
     const rightOut = rightSegs.map(([text, sgr]) => paint(text, sgr)).join('');
-    return rich ? `${T.bandBg}${leftOut}${gap}${rightOut}${T.reset}` : `${leftOut}${gap}${rightOut}`.trimEnd();
+    return rightOut ? `${leftOut}${gap}${rightOut}` : leftOut;
   }
 
+  /** Context occupancy as a short percentage, coloured only when it starts to matter. */
   private contextGroup(): Seg[] {
     if (!this.contextWindow || this.contextUsed === undefined) return [];
     const T = THEME;
     const pct = Math.max(0, Math.min(100, Math.round((this.contextUsed / this.contextWindow) * 100)));
-    const cells = 8;
-    const filled = Math.min(cells, Math.round((pct / 100) * cells));
-    const tone = pct >= 90 ? T.err : pct >= 70 ? T.warn : T.brand;
-    return [
-      ['ctx ', T.faint],
-      ['▰'.repeat(filled), tone],
-      ['▱'.repeat(cells - filled), T.faint],
-      [` ${pct}%`, pct >= 70 ? tone : T.muted],
-    ];
+    const tone = pct >= 90 ? T.err : pct >= 70 ? T.warn : T.faint;
+    return [[`ctx ${pct}%`, tone]];
   }
 
   private render() {
@@ -2432,7 +2453,7 @@ export class TerminalUI {
     const titleParts = this.title.split(' · ');
     const modelName = titleParts[0] || this.title;
     const sessionLabel = titleParts.slice(1).join(' · ') || 'session';
-    const elapsedStr = this.turnStartedAt ? `${formatCompactDuration(Date.now() - this.turnStartedAt)} • ` : '';
+    const elapsed = this.turnStartedAt ? formatCompactDuration(Date.now() - this.turnStartedAt) : '';
 
     // Body lines with strict width bound & scroll-anchor lock when scrolled up
     const all = this.renderStyledBodyLines(safeCols, rich);
@@ -2452,13 +2473,13 @@ export class TerminalUI {
             ? T.muted
             : T.warn;
     const goalGroup: Seg[] = goalIndicator ? [[goalIndicator, goalTone]] : [];
-    const todoGroup: Seg[] = this.todoLabel ? [[`${GLYPH.todo} `, T.brand], [this.todoLabel, T.muted]] : [];
-    const brandSegs: Seg[] = [[' ', ''], [GLYPH.brand, T.brandBold], [' goon', T.strong]];
+    const todoGroup: Seg[] = this.todoLabel ? [[`todo ${this.todoLabel}`, T.faint]] : [];
+    const tokenGroup: Seg[] = [[`${formatTokenCount(this.tokens)} tokens`, T.faint]];
 
-    // Full-screen Transcript overlay (Ctrl+T or /transcript)
+    // Full-screen transcript (Ctrl+T or /transcript): one dim line above and below the history.
     if (this.inTranscriptOverlay) {
       const txHeader = this.band(
-        [...brandSegs, [' · ', T.faint], ['TRANSCRIPT', T.brandBold], [' · ', T.faint], [sessionLabel, T.muted]],
+        [[`${GLYPH.brand} `, T.brandBold], ['transcript', T.strong], [`   ${sessionLabel}`, T.faint]],
         [goalGroup, todoGroup],
         safeCols,
         rich,
@@ -2469,13 +2490,10 @@ export class TerminalUI {
       const end = all.length - this.scroll;
       const body = all.slice(Math.max(0, end - height), end);
       while (body.length < height) body.push('');
-
-      const live: Seg[] = busy
-        ? [[`${indicator} `, T.brand], ['Working', T.strong], [` (${elapsedStr}esc to interrupt)`, T.faint], [' · ', T.faint]]
-        : [];
+      const live: Seg[] = busy ? [[`${indicator} `, T.brand], ['working', T.text], [`  ${elapsed}   `, T.faint]] : [];
       const txFooter = this.band(
-        [[' ', ''], ...live, [`line ${Math.max(1, end)}/${Math.max(1, all.length)}`, T.muted]],
-        [[['↑↓ PgUp/PgDn scroll · Home/End · q / Esc / Ctrl+T back', T.faint]]],
+        [...live, [`line ${Math.max(1, end)} of ${Math.max(1, all.length)}`, T.faint]],
+        [[['↑↓ scroll   esc back', T.faint]]],
         safeCols,
         rich,
       );
@@ -2483,48 +2501,40 @@ export class TerminalUI {
       return;
     }
 
-    // Header band: brand · workspace · branch · session  ……  goal · todo · context meter
-    const leftHeader: Seg[] = [...brandSegs];
-    if (this.workspaceName) leftHeader.push([' · ', T.faint], [this.workspaceName, T.text]);
-    if (this.branch) leftHeader.push([' · ', T.faint], [this.branch, T.info]);
-    leftHeader.push([' · ', T.faint], [sessionLabel, T.muted]);
-    const header = rich ? this.band(leftHeader, [goalGroup, todoGroup, this.contextGroup()], safeCols, rich) : clip(`goon · ${sessionLabel}`);
-
-    // Live status row (Working / scroll / esc hints / attachments / notices)
+    // Live status row: only says something when there is something to say.
     let statusLine = '';
     if (this.scroll > 0) {
-      const text = clip(`↑ Scrolled up ${this.scroll}/${this.maxScroll} lines · wheel/↑↓ scroll · ctrl+t transcript · End/Esc bottom`);
-      statusLine = rich ? `${T.info}${text}${T.reset}` : text;
+      const text = clip(`↑ ${this.scroll} lines above the latest output   End or Esc returns`);
+      statusLine = rich ? `${T.faint}${text}${T.reset}` : text;
     } else if (this.escPrimed === 'backtrack' || this.escPrimed === 'clear') {
-      const text = clip(this.escPrimed === 'backtrack' ? 'Press Esc again to rewind & edit previous prompt' : 'Press Esc again to clear input');
+      const text = clip(this.escPrimed === 'backtrack' ? 'Press Esc again to rewind and edit the previous prompt' : 'Press Esc again to clear the input');
       statusLine = rich ? `${T.warn}${text}${T.reset}` : text;
-    } else if ((this.attachedImages.size > 0 || this.pastedTexts.size > 0) && !busy) {
-      const imgItems = [...this.attachedImages.entries()].map(([k, p]) => `${k}: ${basename(p)}`);
-      const pasteItems = [...this.pastedTexts.keys()];
-      const items = [...imgItems, ...pasteItems].join(' · ');
-      const text = clip(`📎 Attached ${items} (Enter to send · Backspace to remove)`);
-      statusLine = rich ? `${T.info}${text}${T.reset}` : text;
     } else if (busy) {
-      const toolsText = `• Working (${elapsedStr}esc to interrupt · ctrl+t transcript)`;
-      const body = wrapTerminal(toolsText.slice(2), Math.max(1, safeCols - 2))[0];
+      const working = this.status === 'Running' ? 'Working' : this.status;
+      const tail = `  ${elapsed}   esc to interrupt`;
       statusLine = rich
-        ? `${T.brandBold}${indicator}${T.reset} ${T.strong}${body.slice(0, 7)}${T.reset}${T.faint}${body.slice(7)}${T.reset}`
-        : clip(toolsText);
+        ? `${T.brand}${indicator}${T.reset} ${working}${T.faint}${clip(tail)}${T.reset}`
+        : clip(`${indicator} ${working}${tail}`);
+    } else if ((this.attachedImages.size > 0 || this.pastedTexts.size > 0)) {
+      const imgItems = [...this.attachedImages.entries()].map(([k, p]) => `${k} ${basename(p)}`);
+      const items = [...imgItems, ...this.pastedTexts.keys()].join('  ');
+      const text = clip(`attached  ${items}   backspace removes`);
+      statusLine = rich ? `${T.faint}${text}${T.reset}` : text;
     } else if (this.statusNotice) {
       const text = clip(this.statusNotice);
-      statusLine = rich ? `${T.muted}${text}${T.reset}` : text;
+      statusLine = rich ? `${T.faint}${text}${T.reset}` : text;
     } else if (this.goal && this.goal.status !== 'complete') {
-      const text = clip(`◆ ${goalIndicator} · ${this.goal.objective}`);
+      const text = clip(`${GLYPH.brand} ${goalIndicator}   ${this.goal.objective}`);
       statusLine = rich ? `${goalTone}${text}${T.reset}` : text;
     } else if (!(currentInput.startsWith('/') && !/\s/.test(currentInput))) {
-      const text = clip([...this.toolStates.values()].slice(-2).join(' | '));
+      const text = clip([...this.toolStates.values()].slice(-2).join('   '));
       statusLine = rich && text ? `${T.faint}${text}${T.reset}` : text;
     }
 
     if (!rich) {
       // Compact fallback for tiny (<48x12) terminals
-      const footer = clip(`${this.status} · ${this.tokens} tokens · Ctrl+C cancel · PgUp/PgDn scroll`);
-      const height = Math.max(2, rows - 4);
+      const footer = clip(`${this.status}  ${this.tokens} tokens  ctrl+c cancel`);
+      const height = Math.max(2, rows - 3);
       this.maxScroll = Math.max(0, all.length - height);
       this.scroll = Math.min(this.scroll, this.maxScroll);
       const end = all.length - this.scroll;
@@ -2536,25 +2546,25 @@ export class TerminalUI {
       const { visibleBeforeCursor, shownInput } = this.sliceInputWindow(inputAvailCols);
       const prompt = wrapTerminal(label + shownInput, safeCols)[0];
       const cursorColumn = Math.min(columns, labelCols + visibleLength(visibleBeforeCursor) + 1);
-      const screenLines = [header, ...body, statusLine, footer, prompt];
-      const cursorSeq = this.pending ? `\x1b[${screenLines.length};${cursorColumn}H\x1b[?25h` : '';
+      const screenLines = [...body, statusLine, prompt, footer];
+      const cursorSeq = this.pending ? `\x1b[${screenLines.length - 1};${cursorColumn}H\x1b[?25h` : '';
       this.flushScreenLines(screenLines, columns, rows, cursorSeq);
       return;
     }
 
-    // Queued follow-ups (shown without a 'Queue' label)
+    // Queued follow-ups
     const queueLines =
       this.queuedPrompts.length > 0
-        ? [`${T.faint}\x1b[3m${clip(`  ↳ ${this.queuedPrompts.join(' · ')} (Alt+↑ edit)`)}${T.reset}`]
+        ? this.queuedPrompts.slice(-3).map(q => `${T.faint}${clip(`  queued  ${q.replace(/\s+/g, ' ')}   alt+↑ edit`)}${T.reset}`)
         : [];
 
     // Slash-command popup: live-filtered list with descriptions above the composer (↑↓ select, Tab/Enter accept)
-    const fixedRows = 1 + 1 + 1 + queueLines.length + 3; // header + gap + status + queue + composer box
+    const fixedRows = 1 + queueLines.length + 3; // status + queue + rule, prompt, footer
     const popupLines: string[] = [];
     const popup = this.slashPopup();
     if (popup.matches.length) {
       const { matches, index: selected } = popup;
-      const room = Math.max(0, Math.min(6, rows - fixedRows - 3));
+      const room = Math.max(0, Math.min(8, rows - fixedRows - 3));
       const shownCount = matches.length > room ? Math.max(0, room - 1) : matches.length;
       const start = Math.min(Math.max(0, selected - shownCount + 1), Math.max(0, matches.length - shownCount));
       const windowed = matches.slice(start, start + shownCount);
@@ -2563,16 +2573,16 @@ export class TerminalUI {
         const isSelected = start + offset === selected;
         const desc = SLASH_DESCRIPTIONS[cmd] ?? '';
         const marker = isSelected ? '› ' : '  ';
-        const plain = clip(`  ${marker}${cmd.padEnd(nameCols)}${desc}`);
-        const nameEnd = 4 + nameCols;
+        const plain = clip(`${marker}${cmd.padEnd(nameCols)}${desc}`);
+        const nameEnd = 2 + nameCols;
         popupLines.push(
           isSelected
-            ? `${T.brandBold}${plain.slice(0, nameEnd)}${T.reset}${T.muted}${plain.slice(nameEnd)}${T.reset}`
-            : `${T.text}${plain.slice(0, nameEnd)}${T.reset}${T.faint}${plain.slice(nameEnd)}${T.reset}`,
+            ? `${T.brandBold}${plain.slice(0, nameEnd)}${T.reset}${plain.slice(nameEnd)}`
+            : `${plain.slice(0, nameEnd)}${T.faint}${plain.slice(nameEnd)}${T.reset}`,
         );
       }
       if (matches.length > shownCount && room > 0) {
-        popupLines.push(`${T.faint}${clip(`    ${selected + 1}/${matches.length} · ↑↓ select · Tab/Enter accept`)}${T.reset}`);
+        popupLines.push(`${T.faint}${clip(`  ${selected + 1} of ${matches.length}   ↑↓ select   tab accept`)}${T.reset}`);
       }
     }
 
@@ -2584,60 +2594,43 @@ export class TerminalUI {
     const body = all.slice(Math.max(0, end - height), end);
     while (body.length < height) body.push('');
 
-    // Composer box ─ border color carries state: brand (idle), faint (working), amber (awaiting an answer)
-    const borderColor = asking && this.pending ? T.warn : busy ? T.faint : T.brand;
+    // Composer: a single rule, the prompt line, and one quiet footer line. The rule turns amber
+    // while goon waits for an answer (approvals, questions); otherwise it stays dim.
+    const awaiting = asking && Boolean(this.pending);
+    const rule = `${awaiting ? T.warn : T.faint}${'─'.repeat(safeCols)}${T.reset}`;
     const promptLabel = asking ? clip(this.label) : '› ';
     const labelCols = visibleLength(promptLabel);
-    const boxInnerCols = Math.max(1, safeCols - 4 - labelCols);
-
-    const { visibleBeforeCursor, shownInput } = this.sliceInputWindow(boxInnerCols);
+    const inputCols = Math.max(1, safeCols - labelCols);
+    const { visibleBeforeCursor, shownInput } = this.sliceInputWindow(inputCols);
     const isEmptyInput = this.input.length === 0 && !asking;
     const placeholderText = busy
-      ? 'Type to queue a follow-up · /commands run immediately'
-      : 'Ask anything · / commands · @ files · $ skills · ! shell';
-    const placeholder = isEmptyInput ? wrapTerminal(placeholderText, boxInnerCols)[0] : '';
-    const innerContent = placeholder ? `${T.faint}${placeholder}${T.reset}` : formatInlineMarkdown(shownInput);
-    const innerPad = ' '.repeat(Math.max(0, boxInnerCols - visibleLength(placeholder || shownInput)));
+      ? 'Type to queue a follow-up; /commands run now'
+      : 'Ask anything   / commands   @ files   $ skills   ! shell';
+    const placeholder = isEmptyInput ? wrapTerminal(placeholderText, inputCols)[0] : '';
+    const labelStyled = asking ? `${T.warn}${T.strong}${promptLabel}${T.reset}` : `${T.brandBold}${promptLabel}${T.reset}`;
+    const content = placeholder ? `${T.faint}${placeholder}${T.reset}` : this.masked ? shownInput : formatInlineMarkdown(shownInput);
+    const promptLine = `${labelStyled}${content}`;
 
     const displayMode = this.modeLabel === 'auto' ? 'auto-approve' : this.modeLabel;
-    const modeTone =
-      displayMode === 'auto-approve' ? T.ok : displayMode === 'plan' ? T.warn : displayMode === 'readonly' ? T.muted : T.info;
-    const viewBadge = this.viewMode === 'transcript' ? ' · view:transcript' : '';
-    const metaPlain = sliceVisible(` ${displayMode} · ${modelName} · effort:${this.effortLabel}${viewBadge} `, Math.max(1, safeCols - 5));
-    const topDashes = '─'.repeat(Math.max(1, safeCols - 3 - visibleLength(metaPlain)));
-    let metaStyled = `${T.muted}${metaPlain}${T.reset}`;
-    if (metaPlain.startsWith(` ${displayMode}`)) {
-      const afterMode = metaPlain.slice(displayMode.length + 1);
-      const modelPart = afterMode.startsWith(` · ${modelName}`) ? ` · ${modelName}` : '';
-      metaStyled =
-        ` ${modeTone}\x1b[1m${displayMode}${T.reset}` +
-        (modelPart ? `${T.faint} · ${T.reset}${T.strong}${modelName}${T.reset}` : '') +
-        `${T.muted}${afterMode.slice(modelPart.length)}${T.reset}`;
-    }
-    const boxTop = `${borderColor}╭─${T.reset}${metaStyled}${borderColor}${topDashes}╮${T.reset}`;
+    // Auto-approve is the one risky state, so it is the one mode shown in a warning colour.
+    const modeTone = displayMode === 'auto-approve' ? T.warn : displayMode === 'plan' ? T.brand : T.faint;
+    const left: Seg[] = [
+      [displayMode, modeTone],
+      [`   ${modelName}`, T.faint],
+      [`   effort ${this.effortLabel}`, T.faint],
+      ...(this.viewMode === 'transcript' ? [['   transcript view', T.faint] as Seg] : []),
+    ];
+    const hint: Seg[] = awaiting ? [[`enter submit   esc ${this.escHint}`, T.faint]] : [];
+    const place: Seg[] = this.workspaceName
+      ? [[this.branch ? `${this.workspaceName} (${this.branch})` : this.workspaceName, T.faint]]
+      : [];
+    // Right-hand groups are dropped from the front when space runs out: hint and place go first.
+    const footer = this.band(left, [hint, place, goalGroup, todoGroup, this.contextGroup(), tokenGroup], safeCols, rich);
 
-    const labelStyled = asking ? `${T.warn}\x1b[1m${promptLabel}${T.reset}` : `${T.brandBold}${promptLabel}${T.reset}`;
-    const boxMid = `${borderColor}│${T.reset} ${labelStyled}${innerContent}${innerPad} ${borderColor}│${T.reset}`;
-
-    const tokenBadge = ` ${formatTokenCount(this.tokens)} tokens `;
-    const hintText = asking
-      ? ` enter submit · esc ${this.escHint} `
-      : busy
-        ? ' enter queues · esc interrupt '
-        : ' shift+tab mode · ctrl+o copy · ctrl+t transcript ';
-    let hint = hintText;
-    let badge = tokenBadge;
-    if (safeCols - 4 - visibleLength(hint) - visibleLength(badge) < 1) hint = '';
-    if (safeCols - 4 - visibleLength(hint) - visibleLength(badge) < 1) badge = '';
-    const botDashes = '─'.repeat(Math.max(1, safeCols - 4 - visibleLength(hint) - visibleLength(badge)));
-    const boxBot =
-      `${borderColor}╰─${T.reset}${T.faint}${hint}${T.reset}${borderColor}${botDashes}${T.reset}` +
-      `${T.muted}${badge}${T.reset}${borderColor}─╯${T.reset}`;
-
-    const screenLines = [header, ...body, '', statusLine, ...popupLines, ...queueLines, boxTop, boxMid, boxBot];
-    const boxMidRow = screenLines.length - 1;
-    const boxCursorCol = Math.min(safeCols - 1, 2 + labelCols + visibleLength(visibleBeforeCursor) + 1);
-    const cursorSeq = this.pending || this.input.length > 0 ? `\x1b[${boxMidRow};${boxCursorCol}H\x1b[?25h` : '';
+    const screenLines = [...body, statusLine, ...popupLines, ...queueLines, rule, promptLine, footer];
+    const promptRow = screenLines.length - 1;
+    const cursorCol = Math.min(safeCols, labelCols + visibleLength(visibleBeforeCursor) + 1);
+    const cursorSeq = this.pending || this.input.length > 0 ? `\x1b[${promptRow};${cursorCol}H\x1b[?25h` : '';
     this.flushScreenLines(screenLines, columns, rows, cursorSeq);
   }
 
