@@ -35,6 +35,44 @@ export { AnswerProjection, visibleAnswer, lastAssistantAnswer } from './reasonin
 export type { AnswerPart, InlineReasoning } from './reasoning.js';
 export { TerminalUI, InputCancelledError, SLASH_COMMANDS, THEME, GLYPH, formatInlineMarkdown, formatTokenCount, visibleLength, padEndVisible } from './tui.js';
 export { welcomeBanner, readGitBranch } from './cli.js';
+export { PairManager, encodeQrMatrix, renderQrTerminal } from './pair.js';
+export type { PairSessionInfo, PairCallbacks, PendingRemoteApproval } from './pair.js';
+export {
+  AgentNetwork,
+  AgentNetworkBus,
+  DEFAULT_NETWORK_PERSONAS,
+  agentNetworkToolSchema,
+  formatBrainstormReport,
+} from './network.js';
+export type {
+  NetworkMessage,
+  NetworkMessageKind,
+  BlackboardEntry,
+  NetworkNodeInfo,
+  NetworkPersona,
+  BrainstormOptions,
+  BrainstormResult,
+} from './network.js';
+export {
+  BUILTIN_WORKFLOWS,
+  discoverWorkflows,
+  createWorkflowScaffold,
+  removeCustomWorkflow,
+  executeWorkflow,
+  parseWorkflowArgs,
+  interpolateWorkflowTemplate,
+  parseMarkdownWorkflow,
+  formatWorkflowDetails,
+  runWorkflowToolSchema,
+} from './workflow.js';
+export type {
+  WorkflowStepType,
+  WorkflowStep,
+  WorkflowDefinition,
+  WorkflowStepResult,
+  WorkflowRunResult,
+  WorkflowExecutionHooks,
+} from './workflow.js';
 
 
 

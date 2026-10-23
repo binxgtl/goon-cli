@@ -190,6 +190,27 @@ function buildToolMeta(toolName: string, rawInput: unknown): ToolEventMeta {
     const count = Array.isArray(rec.tasks) ? rec.tasks.length : 1;
     return { kind: 'other', summary: `${count} subagent task(s)` };
   }
+  if (canonical === 'agent_network') {
+    const topic = typeof rec.topic === 'string' ? rec.topic.trim().replace(/\s+/g, ' ').slice(0, 80) : 'brainstorm';
+    const rounds = typeof rec.rounds === 'number' ? `${rec.rounds}R` : '2R';
+    return { kind: 'other', summary: `[${rounds}] ${topic}` };
+  }
+  if (canonical === 'peer_send') {
+    const to = typeof rec.to === 'string' ? rec.to : 'peer';
+    const kind = typeof rec.kind === 'string' ? rec.kind : 'message';
+    return { kind: 'other', summary: `→ ${to} (${kind})` };
+  }
+  if (canonical === 'peer_broadcast') {
+    const topic = typeof rec.topic === 'string' ? rec.topic.slice(0, 60) : 'blackboard';
+    return { kind: 'other', summary: `broadcast: ${topic}` };
+  }
+  if (canonical === 'peer_read') {
+    return { kind: 'read', summary: 'agent network inbox & blackboard' };
+  }
+  if (canonical === 'run_workflow') {
+    const wf = typeof rec.name === 'string' ? rec.name : 'workflow';
+    return { kind: 'other', summary: wf };
+  }
   return { kind: 'other', summary: canonical };
 }
 

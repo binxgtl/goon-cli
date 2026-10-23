@@ -27,7 +27,6 @@ import { EFFORT_DESCRIPTIONS, parseEffortInput, runSetupWizard } from './setup.j
 import { discoverModels, formatModelBadge, resolveModelCapabilities, type DiscoveredModel } from './provider.js';
 import { bashApprovalPrefix, isApprovedBashPrefix } from './approval.js';
 
-
 type PermissionMode = 'ask' | 'plan' | 'auto' | 'readonly';
 
 /**
@@ -321,7 +320,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       prompt: { type: 'string', short: 'p' }, cwd: { type: 'string', short: 'C' },
       provider: { type: 'string' }, 'base-url': { type: 'string' }, model: { type: 'string' },
       effort: { type: 'string' },
-      'key-env': { type: 'string' }, resume: { type: 'string' }, yes: { type: 'boolean' },
+      'key-env': { type: 'string' }, resume: { type: 'string' }, pair: { type: 'boolean' }, yes: { type: 'boolean' },
       plan: { type: 'boolean' },
       'read-only': { type: 'boolean' }, json: { type: 'boolean' },
       'no-tui': { type: 'boolean' }, 'no-mcp': { type: 'boolean' }, 'no-subagents': { type: 'boolean' },
@@ -438,10 +437,70 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       stdout.write(values.json ? JSON.stringify(list) + '\n' : list.map(s => `${s.id}  ${s.updatedAt}  ${s.model}${s.title ? `  [${s.title}]` : ''}  ${s.cwd}`).join('\n') + '\n');
       return;
     }
+    if (positionals[0] === 'workflow' || positionals[0] === 'workflows') {
+      const {
+        discoverWorkflows,
+        createWorkflowScaffold,
+        removeCustomWorkflow,
+        formatWorkflowDetails,
+      } = await import('./workflow.js');
+      const wsDir = resolve(values.cwd ?? process.cwd());
+      const sub = (positionals[1] ?? 'list').toLowerCase();
+      if (sub === 'list') {
+        const list = await discoverWorkflows(wsDir);
+        if (values.json) {
+          stdout.write(JSON.stringify(list, null, 2) + '\n');
+        } else {
+          for (const wf of list) {
+            stdout.write(`  ${wf.name.padEnd(20)} [${wf.scope}] (${wf.steps.length} steps) — ${wf.description}\n`);
+          }
+        }
+        return;
+      }
+      if (sub === 'show' || sub === 'get') {
+        const name = positionals[2];
+        if (!name) throw new Error('Usage: goon workflow show <name>');
+        const list = await discoverWorkflows(wsDir);
+        const found = list.find(w => w.name.toLowerCase() === name.toLowerCase());
+        if (!found) throw new Error(`Workflow "${name}" not found.`);
+        stdout.write(values.json ? JSON.stringify(found, null, 2) + '\n' : formatWorkflowDetails(found) + '\n');
+        return;
+      }
+      if (sub === 'init' || sub === 'create') {
+        const name = positionals[2];
+        if (!name) throw new Error('Usage: goon workflow init <name> [description]');
+        const desc = positionals.slice(3).join(' ').trim() || undefined;
+        const created = await createWorkflowScaffold(wsDir, name, desc);
+        stdout.write(`Created workflow "${created.workflow.name}" at ${created.path}\n`);
+        return;
+      }
+      if (sub === 'rm' || sub === 'remove' || sub === 'delete') {
+        const name = positionals[2];
+        if (!name) throw new Error('Usage: goon workflow rm <name>');
+        const removedPath = await removeCustomWorkflow(wsDir, name);
+        stdout.write(`Removed workflow "${name}" (${removedPath}).\n`);
+        return;
+      }
+    }
     let resumeTarget = values.resume;
     let launchResumePicker = false;
+    let launchPairOnStart = values.pair === true;
+    let initialWorkflowCommand: string | undefined;
     let promptPositionals = positionals;
-    if (positionals[0] === 'resume') {
+    if (positionals[0] === 'pair') {
+      launchPairOnStart = true;
+      promptPositionals = positionals.slice(1);
+    } else if ((positionals[0] === 'workflow' || positionals[0] === 'workflows') && positionals[1]?.toLowerCase() === 'run') {
+      const wfName = positionals[2];
+      if (!wfName) throw new Error('Usage: goon workflow run <name> [args...]');
+      initialWorkflowCommand = `/workflow run ${wfName} ${positionals.slice(3).join(' ')}`.trim();
+      promptPositionals = [];
+    } else if (positionals[0] === 'network' || positionals[0] === 'brainstorm') {
+      const netTopic = positionals.slice(1).join(' ').trim();
+      if (!netTopic) throw new Error('Usage: goon network <topic>');
+      initialWorkflowCommand = `/network ${netTopic}`;
+      promptPositionals = [];
+    } else if (positionals[0] === 'resume') {
       const subTarget = positionals[1]?.trim();
       if (subTarget) {
         resumeTarget = subTarget;
@@ -520,6 +579,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     let tui: TerminalUI | undefined;
     let manager: McpManager | undefined;
     let subagents: import('./subagents.js').Subagents | undefined;
+    let pairManager: import('./pair.js').PairManager | undefined;
     let controller: AbortController | undefined;
     let denied = false, exiting = false, terminating = false, starting = true;
     let mode: PermissionMode = values['read-only']
@@ -583,7 +643,10 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         }
       };
       syncTuiHeader(true);
-      const display = (text: string) => tui ? tui.write(text) : stderr.write(cleanTerminal(text));
+      const display = (text: string) => {
+        pairManager?.notifySystem(cleanTerminal(text));
+        return tui ? tui.write(text) : stderr.write(cleanTerminal(text));
+      };
       const question = (label: string, signal?: AbortSignal, remember = false) => tui ? tui.question(label, signal, remember)
         : rl ? rl.question(label, { signal }) : Promise.reject(new Error('Input requires a TTY.'));
       // Plain readline mode: read a secret without echoing it.
@@ -598,6 +661,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       };
       let reasoningSource: 'inline' | 'provider' | undefined;
       const emit = (event: HarnessEvent | SubagentEvent) => {
+        pairManager?.notifyEvent(event);
         if (event.type === 'stopped') denied = true;
         if (event.type === 'plan_exit') {
           mode = prePlanMode;
@@ -671,6 +735,58 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
           const approvalBlock = `\n▲ Allow ${request.tool}?\n${preview}${prefixHint}\n`;
           const label = prefix ? '[y/N/p(refix)/a(lways)] ' : '[y/N/a(lways)] ';
           notifyAttention();
+          if (pairManager?.isRunning && !rl && !tui) {
+            const remote = pairManager.requestRemoteApproval(request.tool, preview, request.signal);
+            const dec = await remote.promise.catch(() => 'no' as const);
+            if (dec === 'always') {
+              sessionAllowedTools.add(request.tool);
+              return true;
+            }
+            return dec === 'yes';
+          }
+          if (pairManager?.isRunning && (tui || rl)) {
+            const raceAbort = new AbortController();
+            const onParentAbort = () => raceAbort.abort(request.signal.reason);
+            request.signal.addEventListener('abort', onParentAbort, { once: true });
+            const remote = pairManager.requestRemoteApproval(request.tool, preview, raceAbort.signal);
+            const termPromise = (
+              tui
+                ? tui.askTransient(approvalBlock, label, raceAbort.signal)
+                : (display(approvalBlock), question(label, raceAbort.signal))
+            ).then(ans => {
+              const clean = ans.trim().toLowerCase();
+              const dec: 'yes' | 'no' | 'always' | 'prefix' =
+                clean === 'a' || clean === 'always'
+                  ? 'always'
+                  : prefix && (clean === 'p' || clean === 'prefix')
+                    ? 'prefix'
+                    : clean === 'y' || clean === 'yes'
+                      ? 'yes'
+                      : 'no';
+              remote.cancel(dec === 'prefix' ? 'yes' : dec);
+              return dec;
+            });
+            const remotePromise = remote.promise.then(dec => {
+              raceAbort.abort(new Error('Resolved remotely'));
+              display(`\n[Paired device approved/denied ${request.tool}: ${dec}]\n`);
+              return dec;
+            });
+            try {
+              const winner = await Promise.race([termPromise, remotePromise]);
+              if (winner === 'always') {
+                sessionAllowedTools.add(request.tool);
+                return true;
+              }
+              if (winner === 'prefix' && prefix) {
+                sessionAllowedBashPrefixes.add(prefix);
+                return true;
+              }
+              return winner === 'yes';
+            } finally {
+              request.signal.removeEventListener('abort', onParentAbort);
+              remote.cancel('closed');
+            }
+          }
           const reply = tui
             ? (await tui.askTransient(approvalBlock, label, request.signal)).trim().toLowerCase()
             : (display(approvalBlock), (await question(label, request.signal)).trim().toLowerCase());
@@ -748,6 +864,48 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         if (!values['no-subagents']) {
           subagents = new Subagents(runtime, store, reg, emit);
           subagents.register();
+          const { discoverWorkflows, executeWorkflow, runWorkflowToolSchema } = await import('./workflow.js');
+          const { formatBrainstormReport } = await import('./network.js');
+          reg.register('run_workflow', {
+            description:
+              'Execute a multi-step custom or built-in workflow (e.g. "feature-dev", "bug-hunt", "tdd-cycle", "security-audit").',
+            schema: runWorkflowToolSchema,
+            readOnly: true,
+            execute: async (input, signal) => {
+              const all = await discoverWorkflows(runtime.cwd);
+              const wf = all.find(w => w.name.toLowerCase() === input.name.toLowerCase());
+              if (!wf) {
+                throw new Error(`Workflow "${input.name}" not found. Available: ${all.map(w => w.name).join(', ')}`);
+              }
+              const res = await executeWorkflow(wf, input.input, {
+                cwd: runtime.cwd,
+                signal,
+                runPrompt: async (stepPrompt, _step, stepSig) => {
+                  const childStore = await SessionStore.open(join(runtime.dataDir, 'workflows', store.session.id), runtime);
+                  try {
+                    const childTools = new ToolRegistry(runtime.cwd, req => reg.approve(req), reg.readOnly);
+                    await new Harness(runtime, childStore, childTools).run(stepPrompt, stepSig, reg.budget);
+                    const { lastAssistantAnswer } = await import('./reasoning.js');
+                    return lastAssistantAnswer(childStore.session.messages, runtime.inlineReasoning);
+                  } finally {
+                    await childStore.close().catch(() => {});
+                  }
+                },
+                runNetwork: async (topic, roles, rounds, stepSig) => {
+                  if (!subagents) return '';
+                  const netRes = await subagents.network.brainstorm({
+                    topic,
+                    roles,
+                    rounds,
+                    signal: stepSig,
+                    budget: reg.budget,
+                  });
+                  return formatBrainstormReport(netRes);
+                },
+              });
+              return JSON.stringify(res, null, 2);
+            },
+          });
         }
         return { tools: reg, harness: new Harness(runtime, store, reg, emit) };
       };
@@ -935,6 +1093,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
           const stepLabel = opts.continuationStep && opts.continuationStep > 1 ? ` · turn ${opts.continuationStep}` : '';
           display(`\n[◆ Pursuing goal${stepLabel}${g ? `: ${g.objective}` : ''}]\n`);
         }
+        pairManager?.notifyUserPrompt(input);
         try {
           outText = await harness.run(input, controller.signal);
           if (outputLastMessage) {
@@ -960,6 +1119,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
           controller = undefined;
           if (interactive && Date.now() - turnStarted >= 15_000) notifyAttention();
           tui?.setStatus('Ready');
+          pairManager?.syncState();
           syncTuiHeader();
           if (tui) void tools.files.listWorkspaceFiles().then(files => tui?.setWorkspaceFiles(files)).catch(() => {});
         }
@@ -1022,6 +1182,78 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         }
       };
 
+      const ensurePairManager = async () => {
+        if (!pairManager) {
+          const { PairManager } = await import('./pair.js');
+          pairManager = new PairManager({
+            getState: () => ({
+              model: runtime.model,
+              provider: runtime.provider,
+              cwd: runtime.cwd,
+              sessionId: store.session.id,
+              mode,
+              status: tui ? tui.getStatus() : controller ? 'Running' : 'Ready',
+              tokens: store.session.tokens,
+              contextWindow: runtime.contextWindow,
+            }),
+            getHistory: () => {
+              const out: Array<{ role: 'user' | 'assistant'; text: string }> = [];
+              for (const m of store.session.messages) {
+                if (m.role === 'user') {
+                  const raw = typeof m.content === 'string'
+                    ? m.content
+                    : Array.isArray(m.content)
+                      ? m.content
+                          .map(p => ('text' in p && typeof p.text === 'string' ? p.text : p.type === 'image' ? '[Image]' : ''))
+                          .filter(Boolean)
+                          .join(' ')
+                      : '';
+                  const cleaned = raw
+                    .replace(/<referenced_file\s+path="([^"]+)"[\s\S]*?<\/referenced_file>/g, '[@$1]')
+                    .trim();
+                  if (cleaned) out.push({ role: 'user', text: cleaned });
+                } else if (m.role === 'assistant') {
+                  if (typeof m.content === 'string') {
+                    const cleaned = m.content.trim();
+                    if (cleaned) out.push({ role: 'assistant', text: cleaned });
+                  } else if (Array.isArray(m.content)) {
+                    const textParts = m.content
+                      .filter(p => p.type === 'text' && 'text' in p && typeof p.text === 'string')
+                      .map(p => (p as { text: string }).text.trim())
+                      .filter(Boolean)
+                      .join('\n\n');
+                    if (textParts) out.push({ role: 'assistant', text: textParts });
+                  }
+                }
+              }
+              return out;
+            },
+            onRemotePrompt: remoteText => {
+              if (tui) {
+                tui.submitExternalPrompt(remoteText);
+              } else {
+                void (async () => {
+                  const handled = await executeImmediateCommand(remoteText);
+                  if (!handled && !controller) {
+                    await run(remoteText);
+                  }
+                })();
+              }
+            },
+            onRemoteModeChange: nextMode => {
+              applyPermissionMode(nextMode);
+            },
+            onRemoteStop: () => {
+              controller?.abort(new Error('Stopped from paired device.'));
+            },
+            onNotice: msg => {
+              if (tui) tui.setNotice(msg);
+            },
+          });
+        }
+        return pairManager;
+      };
+
       const executeImmediateCommand = async (rawCmd: string): Promise<boolean> => {
         const cmdInput = rawCmd.trim();
         if (!cmdInput) return true;
@@ -1050,6 +1282,9 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             '  /skills [list|<name>]             List or inspect SKILL.md skills (use $skill-name in prompt)\n' +
             '  /memories [list|add <text>|rm <id>|clear] Manage persistent user memories across sessions\n' +
             '  /presets [list|save <name> <prompt>|run <name>|rm <name>] Manage reusable prompt presets\n' +
+            '  /pair [start|stop|status|qr|lan]  Pair mobile/web device via Cloudflared tunnel (QR + link)\n' +
+            '  /workflow [list|show|create|rm|run <name> [args]] Multi-step custom & built-in workflows\n' +
+            '  /network [<topic>|board|send|clear] Multi-agent Brainstorm/Council room & P2P message bus\n' +
             '  /mention <filepath>               Insert @filepath mention into the composer\n' +
             '  /cd <dir>, /pwd                   Change or show active workspace directory\n' +
             '  /mode [ask|auto|plan|readonly]    Switch approval mode (or press Shift+Tab)\n' +
@@ -1757,6 +1992,157 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
           display(`Forked current session (${store.session.messages.length} messages) -> new session ID: ${forkedId}\nSwitch to it now with: /resume ${forkedId.slice(0, 8)} (or goon --resume ${forkedId.slice(0, 8)})\n`);
           return true;
         }
+        if (cmdInput === '/pair' || cmdInput.startsWith('/pair ')) {
+          const sub = cmdInput.slice(5).trim().toLowerCase();
+          if (sub === 'stop' || sub === 'off' || sub === 'close') {
+            if (!pairManager?.isRunning) {
+              display('Device pairing is not currently active.\n');
+            } else {
+              await pairManager.stop();
+              if (tui) tui.setNotice('Stopped Cloudflared tunnel & device pairing.');
+              display('Stopped device pairing server and Cloudflared tunnel.\n');
+            }
+            return true;
+          }
+          if (sub === 'status') {
+            if (!pairManager?.isRunning) {
+              display('Device pairing is inactive. Run "/pair" to start a free Cloudflared tunnel + QR code.\n');
+            } else {
+              display(`\n${pairManager.formatBanner()}\n`);
+            }
+            return true;
+          }
+          const pm = await ensurePairManager();
+          if (!pm.isRunning) {
+            const skipTunnel = sub === 'lan' || sub === 'local';
+            if (tui) {
+              tui.setNotice(skipTunnel ? 'Starting local/LAN pair server...' : 'Starting Cloudflared tunnel & waiting for DNS...');
+              await tui.withStatus(skipTunnel ? 'Starting LAN pair' : 'Starting Cloudflared tunnel', () => pm.start({ skipTunnel }));
+            } else {
+              display(skipTunnel ? 'Starting local/LAN pair server...\n' : 'Starting Cloudflared tunnel & waiting for DNS...\n');
+              await pm.start({ skipTunnel });
+            }
+          }
+          display(`\n${pm.formatBanner()}\n`);
+          return true;
+        }
+        if (cmdInput === '/workflow' || cmdInput === '/workflows' || cmdInput.startsWith('/workflow ') || cmdInput.startsWith('/workflows ')) {
+          const {
+            discoverWorkflows,
+            createWorkflowScaffold,
+            removeCustomWorkflow,
+            formatWorkflowDetails,
+          } = await import('./workflow.js');
+          const rest = cmdInput.replace(/^\/workflows?\b/, '').trim();
+          const tokens = rest ? rest.split(/\s+/) : [];
+          const sub = (tokens[0] ?? 'list').toLowerCase();
+          if (!rest || sub === 'list') {
+            const all = await discoverWorkflows(runtime.cwd);
+            const lines = all.map(
+              w => `  ${w.name.padEnd(20)} [${w.scope.padEnd(9)}] (${w.steps.length} steps) — ${w.description}`,
+            );
+            display(
+              `\nAvailable Workflows (${all.length}) — run with "/workflow run <name> [input]":\n` +
+                `${lines.join('\n')}\n` +
+                `  Tip: Create a custom workflow with "/workflow create <name> [description]"\n`,
+            );
+            return true;
+          }
+          if (sub === 'show' || sub === 'get' || sub === 'info') {
+            const name = tokens[1];
+            if (!name) {
+              display('Usage: /workflow show <name>\n');
+              return true;
+            }
+            const all = await discoverWorkflows(runtime.cwd);
+            const found = all.find(w => w.name.toLowerCase() === name.toLowerCase());
+            if (!found) {
+              display(`Workflow "${name}" not found. Run "/workflow list" to see available workflows.\n`);
+              return true;
+            }
+            display(`\n${formatWorkflowDetails(found)}\n`);
+            return true;
+          }
+          if (sub === 'create' || sub === 'init' || sub === 'new') {
+            const name = tokens[1];
+            if (!name) {
+              display('Usage: /workflow create <name> [description]\n');
+              return true;
+            }
+            const desc = tokens.slice(2).join(' ').trim() || undefined;
+            try {
+              const created = await createWorkflowScaffold(runtime.cwd, name, desc);
+              display(
+                `Created custom workflow "${created.workflow.name}" at ${created.path}\n` +
+                  `Edit the JSON file to customize steps, or run it now with: /workflow run ${created.workflow.name} <your task>\n`,
+              );
+            } catch (error) {
+              display(`Failed to create workflow: ${safeError(error, apiKey)}\n`);
+            }
+            return true;
+          }
+          if (sub === 'rm' || sub === 'remove' || sub === 'delete') {
+            const name = tokens[1];
+            if (!name) {
+              display('Usage: /workflow rm <name>\n');
+              return true;
+            }
+            try {
+              const removedPath = await removeCustomWorkflow(runtime.cwd, name);
+              display(`Removed custom workflow "${name}" (${removedPath}).\n`);
+            } catch (error) {
+              display(`Failed to remove workflow: ${safeError(error, apiKey)}\n`);
+            }
+            return true;
+          }
+          // Fall through to idle loop for `/workflow run <name> ...` or `/workflow <name> ...`
+          return false;
+        }
+        if (
+          cmdInput === '/network' ||
+          cmdInput === '/brainstorm' ||
+          cmdInput === '/council' ||
+          cmdInput.startsWith('/network ') ||
+          cmdInput.startsWith('/brainstorm ') ||
+          cmdInput.startsWith('/council ')
+        ) {
+          const isExplicitAlias = /^\/(?:brainstorm|council)\b/i.test(cmdInput);
+          const rest = cmdInput.replace(/^\/(?:network|brainstorm|council)\b/, '').trim();
+          const lower = rest.toLowerCase();
+          if (!rest || (!isExplicitAlias && (lower === 'status' || lower === 'board' || lower === 'list' || lower === 'messages'))) {
+            if (!subagents) {
+              display('Agent Network is disabled (--no-subagents).\n');
+              return true;
+            }
+            display(
+              `\n╭─── Agent Network & Peer-to-Peer Bus ────────────────────────────╮\n` +
+                `${subagents.bus.formatBoardSummary()}\n` +
+                `╰─────────────────────────────────────────────────────────────────╯\n` +
+                `  Tip: Run "/network <topic>" (or "/brainstorm <topic>") to convene a multi-agent ideation session.\n`,
+            );
+            return true;
+          }
+          if (!isExplicitAlias && (lower === 'clear' || lower === 'reset')) {
+            subagents?.bus.clear();
+            display('Cleared Agent Network blackboard and peer message history.\n');
+            return true;
+          }
+          if (!isExplicitAlias && lower.startsWith('send ')) {
+            const body = rest.slice(5).trim();
+            const sp = body.search(/\s/);
+            if (sp <= 0 || !subagents) {
+              display('Usage: /network send <agent_nickname_or_*> <message>\n');
+              return true;
+            }
+            const to = body.slice(0, sp).trim();
+            const msgText = body.slice(sp + 1).trim();
+            const sent = subagents.bus.send({ from: 'User', to, content: msgText, kind: 'message' });
+            display(`Sent peer message [${sent.id}] User → ${sent.to}: ${sent.content}\n`);
+            return true;
+          }
+          // Fall through to main loop to run multi-agent brainstorming session
+          return false;
+        }
         if (cmdInput.startsWith('!')) {
           const { sanitizeBashCommand } = await import('./tools.js');
           const rawShell = cmdInput.slice(1).trim();
@@ -1804,16 +2190,32 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         };
       }
 
+      if (launchPairOnStart) {
+        const pm = await ensurePairManager();
+        if (tui) {
+          tui.setNotice('Starting Cloudflared tunnel & waiting for DNS...');
+          await tui.withStatus('Starting Cloudflared tunnel', () => pm.start());
+        } else {
+          display('Starting Cloudflared tunnel & waiting for DNS...\n');
+          await pm.start();
+        }
+        display(`\n${pm.formatBanner()}\n`);
+      }
+
       if (prompt) await run(prompt);
-      else {
-        if (!rl && !tui) throw new Error('Interactive mode requires a TTY.');
+      else if (initialWorkflowCommand && !interactive) {
+        // Handled below
+      }
+      if (!prompt) {
+        if (!rl && !tui && !initialWorkflowCommand) throw new Error('Interactive mode requires a TTY.');
         tui?.setStatus('Ready');
-        let initialAutoCommand: string | undefined = launchResumePicker ? '/resume' : undefined;
+        let initialAutoCommand: string | undefined = initialWorkflowCommand ?? (launchResumePicker ? '/resume' : undefined);
         while (!exiting) {
           let input: string;
           if (initialAutoCommand) {
             input = initialAutoCommand;
             initialAutoCommand = undefined;
+            if (!stdin.isTTY && !tui && !rl) exiting = true;
           } else {
             try { input = (await question(tui ? 'goon> ' : '\ngoon> ', undefined, true)).trim(); }
             catch { break; }
@@ -2383,6 +2785,142 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             await run(matched.prompt);
             continue;
           }
+          if (input.startsWith('/workflow ') || input.startsWith('/workflows ')) {
+            const { discoverWorkflows, executeWorkflow } = await import('./workflow.js');
+            const { formatBrainstormReport } = await import('./network.js');
+            const rest = input.replace(/^\/workflows?\s+/, '').trim();
+            const withoutRun = rest.replace(/^run\s+/i, '').trim();
+            const sp = withoutRun.search(/\s/);
+            const wfName = (sp > 0 ? withoutRun.slice(0, sp) : withoutRun).trim();
+            const wfArgs = sp > 0 ? withoutRun.slice(sp + 1).trim() : '';
+            const all = await discoverWorkflows(runtime.cwd);
+            const matched = all.find(w => w.name.toLowerCase() === wfName.toLowerCase());
+            if (!matched) {
+              display(`Workflow "${wfName}" not found. Run "/workflow list" to see available workflows.\n`);
+              continue;
+            }
+            controller = new AbortController();
+            tui?.setStatus('Running');
+            try {
+              const wfRes = await executeWorkflow(matched, wfArgs, {
+                cwd: runtime.cwd,
+                signal: controller.signal,
+                onProgress: text => display(text),
+                runPrompt: async (stepPrompt, _step, stepSig) => {
+                  return await harness.run(stepPrompt, stepSig);
+                },
+                runSubagents: async (tasks, readOnly, stepSig) => {
+                  if (!subagents) return await harness.run(tasks.join('\n\n'), stepSig);
+                  const res = await tools.execute(
+                    {
+                      toolCallId: `wf_${Date.now()}`,
+                      toolName: readOnly ? 'delegate_task' : 'delegate_edit',
+                      input: { tasks },
+                    },
+                    stepSig,
+                  );
+                  return res.text;
+                },
+                runNetwork: async (topic, roles, rounds, stepSig) => {
+                  if (!subagents) return await harness.run(topic, stepSig);
+                  const netRes = await subagents.network.brainstorm({
+                    topic,
+                    roles,
+                    rounds,
+                    signal: stepSig,
+                    onProgress: text => display(text),
+                  });
+                  const report = formatBrainstormReport(netRes);
+                  display(`\n${netRes.synthesis}\n`);
+                  return report;
+                },
+                confirmStep: async (msg, stepSig) => {
+                  if (mode === 'auto') return true;
+                  const block = `\n▲ Workflow approval gate: ${msg}\n`;
+                  const ans = tui
+                    ? (await tui.askTransient(block, '[y/N] ', stepSig)).trim().toLowerCase()
+                    : (display(block), (await question('[y/N] ', stepSig)).trim().toLowerCase());
+                  return ans === 'y' || ans === 'yes';
+                },
+              });
+              if (jsonOutput) {
+                stdout.write(JSON.stringify({ type: 'workflow_done', result: wfRes, sessionId: store.session.id }) + '\n');
+              }
+            } catch (error) {
+              display(`\nWorkflow error: ${safeError(error, apiKey)}\n`);
+            } finally {
+              controller = undefined;
+              tui?.setStatus('Ready');
+              syncTuiHeader();
+            }
+            continue;
+          }
+          if (
+            input.startsWith('/network ') ||
+            input.startsWith('/brainstorm ') ||
+            input.startsWith('/council ')
+          ) {
+            if (!subagents) {
+              display('Agent Network is disabled (--no-subagents).\n');
+              continue;
+            }
+            const { formatBrainstormReport } = await import('./network.js');
+            const rawRest = input.replace(/^\/(?:network|brainstorm|council)\s+/, '').trim();
+            let rounds = 2;
+            let roles: string[] | undefined;
+            const topicTokens: string[] = [];
+            for (const tok of rawRest.split(/\s+/)) {
+              if (tok.startsWith('--rounds=')) {
+                const n = Number(tok.slice(9));
+                if (Number.isInteger(n) && n >= 1 && n <= 4) rounds = n;
+              } else if (tok.startsWith('--roles=')) {
+                roles = tok
+                  .slice(8)
+                  .split(',')
+                  .map(s => s.trim())
+                  .filter(Boolean);
+              } else {
+                topicTokens.push(tok);
+              }
+            }
+            const topic = topicTokens.join(' ').trim();
+            if (!topic) {
+              display('Usage: /network [--rounds=2] [--roles=architect,critic,researcher,pragmatist] <topic>\n');
+              continue;
+            }
+            controller = new AbortController();
+            tui?.setStatus('Running');
+            if (tui) {
+              tui.markTurnStart();
+              tui.write(`\n> ${input}\n`);
+            }
+            try {
+              const netRes = await subagents.network.brainstorm({
+                topic,
+                roles,
+                rounds,
+                signal: controller.signal,
+                onProgress: text => display(text),
+              });
+              const report = formatBrainstormReport(netRes);
+              display(`\n[answer]\n${netRes.synthesis}\n`);
+              store.session.messages.push(
+                { role: 'user', content: `[Agent Network Brainstorm]: ${topic}` },
+                { role: 'assistant', content: report },
+              );
+              await store.save();
+              if (jsonOutput) {
+                stdout.write(JSON.stringify({ type: 'network_done', synthesis: netRes.synthesis, rounds: netRes.rounds }) + '\n');
+              }
+            } catch (error) {
+              display(`\nAgent Network failed: ${safeError(error, apiKey)}\n`);
+            } finally {
+              controller = undefined;
+              tui?.setStatus('Ready');
+              syncTuiHeader();
+            }
+            continue;
+          }
           if (input === '/review' || input.startsWith('/review ')) {
             const extra = input.slice(7).trim();
             const branchMatch = /^branch\s+(\S+)(?:\s+([\s\S]+))?$/i.exec(extra);
@@ -2497,7 +3035,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
 
     } finally {
       process.removeListener('SIGINT', stop); process.removeListener('SIGTERM', terminate); process.removeListener('message', onIpcSignal);
-      try { tui?.close(); rl?.close(); await subagents?.closeAll(); await manager?.close(); }
+      try { tui?.close(); rl?.close(); await pairManager?.stop(); await subagents?.closeAll(); await manager?.close(); }
       finally {
         await store.close();
         if (process.connected) {

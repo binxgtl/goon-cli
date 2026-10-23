@@ -23,8 +23,10 @@ export interface ToolDefinition<Input = unknown> {
 }
 export interface RunBudget { spent: number; limit: number }
 export class PermissionDeniedError extends Error {}
+const PEER_TOOLS = new Set(['peer_list', 'peer_send', 'peer_broadcast', 'peer_read']);
 const COLLAB_TOOLS = new Set([
   'spawn_agent', 'wait_agent', 'send_input', 'close_agent', 'resume_agent', 'list_agents',
+  'agent_network', 'run_workflow',
   'update_plan', 'get_goal', 'create_goal', 'update_goal', 'request_user_input', 'view_image',
   'list_mcp_resources', 'list_mcp_resource_templates', 'read_mcp_resource',
 ]);
@@ -80,6 +82,14 @@ export const TOOL_NAME_ALIASES: Record<string, string> = {
   ask_user: 'request_user_input',
   ask_question: 'request_user_input',
   read_image: 'view_image',
+  brainstorm: 'agent_network',
+  brainstorm_network: 'agent_network',
+  agent_council: 'agent_network',
+  network: 'agent_network',
+  workflow: 'run_workflow',
+  peer_message: 'peer_send',
+  broadcast: 'peer_broadcast',
+  peer_read_inbox: 'peer_read',
 };
 
 export function normalizeToolName(name: string, hasExact?: (n: string) => boolean): string {
@@ -95,6 +105,9 @@ export function normalizeToolInput(toolName: string, input: unknown): unknown {
     if (toolName === 'wait_agent') return { targets: [input] };
     if (toolName === 'close_agent' || toolName === 'resume_agent') return { target: input };
     if (toolName === 'view_image') return { path: input };
+    if (toolName === 'agent_network') return { topic: input };
+    if (toolName === 'run_workflow') return { name: input, input: '' };
+    if (toolName === 'peer_broadcast') return { topic: 'General', message: input };
     return input;
   }
   if (!input || typeof input !== 'object' || Array.isArray(input)) return input;
@@ -291,6 +304,49 @@ export function normalizeToolInput(toolName: string, input: unknown): unknown {
       delete obj.tokenBudget;
     }
   }
+  if (toolName === 'agent_network') {
+    if (obj.topic === undefined) {
+      const t = obj.prompt ?? obj.message ?? obj.task ?? obj.question;
+      if (typeof t === 'string') obj.topic = t;
+    }
+    delete obj.prompt;
+    delete obj.message;
+    delete obj.task;
+    delete obj.question;
+  }
+  if (toolName === 'peer_send') {
+    if (obj.to === undefined) {
+      const target = obj.target ?? obj.recipient ?? obj.agent ?? obj.id;
+      if (typeof target === 'string') obj.to = target;
+    }
+    if (obj.message === undefined) {
+      const m = obj.content ?? obj.text ?? obj.prompt;
+      if (typeof m === 'string') obj.message = m;
+    }
+    delete obj.target;
+    delete obj.recipient;
+    delete obj.agent;
+    delete obj.id;
+    delete obj.content;
+    delete obj.text;
+    delete obj.prompt;
+  }
+  if (toolName === 'peer_broadcast') {
+    if (obj.message === undefined) {
+      const m = obj.content ?? obj.text ?? obj.prompt;
+      if (typeof m === 'string') obj.message = m;
+    }
+    if (obj.topic === undefined && typeof obj.title === 'string') {
+      obj.topic = obj.title;
+    }
+    if (obj.topic === undefined) {
+      obj.topic = 'Shared Idea';
+    }
+    delete obj.content;
+    delete obj.text;
+    delete obj.prompt;
+    delete obj.title;
+  }
   return obj;
 }
 
@@ -298,6 +354,7 @@ export class ToolRegistry {
   readonly files: WorkspaceFiles;
   budget?: RunBudget;
   planMode = false;
+  allowPeerToolsInReadOnly = false;
   todos: TodoItem[] = [];
   onTodoUpdate?: (todos: TodoItem[]) => void;
   getGoal?: () => SessionGoal | undefined;
@@ -623,6 +680,7 @@ export class ToolRegistry {
   private isExposed(name: string, d: RegisteredTool): boolean {
     if (name === 'exit_plan_mode' && !this.planMode) return false;
     if ((name === 'get_goal' || name === 'create_goal' || name === 'update_goal') && (!this.getGoal || this.planMode)) return false;
+    if (PEER_TOOLS.has(name) && this.readOnly && !this.planMode && !this.allowPeerToolsInReadOnly) return false;
     if ((name === 'todo_write' || name === 'todo_read' || COLLAB_TOOLS.has(name)) && this.readOnly && !this.planMode) return false;
     return !this.effectiveReadOnly || d.readOnly;
   }

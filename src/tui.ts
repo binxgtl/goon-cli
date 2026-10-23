@@ -135,6 +135,7 @@ export function formatTokenCount(n: number): string {
 export const SLASH_COMMANDS = [
   '/help', '/setup', '/key', '/model', '/effort', '/mode', '/auto', '/yolo', '/view', '/transcript',
   '/copy', '/btw', '/side', '/goal', '/recap', '/skills', '/prompts', '/memories', '/presets', '/mention',
+  '/pair', '/workflow', '/workflows', '/network', '/brainstorm', '/council',
   '/cd', '/pwd', '/mcp', '/subagents', '/agent', '/plan', '/revert', '/undo',
   '/checkpoints', '/todo', '/resume', '/new', '/delete', '/compact', '/diff', '/review', '/fork', '/rename',
   '/export', '/init', '/status', '/tools', '/sessions', '/debug-config', '/warnings', '/doctor', '/clear', '/exit',
@@ -157,6 +158,12 @@ const SLASH_DESCRIPTIONS: Record<string, string> = {
   '/memories': 'manage persistent user memories across sessions',
   '/presets': 'save or run reusable prompt presets',
   '/mention': 'attach @file mention into the composer',
+  '/pair': 'pair mobile/web device via free Cloudflared tunnel (QR + link)',
+  '/workflow': 'list, create, inspect, or run multi-step custom workflows',
+  '/workflows': 'list or manage custom workflows (/workflow alias)',
+  '/network': 'convene multi-agent Brainstorm / Council room or inspect P2P bus',
+  '/brainstorm': 'run multi-agent Agent Network ideation session (/network alias)',
+  '/council': 'convene Agent Network council debate (/network alias)',
   '/cd': 'change active workspace directory',
   '/pwd': 'show active workspace directory',
   '/mcp': 'list, check, add, remove, reload, or import-codex MCP servers',
@@ -1263,6 +1270,30 @@ export class TerminalUI {
     });
     this.schedule();
     return result;
+  }
+
+  /**
+   * Submits an external prompt or slash command (e.g. from a paired mobile/web device).
+   */
+  submitExternalPrompt(text: string) {
+    const trimmed = text.trim();
+    if (!trimmed || this.closed) return;
+    if (this.pending && this.remember) {
+      const pending = this.pending;
+      this.pending = undefined;
+      pending.cleanup();
+      this.scroll = 0;
+      pending.resolve(trimmed);
+      this.schedule(0);
+      return;
+    }
+    if ((trimmed.startsWith('/') || trimmed.startsWith('!')) && this.onImmediateCommand) {
+      this.schedule(0);
+      void this.onImmediateCommand(trimmed);
+      return;
+    }
+    this.queuedPrompts.push(trimmed);
+    this.schedule(0);
   }
 
   private reject(error: Error) {
