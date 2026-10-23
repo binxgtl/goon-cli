@@ -1,7 +1,11 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { spawn, type ChildProcess } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, timingSafeEqual } from 'node:crypto';
+import { chmod, mkdir, stat, writeFile } from 'node:fs/promises';
 import { networkInterfaces } from 'node:os';
+import { join } from 'node:path';
+import { configDir } from './config.js';
+import { limitText } from './files.js';
 import type { HarnessEvent } from './harness.js';
 import type { SubagentEvent } from './subagents.js';
 
@@ -489,7 +493,37 @@ function detectLanIp(): string {
   return '127.0.0.1';
 }
 
-function renderMobileHtml(defaultToken: string): string {
+function safeTokenEquals(candidate: string | null | undefined, expected: string): boolean {
+  if (!candidate || !expected) return false;
+  const a = Buffer.from(candidate, 'utf8');
+  const b = Buffer.from(expected, 'utf8');
+  if (a.length !== b.length) return false;
+  return timingSafeEqual(a, b);
+}
+
+export function isForbiddenRemoteInput(raw: string): boolean {
+  const trimmed = raw.trim();
+  if (!trimmed) return false;
+  if (trimmed.startsWith('!')) return true;
+  const lower = trimmed.toLowerCase();
+  if (lower === '/yolo' || lower.startsWith('/yolo ')) return true;
+  if (lower === '/auto') return true;
+  if (lower.startsWith('/auto ')) {
+    const arg = lower.slice(6).trim();
+    if (!arg || arg === 'on' || arg === 'true' || arg === '1' || arg === 'yes' || arg === 'toggle') {
+      return true;
+    }
+  }
+  if (lower.startsWith('/mode')) {
+    const arg = lower.slice(5).trim();
+    if (!arg || arg === 'auto' || arg === 'auto-approve' || arg === 'yolo') {
+      return true;
+    }
+  }
+  return false;
+}
+
+function renderMobileHtml(): string {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -639,7 +673,6 @@ function renderMobileHtml(defaultToken: string): string {
   </header>
   <div class="modes">
     <button class="mode-btn" data-mode="ask">ask</button>
-    <button class="mode-btn" data-mode="auto">auto</button>
     <button class="mode-btn" data-mode="plan">plan</button>
     <button class="mode-btn" data-mode="readonly">readonly</button>
     <button class="mode-btn stop-btn" id="stopBtn">Stop</button>
@@ -651,13 +684,18 @@ function renderMobileHtml(defaultToken: string): string {
   </form>
 <script>
   const params = new URLSearchParams(location.search);
-  const token = params.get('token') || params.get('t') || ${JSON.stringify(defaultToken)};
+  const token = params.get('token') || params.get('t') || '';
   const logEl = document.getElementById('log');
   const metaEl = document.getElementById('meta');
   const statusEl = document.getElementById('statusBadge');
+  let lastSeq = 0;
+  let sseConnected = false;
 
   function upsertEntry(entry) {
     if (!entry || !entry.id) return;
+    if (typeof entry.seq === 'number' && entry.seq > lastSeq) {
+      lastSeq = entry.seq;
+    }
     const domId = 'entry-' + entry.id;
     let el = document.getElementById(domId);
     const isNearBottom = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 140;
@@ -720,9 +758,10 @@ function renderMobileHtml(defaultToken: string): string {
     return res.json();
   }
 
-  async function pollState() {
+  async function pollState(force) {
+    if (!force && sseConnected) return;
     try {
-      const res = await fetch('/api/state?t=' + encodeURIComponent(token), {
+      const res = await fetch('/api/state?t=' + encodeURIComponent(token) + '&since=' + lastSeq, {
         headers: { 'Authorization': 'Bearer ' + token },
         cache: 'no-store',
       });
@@ -738,11 +777,14 @@ function renderMobileHtml(defaultToken: string): string {
     } catch {}
   }
 
-  pollState();
-  setInterval(pollState, 750);
+  pollState(true);
+  setInterval(() => pollState(false), 3000);
 
   const es = new EventSource('/api/events?t=' + encodeURIComponent(token));
+  es.onopen = () => { sseConnected = true; };
+  es.onerror = () => { sseConnected = false; };
   es.onmessage = (ev) => {
+    sseConnected = true;
     try {
       const msg = JSON.parse(ev.data);
       if (msg.type === 'state') {
@@ -761,12 +803,12 @@ function renderMobileHtml(defaultToken: string): string {
   document.querySelectorAll('.mode-btn[data-mode]').forEach(btn => {
     btn.onclick = async () => {
       await apiPost('/api/mode', { mode: btn.dataset.mode });
-      pollState();
+      pollState(true);
     };
   });
   document.getElementById('stopBtn').onclick = async () => {
     await apiPost('/api/stop', {});
-    pollState();
+    pollState(true);
   };
   document.getElementById('composer').onsubmit = async (e) => {
     e.preventDefault();
@@ -775,11 +817,65 @@ function renderMobileHtml(defaultToken: string): string {
     if (!text) return;
     input.value = '';
     await apiPost('/api/prompt', { prompt: text });
-    pollState();
+    pollState(true);
   };
 </script>
 </body>
 </html>`;
+}
+
+async function resolveCloudflaredBinary(): Promise<string> {
+  const canSpawn = (bin: string) =>
+    new Promise<boolean>(resolve => {
+      try {
+        const p = spawn(bin, ['--version'], { stdio: 'ignore', windowsHide: true });
+        p.once('error', () => resolve(false));
+        p.once('exit', code => resolve(code === 0));
+      } catch {
+        resolve(false);
+      }
+    });
+
+  if (await canSpawn('cloudflared')) return 'cloudflared';
+
+  const binDir = join(configDir(), 'bin');
+  const binName = process.platform === 'win32' ? 'cloudflared.exe' : 'cloudflared';
+  const localBin = join(binDir, binName);
+  try {
+    const st = await stat(localBin);
+    if (st.isFile() && st.size > 1024 && (await canSpawn(localBin))) {
+      return localBin;
+    }
+  } catch {
+    // not downloaded yet
+  }
+
+  let assetName = '';
+  if (process.platform === 'win32') {
+    assetName = process.arch === 'arm64' ? 'cloudflared-windows-arm64.exe' : 'cloudflared-windows-amd64.exe';
+  } else if (process.platform === 'linux') {
+    assetName = process.arch === 'arm64' ? 'cloudflared-linux-arm64' : 'cloudflared-linux-amd64';
+  }
+  if (!assetName) return 'cloudflared';
+
+  try {
+    await mkdir(binDir, { recursive: true });
+    const res = await fetch(
+      `https://github.com/cloudflare/cloudflared/releases/latest/download/${assetName}`,
+      { signal: AbortSignal.timeout(30_000) },
+    );
+    if (res.ok) {
+      const bytes = Buffer.from(await res.arrayBuffer());
+      await writeFile(localBin, bytes);
+      if (process.platform !== 'win32') {
+        await chmod(localBin, 0o755);
+      }
+      if (await canSpawn(localBin)) return localBin;
+    }
+  } catch {
+    // fall back to system PATH lookup
+  }
+  return 'cloudflared';
 }
 
 export class PairManager {
@@ -787,7 +883,8 @@ export class PairManager {
   private tunnelProc?: ChildProcess;
   private heartbeatTimer?: NodeJS.Timeout;
   private port = 0;
-  private token = randomBytes(6).toString('base64url');
+  private bindHost = '127.0.0.1';
+  private token = randomBytes(16).toString('base64url');
   private tunnelUrl?: string;
   private tunnelStatus: PairSessionInfo['tunnelStatus'] = 'stopped';
   private tunnelError?: string;
@@ -806,11 +903,19 @@ export class PairManager {
     return Boolean(this.server);
   }
 
+  get listeningHost(): string {
+    return this.bindHost;
+  }
+
   getInfo(): PairSessionInfo {
     const lanIp = detectLanIp();
     const localUrl = `http://127.0.0.1:${this.port}/?t=${this.token}`;
     const lanUrl = `http://${lanIp}:${this.port}/?t=${this.token}`;
-    const publicPairUrl = this.tunnelUrl ? `${this.tunnelUrl}/?t=${this.token}` : lanUrl;
+    const publicPairUrl = this.tunnelUrl
+      ? `${this.tunnelUrl}/?t=${this.token}`
+      : this.bindHost === '0.0.0.0'
+        ? lanUrl
+        : localUrl;
     return {
       running: Boolean(this.server),
       port: this.port,
@@ -825,12 +930,13 @@ export class PairManager {
     };
   }
 
-  async start(options?: { port?: number; skipTunnel?: boolean; tunnelTimeoutMs?: number }): Promise<PairSessionInfo> {
+  async start(options?: { port?: number; skipTunnel?: boolean; bindLan?: boolean; tunnelTimeoutMs?: number }): Promise<PairSessionInfo> {
     if (this.server) return this.getInfo();
-    this.token = randomBytes(6).toString('base64url');
+    this.token = randomBytes(16).toString('base64url');
     this.tunnelUrl = undefined;
     this.tunnelError = undefined;
     this.tunnelStatus = 'starting';
+    this.bindHost = options?.skipTunnel || options?.bindLan ? '0.0.0.0' : '127.0.0.1';
 
     const srv = createServer((req, res) => {
       void this.handleRequest(req, res);
@@ -838,7 +944,7 @@ export class PairManager {
 
     await new Promise<void>((resolve, reject) => {
       srv.once('error', reject);
-      srv.listen(options?.port ?? 0, '0.0.0.0', () => {
+      srv.listen(options?.port ?? 0, this.bindHost, () => {
         srv.removeListener('error', reject);
         resolve();
       });
@@ -901,6 +1007,7 @@ export class PairManager {
 
   private async launchCloudflared(timeoutMs: number): Promise<void> {
     const targetLocal = `http://127.0.0.1:${this.port}`;
+    const cloudflaredBin = await resolveCloudflaredBinary();
     return new Promise<void>(resolve => {
       let settled = false;
       let matchedUrl: string | undefined;
@@ -933,13 +1040,13 @@ export class PairManager {
           this.callbacks.onNotice?.(`Paired tunnel ready: ${this.tunnelUrl}/?t=${this.token}`);
         } else if (!this.tunnelUrl) {
           this.tunnelStatus = 'fallback_lan';
-          this.tunnelError ??= 'Timed out waiting for trycloudflare.com URL; using local/LAN URL.';
+          this.tunnelError ??= 'Timed out waiting for trycloudflare.com URL; using local URL (run "/pair lan" for Wi-Fi).';
         }
         finish();
       }, timeoutMs);
 
       try {
-        const proc = spawn('cloudflared', ['tunnel', '--no-autoupdate', '--url', targetLocal], {
+        const proc = spawn(cloudflaredBin, ['tunnel', '--no-autoupdate', '--url', targetLocal], {
           stdio: ['ignore', 'pipe', 'pipe'],
           windowsHide: true,
         });
@@ -963,7 +1070,7 @@ export class PairManager {
         proc.stderr?.on('data', onChunk);
         proc.on('error', err => {
           this.tunnelStatus = 'fallback_lan';
-          this.tunnelError = `cloudflared not found or failed (${err.message}). Using LAN URL.`;
+          this.tunnelError = `cloudflared not found or failed (${err.message}). Run "/pair lan" to pair over local Wi-Fi.`;
           finish();
         });
         proc.on('exit', code => {
@@ -1039,7 +1146,7 @@ export class PairManager {
       id: this.nextEntryId++,
       seq: ++this.seqCounter,
       kind,
-      text,
+      text: limitText(text, 8_000),
     };
     this.entries.push(entry);
     if (this.entries.length > 150) this.entries.shift();
@@ -1105,7 +1212,7 @@ export class PairManager {
         entry = this.appendEntry('assistant', event.text);
         this.activeAssistantEntryId = entry.id;
       } else {
-        entry.text += event.text;
+        entry.text = limitText(entry.text + event.text, 8_000);
         entry.seq = ++this.seqCounter;
         this.broadcast({ type: 'entry', entry }, false);
       }
@@ -1172,13 +1279,12 @@ export class PairManager {
 
   formatBanner(): string {
     const info = this.getInfo();
-    const qrTarget = info.tunnelUrl ?? info.publicPairUrl;
-    const qr = renderQrTerminal(qrTarget, '  ');
+    const qr = renderQrTerminal(info.publicPairUrl, '  ');
     const lines: string[] = [
       `╭─── Pair Device via Cloudflared Tunnel ──────────────────────────╮`,
-      `  Status      : ${info.tunnelStatus === 'connected' ? 'Cloudflared Tunnel Active (Free)' : 'Local / LAN Fallback'}`,
+      `  Status      : ${info.tunnelStatus === 'connected' ? 'Cloudflared Tunnel Active (Free)' : this.bindHost === '0.0.0.0' ? 'LAN Mode (0.0.0.0)' : 'Localhost Only (127.0.0.1)'}`,
       ...(info.tunnelUrl ? [`  Tunnel URL  : ${info.publicPairUrl}`] : []),
-      `  LAN URL     : ${info.lanUrl}`,
+      ...(this.bindHost === '0.0.0.0' ? [`  LAN URL     : ${info.lanUrl}`] : []),
       `  Local URL   : ${info.localUrl}`,
       ...(info.tunnelError ? [`  Note        : ${info.tunnelError}`] : []),
       `  Clients     : ${info.connectedClients} connected`,
@@ -1192,9 +1298,12 @@ export class PairManager {
 
   private checkAuth(reqUrl: URL, req: IncomingMessage): boolean {
     const qToken = reqUrl.searchParams.get('token') ?? reqUrl.searchParams.get('t');
-    if (qToken === this.token) return true;
+    if (safeTokenEquals(qToken, this.token)) return true;
     const auth = req.headers.authorization;
-    if (auth === `Bearer ${this.token}`) return true;
+    if (typeof auth === 'string' && auth.startsWith('Bearer ')) {
+      const bearer = auth.slice(7).trim();
+      if (safeTokenEquals(bearer, this.token)) return true;
+    }
     return false;
   }
 
@@ -1221,23 +1330,26 @@ export class PairManager {
         return;
       }
 
-      if (req.method === 'GET' && reqUrl.pathname === '/') {
-        res.writeHead(200, {
-          'Content-Type': 'text/html; charset=utf-8',
-          'Cache-Control': 'no-store, no-cache, must-revalidate',
-        });
-        res.end(renderMobileHtml(this.token));
-        return;
-      }
-
       if (!this.checkAuth(reqUrl, req)) {
         res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' });
         res.end(JSON.stringify({ error: 'Unauthorized: invalid or missing pairing token.' }));
         return;
       }
 
+      if (req.method === 'GET' && reqUrl.pathname === '/') {
+        res.writeHead(200, {
+          'Content-Type': 'text/html; charset=utf-8',
+          'Cache-Control': 'no-store, no-cache, must-revalidate',
+        });
+        res.end(renderMobileHtml());
+        return;
+      }
+
       if (req.method === 'GET' && reqUrl.pathname === '/api/state') {
         this.ensureHistorySeeded();
+        const sinceRaw = Number(reqUrl.searchParams.get('since') ?? 0);
+        const since = Number.isFinite(sinceRaw) && sinceRaw > 0 ? sinceRaw : 0;
+        const deltaEntries = since > 0 ? this.entries.filter(e => e.seq > since) : this.entries;
         res.writeHead(200, {
           'Content-Type': 'application/json; charset=utf-8',
           'Cache-Control': 'no-store',
@@ -1245,7 +1357,7 @@ export class PairManager {
         res.end(
           JSON.stringify({
             state: this.callbacks.getState(),
-            entries: this.entries,
+            entries: deltaEntries,
             pendingApprovals: [...this.pendingApprovals.values()].map(p => ({
               id: p.id,
               tool: p.tool,
@@ -1292,6 +1404,15 @@ export class PairManager {
           res.end(JSON.stringify({ error: 'Prompt is required' }));
           return;
         }
+        if (isForbiddenRemoteInput(prompt)) {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(
+            JSON.stringify({
+              error: 'Direct shell execution (!cmd) and auto-approve mode escalation are disabled for remote devices.',
+            }),
+          );
+          return;
+        }
         this.notifyUserPrompt(prompt);
         this.callbacks.onRemotePrompt(prompt);
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -1302,7 +1423,12 @@ export class PairManager {
       if (req.method === 'POST' && reqUrl.pathname === '/api/mode') {
         const body = await this.readJsonBody(req);
         const m = body.mode;
-        if (m === 'ask' || m === 'auto' || m === 'plan' || m === 'readonly') {
+        if (m === 'auto') {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Cannot enable auto-approve mode from a remote paired device.' }));
+          return;
+        }
+        if (m === 'ask' || m === 'plan' || m === 'readonly') {
           this.callbacks.onRemoteModeChange(m);
           this.syncState();
           res.writeHead(200, { 'Content-Type': 'application/json' });

@@ -355,6 +355,7 @@ export class ToolRegistry {
   budget?: RunBudget;
   planMode = false;
   allowPeerToolsInReadOnly = false;
+  onlyPeerTools = false;
   todos: TodoItem[] = [];
   onTodoUpdate?: (todos: TodoItem[]) => void;
   getGoal?: () => SessionGoal | undefined;
@@ -678,6 +679,7 @@ export class ToolRegistry {
   }
   /** Whether a tool is offered to the model in the current mode. execute() enforces the same rule. */
   private isExposed(name: string, d: RegisteredTool): boolean {
+    if (this.onlyPeerTools) return PEER_TOOLS.has(name);
     if (name === 'exit_plan_mode' && !this.planMode) return false;
     if ((name === 'get_goal' || name === 'create_goal' || name === 'update_goal') && (!this.getGoal || this.planMode)) return false;
     if (PEER_TOOLS.has(name) && this.readOnly && !this.planMode && !this.allowPeerToolsInReadOnly) return false;

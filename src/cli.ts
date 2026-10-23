@@ -870,7 +870,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             description:
               'Execute a multi-step custom or built-in workflow (e.g. "feature-dev", "bug-hunt", "tdd-cycle", "security-audit").',
             schema: runWorkflowToolSchema,
-            readOnly: true,
+            readOnly: false,
             execute: async (input, signal) => {
               const all = await discoverWorkflows(runtime.cwd);
               const wf = all.find(w => w.name.toLowerCase() === input.name.toLowerCase());
@@ -880,15 +880,24 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
               const res = await executeWorkflow(wf, input.input, {
                 cwd: runtime.cwd,
                 signal,
-                runPrompt: async (stepPrompt, _step, stepSig) => {
-                  const childStore = await SessionStore.open(join(runtime.dataDir, 'workflows', store.session.id), runtime);
+                effectiveReadOnly: reg.effectiveReadOnly,
+                approveShell: (command, stepSig) =>
+                  reg.approve({ tool: 'bash', input: { command }, signal: stepSig }),
+                runPrompt: async (stepPrompt, step, stepSig) => {
+                  const wfSessionsRoot = join(runtime.dataDir, 'workflows', store.session.id);
+                  const childStore = await SessionStore.open(wfSessionsRoot, runtime);
+                  const childId = childStore.session.id;
                   try {
-                    const childTools = new ToolRegistry(runtime.cwd, req => reg.approve(req), reg.readOnly);
+                    const stepReadOnly = reg.readOnly || step.readOnly === true || step.mode === 'readonly';
+                    const childTools = new ToolRegistry(runtime.cwd, req => reg.approve(req), stepReadOnly);
+                    childTools.planMode = reg.planMode || step.mode === 'plan';
                     await new Harness(runtime, childStore, childTools).run(stepPrompt, stepSig, reg.budget);
                     const { lastAssistantAnswer } = await import('./reasoning.js');
                     return lastAssistantAnswer(childStore.session.messages, runtime.inlineReasoning);
                   } finally {
                     await childStore.close().catch(() => {});
+                    const { unlink } = await import('node:fs/promises');
+                    await unlink(join(wfSessionsRoot, `${childId}.json`)).catch(() => {});
                   }
                 },
                 runNetwork: async (topic, roles, rounds, stepSig) => {
@@ -1184,7 +1193,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
 
       const ensurePairManager = async () => {
         if (!pairManager) {
-          const { PairManager } = await import('./pair.js');
+          const { PairManager, isForbiddenRemoteInput } = await import('./pair.js');
           pairManager = new PairManager({
             getState: () => ({
               model: runtime.model,
@@ -1229,6 +1238,10 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
               return out;
             },
             onRemotePrompt: remoteText => {
+              if (isForbiddenRemoteInput(remoteText)) {
+                display('\n[Blocked remote attempt to run direct shell (!cmd) or escalate to auto-approve mode.]\n');
+                return;
+              }
               if (tui) {
                 tui.submitExternalPrompt(remoteText);
               } else {
@@ -1241,6 +1254,10 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
               }
             },
             onRemoteModeChange: nextMode => {
+              if (nextMode === 'auto') {
+                display('\n[Blocked remote attempt to switch to auto-approve mode.]\n');
+                return;
+              }
               applyPermissionMode(nextMode);
             },
             onRemoteStop: () => {
@@ -2013,8 +2030,11 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             return true;
           }
           const pm = await ensurePairManager();
+          const skipTunnel = sub === 'lan' || sub === 'local';
+          if (pm.isRunning && skipTunnel && pm.listeningHost !== '0.0.0.0') {
+            await pm.stop();
+          }
           if (!pm.isRunning) {
-            const skipTunnel = sub === 'lan' || sub === 'local';
             if (tui) {
               tui.setNotice(skipTunnel ? 'Starting local/LAN pair server...' : 'Starting Cloudflared tunnel & waiting for DNS...');
               await tui.withStatus(skipTunnel ? 'Starting LAN pair' : 'Starting Cloudflared tunnel', () => pm.start({ skipTunnel }));
@@ -2805,6 +2825,9 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
               const wfRes = await executeWorkflow(matched, wfArgs, {
                 cwd: runtime.cwd,
                 signal: controller.signal,
+                effectiveReadOnly: tools.effectiveReadOnly,
+                approveShell: (command, stepSig) =>
+                  tools.approve({ tool: 'bash', input: { command }, signal: stepSig }),
                 onProgress: text => display(text),
                 runPrompt: async (stepPrompt, _step, stepSig) => {
                   return await harness.run(stepPrompt, stepSig);

@@ -324,7 +324,7 @@ export class Subagents {
         description:
           'Convene a multi-agent Agent Network (Brainstorm / Council Room) where specialized personas (Architect, Researcher, Critic, Pragmatist, Security) explore the codebase, debate ideas peer-to-peer across rounds, and synthesize a consensus blueprint.',
         schema: agentNetworkToolSchema,
-        readOnly: true,
+        readOnly: false,
         execute: async (input, signal) => {
           const budget = this.registry.budget ?? { spent: 0, limit: this.config.runTokenBudget };
           const res = await this.network.brainstorm({

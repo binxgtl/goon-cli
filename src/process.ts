@@ -36,13 +36,13 @@ export function resolveExecutable(command: string): string {
 }
 
 export async function runCommand(command: string, args: string[], options: {
-  cwd: string; signal: AbortSignal; timeoutMs: number;
+  cwd: string; signal: AbortSignal; timeoutMs: number; env?: NodeJS.ProcessEnv;
 }): Promise<CommandResult> {
   options.signal.throwIfAborted();
   const resolvedCommand = resolveExecutable(command);
   return new Promise((resolve, reject) => {
     const child = spawn(resolvedCommand, args, {
-      cwd: options.cwd, env: childEnv(), stdio: ['ignore', 'pipe', 'pipe'],
+      cwd: options.cwd, env: childEnv(options.env), stdio: ['ignore', 'pipe', 'pipe'],
       detached: process.platform !== 'win32', windowsHide: true,
     });
     let first = Buffer.alloc(0), tail = Buffer.alloc(0), bytes = 0;

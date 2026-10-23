@@ -227,6 +227,34 @@ export function parseWorkflowArgs(rawInput: string, defaults?: Record<string, st
   };
 }
 
+function getShellQuoteContext(prefix: string): 'none' | 'single' | 'double' {
+  let state: 'none' | 'single' | 'double' = 'none';
+  for (let i = 0; i < prefix.length; i++) {
+    const ch = prefix[i];
+    if (state === 'none') {
+      if (ch === '\\') i++;
+      else if (ch === "'") state = 'single';
+      else if (ch === '"') state = 'double';
+    } else if (state === 'single') {
+      if (ch === "'") state = 'none';
+    } else if (state === 'double') {
+      if (ch === '\\') i++;
+      else if (ch === '"') state = 'none';
+    }
+  }
+  return state;
+}
+
+export function shellEscape(value: string, quoteContext: 'none' | 'single' | 'double' = 'none'): string {
+  if (quoteContext === 'single') {
+    return value.replace(/'/g, "'\\''");
+  }
+  if (quoteContext === 'double') {
+    return value.replace(/[\\"$`!]/g, '\\$&');
+  }
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
 export function interpolateWorkflowTemplate(
   template: string,
   context: {
@@ -236,11 +264,40 @@ export function interpolateWorkflowTemplate(
     prevOutput: string;
     stepOutputs: Record<string, string>;
   },
+  options?: { mode?: 'text' | 'shell' },
 ): string {
+  const isShell = options?.mode === 'shell';
+  const formatVal = (val: string, offset: number, src: string): string => {
+    if (!isShell) return val;
+    const qCtx = getShellQuoteContext(src.slice(0, offset));
+    return shellEscape(val, qCtx);
+  };
+
   let out = template;
-  out = out.replace(/\{\{\s*steps\.([A-Za-z0-9_-]+)\.output\s*\}\}/g, (_, id: string) => context.stepOutputs[id] ?? '');
-  out = out.replace(/\{\{\s*input\s*\}\}|\$input\b/g, () => context.input);
-  out = out.replace(/\{\{\s*prev\s*\}\}|\$prev\b/g, () => context.prevOutput);
+  out = out.replace(/\{\{\s*steps\.([A-Za-z0-9_-]+)\.output\s*\}\}/g, (_m, id: string, offset: number, src: string) =>
+    formatVal(context.stepOutputs[id] ?? '', offset, src),
+  );
+  out = out.replace(/\{\{\s*input\s*\}\}|\$input\b/g, (_m, offset: number, src: string) =>
+    formatVal(context.input, offset, src),
+  );
+  out = out.replace(/\{\{\s*prev\s*\}\}|\$prev\b/g, (_m, offset: number, src: string) =>
+    formatVal(context.prevOutput, offset, src),
+  );
+
+  if (isShell) {
+    // In shell mode, only replace explicit {{1}}..{{N}} or {{varName}} placeholders so $1, $2 (awk/bash) and $ENV_VARS stay intact.
+    out = out.replace(/\{\{\s*(\d+)\s*\}\}/g, (_m, g1: string, offset: number, src: string) => {
+      const idx = Number(g1) - 1;
+      return formatVal(context.positional[idx] ?? '', offset, src);
+    });
+    out = out.replace(/\{\{\s*([A-Za-z_][A-Za-z0-9_-]*)\s*\}\}/g, (full, key: string, offset: number, src: string) => {
+      if (key in context.named) return formatVal(context.named[key], offset, src);
+      if (key in context.stepOutputs) return formatVal(context.stepOutputs[key], offset, src);
+      return full;
+    });
+    return out;
+  }
+
   out = out.replace(/\{\{\s*(\d+)\s*\}\}|\$(\d+)\b/g, (_, g1: string | undefined, g2: string | undefined) => {
     const idx = Number(g1 ?? g2) - 1;
     return context.positional[idx] ?? '';
@@ -360,7 +417,6 @@ export async function discoverWorkflows(cwd: string): Promise<WorkflowDefinition
   const roots: Array<{ dir: string; scope: 'workspace' | 'user' }> = [
     { dir: join(cwd, '.goon', 'workflows'), scope: 'workspace' },
     { dir: join(cwd, '.agents', 'workflows'), scope: 'workspace' },
-    { dir: join(cwd, 'workflows'), scope: 'workspace' },
     { dir: join(configDir(), 'workflows'), scope: 'user' },
   ];
 
@@ -426,12 +482,25 @@ export async function createWorkflowScaffold(
   name: string,
   description?: string,
   globalScope = false,
+  overwrite = false,
 ): Promise<{ path: string; workflow: WorkflowDefinition }> {
   const cleanName = name.trim().replace(/[^A-Za-z0-9_-]/g, '-').replace(/^-+|-+$/g, '');
   if (!cleanName) throw new Error('Workflow name cannot be empty.');
   const targetDir = globalScope ? join(configDir(), 'workflows') : join(resolve(cwd), '.goon', 'workflows');
   await mkdir(targetDir, { recursive: true });
   const filePath = join(targetDir, `${cleanName}.json`);
+  const mdPath = join(targetDir, `${cleanName}.md`);
+
+  if (!overwrite) {
+    const existingJson = await stat(filePath).then(() => true, () => false);
+    if (existingJson) {
+      throw new Error(`Workflow "${cleanName}" already exists at ${filePath}. Remove it first with "goon workflow rm ${cleanName}".`);
+    }
+    const existingMd = await stat(mdPath).then(() => true, () => false);
+    if (existingMd) {
+      throw new Error(`Workflow "${cleanName}" already exists at ${mdPath}. Remove it first with "goon workflow rm ${cleanName}".`);
+    }
+  }
 
   const def: WorkflowDefinition = {
     name: cleanName,
@@ -483,7 +552,9 @@ export async function removeCustomWorkflow(cwd: string, name: string): Promise<s
 export interface WorkflowExecutionHooks {
   cwd: string;
   signal: AbortSignal;
+  effectiveReadOnly?: boolean;
   onProgress?: (text: string) => void;
+  approveShell?: (command: string, signal: AbortSignal) => Promise<boolean>;
   runPrompt: (prompt: string, step: WorkflowStep, signal: AbortSignal) => Promise<string>;
   runSubagents?: (tasks: string[], readOnly: boolean, signal: AbortSignal) => Promise<string>;
   runNetwork?: (
@@ -516,14 +587,15 @@ export async function executeWorkflow(
     const step = workflow.steps[i];
     const stepTitle = step.title ?? `${step.type} (${step.id})`;
     const started = Date.now();
-    const interp = (text: string | undefined) =>
-      interpolateWorkflowTemplate(text ?? '', {
-        input: parsedArgs.fullInput,
-        positional: parsedArgs.positional,
-        named: parsedArgs.named,
-        prevOutput,
-        stepOutputs,
-      });
+    const interpContext = {
+      input: parsedArgs.fullInput,
+      positional: parsedArgs.positional,
+      named: parsedArgs.named,
+      prevOutput,
+      stepOutputs,
+    };
+    const interp = (text: string | undefined, mode: 'text' | 'shell' = 'text') =>
+      interpolateWorkflowTemplate(text ?? '', interpContext, { mode });
 
     hooks.onProgress?.(`\n◆ Step [${i + 1}/${workflow.steps.length}] ${stepTitle} [${step.type}]\n`);
 
@@ -552,12 +624,33 @@ export async function executeWorkflow(
         }
         stepOutput = 'Approved.';
       } else if (step.type === 'shell') {
-        const rawCmd = interp(step.command ?? step.prompt ?? '');
+        if (hooks.effectiveReadOnly || step.readOnly === true || step.mode === 'plan' || step.mode === 'readonly') {
+          throw new Error(`Shell step "${step.id}" is blocked in read-only or plan mode.`);
+        }
+        const rawCmd = interp(step.command ?? step.prompt ?? '', 'shell');
         if (!rawCmd.trim()) throw new Error(`Shell step "${step.id}" has no command.`);
         const cmd = sanitizeBashCommand(rawCmd);
+        if (hooks.approveShell) {
+          const allowed = await hooks.approveShell(cmd, hooks.signal);
+          if (!allowed) {
+            throw new Error(`Permission denied by the user for shell command: ${cmd}`);
+          }
+        }
         hooks.onProgress?.(`  $ ${cmd}\n`);
+        const wfEnv: NodeJS.ProcessEnv = {
+          ...process.env,
+          GOON_WF_INPUT: parsedArgs.fullInput,
+          GOON_WF_PREV: prevOutput,
+        };
+        for (let pIdx = 0; pIdx < parsedArgs.positional.length; pIdx++) {
+          wfEnv[`GOON_WF_ARG_${pIdx + 1}`] = parsedArgs.positional[pIdx];
+        }
+        for (const [k, v] of Object.entries(parsedArgs.named)) {
+          wfEnv[`GOON_WF_VAR_${k.replace(/[^A-Za-z0-9_]/g, '_').toUpperCase()}`] = v;
+        }
         const res = await runCommand('bash', ['-c', cmd], {
           cwd: hooks.cwd,
+          env: wfEnv,
           signal: AbortSignal.any([hooks.signal, AbortSignal.timeout(120_000)]),
           timeoutMs: 120_000,
         });

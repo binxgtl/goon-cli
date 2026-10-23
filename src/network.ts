@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { rmdir, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { z } from 'zod';
 import { Harness, type HarnessEvent } from './harness.js';
@@ -488,6 +489,8 @@ function resolvePersonas(roles?: string[]): NetworkPersona[] {
   return out.length >= 2 ? out : [DEFAULT_NETWORK_PERSONAS.architect, DEFAULT_NETWORK_PERSONAS.critic];
 }
 
+export const DEFAULT_NETWORK_TOKEN_BUDGET = 120_000;
+
 /**
  * Multi-Agent Brainstorm & Deliberation Network.
  * Runs multiple distinct agent personas across rounds of exploration, P2P debate, and synthesis.
@@ -508,7 +511,12 @@ export class AgentNetwork {
     const personas = resolvePersonas(options.roles);
     const rounds = Math.max(1, Math.min(4, options.rounds ?? 2));
     const explore = options.exploreCodebase !== false;
-    const budget = options.budget ?? { spent: 0, limit: this.config.runTokenBudget };
+    const parentBudget = options.budget;
+    const configuredLimit = parentBudget && parentBudget.limit > 0 ? parentBudget.limit : this.config.runTokenBudget;
+    const budget: RunBudget = {
+      spent: parentBudget?.spent ?? 0,
+      limit: configuredLimit > 0 ? configuredLimit : DEFAULT_NETWORK_TOKEN_BUDGET,
+    };
     const contributions: BrainstormResult['contributions'] = [];
 
     for (const p of personas) {
@@ -526,88 +534,87 @@ export class AgentNetwork {
         `  Topic: ${options.topic}\n`,
     );
 
-    for (let round = 1; round <= rounds; round++) {
-      options.signal.throwIfAborted();
-      options.onProgress?.(`\n◈ Round ${round}/${rounds} — ${round === 1 ? 'Initial Exploration & Proposals' : 'Cross-Critique & Peer Debate'}\n`);
+    try {
+      for (let round = 1; round <= rounds; round++) {
+        options.signal.throwIfAborted();
+        options.onProgress?.(`\n◈ Round ${round}/${rounds} — ${round === 1 ? 'Initial Exploration & Proposals' : 'Cross-Critique & Peer Debate'}\n`);
 
-      // In Round 1, run up to 2 personas concurrently for speed; in debate rounds, run sequentially so each sees the latest peer replies
-      const concurrency = round === 1 ? 2 : 1;
-      let idx = 0;
-      const roundOutputs: Array<{ persona: NetworkPersona; response: string } | undefined> = Array.from({
-        length: personas.length,
+        // In Round 1, run up to 2 personas concurrently for speed; in debate rounds, run sequentially
+        // and append to `contributions` immediately so each persona sees the latest replies from peers in the same round.
+        const concurrency = round === 1 ? 2 : 1;
+        let idx = 0;
+
+        const worker = async () => {
+          while (idx < personas.length && !options.signal.aborted) {
+            const curIdx = idx++;
+            const persona = personas[curIdx];
+            this.bus.updateNodeStatus(persona.name, `round-${round}`);
+            options.onProgress?.(`  ▸ [${persona.name} · ${persona.role}] thinking...\n`);
+
+            const response = await this.runPersonaTurn({
+              persona,
+              allPersonas: personas,
+              topic: options.topic,
+              round,
+              totalRounds: rounds,
+              priorContributions: [...contributions],
+              explore,
+              signal: options.signal,
+              budget,
+            });
+            if (parentBudget) parentBudget.spent = budget.spent;
+
+            contributions.push({ round, persona, response });
+            this.bus.postBlackboard({
+              author: persona.name,
+              role: persona.role,
+              topic: `Round ${round}: ${options.topic.slice(0, 60)}`,
+              content: response,
+              kind: round === 1 ? 'idea' : 'critique',
+              round,
+            });
+            this.bus.updateNodeStatus(persona.name, 'idle');
+
+            const preview = response.replace(/\s+/g, ' ').trim().slice(0, 180);
+            options.onProgress?.(`  ● [${persona.name}] ${preview}${response.length > 180 ? '…' : ''}\n`);
+          }
+        };
+
+        await Promise.all(Array.from({ length: Math.min(concurrency, personas.length) }, worker));
+      }
+
+      options.signal.throwIfAborted();
+      options.onProgress?.(`\n◈ Synthesizing Agent Network Consensus...\n`);
+      const synthesis = await this.runSynthesis({
+        topic: options.topic,
+        personas,
+        rounds,
+        contributions,
+        signal: options.signal,
+        budget,
+      });
+      if (parentBudget) parentBudget.spent = budget.spent;
+
+      this.bus.postBlackboard({
+        author: 'Moderator',
+        role: 'Network Synthesizer',
+        topic: `Consensus: ${options.topic.slice(0, 60)}`,
+        content: synthesis,
+        kind: 'consensus',
       });
 
-      const worker = async () => {
-        while (idx < personas.length && !options.signal.aborted) {
-          const curIdx = idx++;
-          const persona = personas[curIdx];
-          this.bus.updateNodeStatus(persona.name, `round-${round}`);
-          options.onProgress?.(`  ▸ [${persona.name} · ${persona.role}] thinking...\n`);
+      options.onProgress?.(`╰─── Agent Network Complete ──────────────────────────────────────╯\n`);
 
-          const response = await this.runPersonaTurn({
-            persona,
-            allPersonas: personas,
-            topic: options.topic,
-            round,
-            totalRounds: rounds,
-            priorContributions: contributions,
-            explore,
-            signal: options.signal,
-            budget,
-          });
-
-          roundOutputs[curIdx] = { persona, response };
-          this.bus.postBlackboard({
-            author: persona.name,
-            role: persona.role,
-            topic: `Round ${round}: ${options.topic.slice(0, 60)}`,
-            content: response,
-            kind: round === 1 ? 'idea' : 'critique',
-            round,
-          });
-          this.bus.updateNodeStatus(persona.name, 'idle');
-
-          const preview = response.replace(/\s+/g, ' ').trim().slice(0, 180);
-          options.onProgress?.(`  ● [${persona.name}] ${preview}${response.length > 180 ? '…' : ''}\n`);
-        }
+      return {
+        topic: options.topic,
+        rounds,
+        participants: personas,
+        contributions,
+        synthesis,
       };
-
-      await Promise.all(Array.from({ length: Math.min(concurrency, personas.length) }, worker));
-      for (const item of roundOutputs) {
-        if (item) {
-          contributions.push({ round, persona: item.persona, response: item.response });
-        }
-      }
+    } finally {
+      await rmdir(this.networkSessionsRoot).catch(() => {});
     }
-
-    options.signal.throwIfAborted();
-    options.onProgress?.(`\n◈ Synthesizing Agent Network Consensus...\n`);
-    const synthesis = await this.runSynthesis({
-      topic: options.topic,
-      personas,
-      rounds,
-      contributions,
-      signal: options.signal,
-      budget,
-    });
-
-    this.bus.postBlackboard({
-      author: 'Moderator',
-      role: 'Network Synthesizer',
-      topic: `Consensus: ${options.topic.slice(0, 60)}`,
-      content: synthesis,
-      kind: 'consensus',
-    });
-
-    options.onProgress?.(`╰─── Agent Network Complete ──────────────────────────────────────╯\n`);
-
-    return {
-      topic: options.topic,
-      rounds,
-      participants: personas,
-      contributions,
-      synthesis,
-    };
   }
 
   private async runPersonaTurn(params: {
@@ -622,14 +629,15 @@ export class AgentNetwork {
     budget: RunBudget;
   }): Promise<string> {
     const store = await SessionStore.open(this.networkSessionsRoot, this.config);
+    const sessionId = store.session.id;
     store.session.title = `Network · ${params.persona.name} (R${params.round})`;
     try {
       const tools = new ToolRegistry(this.config.cwd, async () => false, true);
       tools.allowPeerToolsInReadOnly = true;
       this.bus.registerPeerTools(tools, params.persona.name, params.persona.role);
       if (!params.explore) {
-        // Keep only peer tools if codebase exploration is disabled
-        tools.readOnly = true;
+        // Expose only peer communication tools when codebase exploration is disabled
+        tools.onlyPeerTools = true;
       }
 
       const peerNames = params.allPersonas
@@ -673,6 +681,7 @@ export class AgentNetwork {
       return `[${params.persona.name} error: ${safeError(err, this.config.apiKey)}]`;
     } finally {
       await store.close().catch(() => {});
+      await unlink(join(this.networkSessionsRoot, `${sessionId}.json`)).catch(() => {});
     }
   }
 
@@ -685,9 +694,11 @@ export class AgentNetwork {
     budget: RunBudget;
   }): Promise<string> {
     const store = await SessionStore.open(this.networkSessionsRoot, this.config);
+    const sessionId = store.session.id;
     store.session.title = `Network · Moderator Synthesis`;
     try {
       const tools = new ToolRegistry(this.config.cwd, async () => false, true);
+      tools.onlyPeerTools = true;
       const transcript = params.contributions
         .map(c => `### [Round ${c.round}] ${c.persona.name} (${c.persona.role})\n${c.response}`)
         .join('\n\n');
@@ -713,6 +724,7 @@ export class AgentNetwork {
       return limitText(answer || '(no synthesis generated)', 12_000);
     } finally {
       await store.close().catch(() => {});
+      await unlink(join(this.networkSessionsRoot, `${sessionId}.json`)).catch(() => {});
     }
   }
 }

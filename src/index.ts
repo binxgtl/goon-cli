@@ -35,12 +35,13 @@ export { AnswerProjection, visibleAnswer, lastAssistantAnswer } from './reasonin
 export type { AnswerPart, InlineReasoning } from './reasoning.js';
 export { TerminalUI, InputCancelledError, SLASH_COMMANDS, THEME, GLYPH, formatInlineMarkdown, formatTokenCount, visibleLength, padEndVisible } from './tui.js';
 export { welcomeBanner, readGitBranch } from './cli.js';
-export { PairManager, encodeQrMatrix, renderQrTerminal } from './pair.js';
+export { PairManager, encodeQrMatrix, renderQrTerminal, isForbiddenRemoteInput } from './pair.js';
 export type { PairSessionInfo, PairCallbacks, PendingRemoteApproval } from './pair.js';
 export {
   AgentNetwork,
   AgentNetworkBus,
   DEFAULT_NETWORK_PERSONAS,
+  DEFAULT_NETWORK_TOKEN_BUDGET,
   agentNetworkToolSchema,
   formatBrainstormReport,
 } from './network.js';
@@ -61,6 +62,7 @@ export {
   executeWorkflow,
   parseWorkflowArgs,
   interpolateWorkflowTemplate,
+  shellEscape,
   parseMarkdownWorkflow,
   formatWorkflowDetails,
   runWorkflowToolSchema,
