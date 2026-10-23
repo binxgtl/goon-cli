@@ -9,6 +9,12 @@ import { type RuntimeConfig } from './config.js';
 import { limitText } from './files.js';
 import { safeError } from './errors.js';
 import { lastAssistantAnswer } from './reasoning.js';
+import {
+  AgentNetwork,
+  AgentNetworkBus,
+  agentNetworkToolSchema,
+  formatBrainstormReport,
+} from './network.js';
 
 export type SubagentProgress = Exclude<HarnessEvent, { type: 'text' | 'reasoning' | 'tool_stream' }>;
 export type SubagentEvent =
@@ -170,13 +176,17 @@ export class Subagents {
   private readonly usedNicknames = new Set<string>();
   readonly spawned = new Map<string, ManagedSubagent>();
   readonly metadataById = new Map<string, { nickname: string; role: AgentRoleType; task: string }>();
+  readonly bus = new AgentNetworkBus();
+  readonly network: AgentNetwork;
 
   constructor(
     readonly config: RuntimeConfig,
     readonly parent: SessionStore,
     readonly registry: ToolRegistry,
     readonly emit: (event: SubagentEvent) => void = () => {},
-  ) {}
+  ) {
+    this.network = new AgentNetwork(this.config, this.parent, this.bus);
+  }
 
   get subagentsRoot(): string {
     return join(this.config.dataDir, 'subagents', this.parent.session.id).replace(/\\/g, '/');
@@ -309,6 +319,29 @@ export class Subagents {
       }),
     );
 
+    unregisters.push(
+      this.registry.register('agent_network', {
+        description:
+          'Convene a multi-agent Agent Network (Brainstorm / Council Room) where specialized personas (Architect, Researcher, Critic, Pragmatist, Security) explore the codebase, debate ideas peer-to-peer across rounds, and synthesize a consensus blueprint.',
+        schema: agentNetworkToolSchema,
+        readOnly: false,
+        execute: async (input, signal) => {
+          const budget = this.registry.budget ?? { spent: 0, limit: this.config.runTokenBudget };
+          const res = await this.network.brainstorm({
+            topic: input.topic,
+            roles: input.roles,
+            rounds: input.rounds,
+            exploreCodebase: input.explore_codebase,
+            signal,
+            budget,
+          });
+          return limitText(formatBrainstormReport(res), 24_000);
+        },
+      }),
+    );
+
+    unregisters.push(this.bus.registerPeerTools(this.registry, 'Lead', 'lead'));
+
     return () => {
       for (const fn of unregisters) fn();
     };
@@ -404,6 +437,13 @@ export class Subagents {
     };
     this.spawned.set(id, managed);
     this.metadataById.set(id, { nickname, role, task: input.message });
+    this.bus.registerNode({
+      id,
+      nickname,
+      role,
+      status: 'running',
+      task: input.message.slice(0, 120),
+    });
 
     const budget = this.registry.budget ?? { spent: 0, limit: this.config.runTokenBudget };
     const formattedPrompt = buildRolePrompt(role, input.message);
@@ -459,6 +499,10 @@ export class Subagents {
         },
         managed.readOnly || this.registry.readOnly,
       );
+      tools.allowPeerToolsInReadOnly = true;
+      this.bus.registerPeerTools(tools, managed.nickname, managed.agentType);
+      const peerInbox = this.bus.drainUnreadPromptBlock(managed.nickname);
+      const effectivePrompt = peerInbox ? `${prompt}\n${peerInbox}` : prompt;
       const childHarness = new Harness(childConfig, store, tools, event => {
         if (event.type !== 'text' && event.type !== 'reasoning' && event.type !== 'tool_stream') {
           this.emit({ type: 'subagent', id: managed.id, state: 'progress', event });
@@ -466,7 +510,7 @@ export class Subagents {
       });
       // The task text was written by the parent model, not typed by the user.
       childHarness.untrustedPrompts = true;
-      await childHarness.run(prompt, signal, budget);
+      await childHarness.run(effectivePrompt, signal, budget);
       if (denied) throw new PermissionDeniedError('Permission denied in a subagent. Stop this run.');
       const answer = lastAssistantAnswer(store.session.messages, childConfig.inlineReasoning);
       managed.lastOutput = limitText(answer, 12_000);
@@ -496,6 +540,7 @@ export class Subagents {
     } finally {
       if (acquired) this.release();
       managed.updatedAt = new Date().toISOString();
+      this.bus.updateNodeStatus(managed.nickname, managed.status, managed.task.slice(0, 120));
       if (store) {
         this.emit({ type: 'subagent', id: managed.id, state: failure ? 'error' : 'done' });
       }

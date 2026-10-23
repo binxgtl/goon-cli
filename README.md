@@ -146,6 +146,9 @@ Khi model đang suy nghĩ hoặc chạy tool:
 - `/btw <câu_hỏi>`: Hỏi nhanh câu hỏi phụ (ephemeral side question) dựa trên ngữ cảnh hiện tại mà không làm bẩn lịch sử phiên.
 - `/goal [set|done|clear]`, `/memory [list|add|remove|clear]`, `/recap`: Đặt mục tiêu phiên, lưu ghi nhớ dài hạn (`memories.json`) hoặc tóm tắt tiến độ.
 - `/init`, `/skills`, `/mention <path>`: Khởi tạo `AGENTS.md`, liệt kê `SKILL.md` (gọi qua `$skill-name`) hoặc đính kèm `@file`/ảnh.
+- `/pair [start|stop|status|lan]`: Mở **Cloudflared Quick Tunnel** miễn phí (`*.trycloudflare.com`), tạo mã QR ngay trên terminal + link bảo mật để quét bằng điện thoại và điều khiển phiên `goon` từ xa (chat, xem stream, đổi chế độ, duyệt/từ chối quyền tool).
+- `/workflow [list|show|create|rm|run <tên> [tham_số]]`: Quản lý và thực thi các pipeline đa bước tuỳ chỉnh (`.json` hoặc `.md` trong `.goon/workflows/`) hoặc workflow tích hợp sẵn (`feature-dev`, `bug-hunt`, `tdd-cycle`, `security-audit`).
+- `/network [<chủ_đề>|board|send|clear]` (hoặc `/brainstorm`, `/council`): Triệu tập **Agent Network** (nhiều vai trò `Architect`, `Researcher`, `Critic`, `Pragmatist`, `Security` thảo luận, phản biện qua lại nhiều vòng để lên ý tưởng và chốt phương án) hoặc kiểm tra **P2P Message Bus** giữa các subagents.
 - `/diff`, `/git`, `/review`: Xem `git status` + `git diff`, hoặc yêu cầu model review toàn bộ thay đổi hiện tại.
 - `/compact [trọng_tâm]`: Chủ động nén ngữ cảnh hội thoại (có lưu archive đầy đủ trước khi nén).
 - `/setup` (hoặc `/provider`), `/key`, `/doctor`: Cấu hình lại provider (nhấn `Esc` để huỷ), đổi API key (nhập ẩn) hoặc kiểm tra kết nối/môi trường.
@@ -320,6 +323,9 @@ npm install -g . --omit=dev
 | `src/cli.ts`, `src/tui.ts` | Flags, giao diện TUI, Transcript Mode (`Ctrl+T`), popup `/slash` |
 | `src/mcp.ts` | MCP client, stdio/HTTP transport, resources, `import-codex`, lifecycle |
 | `src/subagents.ts` | `spawn_agent`/`wait_agent` & `delegate_task`/`delegate_edit`, concurrency, budget |
+| `src/network.ts` | `AgentNetwork` (Brainstorm / Council Room đa vòng) & `AgentNetworkBus` (P2P `peer_send`, `peer_broadcast`, `peer_read`, `peer_list`) |
+| `src/workflow.ts` | Custom Workflow engine (`.json` & `.md`), biến nội suy (`$input`, `$1`, `$prev`), bước `prompt`/`shell`/`subagent`/`network`/`approval` |
+| `src/pair.ts` | Ghép đôi thiết bị qua Cloudflared Tunnel miễn phí, bộ tạo mã QR ISO/IEC 18004 thuần TypeScript và giao diện Mobile Web/SSE |
 | `src/reasoning.ts` | `withReasoningReplay` (`reasoning_content`), `AnswerProjection`, giữ transcript gốc |
 
 ## Repository & Tự động Release
