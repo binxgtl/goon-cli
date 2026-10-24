@@ -1,0 +1,4 @@
+{"v":1,"seq":1,"at":"<timestamp>","sessionId":"<session>","type":"session","event":{"type":"session","id":"<session>","cwd":"<cwd>"}}
+{"v":1,"seq":2,"at":"<timestamp>","sessionId":"<session>","type":"user","event":{"type":"user","text":"boom"}}
+{"v":1,"seq":3,"at":"<timestamp>","sessionId":"<session>","type":"context_budget","event":{"type":"context_budget","inputBudget":111616,"system":16742,"conversation":50227,"files":27905,"truncated":false}}
+{"v":1,"seq":4,"at":"<timestamp>","sessionId":"<session>","type":"error","event":{"type":"error","message":"stub failure"}}

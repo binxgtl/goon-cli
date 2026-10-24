@@ -37,6 +37,8 @@ test('apply_patch honours Move to, chains repeated updates of one file and valid
   await writeFile(join(f.cwd, 'old.txt'), 'one\ntwo\nthree\n');
   await writeFile(join(f.cwd, 'twice.txt'), 'a\nb\nc\n');
   files.beginTurn();
+  await files.read('old.txt');
+  await files.read('twice.txt');
   const summary = await files.applyPatch([
     '*** Begin Patch',
     '*** Update File: old.txt',
@@ -514,7 +516,7 @@ test('resuming a session by ID or with `goon resume` from another folder switche
   const run = (args, input = '') => new Promise((resolveRun, reject) => {
     const child = spawn(process.execPath, [resolve(process.env.GOON_TEST_BIN ?? 'bin/goon.mjs'), '--base-url', p.url, '--model', 'test-model', ...args], {
       cwd: elsewhere,
-      env: { ...process.env, XDG_CONFIG_HOME: f.config, XDG_DATA_HOME: f.data, GOON_API_KEY: 'k' },
+      env: { ...process.env, XDG_CONFIG_HOME: f.config, XDG_DATA_HOME: f.data, GOON_API_KEY: 'test-secret-never-echo' },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     let stdout = '', stderr = '';

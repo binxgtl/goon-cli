@@ -33,7 +33,7 @@
     "build": "tsc",
     "typecheck": "tsc --noEmit",
     "lint": "oxlint src tests bin scripts",
-    "test": "npm run build && node --test tests/*.test.mjs",
+    "test": "npm run build && node --test --test-concurrency=4 \"tests/*.test.mjs\"",
     "prepack": "npm run build",
     "release:pack": "node scripts/pack-release.mjs"
   },

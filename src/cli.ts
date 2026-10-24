@@ -1,11 +1,12 @@
 import { parseArgs } from 'node:util';
 import { createInterface } from 'node:readline/promises';
 import { stdin, stdout, stderr } from 'node:process';
-import { existsSync, fstatSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, fstatSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import {
   DEFAULT_GATEWAY_URL,
   EFFORT_LEVELS,
+  atomicJson,
   type Config,
   type EffortLevel,
   configPath,
@@ -15,19 +16,41 @@ import {
   resolveApiKey,
   resolveRuntime,
   saveConfig,
+  type RuntimeConfig,
 } from './config.js';
 import { safeError } from './errors.js';
 import { VERSION } from './version.js';
 import { HELP } from './help.js';
 import type { HarnessEvent } from './harness.js';
 import type { SubagentEvent } from './subagents.js';
+import type { RunBudget } from './tools.js';
+import {
+  eventLogPath,
+  findSeqGap,
+  openEventLog,
+  readEventLog,
+  sessionIdFromEventLogPath,
+  type EventEnvelope,
+  type EventLogWriter,
+  type LoggedEvent,
+} from './eventlog.js';
 import { InputCancelledError, terminalText as cleanTerminal, TerminalUI } from './tui.js';
 import type { McpManager } from './mcp.js';
 import { EFFORT_DESCRIPTIONS, parseEffortInput, runSetupWizard } from './setup.js';
 import { discoverModels, formatModelBadge, resolveModelCapabilities, type DiscoveredModel } from './provider.js';
-import { bashApprovalPrefix, isApprovedBashPrefix } from './approval.js';
-
+import { bashApprovalPrefix, isApprovedBashPrefix, bashApprovalExact, isApprovedBashExact, canAutoApprove } from './approval.js';
+import { CostLedger, CostPricingError, createRunBudget, formatDurationMs, formatUsd } from './cost.js';
+import { classifyBashRisk } from './risk.js';
+import { resolveExecutionPolicy } from './policy.js';
+import { collectSecrets, redactObject } from './redact.js';
 type PermissionMode = 'ask' | 'plan' | 'auto' | 'readonly';
+
+/** Events the CLI itself adds to the log around harness events. */
+type CliLoggedEvent = HarnessEvent | SubagentEvent
+  | { type: 'session'; id: string; cwd: string }
+  | { type: 'user'; text: string }
+  | { type: 'done'; text: string; denied: boolean; sessionId: string }
+  | { type: 'error'; message: string };
 
 /**
  * Welcome lines shown when a session opens. Plain text (it is also printed in readline mode); the
@@ -248,9 +271,221 @@ export function insecureBaseUrlWarning(baseUrl: string | undefined): string | un
   return undefined;
 }
 
+/**
+ * Resolves a replay target: an explicit event-log path, a full session id, or an id prefix. The
+ * session JSON may be gone (replay is also a recovery path), so the log directory is authoritative.
+ */
+function resolveEventLogTarget(target: string): string {
+  const clean = target.trim();
+  if (!clean) throw new Error('Usage: goon replay <session-id|prefix|event-log-path>');
+  if (existsSync(clean)) {
+    if (!statSync(clean).isFile()) throw new Error(`Not a file: ${clean}`);
+    return resolve(clean);
+  }
+  const root = join(dataDir(), 'sessions');
+  let names: string[] = [];
+  try { names = readdirSync(root); } catch { /* no sessions yet */ }
+  const logs = names
+    .filter(name => name.endsWith('.events.jsonl'))
+    .map(name => ({ id: name.slice(0, -'.events.jsonl'.length), path: join(root, name) }));
+  const lower = clean.toLowerCase();
+  const exact = logs.filter(entry => entry.id.toLowerCase() === lower);
+  const matches = exact.length ? exact : logs.filter(entry => entry.id.toLowerCase().startsWith(lower));
+  if (matches.length > 1) {
+    throw new Error(`Session prefix "${clean}" is ambiguous: ${matches.map(entry => entry.id.slice(0, 8)).join(', ')}`);
+  }
+  if (matches.length === 1) return matches[0].path;
+  const sessionExists = names.some(name => name.endsWith('.json') && name.slice(0, -'.json'.length).toLowerCase().startsWith(lower));
+  throw new Error(sessionExists
+    ? `No event log found for session "${clean}"; it may predate --event-log.`
+    : `No event log found for "${clean}".`);
+}
+
+async function replayCommand(target: string, options: { envelopes: boolean; rebuild: boolean }): Promise<void> {
+  const path = resolveEventLogTarget(target);
+  const { envelopes, truncated } = readEventLog(path);
+  if (truncated) stderr.write(`goon: replay: ignored a torn final line in ${path}\n`);
+  let previous: EventEnvelope | undefined;
+  for (const envelope of envelopes) {
+    if (findSeqGap(previous, envelope)) {
+      stderr.write(`goon: replay: sequence gap after ${previous!.seq} (next ${envelope.seq})\n`);
+    }
+    previous = envelope;
+    stdout.write(`${JSON.stringify(options.envelopes ? envelope : envelope.event)}\n`);
+  }
+  if (!options.rebuild) return;
+  const sessionEnvelope = envelopes.find(envelope => envelope.type === 'session');
+  const sessionBody = (sessionEnvelope?.event && typeof sessionEnvelope.event === 'object'
+    ? sessionEnvelope.event as Record<string, unknown>
+    : {});
+  const rawId = typeof sessionBody.id === 'string' && sessionBody.id ? sessionBody.id : sessionIdFromEventLogPath(path);
+  const id = rawId.replace(/[^A-Za-z0-9._-]/g, '_');
+  const users = envelopes
+    .filter(envelope => envelope.type === 'user')
+    .map(envelope => (envelope.event as { text?: unknown }).text)
+    .filter((text): text is string => typeof text === 'string');
+  const rebuilt: Record<string, unknown> = {
+    version: 1,
+    id,
+    cwd: typeof sessionBody.cwd === 'string' ? sessionBody.cwd : '',
+    user: users,
+  };
+  const doneEnvelope = [...envelopes].reverse().find(envelope => envelope.type === 'done');
+  if (doneEnvelope) {
+    const done = doneEnvelope.event as { text?: unknown; denied?: unknown };
+    rebuilt.answer = typeof done.text === 'string' ? done.text : '';
+    rebuilt.denied = done.denied === true;
+  }
+  const errorEnvelope = [...envelopes].reverse().find(envelope => envelope.type === 'error');
+  if (errorEnvelope) {
+    const error = errorEnvelope.event as { message?: unknown };
+    rebuilt.error = typeof error.message === 'string' ? error.message : 'unknown error';
+  }
+  await atomicJson(join(dirname(path), `${id}.replayed.json`), rebuilt, { compact: true });
+}
+
+const MEMORY_COMMAND_USAGE =
+  'Usage: /memory rag index | rag stats | rag search <query> | budget | pref set <key> <value> | pref get <key> | pref rm <key> | pref list\n' +
+  '      (plain /memories list|add|rm|clear still manages persistent user memories)\n';
+
+/**
+ * `/memory` subcommands that need the on-demand MemoryStore (rag index/stats/search, budget,
+ * preferences). The store is opened per command and always closed, so plain `/memories`
+ * behavior stays untouched. Memory failures are reported, never fatal.
+ */
+async function runMemoryStoreCommand(runtime: RuntimeConfig, rest: string, display: (text: string) => void): Promise<void> {
+  const { MemoryStore } = await import('./memory.js');
+  const { projectIdFor } = await import('./rag.js');
+  const [head, sub, ...tail] = rest.split(/\s+/);
+  let store: Awaited<ReturnType<typeof MemoryStore.open>> | undefined;
+  try {
+    store = await MemoryStore.open({
+      dataDir: runtime.dataDir,
+      projectId: projectIdFor(runtime.cwd),
+      root: runtime.cwd,
+      // apiKey (env or credentials.json) is passed explicitly; MemoryStore.open additionally
+      // merges collectSecrets() itself, so other credential env vars are redacted too.
+      secrets: runtime.apiKey ? [runtime.apiKey] : [],
+      rag: {
+        topK: runtime.ragTopK,
+        capacity: runtime.ragCapacity,
+        threshold: runtime.ragThreshold,
+        maxFiles: runtime.ragIndexMaxFiles,
+        maxFileBytes: runtime.ragIndexMaxFileBytes,
+      },
+    });
+    if (head === 'rag' && sub === 'index') {
+      const result = await store.ensureRepoIndexed();
+      const suffix = result.truncated ? ' (walk truncated at the file cap)' : '';
+      display(`Indexed ${result.files} files / ${result.chunks} chunks in ${result.durationMs}ms [${result.reindexed}]${suffix}\n`);
+      return;
+    }
+    if (head === 'rag' && sub === 'stats') {
+      const stats = await store.knowledge.stats();
+      display(
+        `Knowledge index (${projectIdFor(runtime.cwd)}):\n` +
+        `  Files / chunks : ${stats.files} / ${stats.chunks}\n` +
+        `  Insights       : ${stats.insights}\n` +
+        `  Indexed at     : ${stats.indexedAt ?? 'never (run /memory rag index)'}\n` +
+        `  Top-K / cap    : ${runtime.ragTopK} / ${runtime.ragCapacity} chunks (threshold ${runtime.ragThreshold})\n` +
+        `  Walk caps      : ${runtime.ragIndexMaxFiles} files, ${runtime.ragIndexMaxFileBytes} bytes/file\n` +
+        `  Exec lessons   : ${store.exec.size}\n` +
+        `  Preferences    : ${store.preference.size} (${store.preference.file})\n`,
+      );
+      return;
+    }
+    if (head === 'rag' && sub === 'search') {
+      const query = tail.join(' ').trim();
+      if (!query) {
+        display('Usage: /memory rag search <query>\n');
+        return;
+      }
+      const hits = await store.knowledge.retrieve(query, runtime.ragTopK);
+      if (!hits.length) {
+        display(`No lexical matches for "${query}". Run "/memory rag index" first if the index is empty.\n`);
+        return;
+      }
+      const lines = hits.map(hit => {
+        const preview = hit.content.replace(/\s+/g, ' ').slice(0, 100);
+        return `  ${hit.path}:${hit.startLine}-${hit.endLine}  (${hit.score.toFixed(3)})  ${preview}`;
+      });
+      display(`Top ${hits.length} lexical (hashed term-frequency) matches:\n${lines.join('\n')}\n`);
+      return;
+    }
+    if (head === 'budget') {
+      const stats = await store.knowledge.stats();
+      const working = store.working.render() ?? '';
+      const tree = store.repo.treeSummary() ?? '';
+      display(
+        `Memory & retrieval budget:\n` +
+        `  memoryEnabled=${runtime.memoryEnabled}, ragEnabled=${runtime.ragEnabled}\n` +
+        `  Retrieval      : topK=${runtime.ragTopK}, capacity=${runtime.ragCapacity}, threshold=${runtime.ragThreshold}\n` +
+        `  Walk caps      : ${runtime.ragIndexMaxFiles} files, ${runtime.ragIndexMaxFileBytes} bytes/file\n` +
+        `  Knowledge      : ${stats.files} files / ${stats.chunks} chunks / ${stats.insights} insights\n` +
+        `  Working notes  : ${working.length} chars (~${Math.ceil(working.length / 4)} tokens)\n` +
+        `  Repo tree      : ${tree.length} chars (~${Math.ceil(tree.length / 4)} tokens)\n` +
+        `  Exec lessons   : ${store.exec.size} (rolling 50, summaries only)\n` +
+        `  Preferences    : ${store.preference.size}\n` +
+        `  Injection      : retrieval is injected as an untrusted user block, bounded by the context files budget (v0.6).\n`,
+      );
+      return;
+    }
+    if (head === 'pref') {
+      const action = (sub ?? 'list').toLowerCase();
+      if (action === 'list' || action === 'all') {
+        const all = store.preference.all();
+        const keys = Object.keys(all);
+        if (!keys.length) {
+          display(`No preferences saved (${store.preference.file}).\nUse "/memory pref set <key> <value>".\n`);
+          return;
+        }
+        const lines = keys.sort().map(key => `  ${key} = ${all[key]}`);
+        display(`Preferences (${keys.length}):\n${lines.join('\n')}\n`);
+        return;
+      }
+      if (action === 'set') {
+        const key = (tail.shift() ?? '').trim();
+        const value = tail.join(' ').trim();
+        if (!key || !value) {
+          display('Usage: /memory pref set <key> <value>\n');
+          return;
+        }
+        await store.handleEvent({ type: 'user_preference', key, value });
+        display(`Saved preference "${key}" (${store.preference.file}).\n`);
+        return;
+      }
+      if (action === 'get') {
+        const key = tail.join(' ').trim();
+        const value = store.preference.get(key);
+        display(value === undefined ? `No preference "${key}".\n` : `${key} = ${value}\n`);
+        return;
+      }
+      if (action === 'rm' || action === 'remove') {
+        const key = tail.join(' ').trim();
+        const removed = await store.preference.remove(key);
+        display(removed ? `Removed preference "${key}".\n` : `No preference "${key}".\n`);
+        return;
+      }
+      display(MEMORY_COMMAND_USAGE);
+      return;
+    }
+    display(MEMORY_COMMAND_USAGE);
+  } catch (error) {
+    display(`Memory error: ${safeError(error)}\n`);
+  } finally {
+    await store?.close();
+  }
+}
+
 export async function main(argv = process.argv.slice(2)): Promise<void> {
   let apiKey: string | undefined;
   let jsonOutput = false;
+  // --json stdout carries the same event payloads the event log stores; it must apply the same
+  // redaction (env credential literals + the provider key) so a secret the log scrubs cannot leak
+  // through the JSON stream into automation pipelines. Never mutates the live event object.
+  const writeJsonLine = (value: unknown): void => {
+    stdout.write(JSON.stringify(redactObject(value, [...collectSecrets(), ...(apiKey ? [apiKey] : [])])) + '\n');
+  };
   try {
     if (argv[0] === 'mcp' && argv[1] === 'add') {
       const { loadMcpConfig, saveMcpConfig, mcpServerSchema } = await import('./mcp.js');
@@ -323,23 +558,42 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       'key-env': { type: 'string' }, resume: { type: 'string' }, pair: { type: 'boolean' }, yes: { type: 'boolean' },
       plan: { type: 'boolean' },
       'read-only': { type: 'boolean' }, json: { type: 'boolean' },
+      'allow-net': { type: 'boolean' }, 'allow-net-hosts': { type: 'string', multiple: true },
       'no-tui': { type: 'boolean' }, 'no-mcp': { type: 'boolean' }, 'no-subagents': { type: 'boolean' },
       'inline-reasoning': { type: 'string' }, 'show-reasoning': { type: 'boolean' },
       'context-window': { type: 'string' }, 'max-output-tokens': { type: 'string' },
       'run-token-budget': { type: 'string' }, 'timeout-ms': { type: 'string' },
-      'output-last-message': { type: 'string', short: 'o' },
+      'max-cost-usd': { type: 'string' }, 'max-time-ms': { type: 'string' },      'output-last-message': { type: 'string', short: 'o' },
+      'no-verify': { type: 'boolean' }, 'verify-cmd': { type: 'string', multiple: true },
+      'event-log': { type: 'boolean' }, 'no-event-log': { type: 'boolean' },
+      stub: { type: 'boolean' }, 'stub-fixture': { type: 'string' },
+      envelopes: { type: 'boolean' }, 'rebuild-session': { type: 'boolean' },
     } });
     jsonOutput = values.json === true;
     if (values.help) { stdout.write(HELP); return; }
     if (values.version) { stdout.write(`goon cli ${VERSION}\n`); return; }
     const overrides: Record<string, unknown> = {};
     for (const [flag, key] of Object.entries({ provider: 'provider', 'base-url': 'baseUrl', model: 'model', effort: 'effort', 'key-env': 'keyEnv',
-      'context-window': 'contextWindow', 'max-output-tokens': 'maxOutputTokens', 'run-token-budget': 'runTokenBudget', 'timeout-ms': 'timeoutMs', 'inline-reasoning': 'inlineReasoning' })) {
+      'context-window': 'contextWindow', 'max-output-tokens': 'maxOutputTokens', 'run-token-budget': 'runTokenBudget', 'timeout-ms': 'timeoutMs',
+      'max-cost-usd': 'maxCostUsd', 'max-time-ms': 'maxTimeMs', 'inline-reasoning': 'inlineReasoning' })) {
       const value = values[flag as keyof typeof values];
-      if (typeof value === 'string') overrides[key] = ['contextWindow', 'maxOutputTokens', 'runTokenBudget', 'timeoutMs'].includes(key) ? Number(value) : value;
+      if (typeof value === 'string') overrides[key] = ['contextWindow', 'maxOutputTokens', 'runTokenBudget', 'timeoutMs', 'maxCostUsd', 'maxTimeMs'].includes(key) ? Number(value) : value;
     }
     if (values['show-reasoning'] !== undefined) overrides.showReasoning = values['show-reasoning'];
+    if (values['event-log'] === true) overrides.eventLog = true;
+    if (values['no-event-log'] === true) overrides.eventLog = false;
+    if (values.stub === true) overrides.stub = true;
+    if (typeof values['stub-fixture'] === 'string') overrides.stubFixture = values['stub-fixture'];
+    if (values['no-verify'] === true) overrides.verify = { enabled: false };
+    if (Array.isArray(values['verify-cmd']) && values['verify-cmd'].length > 0) {
+      overrides.verify = { ...(overrides.verify as Record<string, unknown> | undefined), commands: values['verify-cmd'] };
+    }
     let config: Config = await loadConfig(overrides);
+    // Execution policy (P12): network default-deny, resolved from config + explicit CLI flags.
+    const policy = resolveExecutionPolicy(config, {
+      'allow-net': values['allow-net'],
+      'allow-net-hosts': values['allow-net-hosts'],
+    });
     if (positionals[0] === 'mcp') {
       const { loadMcpConfig, saveMcpConfig, mcpConfigPath, McpManager, importCodexMcpServers } = await import('./mcp.js');
       const mcpConfig = await loadMcpConfig();
@@ -403,6 +657,14 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       return;
     }
     if (positionals[0] === 'doctor') {
+      if (config.stub) {
+        stdout.write(JSON.stringify({ version: VERSION, node: process.version, platform: process.platform, arch: process.arch,
+          config: configPath(), provider: 'goon-stub', model: config.model ?? 'stub-model', effort: config.effort ?? 'default',
+          baseUrl: 'stub://local', credentialVariable: config.keyEnv, credentialPresent: false,
+          bash: false, ripgrep: false, searchFallback: true, data: dataDir(), networkTested: false, gatewayReachable: false,
+          discoveredModels: [], modelAvailable: true, stub: true, stubFixture: config.stubFixture ?? null, warnings: [] }, null, 2) + '\n');
+        return;
+      }
       const { runCommand } = await import('./process.js');
       const executable = async (name: string) => {
         try { const r = await runCommand(name, ['--version'], { cwd: resolve(values.cwd ?? '.'), signal: AbortSignal.timeout(5000), timeoutMs: 5000 }); return r.code === 0; }
@@ -435,6 +697,12 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     if (positionals[0] === 'sessions') {
       const list = await SessionStore.list(join(dataDir(), 'sessions'));
       stdout.write(values.json ? JSON.stringify(list) + '\n' : list.map(s => `${s.id}  ${s.updatedAt}  ${s.model}${s.title ? `  [${s.title}]` : ''}  ${s.cwd}`).join('\n') + '\n');
+      return;
+    }
+    if (positionals[0] === 'replay') {
+      const target = positionals[1];
+      if (!target) throw new Error('Usage: goon replay <session-id|prefix|event-log-path> [--json] [--envelopes] [--rebuild-session]');
+      await replayCommand(target, { envelopes: values.envelopes === true, rebuild: values['rebuild-session'] === true });
       return;
     }
     if (positionals[0] === 'workflow' || positionals[0] === 'workflows') {
@@ -500,6 +768,11 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       if (!netTopic) throw new Error('Usage: goon network <topic>');
       initialWorkflowCommand = `/network ${netTopic}`;
       promptPositionals = [];
+    } else if (positionals[0] === 'dag') {
+      const dagGoal = positionals.slice(1).join(' ').trim();
+      if (!dagGoal) throw new Error('Usage: goon dag <goal>');
+      initialWorkflowCommand = `/dag ${dagGoal}`;
+      promptPositionals = [];
     } else if (positionals[0] === 'resume') {
       const subTarget = positionals[1]?.trim();
       if (subTarget) {
@@ -517,7 +790,9 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       const piped = await readStdinLimited(1024 * 1024);
       if (piped.trim()) prompt = `${prompt}\n\n<stdin>\n${piped.replace(/\s+$/, '')}\n</stdin>`;
     }
-    if (!prompt && !stdin.isTTY) {
+    // A positional command (`goon dag <goal>`, `goon network <topic>`) is a valid non-TTY input
+    // source on its own — never demand a piped prompt when one is already queued.
+    if (!prompt && !stdin.isTTY && !initialWorkflowCommand) {
       let bytes = 0; const chunks: Buffer[] = [];
       for await (const chunk of stdin) {
         const buffer = Buffer.from(chunk); bytes += buffer.length;
@@ -528,7 +803,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       if (!prompt) throw new Error('Empty input. Supply --prompt or run in an interactive terminal.');
     }
     // Auto-launch interactive setup wizard on first interactive run if unconfigured
-    if (!prompt && stdin.isTTY && !jsonOutput && (!config.model || !(await resolveApiKey(config)))) {
+    if (!config.stub && !prompt && stdin.isTTY && !jsonOutput && (!config.model || !(await resolveApiKey(config)))) {
       config = await runSetupWizard(config);
     }
     const interactive = !prompt;
@@ -574,7 +849,74 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         }
       }
     }
+    try {
+      CostLedger.fromConfig(runtime, runtime.model);
+    } catch (error) {
+      if (error instanceof CostPricingError) {
+        if (jsonOutput) writeJsonLine({ error: error.message });
+        else stderr.write(`goon: ${error.message}\n`);
+        process.exitCode = 2;
+        return;
+      }
+      throw error;
+    }
     let store = await SessionStore.open(sessionsRootDir, runtime, resumeTarget);
+    let eventWriter: EventLogWriter | undefined;
+    if (config.eventLog) {
+      eventWriter = openEventLog(eventLogPath(runtime.dataDir, store.session.id), {
+        sessionId: store.session.id,
+        secrets: apiKey ? [apiKey] : [],
+        onError: message => stderr.write(`goon: event log: ${message}\n`),
+      });
+    }
+    // P19: the memory store lives for the whole CLI session (opt-in via memoryEnabled), is shared
+    // across harness rebuilds and is closed in the outermost finally. Subagents never receive it.
+    let memoryStore: import('./memory.js').MemoryStore | undefined;
+    if (runtime.memoryEnabled) {
+      try {
+        const { MemoryStore } = await import('./memory.js');
+        const { projectIdFor } = await import('./rag.js');
+        // P24: the embedder seam defaults to "hash" (unchanged offline behavior). Remote
+        // providers ("openai"/"ollama") fail soft here: the CLI degrades to the hash embedder
+        // rather than losing memory entirely. The key is passed only for the openai bearer
+        // header and is never logged.
+        let embedder: import('./rag.js').Embedder | undefined;
+        if ((runtime.embedderProvider ?? 'hash') !== 'hash') {
+          const { createEmbedder } = await import('./embedder.js');
+          try {
+            embedder = createEmbedder({
+              provider: runtime.embedderProvider ?? 'hash',
+              ...(runtime.embedderModel ? { model: runtime.embedderModel } : {}),
+              ...(runtime.embedderProvider === 'openai'
+                ? { baseUrl: runtime.embedderBaseUrl ?? runtime.baseUrl, apiKey: apiKey || undefined }
+                : runtime.embedderBaseUrl
+                  ? { baseUrl: runtime.embedderBaseUrl }
+                  : {}),
+            });
+          } catch (error) {
+            stderr.write(`goon: embedder "${runtime.embedderProvider}" unavailable (${safeError(error, apiKey)}) — falling back to the hash embedder.\n`);
+          }
+        }
+        memoryStore = await MemoryStore.open({
+          dataDir: runtime.dataDir,
+          projectId: projectIdFor(runtime.cwd),
+          root: runtime.cwd,
+          secrets: apiKey ? [apiKey] : [],
+          rag: {
+            topK: runtime.ragTopK,
+            capacity: runtime.ragCapacity,
+            threshold: runtime.ragThreshold,
+            maxFiles: runtime.ragIndexMaxFiles,
+            maxFileBytes: runtime.ragIndexMaxFileBytes,
+            ...(embedder ? { embedder } : {}),
+          },
+          conversation: { get messages() { return store.session.messages; } },
+        });
+      } catch (error) {
+        stderr.write(`goon: memory store unavailable (${safeError(error, apiKey)}) — continuing without memory.\n`);
+        memoryStore = undefined;
+      }
+    }
     let rl: ReturnType<typeof createInterface> | undefined;
     let tui: TerminalUI | undefined;
     let manager: McpManager | undefined;
@@ -593,6 +935,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
 
     const sessionAllowedTools = new Set<string>();
     const sessionAllowedBashPrefixes = new Set<string>();
+    const sessionAllowedBashExactCommands = new Set<string>();
     // Terminal bell when goon needs the user (approval, question) or a long turn finishes, so a
     // developer who switched windows notices. Disable with GOON_NOTIFY=0.
     const notifyEnabled = process.env.GOON_NOTIFY !== '0' && process.env.GOON_NOTIFY !== 'off';
@@ -625,6 +968,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         tui.setViewMode(viewMode);
         tui.setEffort(runtime.effort);
         tui.setTokens(store.session.tokens);
+        tui.setCostUsd(store.session.costUsd ?? 0);
       } else if (stdin.isTTY) rl = createInterface({ input: stdin, output: stderr, terminal: true });
       rl?.on('SIGINT', stop);
       const {
@@ -660,7 +1004,21 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         finally { writer._writeToOutput = original; }
       };
       let reasoningSource: 'inline' | 'provider' | undefined;
-      const emit = (event: HarnessEvent | SubagentEvent) => {
+      const renderEvent = (event: CliLoggedEvent) => {
+        if (event.type === 'user') return;
+        if (event.type === 'session') {
+          if (jsonOutput) writeJsonLine(event);
+          return;
+        }
+        if (event.type === 'done') {
+          if (jsonOutput) writeJsonLine(event);
+          return;
+        }
+        if (event.type === 'error') {
+          if (jsonOutput) writeJsonLine(event);
+          else display(`\n${cleanTerminal(event.message)}\n`);
+          return;
+        }
         pairManager?.notifyEvent(event);
         if (event.type === 'stopped') denied = true;
         if (event.type === 'plan_exit') {
@@ -673,10 +1031,11 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
           return;
         }
         if (event.type === 'tool_stream') {
+          if (jsonOutput) return;
           if (tui) tui.event(event);
           return;
         }
-        if (jsonOutput) { stdout.write(JSON.stringify(event) + '\n'); return; }
+        if (jsonOutput) { writeJsonLine(event); return; }
         if (tui) { tui.event(event); return; }
         if (event.type === 'reasoning') {
           if (viewMode === 'normal') return;
@@ -691,8 +1050,39 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         else if (event.type === 'goal') stderr.write(`\n[${event.goal ? formatGoalStatusIndicator(event.goal) : 'Goal cleared'}]\n`);
         else if (event.type === 'plan_exit') stderr.write('\n[Plan approved — exited plan mode]\n');
         else if (event.type === 'compaction') stderr.write('\n[Context compacted; original history archived.]\n');
+        else if (event.type === 'verify_start') {
+          const commands = event.commands?.length ? ` · ${event.commands.join(' · ')}` : '';
+          stderr.write(`\n[verify: ${event.files.length} file(s)${commands}]\n`);
+        } else if (event.type === 'verify_result') {
+          stderr.write(`\n[verify ${event.status}: ${event.reason}]\n`);
+        } else if (event.type === 'verify_rollback') {
+          const kept = event.conflicts.length ? `; kept ${event.conflicts.length} conflicting file(s)` : '';
+          stderr.write(`\n[verify rollback: ${event.reason}${kept}]\n`);
+        } else if (event.type === 'dag_plan_invalid') {
+          stderr.write(`\n[dag plan invalid: ${event.message}]\n`);
+        } else if (event.type === 'dag_plan_ready') {
+          stderr.write(`\n[dag plan ready: ${event.todos} todo(s)]\n`);
+        } else if (event.type === 'dag_todo_update') {
+          stderr.write(`\n[dag ${event.todoId}: ${event.status} (${event.role})]\n`);
+        } else if (event.type === 'dag_merge') {
+          const detail = [event.conflicts ? `${event.conflicts} conflict(s)` : '', event.reason].filter(Boolean).join(' — ');
+          stderr.write(`\n[dag merge: ${event.verified ? 'verified' : 'NOT verified'}${detail ? `: ${detail}` : ''}]\n`);
+        } else if (event.type === 'workflow_classified') {
+          stderr.write(`\n[workflow ${event.mode}: ${event.reason}]\n`);
+        } else if (event.type === 'scope_round') {
+          stderr.write(`\n[scope round ${event.round} ${event.action}: ${event.reason}]\n`);
+        } else if (event.type === 'cost_degrade') {
+          stderr.write(`\n[cost degrade: ${event.reason} — ${event.candidates} candidate(s)]\n`);
+        }
         else if (event.type === 'stopped') stderr.write(`\n${event.reason}\n`);
       };
+      // Log first, then render: the event log is the source of truth for `goon replay`, and a
+      // rendering bug must not silently drop an event. `logOnly` is used for user turns.
+      const publishEvent = (event: CliLoggedEvent, options: { logOnly?: boolean } = {}) => {
+        eventWriter?.append(event as unknown as LoggedEvent);
+        if (!options.logOnly) renderEvent(event);
+      };
+      const emit = (event: HarnessEvent | SubagentEvent) => publishEvent(event);
       const { ToolRegistry, formatTodos } = await import('./tools.js');
       const { Subagents } = await import('./subagents.js');
       const { Harness } = await import('./harness.js');
@@ -701,8 +1091,19 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         const reg = new ToolRegistry(runtime.cwd, async request => {
           // Only the live mode counts. The mode captured when this harness was built must not keep
           // auto-approving after the user switches back to ask/plan (Shift+Tab, /mode, /auto off).
-          if (mode === 'auto' || sessionAllowedTools.has(request.tool)) return true;
-          if (request.tool === 'bash' && isApprovedBashPrefix(request.input, sessionAllowedBashPrefixes)) return true;
+          const risk = request.risk ?? (request.tool === 'bash'
+            ? classifyBashRisk(request.input && typeof request.input === 'object'
+              ? String((request.input as { command?: unknown }).command ?? '')
+              : '')
+            : 'medium');
+          if (risk === 'critical') return false; // defense in depth; execute() denies first
+          if (canAutoApprove(mode, risk)) return true;
+          // High-risk calls are never remembered, so they always prompt even after an "always".
+          const remembered = risk !== 'high';
+          if (remembered && sessionAllowedTools.has(request.tool)) return true;
+          if (remembered && request.tool === 'bash'
+            && (isApprovedBashExact(request.input, sessionAllowedBashExactCommands)
+              || isApprovedBashPrefix(request.input, sessionAllowedBashPrefixes))) return true;
           if (!rl && !tui) return false;
           if (request.tool === 'exit_plan_mode' && request.input && typeof request.input === 'object' && 'plan' in request.input) {
             const planStr = String((request.input as { plan: unknown }).plan);
@@ -722,24 +1123,40 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
           } else if (request.tool === 'bash' && request.input && typeof request.input === 'object' && 'command' in request.input) {
             const cmd = String((request.input as { command: unknown }).command ?? '').trim();
             rawPreview = `  $ ${cmd}`;
+          } else if (request.tool === 'verify' && request.input && typeof request.input === 'object'
+            && Array.isArray((request.input as { commands?: unknown }).commands)) {
+            rawPreview = ((request.input as { commands: unknown[] }).commands)
+              .map(command => `  $ ${String(command)}`).join('\n');
           } else {
             rawPreview = JSON.stringify(request.input, null, 2);
           }
-          const preview = cleanTerminal(rawPreview.split(runtime.apiKey).join('[REDACTED]').slice(0, 8000));
-          const prefix = request.tool === 'bash' ? bashApprovalPrefix(request.input) : undefined;
+          const preview = cleanTerminal((runtime.apiKey ? rawPreview.split(runtime.apiKey).join('[REDACTED]') : rawPreview).slice(0, 8000));
+          const highRisk = risk === 'high';
+          const prefix = !highRisk && request.tool === 'bash' ? bashApprovalPrefix(request.input) : undefined;
+          const exact = !highRisk && request.tool === 'bash' ? bashApprovalExact(request.input) : undefined;
           const fullCommand = request.input && typeof request.input === 'object' ? String((request.input as { command?: unknown }).command ?? '').trim().split(/\s+/).join(' ') : '';
           const prefixHint = !prefix ? ''
             : prefix === fullCommand
               ? `\n  p = always allow exactly "${prefix}" in this session`
               : `\n  p = always allow "${prefix} …" in this session (simple arguments inside the workspace only)`;
-          const approvalBlock = `\n▲ Allow ${request.tool}?\n${preview}${prefixHint}\n`;
-          const label = prefix ? '[y/N/p(refix)/a(lways)] ' : '[y/N/a(lways)] ';
+          const exactHint = exact && exact !== prefix ? `\n  e = always allow exactly "${exact}" in this session` : '';
+          const highHint = highRisk
+            ? `\n  High risk (${risk}): type the tool name "${request.tool}" to allow it once; it cannot be remembered.`
+            : '';
+          const approvalBlock = `\n▲ Allow ${request.tool}? [${risk}]\n${preview}${prefixHint}${exactHint}${highHint}\n`;
+          const label = highRisk
+            ? `[type "${request.tool}" to allow, N to deny] `
+            : exact
+              ? '[y/N/p(refix)/e(xact)/a(lways)] '
+              : prefix
+                ? '[y/N/p(refix)/a(lways)] '
+                : '[y/N/a(lways)] ';
           notifyAttention();
           if (pairManager?.isRunning && !rl && !tui) {
             const remote = pairManager.requestRemoteApproval(request.tool, preview, request.signal);
             const dec = await remote.promise.catch(() => 'no' as const);
             if (dec === 'always') {
-              sessionAllowedTools.add(request.tool);
+              if (!highRisk) sessionAllowedTools.add(request.tool);
               return true;
             }
             return dec === 'yes';
@@ -774,7 +1191,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             try {
               const winner = await Promise.race([termPromise, remotePromise]);
               if (winner === 'always') {
-                sessionAllowedTools.add(request.tool);
+                if (!highRisk) sessionAllowedTools.add(request.tool);
                 return true;
               }
               if (winner === 'prefix' && prefix) {
@@ -790,8 +1207,13 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
           const reply = tui
             ? (await tui.askTransient(approvalBlock, label, request.signal)).trim().toLowerCase()
             : (display(approvalBlock), (await question(label, request.signal)).trim().toLowerCase());
+          if (highRisk) return reply === request.tool.toLowerCase();
           if (reply === 'a' || reply === 'always') {
             sessionAllowedTools.add(request.tool);
+            return true;
+          }
+          if (exact && (reply === 'e' || reply === 'exact')) {
+            sessionAllowedBashExactCommands.add(exact);
             return true;
           }
           if (prefix && (reply === 'p' || reply === 'prefix')) {
@@ -801,6 +1223,22 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
           return reply === 'y' || reply === 'yes';
         }, currentMode === 'readonly');
         reg.planMode = currentMode === 'plan';
+        // Durable rejection streak: three identical denials stop the run even across resumes.
+        reg.rejectionGuard = {
+          recordDenied: async signature => {
+            const map = store.session.rejectedSignatures ??= {};
+            map[signature] = (map[signature] ?? 0) + 1;
+            await store.save().catch(() => {});
+            return map[signature];
+          },
+          reset: async signature => {
+            const map = store.session.rejectedSignatures;
+            if (!map?.[signature]) return;
+            delete map[signature];
+            await store.save().catch(() => {});
+          },
+        };
+        reg.policy = policy;
         if (rl || tui) {
           reg.askUser = async (questions, callSignal) => {
             const out: Record<string, string[]> = {};
@@ -838,7 +1276,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
           const { loadMcpConfig, McpManager } = await import('./mcp.js');
           controller = new AbortController();
           try {
-            manager = new McpManager(await loadMcpConfig(), runtime.cwd);
+            manager = new McpManager(await loadMcpConfig(), runtime.cwd, policy);
             const connecting = manager.connect(reg, controller.signal);
             // Restores the previous status afterwards so rebuilds (/setup, /model, /cd…) never stick on Working.
             await (tui ? tui.withStatus('Connecting MCP', () => connecting) : connecting);
@@ -881,8 +1319,9 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
                 cwd: runtime.cwd,
                 signal,
                 effectiveReadOnly: reg.effectiveReadOnly,
-                approveShell: (command, stepSig) =>
-                  reg.approve({ tool: 'bash', input: { command }, signal: stepSig }),
+                policy,
+                approveShell: (command, stepSig, risk) =>
+                  reg.approve({ tool: 'bash', input: { command }, signal: stepSig, risk: risk ?? classifyBashRisk(command), trusted: false }),
                 runPrompt: async (stepPrompt, step, stepSig) => {
                   const wfSessionsRoot = join(runtime.dataDir, 'workflows', store.session.id);
                   const childStore = await SessionStore.open(wfSessionsRoot, runtime);
@@ -890,8 +1329,18 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
                   try {
                     const stepReadOnly = reg.readOnly || step.readOnly === true || step.mode === 'readonly';
                     const childTools = new ToolRegistry(runtime.cwd, req => reg.approve(req), stepReadOnly);
+                    childTools.policy = reg.policy;
                     childTools.planMode = reg.planMode || step.mode === 'plan';
-                    await new Harness(runtime, childStore, childTools).run(stepPrompt, stepSig, reg.budget);
+                    childTools.costLedger = reg.costLedger;
+                    childTools.rejectionGuard = reg.rejectionGuard;
+                    const workflowCostBefore = childStore.session.costUsd ?? 0;
+                    await new Harness(runtime, childStore, childTools, undefined, undefined, { verify: { enabled: false } }).run(stepPrompt, stepSig, reg.budget);
+                    // Per-child session counter: a shared-ledger snapshot double-counts overlapping runs.
+                    const workflowDelta = (childStore.session.costUsd ?? 0) - workflowCostBefore;
+                    if (workflowDelta > 0) {
+                      store.session.costUsd = (store.session.costUsd ?? 0) + workflowDelta;
+                      await store.save().catch(() => {});
+                    }
                     const { lastAssistantAnswer } = await import('./reasoning.js');
                     return lastAssistantAnswer(childStore.session.messages, runtime.inlineReasoning);
                   } finally {
@@ -908,15 +1357,24 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
                     rounds,
                     signal: stepSig,
                     budget: reg.budget,
+                    policy: reg.policy,
                   });
                   return formatBrainstormReport(netRes);
                 },
+                // v0.7 P22: a `dag` step spawns the multi-agent DAG only when the classifier calls
+                // the goal `multi` AND multi-agent mode is enabled; otherwise it stays a prompt.
+                runDag: async (goal, stepSig) =>
+                  runDagCore(goal, reg.budget ?? createRunBudget(runtime), stepSig),
+                multiAgentEnabled: (runtime.multiAgentMode ?? 'manual') !== 'off',
+                onEvent: event => publishEvent(event),
               });
               return JSON.stringify(res, null, 2);
             },
           });
         }
-        return { tools: reg, harness: new Harness(runtime, store, reg, emit) };
+        // P19: pass the session-lifetime memory store (undefined when memoryEnabled is off, so
+        // the default harness behavior is untouched). Children/subagents never get it.
+        return { tools: reg, harness: new Harness(runtime, store, reg, emit, undefined, memoryStore ? { memory: memoryStore } : {}) };
       };
 
       const applyPermissionMode = (nextMode: PermissionMode) => {
@@ -1066,12 +1524,14 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       };
 
       starting = false;
-      if (jsonOutput) stdout.write(JSON.stringify({ type: 'session', id: store.session.id, cwd: runtime.cwd }) + '\n');
-      else if (interactive) {
-        display(welcomeBanner(runtime.model, runtime.provider, runtime.baseUrl, runtime.effort, runtime.cwd, store.session.id, mode));
-        renderResumedHistory();
+      publishEvent({ type: 'session', id: store.session.id, cwd: runtime.cwd });
+      if (!jsonOutput) {
+        if (interactive) {
+          display(welcomeBanner(runtime.model, runtime.provider, runtime.baseUrl, runtime.effort, runtime.cwd, store.session.id, mode));
+          renderResumedHistory();
+        }
+        else display(`goon · ${runtime.model} · session ${store.session.id}\n`);
       }
-      else display(`goon · ${runtime.model} · session ${store.session.id}\n`);
       let goalContinuationDeferred = false;
 
       const runTurn = async (
@@ -1103,22 +1563,24 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
           display(`\n[◆ Pursuing goal${stepLabel}${g ? `: ${g.objective}` : ''}]\n`);
         }
         pairManager?.notifyUserPrompt(input);
+        publishEvent({ type: 'user', text: input }, { logOnly: true });
         try {
           outText = await harness.run(input, controller.signal);
           if (outputLastMessage) {
             const { writeFile } = await import('node:fs/promises');
             await writeFile(resolve(outputLastMessage), outText.endsWith('\n') ? outText : `${outText}\n`, 'utf8');
           }
-          if (jsonOutput) stdout.write(JSON.stringify({ type: 'done', text: outText, denied, sessionId: store.session.id }) + '\n');
-          else if (tui) tui.write('\n'); else stdout.write('\n');
+          publishEvent({ type: 'done', text: outText, denied, sessionId: store.session.id });
+          if (!jsonOutput) {
+            if (tui) tui.write('\n'); else stdout.write('\n');
+          }
           if (denied && !interactive) process.exitCode = 2;
         } catch (error) {
           aborted = controller.signal.aborted;
           hadError = true;
           if (!interactive) process.exitCode = aborted ? terminating ? 143 : 130 : 1;
           const message = safeError(error, apiKey);
-          if (jsonOutput) stdout.write(JSON.stringify({ type: 'error', message }) + '\n');
-          else display(`\n${message}\n`);
+          publishEvent({ type: 'error', message });
           if (aborted && !exiting && !terminating && store.session.goal?.status === 'active') {
             goalContinuationDeferred = true;
             if (tui) tui.setNotice('Goal continuation paused after interrupt — run /goal resume to continue.');
@@ -1181,6 +1643,107 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             consecutiveEmptyTurns = 0;
           }
         }
+      };
+
+      /**
+       * Shared `/dag` core (v0.7 P22): planner + `runDag` + fail-closed verification with the
+       * parent approval policy. Used by `/dag` and by workflow `dag` steps. Assumes the caller
+       * pinned `budget` (and owns controller/status display); returns the DAG summary text.
+       */
+      const runDagCore = async (goal: string, budget: RunBudget, sig: AbortSignal): Promise<string> => {
+        if (!subagents) throw new Error('DAG requires subagents; restart without --no-subagents.');
+        const { runDag } = await import('./coord.js');
+        const { planVerification, redactVerdict, runVerification, createVerifyRunner } = await import('./verify.js');
+        const { streamText } = await import('ai');
+        const { createModel } = await import('./provider.js');
+        const dagSubagents = subagents;
+        const approveVerifyPlan = (files: string[], approveSig: AbortSignal) => async (plan: { commands: Array<{ display: string }> }) =>
+          tools.approve({
+            tool: 'verify',
+            input: { files, commands: plan.commands.map(command => command.display) },
+            signal: approveSig,
+          });
+        // Per-todo test and final verification both run through runVerification with the exact
+        // commands offered to the parent approval policy. A plan with commands and no way to
+        // approve stays fail-closed (VerificationApprovalError from runVerification).
+        const runDagVerification = async (files: string[], verifySig: AbortSignal): Promise<boolean> => {
+          if (!runtime.verify?.enabled) return true;
+          const plan = planVerification(runtime.cwd, files, runtime.verify, runtime.verify.policy);
+          publishEvent({ type: 'verify_start', files, commands: plan.commands.map(command => command.display) });
+          const startedMs = Date.now();
+          let verdict = await runVerification(runtime.cwd, files, runtime.verify, runtime.verify.policy,
+            createVerifyRunner(), verifySig, plan, approveVerifyPlan(files, verifySig));
+          verdict = redactVerdict(verdict, [runtime.apiKey]);
+          const failedStage = verdict.stages.find(stage => stage.severity === 'fail');
+          publishEvent({
+            type: 'verify_result',
+            status: verdict.severity,
+            ...(failedStage ? { stage: failedStage.stage } : {}),
+            reason: verdict.reason,
+            errors: verdict.errors,
+            warnings: verdict.warnings,
+            durationMs: Date.now() - startedMs,
+          });
+          return verdict.pass;
+        };
+        const result = await runDag(goal, {
+          planner: async (plannerGoal, plannerSig) => {
+            const model = createModel(runtime, store.session.id);
+            const plannerSystem =
+              'You are a planning assistant for a multi-agent coding DAG. Decompose the goal into 1-8 todos. '
+              + 'Respond with ONLY a JSON object, no prose or code fences: {"goal": "...", "todos": ['
+              + '{"id": "t1", "title": "short imperative step", "acceptance": "how to verify", "dependsOn": [], '
+              + '"role": "planner|coder|reviewer|tester|researcher", "assignee": "optional display label"}]}. '
+              + 'Use "coder" for todos that modify files and "tester" for todos that verify them; read-only analysis uses planner/reviewer/researcher. '
+              + 'dependsOn may only reference earlier todo ids (acyclic); ids are t1, t2, ...';
+            const res = streamText({
+              model,
+              system: plannerSystem,
+              messages: [{ role: 'user', content: plannerGoal }],
+              maxOutputTokens: Math.min(8_192, runtime.maxOutputTokens),
+              maxRetries: 2,
+              abortSignal: AbortSignal.any([plannerSig, AbortSignal.timeout(runtime.timeoutMs)]),
+              onError: () => {},
+            });
+            let raw = '';
+            for await (const event of res.fullStream) {
+              if (event.type === 'error') throw event.error;
+              if (event.type === 'text-delta') raw += event.text;
+            }
+            const usage = await res.usage;
+            harness.accountUsage(usage, runtime.model, budget);
+            const start = raw.indexOf('{');
+            const end = raw.lastIndexOf('}');
+            if (start < 0 || end <= start) throw new Error('Planner did not return a JSON plan.');
+            return JSON.parse(raw.slice(start, end + 1));
+          },
+          spawn: ({ todo, readOnly, allowedTools, budget: spawnBudget, signal: spawnSig }) => {
+            const task = [
+              `Goal: ${goal}`,
+              `Todo ${todo.id}: ${todo.title}`,
+              todo.acceptance ? `Acceptance criteria: ${todo.acceptance}` : '',
+              'Other todos may have already changed the workspace; do not revert their work. End with a short report.',
+            ].filter(Boolean).join('\n');
+            // Public spawn path only; the role toolset is pinned in the child registry.
+            return dagSubagents.runTasks([task], {
+              readOnly,
+              signal: spawnSig,
+              budget: spawnBudget,
+              allowedTools: new Set(allowedTools),
+              role: todo.role,
+            });
+          },
+          test: async (_todo, files, testSig) => runDagVerification(files, testSig),
+          verify: async (files, _combinedDiff, verifySig) => runDagVerification(files, verifySig),
+        }, {
+          config: runtime,
+          signal: sig,
+          files: tools.files,
+          budget,
+          allowedMcpTools: runtime.multiAgentMcpTools ?? [],
+          emit: event => publishEvent(event),
+        });
+        return result.summary;
       };
 
       const run = async (input: string) => {
@@ -1298,10 +1861,12 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             '  /recap                            Generate a live summary of current session progress\n' +
             '  /skills [list|<name>]             List or inspect SKILL.md skills (use $skill-name in prompt)\n' +
             '  /memories [list|add <text>|rm <id>|clear] Manage persistent user memories across sessions\n' +
+            '  /memory [rag index|rag stats|rag search <q>|budget|pref set/get/rm/list] Memory store: lexical repo index & preferences\n' +
             '  /presets [list|save <name> <prompt>|run <name>|rm <name>] Manage reusable prompt presets\n' +
             '  /pair [start|stop|status|qr|lan]  Pair mobile/web device via Cloudflared tunnel (QR + link)\n' +
             '  /workflow [list|show|create|rm|run <name> [args]] Multi-step custom & built-in workflows\n' +
             '  /network [<topic>|board|send|clear] Multi-agent Brainstorm/Council room & P2P message bus\n' +
+            '  /dag <goal>                       Multi-agent todo DAG: planner -> serial coders -> merge + verify\n' +
             '  /mention <filepath>               Insert @filepath mention into the composer\n' +
             '  /cd <dir>, /pwd                   Change or show active workspace directory\n' +
             '  /mode [ask|auto|plan|readonly]    Switch approval mode (or press Shift+Tab)\n' +
@@ -1592,8 +2157,14 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
           return true;
         }
         if (cmdInput === '/memories' || cmdInput === '/memory' || cmdInput.startsWith('/memories ') || cmdInput.startsWith('/memory ')) {
-          const { loadMemories, saveMemories, memoriesPath } = await import('./context.js');
           const rest = cmdInput.replace(/^\/memor(?:ies|y)\b/, '').trim();
+          const head = rest.split(/\s+/)[0]?.toLowerCase() ?? '';
+          // Memory-store subcommands (v0.6): rag index/stats/search, budget, preferences.
+          if (head === 'rag' || head === 'budget' || head === 'pref') {
+            await runMemoryStoreCommand(runtime, rest, display);
+            return true;
+          }
+          const { loadMemories, saveMemories, memoriesPath } = await import('./context.js');
           const entries = await loadMemories();
           if (!rest || rest.toLowerCase() === 'list') {
             if (!entries.length) {
@@ -1957,6 +2528,9 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
           const goalLine = store.session.goal
             ? `Goal           [${goalStatusLabel(store.session.goal.status)}] ${store.session.goal.objective} (${formatGoalUsageSummary(store.session.goal)})\n`
             : '';
+          const costCap = runtime.maxCostUsd > 0 ? formatUsd(runtime.maxCostUsd) : 'unlimited';
+          const timeCap = runtime.maxTimeMs > 0 ? formatDurationMs(runtime.maxTimeMs) : 'unlimited';
+          const tokenCap = runtime.runTokenBudget > 0 ? String(runtime.runTokenBudget) : 'unlimited';
           display(
             `Session        ${store.session.id}${store.session.title ? ` (${store.session.title})` : ''}\n` +
             goalLine +
@@ -1970,7 +2544,22 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             `Context usage  ~${usedEst} / ${runtime.contextWindow} tokens (${pct}%)\n` +
             `Compactions    ${store.session.compactions}\n` +
             `Session tokens ${store.session.tokens}\n` +
+            `Cost           ${formatUsd(store.session.costUsd ?? 0)} (cap ${costCap})\n` +
+            `Time cap       ${timeCap}\n` +
+            `Token cap      ${tokenCap}\n` +
             `MCP tools      ${manager?.tools.length ?? 0}\n`
+          );
+          return true;
+        }
+        if (cmdInput === '/cost') {
+          const ledger = harness.costLedger;
+          const price = ledger.priceFor(runtime.model);
+          display(
+            `${ledger.describe(tools.budget, store.session.costUsd ?? 0)}\n` +
+            `Pricing        ${price ? `input ${formatUsd(price.inputPer1M)}/1M, output ${formatUsd(price.outputPer1M)}/1M` : 'missing (cost tracking inactive)'}\n` +
+            `Cost cap       ${runtime.maxCostUsd > 0 ? formatUsd(runtime.maxCostUsd) : 'unlimited'}\n` +
+            `Time cap       ${runtime.maxTimeMs > 0 ? formatDurationMs(runtime.maxTimeMs) : 'unlimited'}\n` +
+            `Token cap      ${runtime.runTokenBudget > 0 ? `${runtime.runTokenBudget} tokens` : 'unlimited'}\n`
           );
           return true;
         }
@@ -2162,6 +2751,60 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
           }
           // Fall through to main loop to run multi-agent brainstorming session
           return false;
+        }
+        if (cmdInput === '/dag' || cmdInput.startsWith('/dag ')) {
+          const goal = cmdInput.slice(4).trim();
+          if (!goal) {
+            display('Usage: /dag <goal> — decompose a goal into a role-based todo DAG (planner/coder/reviewer/tester/researcher) and execute it with subagents. Writes run serially with per-todo rollback and a final verification gate.\n');
+            return true;
+          }
+          if ((runtime.multiAgentMode ?? 'manual') === 'off') {
+            display('/dag is disabled: set "multiAgentMode" to "manual" or "auto" in the goon config.\n');
+            return true;
+          }
+          if (tools.effectiveReadOnly) {
+            display('/dag needs write access for coder todos; leave read-only/plan mode first.\n');
+            return true;
+          }
+          if (!subagents) {
+            display('/dag requires subagents; restart without --no-subagents.\n');
+            return true;
+          }
+          if (controller || harness.busy) {
+            display('/dag can only run while the agent is idle.\n');
+            return true;
+          }
+          const { DEFAULT_DAG_TOKEN_BUDGET } = await import('./coord.js');
+          const dagController = new AbortController();
+          controller = dagController;
+          // Shared DAG budget: the mirror is seeded from the parent session/ledger (never a
+          // child counter) so every spawn and the planner account against the same caps.
+          const previousBudget = tools.budget;
+          const budget: RunBudget = {
+            spent: 0,
+            limit: runtime.runTokenBudget > 0 ? runtime.runTokenBudget : DEFAULT_DAG_TOKEN_BUDGET,
+            costSpent: store.session.costUsd ?? 0,
+            ...(tools.costLedger ? { ledger: tools.costLedger } : {}),
+          };
+          tools.budget = budget;
+          tui?.setStatus('Running');
+          if (tui) {
+            tui.markTurnStart();
+            tui.write(`\n> /dag ${goal}\n`);
+          } else if (!jsonOutput) {
+            display(`\n[dag] ${goal}\n`);
+          }
+          try {
+            const summary = await runDagCore(goal, budget, dagController.signal);
+            display(`\n${summary}\n`);
+          } catch (error) {
+            display(`\n[dag failed] ${safeError(error, apiKey)}\n`);
+          } finally {
+            tools.budget = previousBudget;
+            if (controller === dagController) controller = undefined;
+            tui?.setStatus('Ready');
+          }
+          return true;
         }
         if (cmdInput.startsWith('!')) {
           const { sanitizeBashCommand } = await import('./tools.js');
@@ -2522,6 +3165,8 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
               if (keptNote || lostNote) display(keptNote + lostNote);
               if (tui) {
                 tui.setTokens(store.session.tokens);
+        tui.setCostUsd(store.session.costUsd ?? 0);
+                tui.setCostUsd(store.session.costUsd ?? 0);
                 syncTuiHeader(true);
                 const changedFiles = [...res.restoredFiles, ...res.deletedFiles];
                 if (scope === 'both' || scope === 'messages') {
@@ -2576,12 +3221,15 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             }
             const oldStore = store;
             store = newStore;
+            eventWriter?.switchSession(newStore.session.id);
+            publishEvent({ type: 'session', id: newStore.session.id, cwd: runtime.cwd });
             await oldStore.discardIfEmpty();
             await oldStore.close();
             await rebuildHarness();
             tui?.clear();
             tui?.setTitle(store.session.title ? `${runtime.model} · ${store.session.title}` : `${runtime.model} · ${store.session.id.slice(0, 8)}`);
             tui?.setTokens(0);
+            tui?.setCostUsd(0);
             syncTuiHeader(true);
             tui?.event({ type: 'todo', todos: [] });
             display(welcomeBanner(runtime.model, runtime.provider, runtime.baseUrl, runtime.effort, runtime.cwd, store.session.id, mode));
@@ -2679,6 +3327,8 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
               }
               const oldStore = store;
               store = newStore;
+              eventWriter?.switchSession(newStore.session.id);
+              publishEvent({ type: 'session', id: newStore.session.id, cwd: runtime.cwd });
               await oldStore.discardIfEmpty();
               await oldStore.close();
               await rebuildHarness(switching ? { reconnectMcp: true } : {});
@@ -2689,6 +3339,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
               }
               tui?.setTitle(store.session.title ? `${runtime.model} · ${store.session.title}` : `${runtime.model} · ${store.session.id.slice(0, 8)}`);
               tui?.setTokens(store.session.tokens);
+              tui?.setCostUsd(store.session.costUsd ?? 0);
               syncTuiHeader(true);
               tui?.event({ type: 'todo', todos: store.session.todos ?? [] });
               renderResumedHistory();
@@ -2767,12 +3418,15 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
               const oldId = store.session.id;
               const oldStore = store;
               store = await SessionStore.open(sessionsRoot, runtime);
+              eventWriter?.switchSession(store.session.id);
+              publishEvent({ type: 'session', id: store.session.id, cwd: runtime.cwd });
               await oldStore.close();
               await SessionStore.deleteSession(sessionsRoot, oldId);
               await rebuildHarness();
               tui?.clear();
               tui?.setTitle(`${runtime.model} · ${store.session.id.slice(0, 8)}`);
               tui?.setTokens(0);
+              tui?.setCostUsd(0);
               syncTuiHeader(true);
               tui?.event({ type: 'todo', todos: [] });
               display(welcomeBanner(runtime.model, runtime.provider, runtime.baseUrl, runtime.effort, runtime.cwd, store.session.id, mode));
@@ -2821,42 +3475,55 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             }
             controller = new AbortController();
             tui?.setStatus('Running');
+            // Every workflow step shares one run budget (token/cost/time caps).
+            const workflowBudget = tools.budget ?? createRunBudget(runtime);
             try {
               const wfRes = await executeWorkflow(matched, wfArgs, {
                 cwd: runtime.cwd,
                 signal: controller.signal,
                 effectiveReadOnly: tools.effectiveReadOnly,
-                approveShell: (command, stepSig) =>
-                  tools.approve({ tool: 'bash', input: { command }, signal: stepSig }),
+                policy,
+                approveShell: (command, stepSig, risk) =>
+                  tools.approve({ tool: 'bash', input: { command }, signal: stepSig, risk: risk ?? classifyBashRisk(command), trusted: false }),
                 onProgress: text => display(text),
                 runPrompt: async (stepPrompt, _step, stepSig) => {
-                  return await harness.run(stepPrompt, stepSig);
+                  return await harness.run(stepPrompt, stepSig, workflowBudget);
                 },
                 runSubagents: async (tasks, readOnly, stepSig) => {
-                  if (!subagents) return await harness.run(tasks.join('\n\n'), stepSig);
-                  const res = await tools.execute(
+                  if (!subagents) return await harness.run(tasks.join('\n\n'), stepSig, workflowBudget);
+                  // Between runs `Harness.run` clears `tools.budget`; pin the shared workflow
+                  // budget so delegate children enforce the same token/cost/time caps.
+                  const res = await tools.withBudget(workflowBudget, () => tools.execute(
                     {
                       toolCallId: `wf_${Date.now()}`,
                       toolName: readOnly ? 'delegate_task' : 'delegate_edit',
                       input: { tasks },
                     },
                     stepSig,
-                  );
+                  ));
                   return res.text;
                 },
                 runNetwork: async (topic, roles, rounds, stepSig) => {
-                  if (!subagents) return await harness.run(topic, stepSig);
+                  if (!subagents) return await harness.run(topic, stepSig, workflowBudget);
                   const netRes = await subagents.network.brainstorm({
                     topic,
                     roles,
                     rounds,
                     signal: stepSig,
+                    budget: workflowBudget,
+                    policy,
                     onProgress: text => display(text),
                   });
                   const report = formatBrainstormReport(netRes);
                   display(`\n${netRes.synthesis}\n`);
                   return report;
                 },
+                // v0.7 P22: a `dag` step spawns the multi-agent DAG (shared workflow budget) only
+                // when the classifier calls the goal `multi` AND multi-agent mode is enabled.
+                runDag: async (goal, stepSig) =>
+                  tools.withBudget(workflowBudget, () => runDagCore(goal, workflowBudget, stepSig)),
+                multiAgentEnabled: (runtime.multiAgentMode ?? 'manual') !== 'off',
+                onEvent: event => publishEvent(event),
                 confirmStep: async (msg, stepSig) => {
                   if (mode === 'auto') return true;
                   const block = `\n▲ Workflow approval gate: ${msg}\n`;
@@ -2867,7 +3534,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
                 },
               });
               if (jsonOutput) {
-                stdout.write(JSON.stringify({ type: 'workflow_done', result: wfRes, sessionId: store.session.id }) + '\n');
+                writeJsonLine({ type: 'workflow_done', result: wfRes, sessionId: store.session.id });
               }
             } catch (error) {
               display(`\nWorkflow error: ${safeError(error, apiKey)}\n`);
@@ -2922,6 +3589,8 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
                 topic,
                 roles,
                 rounds,
+                budget: tools.budget ?? createRunBudget(runtime),
+                policy,
                 signal: controller.signal,
                 onProgress: text => display(text),
               });
@@ -2933,7 +3602,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
               );
               await store.save();
               if (jsonOutput) {
-                stdout.write(JSON.stringify({ type: 'network_done', synthesis: netRes.synthesis, rounds: netRes.rounds }) + '\n');
+                writeJsonLine({ type: 'network_done', synthesis: netRes.synthesis, rounds: netRes.rounds });
               }
             } catch (error) {
               display(`\nAgent Network failed: ${safeError(error, apiKey)}\n`);
@@ -3060,6 +3729,8 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       process.removeListener('SIGINT', stop); process.removeListener('SIGTERM', terminate); process.removeListener('message', onIpcSignal);
       try { tui?.close(); rl?.close(); await pairManager?.stop(); await subagents?.closeAll(); await manager?.close(); }
       finally {
+        eventWriter?.close();
+        try { await memoryStore?.close(); } catch { /* memory must never take the CLI down */ }
         await store.close();
         if (process.connected) {
           try { process.disconnect(); } catch { /* ignore */ }
@@ -3068,7 +3739,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     }
   } catch (error) {
     const message = cleanTerminal(safeError(error, apiKey));
-    if (jsonOutput) stdout.write(JSON.stringify({ type: 'error', message }) + '\n');
+    if (jsonOutput) writeJsonLine({ type: 'error', message });
     else stderr.write(`goon: ${message}\n`);
     if (process.exitCode !== 130 && process.exitCode !== 143) process.exitCode = 1;
   }

@@ -1222,6 +1222,32 @@ export class PairManager {
     } else if (event.type === 'subagent' && event.state !== 'progress') {
       this.activeAssistantEntryId = undefined;
       this.appendEntry('tool', `● [subagent:${event.id.slice(0, 8)}] ${event.state}`);
+    } else if (event.type === 'verify_start') {
+      this.activeAssistantEntryId = undefined;
+      this.appendEntry('tool', `● [verify] ${event.files.length} file(s)`);
+    } else if (event.type === 'verify_result') {
+      this.activeAssistantEntryId = undefined;
+      this.appendEntry('tool', `● [verify] ${event.status}: ${event.reason.split(/\r?\n/)[0].slice(0, 200)}`);
+      this.syncState();
+    } else if (event.type === 'verify_rollback') {
+      this.activeAssistantEntryId = undefined;
+      this.appendEntry('tool', `● [verify rollback] ${event.reason.split(/\r?\n/)[0].slice(0, 200)}`);
+      this.syncState();
+    } else if (event.type === 'dag_plan_invalid') {
+      this.activeAssistantEntryId = undefined;
+      this.appendEntry('tool', `● [dag] plan invalid: ${event.message.slice(0, 200)}`);
+      this.syncState();
+    } else if (event.type === 'dag_plan_ready') {
+      this.activeAssistantEntryId = undefined;
+      this.appendEntry('tool', `● [dag] plan ready: ${event.todos} todo(s)`);
+      this.syncState();
+    } else if (event.type === 'dag_todo_update') {
+      this.appendEntry('tool', `● [dag] ${event.todoId}: ${event.status} (${event.role})`);
+      this.syncState();
+    } else if (event.type === 'dag_merge') {
+      this.activeAssistantEntryId = undefined;
+      this.appendEntry('tool', `● [dag] merge ${event.verified ? 'verified' : 'NOT verified'}${event.reason ? `: ${event.reason.slice(0, 160)}` : ''}`);
+      this.syncState();
     } else if (event.type === 'usage' || event.type === 'stopped' || event.type === 'plan_exit') {
       if (event.type === 'stopped') {
         this.activeAssistantEntryId = undefined;

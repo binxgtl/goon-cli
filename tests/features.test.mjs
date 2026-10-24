@@ -167,6 +167,16 @@ test('PairManager enforces token auth on GET /, blocks remote auto/shell escalat
     await fetch(`http://127.0.0.1:${info.port}/api/state?t=${info.token}&since=${maxSeq}`)
   ).json();
   assert.equal(deltaEmpty.entries.length, 0);
+
+  // 6. Verify events render as short tool rows on the phone.
+  pm.notifyEvent({ type: 'verify_start', files: ['src/a.ts'], commands: ['npm test'] });
+  pm.notifyEvent({ type: 'verify_result', status: 'fail', stage: 'test', reason: '1 failing test', errors: [], warnings: [], durationMs: 4 });
+  pm.notifyEvent({ type: 'verify_rollback', reason: 'Verification failed', restored: ['src/a.ts'], deleted: [], conflicts: [] });
+  const verifyState = await (await fetch(`http://127.0.0.1:${info.port}/api/state?t=${info.token}`)).json();
+  const verifyRows = verifyState.entries.filter(e => e.kind === 'tool' && e.text.includes('[verify'));
+  assert.ok(verifyRows.some(e => e.text.includes('[verify] 1 file(s)')));
+  assert.ok(verifyRows.some(e => e.text.includes('[verify] fail: 1 failing test')));
+  assert.ok(verifyRows.some(e => e.text.includes('[verify rollback]')));
 });
 
 test('Custom Workflows: shell escaping, awk $1 preservation, approval gates, and discovery isolation', async t => {

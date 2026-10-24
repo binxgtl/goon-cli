@@ -7,11 +7,15 @@ import { fileURLToPath } from 'node:url';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { McpManager, mcpConfigSchema, mcpToolName } from '../dist/mcp.js';
 import { ToolRegistry } from '../dist/tools.js';
+import { classifyMcpRisk } from '../dist/risk.js';
+import { resolveExecutionPolicy } from '../dist/policy.js';
 import { mockMcpServer } from './fixtures/mcp-server.mjs';
 import { fixture, cli, provider, sse } from './helpers.mjs';
 
 const stdio = extra => mcpConfigSchema.parse({ servers: { local: { transport: 'stdio', command: process.execPath,
   args: [fileURLToPath(new URL('./fixtures/mcp-server.mjs', import.meta.url)), '--stdio'], ...extra } } });
+const annotations = extra => mcpConfigSchema.parse({ servers: { ann: { transport: 'stdio', command: process.execPath,
+  args: [fileURLToPath(new URL('./fixtures/mcp-server.mjs', import.meta.url)), '--annotations'], ...extra } } });
 const call = (toolName, input = {}) => ({ toolName, input, toolCallId: 'fixture' });
 const signal = () => new AbortController().signal;
 
@@ -173,6 +177,7 @@ test('MCP stdio handles REA-scale server (207 tools, >2.7MB tools/list payload, 
   assert.equal(manager.statuses.length, 1);
   assert.equal(manager.statuses[0].status, 'ok');
   assert.equal(manager.statuses[0].toolCount, 207);
+  assert(manager.tools.every(tool => tool.readOnly === false), 'trust no longer implies readOnly');
   const firstTool = mcpToolName('rea', 'rea_tool_1');
   const lastTool = mcpToolName('rea', 'rea_tool_207');
   assert(Object.keys(registry.schemas()).includes(firstTool));
@@ -230,4 +235,131 @@ REA_MODE = "production"
     mcpToolName('rea', 'rea_tool_3'),
   ].sort());
   await manager.close();
+});
+
+test('MCP annotations may only escalate; readOnlyTools is the only low-risk override', () => {
+  const base = stdio().servers.local;
+  const risk = (annotation, extra = {}) => classifyMcpRisk('s', 'tool', { ...annotation }, { ...base, ...extra });
+  assert.equal(risk({ readOnlyHint: true }).risk, 'medium', 'readOnlyHint is a medium floor');
+  assert.equal(risk({ readOnlyHint: true }).net, false);
+  assert.equal(risk({ destructiveHint: true }).risk, 'high');
+  assert.equal(risk({ openWorldHint: true }).risk, 'high');
+  assert.equal(risk({ openWorldHint: true }).net, true);
+  assert.equal(risk(undefined).risk, 'medium', 'no annotation stays medium');
+  assert.equal(risk(undefined, { trust: true }).risk, 'medium', 'trust does not raise risk');
+  assert.equal(risk({ destructiveHint: true }, { trust: true }).risk, 'high', 'destructive wins over trust');
+  assert.equal(risk({ openWorldHint: true }, { trust: true }).net, true);
+  assert.equal(risk({ readOnlyHint: true }, { readOnlyTools: ['tool'] }).risk, 'low');
+  assert.equal(risk({ destructiveHint: true }, { readOnlyTools: ['tool'] }).risk, 'low');
+  assert.equal(risk(undefined, { net: true }).net, true, 'server net flag marks the tool');
+  const httpConfig = mcpConfigSchema.parse({ servers: { remote: { transport: 'http', url: 'http://127.0.0.1:1/mcp' } } }).servers.remote;
+  assert.equal(classifyMcpRisk('remote', 'tool', {}, httpConfig).net, false, 'HTTP transport alone is not net');
+});
+
+test('MCP spec keeps risk/net/trusted/annotations and gates openWorld tools before approval', async t => {
+  const f = await fixture(t);
+  const deniedPolicy = resolveExecutionPolicy({ allowNet: false, allowNetHosts: [] });
+  let approvals = 0;
+  const registry = new ToolRegistry(f.cwd, async () => { approvals++; return true; });
+  registry.policy = deniedPolicy;
+  const manager = new McpManager(annotations(), f.cwd, deniedPolicy);
+  try {
+    await manager.connect(registry);
+    assert.equal(manager.tools.length, 5);
+    const byName = Object.fromEntries(manager.tools.map(tool => [tool.originalName, tool]));
+    assert.equal(byName['plain-tool'].risk, 'medium');
+    assert.equal(byName['plain-tool'].net, false);
+    assert.equal(byName['plain-tool'].trusted, false);
+    assert.deepEqual(byName['readonly-tool'].annotations, { readOnlyHint: true });
+    assert.equal(byName['readonly-tool'].risk, 'medium');
+    assert.equal(byName['destructive-tool'].risk, 'high');
+    assert.equal(byName['open-tool'].risk, 'high');
+    assert.equal(byName['open-tool'].net, true);
+    assert.equal(byName['destructive-open-tool'].risk, 'high');
+    assert.equal(byName['destructive-open-tool'].net, true);
+    assert.equal(byName['plain-tool'].readOnly, false, 'trust/annotations never imply readOnly');
+
+    const denied = await registry.execute(call(mcpToolName('ann', 'open-tool')), signal());
+    assert.equal(denied.denied, true);
+    assert.match(denied.text, /network/i);
+    assert.equal(approvals, 0, 'openWorld denial happens before approval');
+
+    const plain = await registry.execute(call(mcpToolName('ann', 'plain-tool')), signal());
+    assert.equal(plain.text, 'annotated:plain-tool');
+    assert.equal(approvals, 1, 'non-network MCP tools still use approval');
+  } finally {
+    await manager.close();
+  }
+});
+
+test('MCP trusted server auto-approves medium/low but never high risk', async t => {
+  const f = await fixture(t);
+  let approvals = 0;
+  const registry = new ToolRegistry(f.cwd, async () => { approvals++; return false; });
+  const policy = resolveExecutionPolicy({ allowNet: false, allowNetHosts: [] });
+  registry.policy = policy;
+  const manager = new McpManager(annotations({ trust: true }), f.cwd, policy);
+  try {
+    await manager.connect(registry);
+    assert.equal(manager.tools.every(tool => tool.trusted), true);
+
+    const readonly = await registry.execute(call(mcpToolName('ann', 'readonly-tool')), signal());
+    assert.equal(readonly.text, 'annotated:readonly-tool');
+    assert.equal(approvals, 0, 'trust auto-approves medium risk');
+
+    const destructive = await registry.execute(call(mcpToolName('ann', 'destructive-tool')), signal());
+    assert.equal(destructive.denied, true);
+    assert.equal(approvals, 1, 'destructive annotations escalate to high and still prompt');
+  } finally {
+    await manager.close();
+  }
+});
+
+test('MCP server allowNet exempts its tools, global allow-net exempts every server', async t => {
+  const f = await fixture(t);
+  let approvals = 0;
+  const deniedPolicy = resolveExecutionPolicy({ allowNet: false, allowNetHosts: [] });
+  const registry = new ToolRegistry(f.cwd, async () => { approvals++; return false; });
+  registry.policy = deniedPolicy;
+  const blocked = new McpManager(annotations({ readOnlyTools: ['open-tool'] }), f.cwd, deniedPolicy);
+  try {
+    await blocked.connect(registry);
+    assert.equal((await registry.execute(call(mcpToolName('ann', 'open-tool')), signal())).denied, true);
+  } finally {
+    await blocked.close();
+  }
+
+  const serverAllowed = new McpManager(annotations({ readOnlyTools: ['open-tool'], allowNet: true }), f.cwd, deniedPolicy);
+  try {
+    await serverAllowed.connect(registry);
+    const result = await registry.execute(call(mcpToolName('ann', 'open-tool')), signal());
+    assert.equal(result.text, 'annotated:open-tool');
+    assert.equal(approvals, 0);
+  } finally {
+    await serverAllowed.close();
+  }
+
+  const globalRegistry = new ToolRegistry(f.cwd, async () => { approvals++; return false; });
+  globalRegistry.policy = resolveExecutionPolicy({ allowNet: true, allowNetHosts: [] });
+  const globallyAllowed = new McpManager(annotations({ readOnlyTools: ['open-tool'] }), f.cwd, globalRegistry.policy);
+  try {
+    await globallyAllowed.connect(globalRegistry);
+    assert.equal((await globalRegistry.execute(call(mcpToolName('ann', 'open-tool')), signal())).text, 'annotated:open-tool');
+  } finally {
+    await globallyAllowed.close();
+  }
+});
+
+test('MCP trust does not expose tools in --read-only mode', async t => {
+  const f = await fixture(t);
+  const registry = new ToolRegistry(f.cwd, async () => true, true);
+  const manager = new McpManager(annotations({ trust: true }), f.cwd);
+  try {
+    await manager.connect(registry);
+    assert.equal(manager.tools.length, 5);
+    assert(manager.tools.every(tool => tool.readOnly === false), 'trust does not imply readOnly');
+    assert(!Object.keys(registry.schemas()).some(name => name.startsWith('mcp_')), 'trust cannot expose tools in read-only');
+  } finally {
+    await manager.close();
+  }
 });

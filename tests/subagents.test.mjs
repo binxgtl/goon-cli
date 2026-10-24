@@ -7,7 +7,15 @@ import { Harness } from '../dist/harness.js';
 import { SessionStore } from '../dist/session.js';
 import { Subagents } from '../dist/subagents.js';
 import { ToolRegistry } from '../dist/tools.js';
+import { AgentNetwork, AgentNetworkBus } from '../dist/network.js';
+import { CostLedger } from '../dist/cost.js';
 import { fixture, provider, sse, cli } from './helpers.mjs';
+
+const denyPolicy = {
+  network: { mode: 'deny', hosts: new Set() },
+  limits: { defaultToolTimeoutMs: 5000, maxToolTimeoutMs: 10_000, maxOutputBytes: 64 * 1024, hardOutputBytes: 128 * 1024, mcpMaxOutputBytes: 32 * 1024 },
+  allowNetForServer: () => false,
+};
 
 const isChild = body => body.messages.some(m => typeof m.content === 'string' && m.content.startsWith('You are a delegated agent.'));
 const configFor = (f, p, extra = {}) => ({ cwd: f.cwd, dataDir: f.data, provider: 'openai-compatible', model: 'test-model', baseUrl: p.url,
@@ -355,4 +363,138 @@ test('Codex tools (update_plan, request_user_input, view_image), $skill-name exp
   assert.equal(copiedCode?.text, 'const ok = true;');
 });
 
+test('parallel child costs are aggregated per child session, not by shared-ledger snapshots', async t => {
+  const f = await fixture(t);
+  // Each provider request costs exactly $1 (100 input tokens at $10_000/1M, output free).
+  const pricing = { 'test-model': { inputPer1M: 10_000, outputPer1M: 0 } };
+  let childRequests = 0;
+  const p = await provider(t, async (body, response) => {
+    if (isChild(body)) {
+      childRequests++;
+      // Hold the response open so both read-only children overlap inside the shared ledger.
+      await setTimeout(150);
+      return sse(response, { text: `Report from child ${childRequests}` });
+    }
+    if (!body.messages.some(m => m.role === 'tool')) {
+      return sse(response, { calls: [{ id: 'delegate1', name: 'delegate_task', input: { tasks: ['alpha', 'beta'] } }] });
+    }
+    return sse(response, { text: 'Combined.' });
+  });
+  const config = configFor(f, p, { pricing });
+  const store = await SessionStore.open(join(f.data, 'sessions'), config);
+  t.after(() => store.close());
+  const tools = new ToolRegistry(f.cwd, async () => true);
+  new Subagents(config, store, tools).register();
+  const h = new Harness(config, store, tools);
+  const ledger = CostLedger.fromConfig(config, config.model);
+  const startedAt = Date.now() - 5_000;
+  const budget = {
+    spent: 0, limit: 100_000, costSpent: 0, costLimit: 100,
+    startedAt, timeLimitMs: 600_000, ledger,
+  };
+  await h.run('delegate', AbortSignal.timeout(8000), budget);
 
+  // 4 requests in total: parent delegate call + 2 overlapping children + parent final answer.
+  // Correct aggregation is 4; a shared-ledger snapshot pair for each of the 2 children would
+  // read the full $3 window twice and inflate the parent session to $6.
+  assert.deepEqual(childRequests, 2);
+  const cost = store.session.costUsd ?? 0;
+  assert.ok(Math.abs(cost - 4) < 0.01, `parent session cost should be $4, got ${cost}`);
+  // One ledger, one mirror: children update the shared total but never reset it from their own
+  // fresh session counter, and they inherit the parent's time cap/deadline unchanged.
+  assert.ok(Math.abs(ledger.total - 4) < 0.01, `shared ledger should be $4, got ${ledger.total}`);
+  assert.ok(Math.abs((budget.costSpent ?? 0) - 4) < 0.01, `budget mirror should be $4, got ${budget.costSpent}`);
+  assert.equal(budget.startedAt, startedAt, 'child harnesses must not restart the shared time budget');
+  assert.equal(budget.timeLimitMs, 600_000, 'child harnesses must not replace the shared time limit');
+});
+
+
+
+test('child registries inherit the parent network policy and deny before approval', async t => {
+  const f = await fixture(t), approvals = [];
+  const p = await provider(t, (body, response) => {
+    if (isChild(body)) {
+      if (!body.messages.some(m => m.role === 'tool')) {
+        return sse(response, { calls: [{ id: 'child-curl', name: 'bash', input: { command: 'curl https://example.com' } }] });
+      }
+      return sse(response, { text: 'Child stopped after the denial.' });
+    }
+    if (!body.messages.some(m => m.role === 'tool')) {
+      return sse(response, { calls: [{ id: 'edit-agent', name: 'delegate_edit', input: { tasks: ['fetch example.com'] } }] });
+    }
+    return sse(response, { text: 'Parent done.' });
+  });
+  const config = configFor(f, p);
+  const store = await SessionStore.open(join(f.data, 'sessions'), config);
+  t.after(() => store.close());
+  const tools = new ToolRegistry(f.cwd, async request => { approvals.push(request.tool); return true; });
+  tools.policy = denyPolicy;
+  new Subagents(config, store, tools).register();
+
+  assert.equal(await new Harness(config, store, tools).run('delegate', AbortSignal.timeout(5000)), 'Parent done.');
+  // Only the parent delegation was approved: the child's network command was denied by the
+  // inherited policy gate before it could reach the approval callback.
+  assert.deepEqual(approvals, ['delegate_edit']);
+  const childDir = join(f.data, 'subagents', store.session.id);
+  const transcripts = await Promise.all((await readdir(childDir)).filter(n => n.endsWith('.json'))
+    .map(n => readFile(join(childDir, n), 'utf8')));
+  assert(transcripts.some(text => /network access/i.test(text)), 'the child transcript records the policy denial');
+});
+
+test('delegate tools ignore model-supplied allowedTools and keep the pinned child toolset', async t => {
+  const f = await fixture(t);
+  let childToolNames;
+  const p = await provider(t, (body, response) => {
+    if (isChild(body)) {
+      childToolNames = body.tools.map(tool => tool.function.name).sort();
+      return sse(response, { text: 'Read-only report.' });
+    }
+    if (!body.messages.some(m => m.role === 'tool')) {
+      return sse(response, {
+        calls: [{
+          id: 'delegate-escalate',
+          name: 'delegate_task',
+          input: { tasks: ['inspect'], allowedTools: ['bash', 'write_file', 'mcp__server__tool'] },
+        }],
+      });
+    }
+    return sse(response, { text: 'Done.' });
+  });
+  const h = await harness(t, f, p, async () => true);
+  assert.equal(await h.run(), 'Done.');
+  assert.deepEqual(childToolNames, ['list_files', 'read_file', 'search']);
+});
+
+test('Agent Network shares the parent ledger and mirrors cost back to the parent budget', async t => {
+  const f = await fixture(t);
+  const p = await provider(t, (_body, response) => sse(response, { text: 'Persona view.' }));
+  const pricing = { 'test-model': { inputPer1M: 10_000, outputPer1M: 0 } };
+  const config = configFor(f, p, { pricing, runTokenBudget: 100_000 });
+  const store = await SessionStore.open(join(f.data, 'sessions'), config);
+  t.after(() => store.close());
+  const ledger = CostLedger.fromConfig(config, config.model);
+  const startedAt = Date.now() - 1_000;
+  const budget = {
+    spent: 0, limit: 100_000, costSpent: 0, costLimit: 100,
+    startedAt, timeLimitMs: 600_000, ledger,
+  };
+
+  const net = new AgentNetwork(config, store, new AgentNetworkBus());
+  const result = await net.brainstorm({
+    topic: 'Review the design',
+    roles: ['architect', 'critic'],
+    rounds: 1,
+    exploreCodebase: false,
+    signal: AbortSignal.timeout(10_000),
+    budget,
+    policy: denyPolicy,
+  });
+
+  assert.equal(result.participants.length, 2);
+  // Two personas plus one synthesis request, each $1 at 100 prompt tokens / $10k per 1M.
+  assert.ok(Math.abs((store.session.costUsd ?? 0) - 3) < 0.01, `session cost was ${store.session.costUsd}`);
+  assert.ok(Math.abs((budget.costSpent ?? 0) - 3) < 0.01, `budget mirror was ${budget.costSpent}`);
+  assert.ok(Math.abs(ledger.total - 3) < 0.01, `ledger total was ${ledger.total}`);
+  assert.equal(budget.startedAt, startedAt);
+  assert.equal(budget.timeLimitMs, 600_000);
+});

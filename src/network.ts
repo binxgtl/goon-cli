@@ -5,6 +5,8 @@ import { z } from 'zod';
 import { Harness, type HarnessEvent } from './harness.js';
 import { SessionStore } from './session.js';
 import { ToolRegistry, type RunBudget } from './tools.js';
+import { CostLedger } from './cost.js';
+import type { ExecutionPolicy } from './policy.js';
 import type { RuntimeConfig } from './config.js';
 import { limitText } from './files.js';
 import { safeError } from './errors.js';
@@ -450,6 +452,8 @@ export interface BrainstormOptions {
   exploreCodebase?: boolean;
   signal: AbortSignal;
   budget?: RunBudget;
+  /** Execution policy inherited from the parent registry (network gate + limits). */
+  policy?: ExecutionPolicy;
   onProgress?: (line: string) => void;
 }
 
@@ -516,6 +520,11 @@ export class AgentNetwork {
     const budget: RunBudget = {
       spent: parentBudget?.spent ?? 0,
       limit: configuredLimit > 0 ? configuredLimit : DEFAULT_NETWORK_TOKEN_BUDGET,
+      costSpent: parentBudget?.costSpent ?? this.parent.session.costUsd ?? 0,
+      costLimit: parentBudget?.costLimit ?? this.config.maxCostUsd ?? 0,
+      startedAt: parentBudget?.startedAt ?? Date.now(),
+      timeLimitMs: parentBudget?.timeLimitMs ?? this.config.maxTimeMs ?? 0,
+      ledger: parentBudget?.ledger,
     };
     const contributions: BrainstormResult['contributions'] = [];
 
@@ -561,8 +570,9 @@ export class AgentNetwork {
               explore,
               signal: options.signal,
               budget,
+              policy: options.policy,
             });
-            if (parentBudget) parentBudget.spent = budget.spent;
+            this.syncParentBudget(parentBudget, budget);
 
             contributions.push({ round, persona, response });
             this.bus.postBlackboard({
@@ -592,8 +602,9 @@ export class AgentNetwork {
         contributions,
         signal: options.signal,
         budget,
+        policy: options.policy,
       });
-      if (parentBudget) parentBudget.spent = budget.spent;
+      this.syncParentBudget(parentBudget, budget);
 
       this.bus.postBlackboard({
         author: 'Moderator',
@@ -617,6 +628,32 @@ export class AgentNetwork {
     }
   }
 
+  /**
+   * Adds the child run's cost to the parent session without touching the shared budget mirror.
+   * Uses the child session counter: parallel personas share one ledger, so a ledger snapshot
+   * would double-count overlapping turns.
+   */
+  private aggregateRunCost(store: SessionStore, before: number): void {
+    const delta = (store.session.costUsd ?? 0) - before;
+    if (delta <= 0) return;
+    this.parent.session.costUsd = (this.parent.session.costUsd ?? 0) + delta;
+    void this.parent.save().catch(() => {});
+  }
+
+  /**
+   * Copies the shared budget's ledger mirror back onto the caller's budget object. Persona turns
+   * use a budget copy (so the network can substitute its own default token limit); without this
+   * sync the parent would not see the cost/time/token spend of the network run.
+   */
+  private syncParentBudget(parentBudget: RunBudget | undefined, budget: RunBudget): void {
+    if (!parentBudget) return;
+    parentBudget.spent = budget.spent;
+    parentBudget.costSpent = Math.max(
+      parentBudget.costSpent ?? 0,
+      budget.costSpent ?? this.parent.session.costUsd ?? 0,
+    );
+  }
+
   private async runPersonaTurn(params: {
     persona: NetworkPersona;
     allPersonas: NetworkPersona[];
@@ -627,6 +664,7 @@ export class AgentNetwork {
     explore: boolean;
     signal: AbortSignal;
     budget: RunBudget;
+    policy?: ExecutionPolicy;
   }): Promise<string> {
     const store = await SessionStore.open(this.networkSessionsRoot, this.config);
     const sessionId = store.session.id;
@@ -634,6 +672,10 @@ export class AgentNetwork {
     try {
       const tools = new ToolRegistry(this.config.cwd, async () => false, true);
       tools.allowPeerToolsInReadOnly = true;
+      // Persona registries inherit the caller's policy and ledger, so network runs obey the same
+      // network gate/limits and share one cost total with the parent.
+      tools.policy = params.policy;
+      if (params.budget.ledger instanceof CostLedger) tools.costLedger = params.budget.ledger;
       this.bus.registerPeerTools(tools, params.persona.name, params.persona.role);
       if (!params.explore) {
         // Expose only peer communication tools when codebase exploration is disabled
@@ -672,8 +714,13 @@ export class AgentNetwork {
             `2. Point out specific strengths, blind spots, or trade-offs in other agents' ideas (reference them by name, e.g. @Architect, @Critic).\n` +
             `3. Refine your recommendation so the group converges toward the strongest practical solution (150-300 words).`;
 
-      const harness = new Harness(this.config, store, tools);
-      await harness.run(prompt, params.signal, params.budget);
+      const costBefore = store.session.costUsd ?? 0;
+      const harness = new Harness(this.config, store, tools, undefined, undefined, { verify: { enabled: false } });
+      try {
+        await harness.run(prompt, params.signal, params.budget);
+      } finally {
+        this.aggregateRunCost(store, costBefore);
+      }
       const answer = lastAssistantAnswer(store.session.messages, this.config.inlineReasoning);
       return limitText(answer || '(no response)', 6_000);
     } catch (err) {
@@ -692,6 +739,7 @@ export class AgentNetwork {
     contributions: BrainstormResult['contributions'];
     signal: AbortSignal;
     budget: RunBudget;
+    policy?: ExecutionPolicy;
   }): Promise<string> {
     const store = await SessionStore.open(this.networkSessionsRoot, this.config);
     const sessionId = store.session.id;
@@ -699,6 +747,8 @@ export class AgentNetwork {
     try {
       const tools = new ToolRegistry(this.config.cwd, async () => false, true);
       tools.onlyPeerTools = true;
+      tools.policy = params.policy;
+      if (params.budget.ledger instanceof CostLedger) tools.costLedger = params.budget.ledger;
       const transcript = params.contributions
         .map(c => `### [Round ${c.round}] ${c.persona.name} (${c.persona.role})\n${c.response}`)
         .join('\n\n');
@@ -718,8 +768,13 @@ export class AgentNetwork {
         `3. **Actionable Implementation Plan** (concrete files, components, and verification steps)\n` +
         `Respond in the same language as the user's Topic.`;
 
-      const harness = new Harness(this.config, store, tools);
-      await harness.run(prompt, params.signal, params.budget);
+      const costBefore = store.session.costUsd ?? 0;
+      const harness = new Harness(this.config, store, tools, undefined, undefined, { verify: { enabled: false } });
+      try {
+        await harness.run(prompt, params.signal, params.budget);
+      } finally {
+        this.aggregateRunCost(store, costBefore);
+      }
       const answer = lastAssistantAnswer(store.session.messages, this.config.inlineReasoning);
       return limitText(answer || '(no synthesis generated)', 12_000);
     } finally {

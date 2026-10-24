@@ -9,6 +9,7 @@ import { pathToFileURL } from 'node:url';
 
 const exec = promisify(execFile);
 test('publishing creates the first tag, bumps on update and repairs a rerun without another bump', { timeout: 60000 }, async t => {
+  if (process.platform === 'win32') { t.skip('the fake gh executable shim is POSIX-only'); return; }
   const root = await mkdtemp(join(tmpdir(), 'goon-publish-test-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const work = join(root, 'work'), remote = join(root, 'remote.git'), bin = join(root, 'fake-bin');

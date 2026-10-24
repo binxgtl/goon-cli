@@ -1115,3 +1115,16 @@ test('Codex /goal system: formatting, draft parsing, get_goal/create_goal/update
   assert.equal(cliStep, 4, 'CLI should run Turn 1 (2 model calls) + automatic Continuation Turn 2 (2 model calls)');
   assert.equal(sawContinuationXml, true, 'Continuation turn must include Codex goal continuation XML');
 });
+
+test('TUI renders verify events with fail glyph and skip is silent', async t => {
+  const tty = terminal(t);
+  tty.ui.event({ type: 'verify_start', files: ['src/a.ts', 'src/b.ts'], commands: ['npm test'] });
+  tty.ui.event({ type: 'verify_result', status: 'fail', stage: 'test', reason: '1 failing test', errors: [], warnings: [], durationMs: 5 });
+  tty.ui.event({ type: 'verify_rollback', reason: 'Verification failed (attempt 2/2)', restored: ['src/a.ts'], deleted: ['src/new.ts'], conflicts: [] });
+  tty.ui.event({ type: 'verify_result', status: 'skip', reason: 'approval denied', errors: [], warnings: [], durationMs: 0 });
+  await new Promise(resolve => setTimeout(resolve, 40));
+  assert.ok(tty.written.includes('Verify 2 file(s) · npm test'), 'verify_start row missing');
+  assert.ok(tty.written.includes('Verify fail: 1 failing test'), 'verify_result row missing');
+  assert.ok(tty.written.includes('Verify rollback'), 'verify_rollback row missing');
+  assert.ok(!tty.written.includes('approval denied'), 'skip must not render a row');
+});
