@@ -3,10 +3,108 @@ import { join, resolve } from 'node:path';
 import { z } from 'zod';
 import { atomicJson, configDir, type EffortLevel } from './config.js';
 import { sanitizeBashCommand } from './tools.js';
-import { runCommand } from './process.js';
+import { classifyBashRisk, type RiskClass } from './risk.js';
+import { DEFAULT_COMMAND_TIMEOUT_MS, runCommand } from './process.js';
+import { isNetworkAllowedForCommand, networkDeniedMessage, type ExecutionPolicy } from './policy.js';
 import { limitText } from './files.js';
 
-export type WorkflowStepType = 'prompt' | 'shell' | 'subagent' | 'network' | 'approval';
+/** Thrown when a workflow shell step cannot obtain an explicit approval. */
+export class WorkflowApprovalError extends Error {
+  constructor(message: string, readonly risk?: RiskClass) {
+    super(message);
+    this.name = 'WorkflowApprovalError';
+  }
+}
+
+export type WorkflowStepType = 'prompt' | 'shell' | 'subagent' | 'network' | 'approval' | 'dag';
+
+// ---------------------------------------------------------------------------
+// Dynamic workflow classifier (v0.7, P22)
+// ---------------------------------------------------------------------------
+
+export type WorkflowMode = 'single' | 'multi';
+
+export interface WorkflowClassification {
+  mode: WorkflowMode;
+  reason: string;
+}
+
+export interface WorkflowClassifierContext {
+  /** File paths the caller already knows the task touches (added to the path-mention count). */
+  fileCount?: number;
+}
+
+const IMPERATIVE_VERBS = [
+  'add', 'implement', 'fix', 'refactor', 'create', 'write', 'update', 'delete', 'remove',
+  'migrate', 'port', 'build', 'review', 'audit', 'deploy', 'design', 'research', 'install',
+  'configure', 'rename', 'move', 'split', 'merge', 'optimize', 'document', 'clean', 'extract',
+  // Vietnamese imperatives (Termux-first): common single-word and two-word action verbs.
+  // Only ASCII-ending forms are listed: JS `\b` is ASCII-only, so "xoá" would never match.
+  'thêm', 'sửa', 'xóa', 'tạo', 'viết', 'chạy',
+  'cập nhật', 'kiểm tra', 'xây dựng', 'triển khai',
+];
+
+function escapeForRegex(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+const VERB_RE = new RegExp(`\\b(?:${IMPERATIVE_VERBS.map(escapeForRegex).join('|')})\\b`, 'gi');
+/** Strong sequencing connectors ("A then B", "sau đó", "and then"). */
+// Trailing `\b` only for ASCII-ending words: JS word boundaries are ASCII-only, so a diacritic
+// ending ("sau đó", "và") would never match `\b`. A lookahead keeps those out of longer words.
+const SEQUENCE_CONNECTOR_RE = /\b(?:and then|then|after that|tiếp theo)\b|\bsau[ -]?(?:đó|do)(?![a-z0-9_])/gi;
+/** Plain conjunctions; alone they never make a task multi-step. */
+const WEAK_CONNECTOR_RE = /\band\b|\bvà(?![a-z0-9_])/gi;
+const MULTI_STEP_KEYWORD_RE = /\b(?:plan|workflow|multi[- ]?step|multi[- ]?agent|pipeline|roadmap|checklist|phase)\b/i;
+/** Path-like mentions: segments with a slash, or files with a known code/doc extension. */
+const PATH_MENTION_RE = /(?:(?:[\w.@-]+\/)+[\w@.-]+)|(?:\b[\w-]+\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs|py|go|rs|java|rb|php|json|ya?ml|toml|sh|md)\b)/g;
+
+/**
+ * Pure, model-free complexity classifier (v0.7 P22). Conservative by design: when the signals do
+ * not clearly add up to several coordinated steps the answer is `single`, so existing linear
+ * workflows keep running unchanged and a `dag` step only spawns a DAG when the task really asks
+ * for one. Signals (§8.1): imperative verbs, sequencing connectors ("and/then/sau đó"),
+ * path mentions, and explicit multi-step keywords.
+ */
+export function classifyWorkflowComplexity(prompt: string, context?: WorkflowClassifierContext): WorkflowClassification {
+  const text = typeof prompt === 'string' ? prompt : '';
+  const verbKinds = new Set<string>();
+  let verbHits = 0;
+  for (const match of text.matchAll(VERB_RE)) {
+    verbKinds.add(match[0].toLowerCase());
+    verbHits++;
+  }
+  const connectors = [...text.matchAll(SEQUENCE_CONNECTOR_RE)].length;
+  const weakConnectors = [...text.matchAll(WEAK_CONNECTOR_RE)].length;
+  const paths = new Set([...text.matchAll(PATH_MENTION_RE)].map(match => match[0].toLowerCase()));
+  const pathCount = paths.size + Math.max(0, context?.fileCount ?? 0);
+  const keyword = MULTI_STEP_KEYWORD_RE.test(text);
+
+  const detail =
+    `${verbKinds.size} distinct imperative verb(s) in ${verbHits} hit(s), ${connectors} sequencing ` +
+    `connector(s), ${weakConnectors} conjunction(s), ${pathCount} path mention(s)` +
+    `${keyword ? ', multi-step keyword' : ''}`;
+
+  if (verbKinds.size >= 3) {
+    return { mode: 'multi', reason: `multi: ${verbKinds.size} distinct imperative verbs (${detail})` };
+  }
+  if (connectors >= 2) {
+    return { mode: 'multi', reason: `multi: ${connectors} sequencing connectors (${detail})` };
+  }
+  if (verbKinds.size >= 2 && connectors >= 1) {
+    return { mode: 'multi', reason: `multi: ${verbKinds.size} imperative verbs chained by a sequencing connector (${detail})` };
+  }
+  if (keyword && verbKinds.size + connectors >= 2) {
+    return { mode: 'multi', reason: `multi: multi-step keyword with ${verbKinds.size} verb(s) and ${connectors} connector(s) (${detail})` };
+  }
+  if (pathCount >= 3 && verbKinds.size >= 2) {
+    return { mode: 'multi', reason: `multi: ${pathCount} path mentions with ${verbKinds.size} imperative verbs (${detail})` };
+  }
+  return { mode: 'single', reason: `single: conservative default, no strong multi-step signal (${detail})` };
+}
+
+/** v0.7 P22: emitted whenever a `dag` workflow step is classified. Additive to `HarnessEvent`. */
+export type WorkflowEvent = { type: 'workflow_classified'; mode: WorkflowMode; reason: string };
 
 export interface WorkflowStep {
   id: string;
@@ -53,7 +151,7 @@ export interface WorkflowRunResult {
 const workflowStepSchema = z.object({
   id: z.string().trim().min(1).max(64).optional(),
   title: z.string().trim().max(140).optional(),
-  type: z.enum(['prompt', 'shell', 'subagent', 'network', 'approval']).default('prompt'),
+  type: z.enum(['prompt', 'shell', 'subagent', 'network', 'approval', 'dag']).default('prompt'),
   prompt: z.string().optional(),
   command: z.string().optional(),
   tasks: z.array(z.string()).optional(),
@@ -356,9 +454,9 @@ export function parseMarkdownWorkflow(
       let rounds: number | undefined;
       for (const part of attrRaw.split(/[\s,]+/).filter(Boolean)) {
         const [k, v] = part.split('=');
-        if (!v && ['prompt', 'shell', 'subagent', 'network', 'approval'].includes(k.toLowerCase())) {
+        if (!v && ['prompt', 'shell', 'subagent', 'network', 'approval', 'dag'].includes(k.toLowerCase())) {
           type = k.toLowerCase() as WorkflowStepType;
-        } else if (k === 'type' && ['prompt', 'shell', 'subagent', 'network', 'approval'].includes(v.toLowerCase())) {
+        } else if (k === 'type' && ['prompt', 'shell', 'subagent', 'network', 'approval', 'dag'].includes(v.toLowerCase())) {
           type = v.toLowerCase() as WorkflowStepType;
         } else if (k === 'id' && v) {
           id = v;
@@ -384,6 +482,8 @@ export function parseMarkdownWorkflow(
         steps.push({ id, title, type: 'subagent', tasks: bullets.length ? bullets : [sectionBody], readOnly: true });
       } else if (type === 'approval') {
         steps.push({ id, title, type: 'approval', message: sectionBody || title });
+      } else if (type === 'dag') {
+        steps.push({ id, title, type: 'dag', prompt: sectionBody });
       } else {
         steps.push({ id, title, type: 'prompt', prompt: sectionBody });
       }
@@ -553,8 +653,10 @@ export interface WorkflowExecutionHooks {
   cwd: string;
   signal: AbortSignal;
   effectiveReadOnly?: boolean;
+  /** Execution policy shared with the parent (network gate + process limits, v0.5 P12/P14). */
+  policy?: ExecutionPolicy;
   onProgress?: (text: string) => void;
-  approveShell?: (command: string, signal: AbortSignal) => Promise<boolean>;
+  approveShell?: (command: string, signal: AbortSignal, risk?: RiskClass) => Promise<boolean>;
   runPrompt: (prompt: string, step: WorkflowStep, signal: AbortSignal) => Promise<string>;
   runSubagents?: (tasks: string[], readOnly: boolean, signal: AbortSignal) => Promise<string>;
   runNetwork?: (
@@ -563,6 +665,15 @@ export interface WorkflowExecutionHooks {
     rounds: number | undefined,
     signal: AbortSignal,
   ) => Promise<string>;
+  /**
+   * v0.7 P22: runs a `dag` step as a full multi-agent DAG (e.g. the CLI's `/dag` machinery).
+   * Only consulted when the classifier agrees the step goal is `multi` AND `multiAgentEnabled`.
+   */
+  runDag?: (goal: string, signal: AbortSignal) => Promise<string>;
+  /** v0.7 P22: `multiAgentMode !== 'off'`. A `dag` step never spawns a DAG without it. */
+  multiAgentEnabled?: boolean;
+  /** v0.7 P22: receives the `workflow_classified` event for each classified `dag` step. */
+  onEvent?: (event: WorkflowEvent) => void;
   confirmStep?: (message: string, signal: AbortSignal) => Promise<boolean>;
 }
 
@@ -630,11 +741,32 @@ export async function executeWorkflow(
         const rawCmd = interp(step.command ?? step.prompt ?? '', 'shell');
         if (!rawCmd.trim()) throw new Error(`Shell step "${step.id}" has no command.`);
         const cmd = sanitizeBashCommand(rawCmd);
-        if (hooks.approveShell) {
-          const allowed = await hooks.approveShell(cmd, hooks.signal);
-          if (!allowed) {
-            throw new Error(`Permission denied by the user for shell command: ${cmd}`);
-          }
+        const risk = classifyBashRisk(cmd);
+        // A workflow is not an approval bypass: every shell step needs an explicit callback and
+        // critical commands are refused before the callback is consulted.
+        if (risk === 'critical') {
+          throw new WorkflowApprovalError(
+            `Permission denied: workflow shell step "${step.id}" is critical risk and cannot run.`,
+            risk,
+          );
+        }
+        // Network default-deny applies to workflow shell steps too: the policy gate runs before
+        // the approval callback, so a denied network command is never offered for approval.
+        if (hooks.policy && !isNetworkAllowedForCommand(hooks.policy, cmd)) {
+          throw new WorkflowApprovalError(networkDeniedMessage(cmd), risk);
+        }
+        if (!hooks.approveShell) {
+          throw new WorkflowApprovalError(
+            `Workflow shell step "${step.id}" requires explicit approval, but no approval handler is available.`,
+            risk,
+          );
+        }
+        const allowed = await hooks.approveShell(cmd, hooks.signal, risk);
+        if (!allowed) {
+          throw new WorkflowApprovalError(
+            `Permission denied by the user for shell command: ${cmd}`,
+            risk,
+          );
         }
         hooks.onProgress?.(`  $ ${cmd}\n`);
         const wfEnv: NodeJS.ProcessEnv = {
@@ -648,11 +780,18 @@ export async function executeWorkflow(
         for (const [k, v] of Object.entries(parsedArgs.named)) {
           wfEnv[`GOON_WF_VAR_${k.replace(/[^A-Za-z0-9_]/g, '_').toUpperCase()}`] = v;
         }
+        const limits = hooks.policy?.limits;
+        const timeoutMs = Math.max(1000, Math.min(
+          limits?.defaultToolTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS,
+          limits?.maxToolTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS,
+        ));
         const res = await runCommand('bash', ['-c', cmd], {
           cwd: hooks.cwd,
           env: wfEnv,
-          signal: AbortSignal.any([hooks.signal, AbortSignal.timeout(120_000)]),
-          timeoutMs: 120_000,
+          signal: AbortSignal.any([hooks.signal, AbortSignal.timeout(timeoutMs)]),
+          timeoutMs,
+          outputLimitBytes: limits?.maxOutputBytes,
+          hardOutputBytes: limits?.hardOutputBytes,
         });
         stepOutput = limitText(`Exit code: ${res.code}\n${res.output}`.trim(), 12_000);
         if (res.code !== 0 && !step.continueOnError) {
@@ -676,6 +815,19 @@ export async function executeWorkflow(
           stepOutput = await hooks.runPrompt(tasks.join('\n\n'), step, hooks.signal);
         } else {
           stepOutput = await hooks.runSubagents(tasks, step.readOnly !== false, hooks.signal);
+        }
+      } else if (step.type === 'dag') {
+        // v0.7 P22: a `dag` step only becomes a multi-agent DAG when the pure classifier calls the
+        // goal `multi` AND the caller enabled multi-agent mode AND provided the runDag hook.
+        // Otherwise the step stays linear (plain prompt) — old workflows never see a difference.
+        const goal = interp(step.prompt ?? step.topic ?? step.command ?? '$input').trim();
+        if (!goal) throw new Error(`DAG step "${step.id}" has no goal.`);
+        const classification = classifyWorkflowComplexity(goal);
+        hooks.onEvent?.({ type: 'workflow_classified', mode: classification.mode, reason: classification.reason });
+        if (classification.mode === 'multi' && hooks.multiAgentEnabled === true && hooks.runDag) {
+          stepOutput = await hooks.runDag(goal, hooks.signal);
+        } else {
+          stepOutput = await hooks.runPrompt(goal, step, hooks.signal);
         }
       } else {
         const promptText = interp(step.prompt ?? '$input');
@@ -743,7 +895,9 @@ export function formatWorkflowDetails(wf: WorkflowDefinition): string {
           ? `roles=[${(s.roles ?? ['architect', 'researcher', 'critic', 'pragmatist']).join(', ')}] rounds=${s.rounds ?? 2} topic="${(s.topic ?? '').slice(0, 80)}"`
           : s.type === 'subagent'
             ? `${s.tasks?.length ?? 1} subagent task(s)`
-            : (s.prompt ?? s.message ?? '').replace(/\s+/g, ' ').slice(0, 90);
+            : s.type === 'dag'
+              ? `dag goal="${(s.prompt ?? s.topic ?? '').replace(/\s+/g, ' ').slice(0, 80)}"`
+              : (s.prompt ?? s.message ?? '').replace(/\s+/g, ' ').slice(0, 90);
     lines.push(`  ${i + 1}. [${s.id}] ${s.title ?? s.id} (${s.type}) — ${detail}`);
   }
   return lines.join('\n');

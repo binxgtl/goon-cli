@@ -1,12 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { writeFile, readFile, symlink, stat, chmod } from 'node:fs/promises';
+import { writeFile, readFile, symlink, stat, chmod, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { WorkspaceFiles } from '../dist/files.js';
 import { runCommand } from '../dist/process.js';
 import { fixture } from './helpers.mjs';
 
 test('existing files require a fresh read; edits preserve file mode', async t => {
+  if (process.platform === 'win32') { t.skip('POSIX file mode bits are not available on Windows'); return; }
   const f = await fixture(t), files = new WorkspaceFiles(f.cwd);
   const path = join(f.cwd, 'script.sh');
   await writeFile(path, 'first\n', { mode: 0o755 });
@@ -23,6 +24,7 @@ test('existing files require a fresh read; edits preserve file mode', async t =>
 });
 
 test('edits preserve exact permissions under restrictive umasks; new files obey umask', async t => {
+  if (process.platform === 'win32') { t.skip('POSIX umask and mode bits are not available on Windows'); return; }
   const f = await fixture(t);
   for (const mask of [0o027, 0o007, 0o077]) {
     const source = `
@@ -145,6 +147,9 @@ test('applyPatch supports Add/Update/Delete and restoreBackups reverts modified,
   assert.match(preview, /\+line2_patched/);
   assert.match(preview, /\+hello world/);
 
+  // apply_patch is read-first: existing files must be read before patching.
+  await files.read('keep.txt');
+  await files.read('remove-me.txt');
   await files.applyPatch(patch);
   assert.equal(await readFile(join(f.cwd, 'keep.txt'), 'utf8'), 'line1\nline2_patched\nline3\n');
   // Codex apply_patch semantics: every "+" line is a complete line, so added files end with a newline.
@@ -179,3 +184,153 @@ test('applyPatch supports Add/Update/Delete and restoreBackups reverts modified,
   assert.equal(await readFile(join(f.cwd, 'keep.txt'), 'utf8'), 'line1\nline2\nline3\n');
 });
 
+
+test('applyPatch rejects unread or stale files before planning any write', async t => {
+  const f = await fixture(t), files = new WorkspaceFiles(f.cwd);
+  await writeFile(join(f.cwd, 'a.txt'), 'one\n');
+  const update = ['*** Begin Patch', '*** Update File: a.txt', '@@', '-one', '+two', '*** End Patch'].join('\n');
+  assert.match(await files.previewDiff('apply_patch', { patch: update }), /\+two/);
+  await assert.rejects(files.applyPatch(update), /Read the current file before patching; it is unread or has changed\./);
+  await files.read('a.txt');
+  await writeFile(join(f.cwd, 'a.txt'), 'changed outside\n');
+  await assert.rejects(files.applyPatch(update), /Read the current file before patching; it is unread or has changed\./);
+  assert.equal(await readFile(join(f.cwd, 'a.txt'), 'utf8'), 'changed outside\n');
+  await assert.rejects(files.applyPatch('*** Begin Patch\n*** Delete File: a.txt\n*** End Patch'), /Read the current file before patching/);
+});
+
+test('applyPatch rejects ambiguous hunks and applies insertion-only hunks at the cursor', async t => {
+  const f = await fixture(t), files = new WorkspaceFiles(f.cwd);
+  await writeFile(join(f.cwd, 'dup.txt'), 'x\nx\nx\n');
+  await files.read('dup.txt');
+  const ambiguous = ['*** Begin Patch', '*** Update File: dup.txt', '@@', '-x', '+y', '*** End Patch'].join('\n');
+  await assert.rejects(files.applyPatch(ambiguous), /Patch hunk is ambiguous in dup\.txt \(matched 3 times\); add more surrounding context\./);
+  assert.equal(await readFile(join(f.cwd, 'dup.txt'), 'utf8'), 'x\nx\nx\n');
+
+  await writeFile(join(f.cwd, 'insert.txt'), 'a\nb\n');
+  await files.read('insert.txt');
+  await files.applyPatch(['*** Begin Patch', '*** Update File: insert.txt', '@@', '+before', '*** End Patch'].join('\n'));
+  assert.equal(await readFile(join(f.cwd, 'insert.txt'), 'utf8'), 'before\na\nb\n');
+});
+
+test('applyPatch validates resulting syntax before writing anything', async t => {
+  const f = await fixture(t), files = new WorkspaceFiles(f.cwd);
+  await assert.rejects(
+    files.applyPatch(['*** Begin Patch', '*** Add File: bad.ts', '+export function f() {', '*** End Patch'].join('\n')),
+    /Syntax validation failed for bad\.ts: Unclosed/,
+  );
+  await assert.rejects(readFile(join(f.cwd, 'bad.ts'), 'utf8'));
+
+  await writeFile(join(f.cwd, 'ok.txt'), 'ok\n');
+  await files.read('ok.txt');
+  const patch = [
+    '*** Begin Patch',
+    '*** Update File: ok.txt',
+    '@@',
+    '-ok',
+    '+ok2',
+    '*** Add File: bad.ts',
+    '+export function g() {',
+    '*** End Patch',
+  ].join('\n');
+  await assert.rejects(files.applyPatch(patch), /Syntax validation failed/);
+  assert.equal(await readFile(join(f.cwd, 'ok.txt'), 'utf8'), 'ok\n');
+  assert.equal(files.hasTurnChanges(), false);
+});
+
+test('applyPatch accepts valid syntax and ignores braces inside strings, regex and templates', async t => {
+  const f = await fixture(t), files = new WorkspaceFiles(f.cwd);
+  const ts = [
+    'const re = /[{}()]/g;',
+    'const msg = "}";',
+    'const tpl = `{ ${"}"} }`;',
+    'export const obj = { ok: true };',
+  ].join('\n');
+  const patch = ['*** Begin Patch', '*** Add File: good.ts', ...ts.split('\n').map(line => `+${line}`), '*** End Patch'].join('\n');
+  await files.applyPatch(patch);
+  assert.equal(await readFile(join(f.cwd, 'good.ts'), 'utf8'), `${ts}\n`);
+});
+
+test('applyPatch validates plain JSON but accepts JSONC config paths', async t => {
+  const f = await fixture(t), files = new WorkspaceFiles(f.cwd);
+  const jsonc = ['{', '  // comment', '  "compilerOptions": { "strict": true, },', '}'].join('\n');
+  const patch = ['*** Begin Patch', '*** Add File: tsconfig.json', ...jsonc.split('\n').map(line => `+${line}`), '*** End Patch'].join('\n');
+  await files.applyPatch(patch);
+  await assert.rejects(
+    files.applyPatch(['*** Begin Patch', '*** Add File: package.json', '+{ "a": 1, }', '*** End Patch'].join('\n')),
+    /Syntax validation failed for package\.json: invalid JSON/,
+  );
+});
+
+test('deletions are tombstoned: rollback restores originals and keeps user re-creations', async t => {
+  const f = await fixture(t), files = new WorkspaceFiles(f.cwd);
+  await writeFile(join(f.cwd, 'gone.txt'), 'original\n');
+  files.beginTurn();
+  await files.read('gone.txt');
+  await files.applyPatch('*** Begin Patch\n*** Delete File: gone.txt\n*** End Patch');
+  const backups = files.peekTurnBackups();
+  assert.equal(backups.length, 1);
+  assert.equal(backups[0].afterDeleted, true);
+  assert.equal(backups[0].afterHash, undefined);
+  assert.equal(backups[0].content, 'original\n');
+
+  await writeFile(join(f.cwd, 'gone.txt'), 'user recreated\n');
+  const conflicted = await files.restoreBackups(backups);
+  assert.deepEqual(conflicted.conflicts, ['gone.txt']);
+  assert.equal(await readFile(join(f.cwd, 'gone.txt'), 'utf8'), 'user recreated\n');
+
+  await unlink(join(f.cwd, 'gone.txt'));
+  const restored = await files.restoreBackups(backups);
+  assert.deepEqual(restored.restored, ['gone.txt']);
+  assert.equal(await readFile(join(f.cwd, 'gone.txt'), 'utf8'), 'original\n');
+
+  // Force overrides a user re-creation and deletes back to the original state.
+  await writeFile(join(f.cwd, 'gone.txt'), 'user recreated\n');
+  const forced = await files.restoreBackups(backups, { force: true });
+  assert.deepEqual(forced.restored, ['gone.txt']);
+  assert.equal(await readFile(join(f.cwd, 'gone.txt'), 'utf8'), 'original\n');
+});
+
+test('WorkspaceFiles exposes turn backup APIs without consuming state', async t => {
+  const f = await fixture(t), files = new WorkspaceFiles(f.cwd);
+  await writeFile(join(f.cwd, 'a.txt'), 'one\n');
+  files.beginTurn();
+  await files.read('a.txt');
+  await files.write('a.txt', 'two\n');
+  assert.equal(files.hasTurnChanges(), true);
+  assert.deepEqual(files.turnChangedFiles(), ['a.txt']);
+  const peeked = files.peekTurnBackups();
+  assert.equal(peeked.length, 1);
+  assert.equal(files.peekTurnBackups().length, 1);
+  files.beginTurn();
+  assert.equal(files.hasTurnChanges(), false);
+  files.replaceTurnBackups(peeked);
+  assert.equal(files.hasTurnChanges(), true);
+  const taken = files.takeTurnBackups();
+  assert.equal(taken.length, 1);
+  assert.equal(files.hasTurnChanges(), false);
+});
+
+test('mergeBackups propagates afterDeleted and fills missing pre-turn fields', async t => {
+  const f = await fixture(t), files = new WorkspaceFiles(f.cwd);
+  await writeFile(join(f.cwd, 'm.txt'), 'base\n');
+  files.beginTurn();
+  await files.read('m.txt');
+  await files.write('m.txt', 'parent\n');
+  files.mergeBackups([{ path: 'm.txt', existed: true, content: 'base\n', mode: 0o644, afterDeleted: true }]);
+  let [merged] = files.peekTurnBackups();
+  assert.equal(merged.afterDeleted, true);
+  assert.equal(merged.afterHash, undefined);
+  assert.equal(merged.content, 'base\n');
+
+  files.mergeBackups([{ path: 'm.txt', existed: true, content: 'base\n', mode: 0o644, afterHash: 'deadbeef' }]);
+  [merged] = files.peekTurnBackups();
+  assert.equal(merged.afterDeleted, undefined);
+  assert.equal(merged.afterHash, 'deadbeef');
+
+  files.beginTurn();
+  files.mergeBackups([{ path: 'x.txt', existed: true, mode: undefined }]);
+  files.mergeBackups([{ path: 'x.txt', existed: true, content: 'content', mode: 0o755 }]);
+  const [filled] = files.peekTurnBackups();
+  assert.equal(filled.content, 'content');
+  assert.equal(filled.mode, 0o755);
+});

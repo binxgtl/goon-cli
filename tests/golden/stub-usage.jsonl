@@ -1,0 +1,6 @@
+{"v":1,"seq":1,"at":"<timestamp>","sessionId":"<session>","type":"session","event":{"type":"session","id":"<session>","cwd":"<cwd>"}}
+{"v":1,"seq":2,"at":"<timestamp>","sessionId":"<session>","type":"user","event":{"type":"user","text":"usage please"}}
+{"v":1,"seq":3,"at":"<timestamp>","sessionId":"<session>","type":"context_budget","event":{"type":"context_budget","inputBudget":111616,"system":16742,"conversation":50227,"files":27905,"truncated":false}}
+{"v":1,"seq":4,"at":"<timestamp>","sessionId":"<session>","type":"text","event":{"type":"text","text":"usage check"}}
+{"v":1,"seq":5,"at":"<timestamp>","sessionId":"<session>","type":"usage","event":{"type":"usage","input":1234,"output":56,"total":1290}}
+{"v":1,"seq":6,"at":"<timestamp>","sessionId":"<session>","type":"done","event":{"type":"done","text":"usage check","denied":false,"sessionId":"<session>"}}

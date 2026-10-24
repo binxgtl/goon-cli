@@ -134,11 +134,11 @@ export function formatTokenCount(n: number): string {
 }
 export const SLASH_COMMANDS = [
   '/help', '/setup', '/key', '/model', '/effort', '/mode', '/auto', '/yolo', '/view', '/transcript',
-  '/copy', '/btw', '/side', '/goal', '/recap', '/skills', '/prompts', '/memories', '/presets', '/mention',
-  '/pair', '/workflow', '/workflows', '/network', '/brainstorm', '/council',
+  '/copy', '/btw', '/side', '/goal', '/recap', '/skills', '/prompts', '/memories', '/memory', '/presets', '/mention',
+  '/pair', '/workflow', '/workflows', '/network', '/brainstorm', '/council', '/dag',
   '/cd', '/pwd', '/mcp', '/subagents', '/agent', '/plan', '/revert', '/undo',
   '/checkpoints', '/todo', '/resume', '/new', '/delete', '/compact', '/diff', '/review', '/fork', '/rename',
-  '/export', '/init', '/status', '/tools', '/sessions', '/debug-config', '/warnings', '/doctor', '/clear', '/exit',
+  '/export', '/init', '/status', '/cost', '/tools', '/sessions', '/debug-config', '/warnings', '/doctor', '/clear', '/exit',
 ];
 
 const SLASH_DESCRIPTIONS: Record<string, string> = {
@@ -156,12 +156,14 @@ const SLASH_DESCRIPTIONS: Record<string, string> = {
   '/recap': 'summarize current session progress without compacting',
   '/skills': 'list or inspect SKILL.md skills (use $skill-name in prompt)',
   '/memories': 'manage persistent user memories across sessions',
+  '/memory': 'memory store: rag index/stats/search, budget, preferences',
   '/presets': 'save or run reusable prompt presets',
   '/mention': 'attach @file mention into the composer',
   '/pair': 'pair mobile/web device via free Cloudflared tunnel (QR + link)',
   '/workflow': 'list, create, inspect, or run multi-step custom workflows',
   '/workflows': 'list or manage custom workflows (/workflow alias)',
   '/network': 'convene multi-agent Brainstorm / Council room or inspect P2P bus',
+  '/dag': 'decompose a goal into a role-based todo DAG and execute it with subagents',
   '/brainstorm': 'run multi-agent Agent Network ideation session (/network alias)',
   '/council': 'convene Agent Network council debate (/network alias)',
   '/cd': 'change active workspace directory',
@@ -183,6 +185,7 @@ const SLASH_DESCRIPTIONS: Record<string, string> = {
   '/debug-config': 'show resolved config paths, model capabilities, and settings',
   '/warnings': 'show retained MCP or runtime warnings',
   '/status': 'show session & token status',
+  '/cost': 'show session cost and caps',
   '/doctor': 'verify environment & gateway /models',
   '/setup': 'run the provider / model setup wizard',
   '/key': 'replace the stored API key (input hidden)',
@@ -527,6 +530,7 @@ export class TerminalUI {
   private todoLabel = '';
   private workspaceFiles: string[] = [];
   private tokens = 0;
+  private costUsd = 0;
   private pending?: Pending;
   private closed = false;
   private timer?: NodeJS.Timeout;
@@ -768,6 +772,11 @@ export class TerminalUI {
 
   setTokens(tokens: number) {
     this.tokens = tokens;
+    this.schedule();
+  }
+
+  setCostUsd(costUsd: number) {
+    this.costUsd = Number.isFinite(costUsd) && costUsd > 0 ? costUsd : 0;
     this.schedule();
   }
 
@@ -1031,7 +1040,10 @@ export class TerminalUI {
 
   event(event: HarnessEvent | SubagentEvent) {
     if (event.type === 'subagent') {
-      if (event.state === 'progress' && event.event.type === 'usage') this.tokens += event.event.total;
+      if (event.state === 'progress' && event.event.type === 'usage') {
+        this.tokens += event.event.total;
+        if (event.event.costUsd) this.costUsd += event.event.costUsd;
+      }
       const key = `agent:${event.id}`;
       const state =
         event.state === 'progress'
@@ -1099,12 +1111,50 @@ export class TerminalUI {
       this.goal = event.goal;
     } else if (event.type === 'usage') {
       this.tokens += event.total;
+      if (event.costUsd) this.costUsd += event.costUsd;
       // Prompt + completion of the latest request is the provider's own measure of context occupancy.
       if (event.input > 0) this.contextUsed = event.input + event.output;
     } else if (event.type === 'compaction') {
       this.flushExploreGroup();
       this.contextUsed = undefined;
       this.appendCell(`\n${GLYPH.compact} Context compacted #${event.count}\n`);
+    } else if (event.type === 'verify_start') {
+      this.flushExploreGroup();
+      const commands = event.commands?.length ? ` · ${event.commands.slice(0, 3).join(' · ')}` : '';
+      this.appendCell(`\n${GLYPH.ran} Verify ${event.files.length} file(s)${commands.slice(0, 160)}\n`);
+    } else if (event.type === 'verify_result') {
+      if (event.status !== 'skip') {
+        this.flushExploreGroup();
+        const glyph = event.status === 'fail' ? GLYPH.failed : event.status === 'warn' ? GLYPH.allow : GLYPH.done;
+        this.appendCell(`\n${glyph} Verify ${event.status}: ${event.reason.split(/\r?\n/)[0]}\n`);
+      }
+    } else if (event.type === 'verify_rollback') {
+      this.flushExploreGroup();
+      this.appendCell(`\n${GLYPH.reverted} Verify rollback: ${event.reason.split(/\r?\n/)[0]}\n`);
+    } else if (event.type === 'dag_plan_invalid') {
+      this.flushExploreGroup();
+      this.appendCell(`\n${GLYPH.failed} DAG plan invalid: ${event.message.split(/\r?\n/)[0]}\n`);
+    } else if (event.type === 'dag_plan_ready') {
+      this.flushExploreGroup();
+      this.appendCell(`\n${GLYPH.todo} DAG plan ready: ${event.todos} todo(s)\n`);
+    } else if (event.type === 'dag_todo_update') {
+      const glyph = event.status === 'done' ? GLYPH.done : event.status === 'failed' || event.status === 'blocked' ? GLYPH.failed : GLYPH.ran;
+      this.appendCell(`\n${glyph} DAG ${event.todoId}: ${event.status} (${event.role})\n`);
+    } else if (event.type === 'dag_merge') {
+      this.flushExploreGroup();
+      const glyph = event.verified ? GLYPH.done : GLYPH.failed;
+      this.appendCell(`\n${glyph} DAG merge: ${event.verified ? 'verified' : 'NOT verified'}${event.reason ? ` — ${event.reason.split(/\r?\n/)[0]}` : ''}\n`);
+    } else if (event.type === 'workflow_classified') {
+      this.flushExploreGroup();
+      const glyph = event.mode === 'multi' ? GLYPH.todo : GLYPH.ran;
+      this.appendCell(`\n${glyph} Workflow ${event.mode}: ${event.reason.split(/\r?\n/)[0]}\n`);
+    } else if (event.type === 'scope_round') {
+      this.flushExploreGroup();
+      const glyph = event.action === 'stop' ? GLYPH.failed : event.action === 'expand' ? GLYPH.ran : GLYPH.done;
+      this.appendCell(`\n${glyph} Scope round ${event.round} ${event.action}: ${event.reason.split(/\r?\n/)[0]}\n`);
+    } else if (event.type === 'cost_degrade') {
+      this.flushExploreGroup();
+      this.appendCell(`\n${GLYPH.allow} Cost degrade: ${event.reason.split(/\r?\n/)[0]} (${event.candidates} candidate(s))\n`);
     } else if (event.type === 'stopped') {
       this.flushExploreGroup();
       this.appendCell(`\n${GLYPH.allow} ${event.reason}\n`);
@@ -2671,7 +2721,10 @@ export class TerminalUI {
             : T.warn;
     const goalGroup: Seg[] = goalIndicator ? [[goalIndicator, goalTone]] : [];
     const todoGroup: Seg[] = this.todoLabel ? [[`todo ${this.todoLabel}`, T.faint]] : [];
-    const tokenGroup: Seg[] = [[`${formatTokenCount(this.tokens)} tokens`, T.faint]];
+    const tokenGroup: Seg[] = [
+      [`${formatTokenCount(this.tokens)} tokens`, T.faint],
+      ...(this.costUsd > 0 ? [[` · $${this.costUsd.toFixed(4)}`, T.faint] as Seg] : []),
+    ];
 
     // A picker (e.g. /resume) replaces the status/popup rows and turns the prompt into its filter.
     if (this.picker) {

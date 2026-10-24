@@ -5,6 +5,8 @@ import { createOpenAI } from '@ai-sdk/openai';
 import { createAnthropic } from '@ai-sdk/anthropic';
 import type { LanguageModel } from 'ai';
 import { EFFORT_LEVELS, normalizeGatewayUrl, type Config, type EffortLevel, type RuntimeConfig } from './config.js';
+import { loadStubFixture } from './stub-fixtures.js';
+import { createStubModel } from './stub-provider.js';
 
 try {
   setDefaultResultOrder('ipv4first');
@@ -14,8 +16,8 @@ try {
 
 export type ProviderOptionsMap = Record<string, Record<string, string>>;
 
-export function buildProviderOptions(config: Pick<Config, 'provider' | 'effort'>): ProviderOptionsMap | undefined {
-  if (!config.effort) return undefined;
+export function buildProviderOptions(config: Pick<Config, 'provider' | 'effort'> & { stub?: boolean }): ProviderOptionsMap | undefined {
+  if (config.stub === true || !config.effort) return undefined;
   const effort: EffortLevel = config.effort;
   if (config.provider === 'anthropic') {
     return { anthropic: { effort } };
@@ -123,6 +125,7 @@ export function createEffortFetch(
 }
 
 export function createModel(config: RuntimeConfig, sessionId?: string): LanguageModel {
+  if (config.stub) return createStubModel(loadStubFixture(config.stubFixture), config.stubCursor ?? { index: 0 }, config.model);
   const customFetch = createEffortFetch(config.provider, config.effort, sessionId);
   const baseHeaders: Record<string, string> = {
     ...(sessionId ? { 'x-session-id': sessionId, 'x-opencode-session': sessionId } : {}),
