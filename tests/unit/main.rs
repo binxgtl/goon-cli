@@ -18,3 +18,5 @@ mod eventlog;
 mod session;
 mod memory;
 mod memory_integration;
+mod embedder;
+mod mcp;

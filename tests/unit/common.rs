@@ -236,6 +236,8 @@ pub type Handler = Arc<dyn Fn(&Value, usize) -> MockResponse + Send + Sync>;
 pub struct MockProvider {
     pub url: String,
     pub requests: Arc<Mutex<Vec<Value>>>,
+    /// `(request path, lower-cased headers)` per request.
+    pub heads: Arc<Mutex<Vec<(String, Vec<(String, String)>)>>>,
     shutdown: CancellationToken,
 }
 
@@ -252,6 +254,16 @@ impl MockProvider {
     pub fn count(&self) -> usize {
         self.requests.lock().unwrap().len()
     }
+    pub fn header(&self, nth: usize, name: &str) -> Option<String> {
+        self.heads.lock().unwrap().get(nth).and_then(|(_, h)| h.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone()))
+    }
+    pub fn path(&self, nth: usize) -> String {
+        self.heads.lock().unwrap().get(nth).map(|(p, _)| p.clone()).unwrap_or_default()
+    }
+    /// The server origin without the `/v1` suffix.
+    pub fn origin(&self) -> String {
+        self.url.trim_end_matches("/v1").to_string()
+    }
 }
 
 /// Starts a loopback HTTP server answering every POST with `handler(body, nth)` (1-based).
@@ -260,9 +272,11 @@ pub async fn provider(handler: impl Fn(&Value, usize) -> MockResponse + Send + S
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let requests = Arc::new(Mutex::new(vec![]));
+    let heads: Arc<Mutex<Vec<(String, Vec<(String, String)>)>>> = Arc::new(Mutex::new(vec![]));
     let shutdown = CancellationToken::new();
     let handler: Handler = Arc::new(handler);
     let reqs = requests.clone();
+    let hds = heads.clone();
     let stop = shutdown.clone();
     tokio::spawn(async move {
         loop {
@@ -273,6 +287,7 @@ pub async fn provider(handler: impl Fn(&Value, usize) -> MockResponse + Send + S
             let Ok((mut socket, _)) = accepted else { continue };
             let handler = handler.clone();
             let reqs = reqs.clone();
+            let hds = hds.clone();
             let stop = stop.clone();
             tokio::spawn(async move {
                 loop {
@@ -306,6 +321,12 @@ pub async fn provider(handler: impl Fn(&Value, usize) -> MockResponse + Send + S
                         buf.extend_from_slice(&chunk[..n]);
                     }
                     let body = String::from_utf8_lossy(&buf[header_end..header_end + length]).to_string();
+                    {
+                        let mut lines = head.lines();
+                        let path = lines.next().and_then(|l| l.split_whitespace().nth(1)).unwrap_or("").to_string();
+                        let headers = lines.filter_map(|l| l.split_once(':')).map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string())).collect();
+                        hds.lock().unwrap().push((path, headers));
+                    }
                     let parsed: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
                     let nth = {
                         let mut r = reqs.lock().unwrap();
@@ -332,7 +353,7 @@ pub async fn provider(handler: impl Fn(&Value, usize) -> MockResponse + Send + S
             });
         }
     });
-    MockProvider { url: format!("http://127.0.0.1:{port}/v1"), requests, shutdown }
+    MockProvider { url: format!("http://127.0.0.1:{port}/v1"), requests, heads, shutdown }
 }
 
 /// The text of every `role: tool` message the provider received in request `body`.
