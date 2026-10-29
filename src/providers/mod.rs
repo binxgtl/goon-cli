@@ -231,7 +231,7 @@ pub async fn post_json(url: &str, headers: &[(String, String)], body: &Value, ca
     if !status.is_success() {
         return Err(error_from_body(status, response_headers, &text));
     }
-    serde_json::from_str(&text).map_err(|e| ApiError::new(format!("Invalid JSON response: {e}")))
+    crate::jsutil::parse_json(&text).map_err(|e| ApiError::new(format!("Invalid JSON response: {e}")))
 }
 
 /// Request body for a non-streaming call: the streaming body without its stream fields.

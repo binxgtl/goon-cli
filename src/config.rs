@@ -700,7 +700,7 @@ pub fn number_value(value: f64) -> Value {
 /// `loadConfig(overrides)`: stored config, then env, then CLI overrides, validated again.
 pub fn load_config(overrides: &Map<String, Value>) -> Result<Config> {
     let stored: Value = match std::fs::read_to_string(config_path()) {
-        Ok(text) => serde_json::from_str(&text).map_err(|e| anyhow!("{}", json_error_message(&e, &text)))?,
+        Ok(text) => crate::jsutil::parse_json(&text).map_err(|e| anyhow!("{e}"))?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!({}),
         Err(error) => return Err(error.into()),
     };
@@ -867,11 +867,6 @@ pub fn load_config(overrides: &Map<String, Value>) -> Result<Config> {
         config.base_url = Some(normalize_gateway_url(base));
     }
     Ok(config)
-}
-
-/// Node-style message for an invalid JSON document.
-pub fn json_error_message(error: &serde_json::Error, _text: &str) -> String {
-    format!("Unexpected token in JSON at line {} column {}: {}", error.line(), error.column(), error)
 }
 
 pub fn save_config(config: &Config) -> Result<()> {

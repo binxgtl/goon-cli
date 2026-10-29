@@ -40,7 +40,7 @@ pub fn validate_syntax(path: &str, content: &str) -> Result<()> {
             return Ok(());
         }
         let text = content.strip_prefix('\u{feff}').unwrap_or(content);
-        if let Err(error) = serde_json::from_str::<serde_json::Value>(text) {
+        if let Err(error) = crate::jsutil::parse_json(text) {
             bail!("invalid JSON: {}", error);
         }
         return Ok(());

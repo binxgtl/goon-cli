@@ -398,7 +398,7 @@ pub fn mcp_config_path() -> PathBuf {
 pub fn load_mcp_config() -> Result<McpConfig> {
     match std::fs::read_to_string(mcp_config_path()) {
         Ok(text) => {
-            let raw: Value = serde_json::from_str(&text).map_err(|e| anyhow!("{}", e))?;
+            let raw: Value = crate::jsutil::parse_json(&text).map_err(|e| anyhow!("{e}"))?;
             parse_mcp_config(&raw)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(McpConfig::default()),

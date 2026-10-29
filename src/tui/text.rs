@@ -208,7 +208,9 @@ pub fn wrap_chunks(text: &str, first: usize, cont: usize, words: bool) -> Vec<St
 
 pub fn format_token_count(n: f64) -> String {
     if !n.is_finite() || n < 1000.0 {
-        return format!("{}", (if n.is_finite() { n } else { 0.0 }).round().max(0.0) as u64);
+        // `String(Math.max(0, Math.round(n || 0)))`: NaN and -Infinity print 0, Infinity stays.
+        let n = if n.is_nan() { 0.0 } else { n };
+        return crate::jsutil::number_to_string(crate::jsutil::js_round(n).max(0.0));
     }
     let trim = |s: String| s.strip_suffix(".0").map(str::to_string).unwrap_or(s);
     if n < 1_000_000.0 {

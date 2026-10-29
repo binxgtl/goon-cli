@@ -348,7 +348,7 @@ impl App {
                     if end <= start {
                         bail!("Planner did not return a JSON plan.");
                     }
-                    serde_json::from_str(&raw[start..=end]).map_err(|e| anyhow!("{e}"))
+                    crate::jsutil::parse_json(&raw[start..=end]).map_err(|e| anyhow!("{e}"))
                 })
             })
         };

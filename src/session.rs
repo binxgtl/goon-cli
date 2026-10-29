@@ -431,7 +431,7 @@ fn validate_session(session: &Session) -> Result<()> {
 
 /// Parses and validates a stored session, repairing legacy binary payloads first.
 pub fn parse_session(text: &str) -> Result<Session> {
-    let mut raw: Value = serde_json::from_str(text)?;
+    let mut raw: Value = crate::jsutil::parse_json(text).map_err(|e| anyhow!("{e}"))?;
     repair_binary_payloads(&mut raw);
     let session: Session = serde_json::from_value(raw).map_err(|e| anyhow!("Invalid session: {e}"))?;
     validate_session(&session)?;

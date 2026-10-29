@@ -1029,7 +1029,7 @@ impl PairManager {
                         if raw.is_empty() {
                             Ok(json!({}))
                         } else {
-                            serde_json::from_str::<Value>(&raw).map_err(|e| e.to_string())
+                            crate::jsutil::parse_json(&raw)
                         }
                     }
                     Err(e) => Err(e.to_string()),

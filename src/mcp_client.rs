@@ -245,7 +245,7 @@ impl Rpc {
         }
         if essence == "application/json" {
             let raw = response.text().await.map_err(|e| anyhow!("{e}"))?;
-            let data: Value = serde_json::from_str(&raw).map_err(|e| anyhow!("{e}"))?;
+            let data: Value = crate::jsutil::parse_json(&raw).map_err(|e| anyhow!("{e}"))?;
             match data {
                 Value::Array(items) => items.into_iter().for_each(|m| self.dispatch(m)),
                 other => self.dispatch(other),

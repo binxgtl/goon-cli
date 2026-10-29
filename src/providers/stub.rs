@@ -171,7 +171,7 @@ pub fn load_stub_fixture(path: Option<&str>) -> Result<StubFixture> {
         bail!("Stub fixture exceeds 1 MiB: {} ({} bytes).", absolute.display(), info.len());
     }
     let text = std::fs::read_to_string(&absolute)?;
-    let parsed: Value = serde_json::from_str(&text).map_err(|e| anyhow!("Stub fixture is not valid JSON: {} ({}).", absolute.display(), e))?;
+    let parsed: Value = crate::jsutil::parse_json(&text).map_err(|e| anyhow!("Stub fixture is not valid JSON: {} ({}).", absolute.display(), e))?;
     parse_fixture(&parsed)
 }
 
