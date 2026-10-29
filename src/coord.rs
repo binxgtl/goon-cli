@@ -922,6 +922,12 @@ pub struct Candidate {
     pub backups: Vec<FileBackup>,
 }
 
+/// Reflection: folds a verification verdict into a rankable candidate. A candidate passes
+/// whenever the verdict does not `fail` (warn and skip count as pass).
+pub fn reflect(index: usize, task: &str, report: &str, cost_usd: f64, backups: Vec<FileBackup>, verdict: &VerifyVerdict) -> Candidate {
+    Candidate { index, task: task.into(), report: report.into(), cost_usd, passed: verdict.severity != Severity::Fail, warnings: verdict.warnings.len(), reason: verdict.reason.clone(), backups }
+}
+
 pub fn rerank(candidates: &[Candidate]) -> Vec<Candidate> {
     let mut out = candidates.to_vec();
     out.sort_by(|a, b| {
@@ -996,7 +1002,7 @@ pub async fn run_candidates(
             report = generate(task.to_string(), index, degraded, cancel.clone()).await?;
             backups = files.take_turn_backups();
             let verdict = verify(unique_paths(&backups), cancel.clone()).await?;
-            Ok(Candidate { index, task: task.into(), report: report.clone(), cost_usd: (spent() - before).max(0.0), passed: verdict.severity != Severity::Fail, warnings: verdict.warnings.len(), reason: verdict.reason.clone(), backups: backups.clone() })
+            Ok(reflect(index, task, &report, (spent() - before).max(0.0), backups.clone(), &verdict))
         }
         .await;
         match outcome {

@@ -146,7 +146,7 @@ pub fn runtime(cwd: &Path, data: &Path, base_url: &str, extra: Value) -> Arc<con
 }
 
 pub fn store(rt: &config::RuntimeConfig) -> Arc<session::SessionStore> {
-    Arc::new(session::SessionStore::open(&rt.data_dir, session::SessionRoute::from_runtime(rt), None, None).unwrap())
+    Arc::new(session::SessionStore::open(&rt.data_dir.join("sessions"), session::SessionRoute::from_runtime(rt), None, None).unwrap())
 }
 
 /// Collects harness events.
