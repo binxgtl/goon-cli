@@ -688,7 +688,7 @@ pub fn js_number(text: &str) -> f64 {
     f64::NAN
 }
 
-fn number_value(value: f64) -> Value {
+pub fn number_value(value: f64) -> Value {
     if value.is_finite() {
         num(value)
     } else {

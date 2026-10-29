@@ -34,6 +34,11 @@ fn ansi_re() -> &'static Regex {
     })
 }
 
+/// `stripVTControlCharacters`: removes complete escape sequences only.
+pub fn strip_vt(value: &str) -> std::borrow::Cow<'_, str> {
+    ansi_re().replace_all(value, "")
+}
+
 /// `stripVTControlCharacters` + NFC + removal of remaining control characters (keeps `\t`, `\n`).
 pub fn terminal_text(value: &str) -> String {
     use unicode_normalization::UnicodeNormalization;

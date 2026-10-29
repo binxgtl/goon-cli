@@ -10,7 +10,6 @@ use anyhow::{anyhow, bail, Result};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -96,7 +95,7 @@ pub struct Session {
     #[serde(default, skip_serializing_if = "Option::is_none", serialize_with = "js_f64_opt::serialize")]
     pub cost_usd: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rejected_signatures: Option<BTreeMap<String, u64>>,
+    pub rejected_signatures: Option<indexmap::IndexMap<String, u64>>,
 }
 
 impl Session {
@@ -629,7 +628,7 @@ impl SessionStore {
                     todos: None,
                     goal: None,
                     cost_usd: Some(0.0),
-                    rejected_signatures: Some(BTreeMap::new()),
+                    rejected_signatures: Some(indexmap::IndexMap::new()),
                 }
             };
             let real = crate::config::realpath(Path::new(&session.cwd)).map(|p| p.to_string_lossy().to_string()).unwrap_or_default();

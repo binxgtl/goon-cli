@@ -2,6 +2,7 @@
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
 pub mod approval;
+pub mod cli;
 pub mod config;
 pub mod embedder;
 pub mod context;
@@ -18,6 +19,7 @@ pub mod jsutil;
 pub mod mcp;
 pub mod memory;
 pub mod network;
+pub mod pair;
 pub mod mcp_client;
 pub mod model;
 pub mod policy;
@@ -35,6 +37,7 @@ pub mod subagents;
 pub mod setup;
 pub mod syntax;
 pub mod term;
+pub mod tui;
 pub mod tools;
 pub mod verify;
 pub mod workflow;
