@@ -28,7 +28,8 @@ npm run dev -- --stub -p "xin chào"              # chạy CLI từ source, khô
 
 **Điều quan trọng nhất:** `dist/` không được commit, nhưng `bin/goon.mjs` và **mọi test** đều chạy trên
 `dist/`. Sửa `src/*.ts` mà không build lại thì bạn đang test mã cũ. Các script bên dưới đã tự build;
-nếu gọi `node` trực tiếp, hãy bật `npm run watch` (mục 4).
+nếu gọi `node` trực tiếp, hãy bật `npm run watch` (mục 4). Lỗi `ERR_MODULE_NOT_FOUND … dist/cli.js` khi chạy
+`node bin/goon.mjs` trên bản clone mới nghĩa là bạn chưa build: chạy `npm run build`.
 
 ## 3. Script npm
 
