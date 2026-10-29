@@ -33,4 +33,5 @@ pub mod syntax;
 pub mod term;
 pub mod tools;
 pub mod verify;
+pub mod workflow;
 pub mod version;

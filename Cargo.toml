@@ -25,7 +25,7 @@ crossterm = "0.29"
 fancy-regex = "0.14"
 futures-util = "0.3"
 hex = "0.4"
-indexmap = "2"
+indexmap = { version = "2", features = ["serde"] }
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json", "http2"] }
 serde = { version = "1", features = ["derive"] }
