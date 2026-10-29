@@ -1,6 +1,6 @@
 //! OpenAI Responses API (`POST {base}/responses`, streaming).
 
-use super::{part_channel, post_sse, session_headers};
+use super::{part_channel, post_json, post_sse, session_headers, without_stream};
 use crate::model::*;
 use futures_util::future::BoxFuture;
 use serde_json::{json, Map, Value};
@@ -137,6 +137,56 @@ impl LanguageModel for OpenAIResponsesModel {
 
     fn provider(&self) -> &str {
         "openai-responses"
+    }
+
+    fn generate(&self, request: ModelRequest) -> BoxFuture<'static, Result<GenerateResponse, ApiError>> {
+        let url = join_url(&self.base_url, "responses");
+        let body = without_stream(build_body(&self.model_id, &request));
+        let mut headers = vec![("authorization".to_string(), format!("Bearer {}", self.api_key))];
+        headers.extend(session_headers(self.session_id.as_deref()));
+        Box::pin(async move {
+            let response = post_json(&url, &headers, &body, request.cancel.clone(), request.timeout).await?;
+            if let Some(error) = response.get("error").filter(|e| !e.is_null()) {
+                return Err(ApiError::new(error.get("message").and_then(Value::as_str).unwrap_or("Responses API error").to_string()));
+            }
+            let mut text = String::new();
+            let mut reasoning = String::new();
+            let mut has_calls = false;
+            for item in response.get("output").and_then(Value::as_array).cloned().unwrap_or_default() {
+                match part_type(&item) {
+                    "message" => {
+                        for c in item.get("content").and_then(Value::as_array).cloned().unwrap_or_default() {
+                            if part_type(&c) == "output_text" {
+                                text.push_str(c.get("text").and_then(Value::as_str).unwrap_or(""));
+                            }
+                        }
+                    }
+                    "reasoning" => {
+                        for c in item.get("summary").and_then(Value::as_array).cloned().unwrap_or_default() {
+                            reasoning.push_str(c.get("text").and_then(Value::as_str).unwrap_or(""));
+                        }
+                    }
+                    "function_call" => has_calls = true,
+                    _ => {}
+                }
+            }
+            let u = response.get("usage").cloned().unwrap_or(json!({}));
+            let usage = Usage {
+                input_tokens: u.get("input_tokens").and_then(Value::as_u64),
+                output_tokens: u.get("output_tokens").and_then(Value::as_u64),
+                cache_read_tokens: u.get("input_tokens_details").and_then(|d| d.get("cached_tokens")).and_then(Value::as_u64),
+                cache_write_tokens: None,
+                reasoning_tokens: u.get("output_tokens_details").and_then(|d| d.get("reasoning_tokens")).and_then(Value::as_u64),
+            };
+            let finish_reason = match response.get("incomplete_details").and_then(|d| d.get("reason")).and_then(Value::as_str) {
+                Some("max_output_tokens") => FinishReason::Length,
+                Some("content_filter") => FinishReason::ContentFilter,
+                Some(_) => FinishReason::Other,
+                None if has_calls => FinishReason::ToolCalls,
+                None => FinishReason::Stop,
+            };
+            Ok(GenerateResponse { text, reasoning, finish_reason, usage })
+        })
     }
 
     fn stream(&self, request: ModelRequest) -> BoxFuture<'static, Result<PartStream, ApiError>> {

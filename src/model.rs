@@ -127,11 +127,43 @@ impl std::error::Error for ApiError {}
 
 pub type PartStream = BoxStream<'static, StreamPart>;
 
+/// Result of a non-streaming call (`generateText` for compaction, /recap, /btw).
+#[derive(Clone, Debug)]
+pub struct GenerateResponse {
+    pub text: String,
+    pub reasoning: String,
+    pub finish_reason: FinishReason,
+    pub usage: Usage,
+}
+
 /// A chat model that streams normalized parts.
 pub trait LanguageModel: Send + Sync {
     fn model_id(&self) -> &str;
     fn provider(&self) -> &str;
     fn stream(&self, request: ModelRequest) -> futures_util::future::BoxFuture<'static, Result<PartStream, ApiError>>;
+
+    /// Non-streaming generation. The default collects the stream (used by the offline stub).
+    fn generate(&self, request: ModelRequest) -> futures_util::future::BoxFuture<'static, Result<GenerateResponse, ApiError>> {
+        let stream = self.stream(request);
+        Box::pin(async move {
+            use futures_util::StreamExt;
+            let mut parts = stream.await?;
+            let mut out = GenerateResponse { text: String::new(), reasoning: String::new(), finish_reason: FinishReason::Unknown, usage: Usage::default() };
+            while let Some(part) = parts.next().await {
+                match part {
+                    StreamPart::TextDelta { delta, .. } => out.text.push_str(&delta),
+                    StreamPart::ReasoningDelta { delta, .. } => out.reasoning.push_str(&delta),
+                    StreamPart::Finish { usage, finish_reason } => {
+                        out.usage = usage;
+                        out.finish_reason = finish_reason;
+                    }
+                    StreamPart::Error(error) => return Err(error),
+                    _ => {}
+                }
+            }
+            Ok(out)
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

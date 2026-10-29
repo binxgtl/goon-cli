@@ -208,6 +208,41 @@ pub async fn post_sse(
     Ok(rx)
 }
 
+/// POSTs a JSON body and parses the JSON response (non-streaming `generate`).
+pub async fn post_json(url: &str, headers: &[(String, String)], body: &Value, cancel: CancellationToken, timeout: Duration) -> Result<Value, ApiError> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut request = http_client().post(url).header("content-type", "application/json");
+    for (k, v) in headers {
+        request = request.header(k.as_str(), v.as_str());
+    }
+    let send = request.body(crate::jsutil::stringify(body)).send();
+    let response = tokio::select! {
+        r = send => r.map_err(|e| ApiError::network(network_message(&e)))?,
+        _ = cancel.cancelled() => return Err(ApiError::aborted()),
+        _ = tokio::time::sleep_until(deadline) => return Err(ApiError::aborted()),
+    };
+    let status = response.status();
+    let response_headers = header_map(&response);
+    let text = tokio::select! {
+        t = response.text() => t.map_err(|e| ApiError::network(network_message(&e)))?,
+        _ = cancel.cancelled() => return Err(ApiError::aborted()),
+        _ = tokio::time::sleep_until(deadline) => return Err(ApiError::aborted()),
+    };
+    if !status.is_success() {
+        return Err(error_from_body(status, response_headers, &text));
+    }
+    serde_json::from_str(&text).map_err(|e| ApiError::new(format!("Invalid JSON response: {e}")))
+}
+
+/// Request body for a non-streaming call: the streaming body without its stream fields.
+pub fn without_stream(mut body: Value) -> Value {
+    if let Some(o) = body.as_object_mut() {
+        o.remove("stream");
+        o.remove("stream_options");
+    }
+    body
+}
+
 fn network_message(error: &reqwest::Error) -> String {
     let mut message = error.to_string();
     let mut source = std::error::Error::source(error);

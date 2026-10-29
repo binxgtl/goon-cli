@@ -3,8 +3,13 @@
 
 pub mod approval;
 pub mod config;
+pub mod context;
+pub mod context_budget;
+pub mod cost;
 pub mod errors;
+pub mod eventlog;
 pub mod files;
+pub mod generate;
 pub mod help;
 pub mod jsutil;
 pub mod mcp;
@@ -12,10 +17,12 @@ pub mod mcp_client;
 pub mod model;
 pub mod policy;
 pub mod process;
+pub mod provider;
 pub mod providers;
 pub mod reasoning;
 pub mod redact;
 pub mod risk;
+pub mod session;
 pub mod syntax;
 pub mod verify;
 pub mod version;

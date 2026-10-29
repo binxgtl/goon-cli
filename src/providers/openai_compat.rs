@@ -1,6 +1,6 @@
 //! OpenAI-compatible Chat Completions (`POST {base}/chat/completions`, streaming).
 
-use super::{generate_id, part_channel, post_sse, session_headers};
+use super::{generate_id, part_channel, post_json, post_sse, session_headers, without_stream};
 use crate::model::*;
 use futures_util::future::BoxFuture;
 use serde_json::{json, Map, Value};
@@ -306,6 +306,32 @@ impl LanguageModel for OpenAICompatModel {
 
     fn provider(&self) -> &str {
         "openai-compatible"
+    }
+
+    fn generate(&self, request: ModelRequest) -> BoxFuture<'static, Result<GenerateResponse, ApiError>> {
+        let url = join_url(&self.base_url, "chat/completions");
+        let body = without_stream(build_body(&self.model_id, &request));
+        let mut headers = vec![("authorization".to_string(), format!("Bearer {}", self.api_key))];
+        headers.extend(session_headers(self.session_id.as_deref()));
+        Box::pin(async move {
+            let response = post_json(&url, &headers, &body, request.cancel.clone(), request.timeout).await?;
+            if let Some(error) = response.get("error").filter(|e| !e.is_null()) {
+                return Err(ApiError::new(error.get("message").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| crate::jsutil::stringify(error))));
+            }
+            let choice = response.get("choices").and_then(Value::as_array).and_then(|c| c.first()).cloned().unwrap_or(json!({}));
+            let message = choice.get("message").cloned().unwrap_or(json!({}));
+            let mut text = String::new();
+            let mut reasoning = message.get("reasoning_content").and_then(Value::as_str).or_else(|| message.get("reasoning").and_then(Value::as_str)).unwrap_or("").to_string();
+            for (is_reasoning, chunk) in content_items(message.get("content")) {
+                if is_reasoning {
+                    reasoning.push_str(&chunk);
+                } else {
+                    text.push_str(&chunk);
+                }
+            }
+            let finish_reason = choice.get("finish_reason").and_then(Value::as_str).map(map_finish_reason).unwrap_or(FinishReason::Unknown);
+            Ok(GenerateResponse { text, reasoning, finish_reason, usage: convert_usage(response.get("usage")) })
+        })
     }
 
     fn stream(&self, request: ModelRequest) -> BoxFuture<'static, Result<PartStream, ApiError>> {

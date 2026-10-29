@@ -1,6 +1,6 @@
 //! Anthropic Messages API (`POST {base}/messages`, streaming).
 
-use super::{part_channel, post_sse, session_headers};
+use super::{part_channel, post_json, post_sse, session_headers, without_stream};
 use crate::model::*;
 use futures_util::future::BoxFuture;
 use serde_json::{json, Map, Value};
@@ -188,6 +188,45 @@ impl LanguageModel for AnthropicModel {
 
     fn provider(&self) -> &str {
         "anthropic"
+    }
+
+    fn generate(&self, request: ModelRequest) -> BoxFuture<'static, Result<GenerateResponse, ApiError>> {
+        let url = join_url(&self.base_url, "messages");
+        let body = without_stream(build_body(&self.model_id, &request));
+        let mut headers = vec![
+            ("anthropic-version".to_string(), "2023-06-01".to_string()),
+            ("x-api-key".to_string(), self.api_key.clone()),
+            ("authorization".to_string(), format!("Bearer {}", self.api_key)),
+        ];
+        headers.extend(session_headers(self.session_id.as_deref()));
+        Box::pin(async move {
+            let response = post_json(&url, &headers, &body, request.cancel.clone(), request.timeout).await?;
+            if response.get("type").and_then(Value::as_str) == Some("error") {
+                let message = response.get("error").and_then(|e| e.get("message")).and_then(Value::as_str).unwrap_or("Anthropic API error").to_string();
+                return Err(ApiError::new(message));
+            }
+            let mut text = String::new();
+            let mut reasoning = String::new();
+            for block in response.get("content").and_then(Value::as_array).cloned().unwrap_or_default() {
+                match part_type(&block) {
+                    "text" => text.push_str(block.get("text").and_then(Value::as_str).unwrap_or("")),
+                    "thinking" => reasoning.push_str(block.get("thinking").and_then(Value::as_str).unwrap_or("")),
+                    _ => {}
+                }
+            }
+            let u = response.get("usage").cloned().unwrap_or(json!({}));
+            let cache_read = u.get("cache_read_input_tokens").and_then(Value::as_u64).unwrap_or(0);
+            let cache_write = u.get("cache_creation_input_tokens").and_then(Value::as_u64).unwrap_or(0);
+            let usage = Usage {
+                input_tokens: u.get("input_tokens").and_then(Value::as_u64).map(|i| i + cache_read + cache_write),
+                output_tokens: u.get("output_tokens").and_then(Value::as_u64),
+                cache_read_tokens: Some(cache_read),
+                cache_write_tokens: Some(cache_write),
+                reasoning_tokens: None,
+            };
+            let finish_reason = response.get("stop_reason").and_then(Value::as_str).map(map_stop_reason).unwrap_or(FinishReason::Unknown);
+            Ok(GenerateResponse { text, reasoning, finish_reason, usage })
+        })
     }
 
     fn stream(&self, request: ModelRequest) -> BoxFuture<'static, Result<PartStream, ApiError>> {
