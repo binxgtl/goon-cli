@@ -4,5 +4,13 @@ release-out/
 *.tgz
 !release/*.tgz
 .env
+.env.*
+!.env.example
 .goon/
 .refs/
+*.log
+*.tsbuildinfo
+.DS_Store
+.idea/
+.vscode/
+.claude/worktrees/
