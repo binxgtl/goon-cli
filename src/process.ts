@@ -9,7 +9,7 @@ export interface CommandResult { code: number; output: string; truncated: boolea
  * child process (bash tool, `!cmd`, ripgrep, git) so a command (or a prompt-injected model asking
  * for `env` / `curl ...$GOON_API_KEY`) can never read or exfiltrate the key.
  */
-const secretEnvNames = new Set<string>(['GOON_API_KEY']);
+const secretEnvNames = new Set<string>(['GOON_API_KEY', 'GOON_EMBEDDER_API_KEY']);
 export function protectSecretEnv(...names: Array<string | undefined>): void {
   for (const name of names) if (name) secretEnvNames.add(name);
 }
@@ -18,8 +18,11 @@ export function childEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessE
   for (const name of secretEnvNames) delete env[name];
   return env;
 }
-const OUTPUT_LIMIT = 64 * 1024;
-const HARD_OUTPUT_LIMIT = 4 * 1024 * 1024;
+/** Shared process limits. ExecutionPolicy.limits is the single source of truth (v0.5, P12). */
+export const DEFAULT_OUTPUT_LIMIT_BYTES = 64 * 1024;
+export const DEFAULT_HARD_OUTPUT_LIMIT_BYTES = 4 * 1024 * 1024;
+export const DEFAULT_COMMAND_TIMEOUT_MS = 120_000;
+export const MAX_COMMAND_TIMEOUT_MS = 600_000;
 
 export function resolveExecutable(command: string): string {
   if (command !== 'bash' || process.platform !== 'win32') return command;
@@ -37,8 +40,15 @@ export function resolveExecutable(command: string): string {
 
 export async function runCommand(command: string, args: string[], options: {
   cwd: string; signal: AbortSignal; timeoutMs: number; env?: NodeJS.ProcessEnv;
+  /** Head+tail capture budget. Defaults to DEFAULT_OUTPUT_LIMIT_BYTES. */
+  outputLimitBytes?: number;
+  /** Kill the process group above this total byte count. Defaults to DEFAULT_HARD_OUTPUT_LIMIT_BYTES. */
+  hardOutputBytes?: number;
 }): Promise<CommandResult> {
   options.signal.throwIfAborted();
+  const outputLimit = Math.max(1024, Math.floor(options.outputLimitBytes ?? DEFAULT_OUTPUT_LIMIT_BYTES));
+  const hardOutputLimit = Math.max(outputLimit, Math.floor(options.hardOutputBytes ?? DEFAULT_HARD_OUTPUT_LIMIT_BYTES));
+  const halfLimit = Math.floor(outputLimit / 2);
   const resolvedCommand = resolveExecutable(command);
   return new Promise((resolve, reject) => {
     const child = spawn(resolvedCommand, args, {
@@ -77,10 +87,10 @@ export async function runCommand(command: string, args: string[], options: {
     if (options.signal.aborted) abort();
     const capture = (chunk: Buffer) => {
       bytes += chunk.length;
-      const remaining = OUTPUT_LIMIT / 2 - first.length;
+      const remaining = halfLimit - first.length;
       if (remaining > 0) first = Buffer.concat([first, chunk.subarray(0, remaining)]);
-      tail = Buffer.concat([tail, chunk]).subarray(-OUTPUT_LIMIT / 2);
-      if (bytes > HARD_OUTPUT_LIMIT) stop(new Error('Command exceeded the 4 MiB output limit.'));
+      tail = Buffer.concat([tail, chunk]).subarray(-halfLimit);
+      if (bytes > hardOutputLimit) stop(new Error(`Command exceeded the ${Math.round(hardOutputLimit / 1024)} KiB output limit.`));
     };
     child.stdout.on('data', capture);
     child.stderr.on('data', capture);
@@ -94,10 +104,10 @@ export async function runCommand(command: string, args: string[], options: {
       cleanup();
       if (terminalError) { reject(terminalError); return; }
       // Avoid duplicating the middle bytes when output fits in the budget.
-      const output = bytes <= OUTPUT_LIMIT / 2 ? first.toString('utf8') :
-        bytes <= OUTPUT_LIMIT ? Buffer.concat([first, tail.subarray(tail.length - (bytes - first.length))]).toString('utf8') :
+      const output = bytes <= halfLimit ? first.toString('utf8') :
+        bytes <= outputLimit ? Buffer.concat([first, tail.subarray(tail.length - (bytes - first.length))]).toString('utf8') :
           `${first.toString('utf8')}\n...[output truncated]...\n${tail.toString('utf8')}`;
-      resolve({ code: code ?? 1, output, truncated: bytes > OUTPUT_LIMIT });
+      resolve({ code: code ?? 1, output, truncated: bytes > outputLimit });
     });
   });
 }

@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, resolve, relative, isAbsolute, join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import type { FileBackup } from './session.js';
+import { validateSyntax } from './syntax.js';
 
 const MAX_FILE_BYTES = 2 * 1024 * 1024;
 export const WINDOWS_RESERVED_DEVICE_RE = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i;
@@ -66,6 +67,49 @@ export const limitText = (text: string, limit = 32_000): string => {
   const omitted = text.length - headLen - tailLen;
   return `${text.slice(0, headLen)}\n...[truncated ${omitted} chars; narrow the request]...\n${text.slice(text.length - tailLen)}`;
 };
+
+/** Largest prefix/suffix whose UTF-8 encoding fits in `maxBytes` (never splits a surrogate pair). */
+function sliceByBytes(text: string, maxBytes: number, fromEnd: boolean): string {
+  if (maxBytes <= 0) return '';
+  if (Buffer.byteLength(text, 'utf8') <= maxBytes) return text;
+  let low = 0, high = text.length;
+  while (low < high) {
+    const mid = Math.ceil((low + high) / 2);
+    const part = fromEnd ? text.slice(text.length - mid) : text.slice(0, mid);
+    if (Buffer.byteLength(part, 'utf8') <= maxBytes) low = mid;
+    else high = mid - 1;
+  }
+  if (!fromEnd) {
+    if (low > 0 && low < text.length && /[\uD800-\uDBFF]/.test(text[low - 1]) && /[\uDC00-\uDFFF]/.test(text[low])) low--;
+    return text.slice(0, low);
+  }
+  let start = text.length - low;
+  if (start > 0 && start < text.length && /[\uDC00-\uDFFF]/.test(text[start]) && /[\uD800-\uDBFF]/.test(text[start - 1])) start++;
+  return text.slice(start);
+}
+
+/**
+ * Byte-bounded head/tail truncation (v0.5, P12). Used for MCP output where the limit is expressed
+ * in bytes; the marker is ASCII and the result never exceeds `maxBytes`.
+ */
+export function limitTextBytes(text: string, maxBytes = 64 * 1024): string {
+  const total = Buffer.byteLength(text, 'utf8');
+  if (total <= maxBytes) return text;
+  const budget = Math.max(0, maxBytes - 128);
+  let head = sliceByBytes(text, Math.floor(budget * 0.65), false);
+  let tail = sliceByBytes(text, budget - Math.floor(budget * 0.65), true);
+  const omitted = total - Buffer.byteLength(head, 'utf8') - Buffer.byteLength(tail, 'utf8');
+  const marker = `\n...[truncated ${omitted} bytes; narrow the request]...\n`;
+  // Defensive: if the marker pushed us over the limit (tiny maxBytes), shrink tail, then head.
+  // Each pass removes a whole code point, so the loop always terminates.
+  const size = () => Buffer.byteLength(head, 'utf8') + Buffer.byteLength(marker, 'utf8') + Buffer.byteLength(tail, 'utf8');
+  while (size() > maxBytes && (tail.length > 0 || head.length > 0)) {
+    if (tail.length > 0) tail = tail.slice(Array.from(tail)[0]!.length);
+    else head = head.slice(0, head.length - Array.from(head).pop()!.length);
+  }
+  const result = `${head}${marker}${tail}`;
+  return Buffer.byteLength(result, 'utf8') <= maxBytes ? result : marker.trim().slice(0, Math.max(0, maxBytes));
+}
 
 export function computeUnifiedDiff(path: string, before: string, after: string, contextLines = 3): string {
   const splitLines = (text: string): string[] => {
@@ -252,14 +296,20 @@ export function parsePatchText(rawPatch: string): PatchOperation[] {
   return ops;
 }
 
-function seekSubsequence(haystack: string[], needle: string[], startIdx: number): number {
-  if (needle.length === 0) return startIdx;
+/**
+ * Finds the single occurrence of `needle` at or after `startIdx`, trying exact, right-trimmed
+ * and fully trimmed comparisons in that order. More than one match in the chosen pass is
+ * ambiguous: silently picking the first one can corrupt a file, so the caller must add context.
+ */
+export function findHunkIndex(haystack: string[], needle: string[], startIdx: number, path: string): number {
+  if (needle.length === 0) return startIdx; // insertion-only hunk: apply at the cursor
   const passes: Array<(a: string, b: string) => boolean> = [
     (a, b) => a === b,
     (a, b) => a.trimEnd() === b.trimEnd(),
     (a, b) => a.trim() === b.trim(),
   ];
   for (const eq of passes) {
+    const hits: number[] = [];
     for (let i = startIdx; i <= haystack.length - needle.length; i++) {
       let ok = true;
       for (let j = 0; j < needle.length; j++) {
@@ -268,8 +318,12 @@ function seekSubsequence(haystack: string[], needle: string[], startIdx: number)
           break;
         }
       }
-      if (ok) return i;
+      if (ok) hits.push(i);
     }
+    if (hits.length > 1) {
+      throw new Error(`Patch hunk is ambiguous in ${path} (matched ${hits.length} times); add more surrounding context.`);
+    }
+    if (hits.length === 1) return hits[0];
   }
   return -1;
 }
@@ -279,7 +333,7 @@ export function applyHunksToContent(current: string, hunks: PatchHunk[], path: s
   const lines = current.replace(/\r\n/g, '\n').split('\n');
   let cursor = 0;
   for (const hunk of hunks) {
-    const idx = seekSubsequence(lines, hunk.oldLines, cursor);
+    const idx = findHunkIndex(lines, hunk.oldLines, cursor, path);
     if (idx === -1) {
       throw new Error(`Failed to match patch hunk in ${path} near: "${hunk.oldLines[0] ?? ''}"`);
     }
@@ -303,8 +357,29 @@ export class WorkspaceFiles {
   beginTurn() {
     this.activeBackups.clear();
   }
+  /** Backups collected so far without consuming them (rollback keeps them for the checkpoint). */
+  peekTurnBackups(): FileBackup[] {
+    return [...this.activeBackups.values()];
+  }
+  /** Workspace-relative posix paths the agent touched (write/edit/apply_patch) this turn. */
+  turnChangedFiles(): string[] {
+    return [...this.activeBackups.keys()];
+  }
+  hasTurnChanges(): boolean {
+    return this.activeBackups.size > 0;
+  }
+  clearTurnBackups(): void {
+    this.activeBackups.clear();
+  }
+  replaceTurnBackups(backups: FileBackup[]): void {
+    this.activeBackups.clear();
+    for (const b of backups) {
+      const key = b.path.replace(/\\/g, '/');
+      this.activeBackups.set(key, { ...b, path: key });
+    }
+  }
   takeTurnBackups(): FileBackup[] {
-    const list = [...this.activeBackups.values()];
+    const list = this.peekTurnBackups();
     this.activeBackups.clear();
     return list;
   }
@@ -314,12 +389,22 @@ export class WorkspaceFiles {
       const existing = this.activeBackups.get(key);
       if (!existing) {
         this.activeBackups.set(key, { ...b, path: key });
-      } else {
-        existing.afterHash = b.afterHash;
+        continue;
       }
+      // `existing` is the earliest pre-turn state and stays authoritative. Only the follow-on
+      // state (what the file looks like now) is merged, so a child deletion is not lost.
+      existing.afterHash = b.afterHash;
+      if (b.afterDeleted) {
+        existing.afterDeleted = true;
+        delete existing.afterHash;
+      } else {
+        delete existing.afterDeleted;
+      }
+      if (existing.content === undefined && b.content !== undefined) existing.content = b.content;
+      if (existing.mode === undefined && b.mode !== undefined) existing.mode = b.mode;
     }
   }
-  private recordBackup(relPath: string, existed: boolean, content?: string, mode?: number, afterContent?: string) {
+  private recordBackup(relPath: string, existed: boolean, content?: string, mode?: number, afterContent?: string, afterDeleted = false) {
     const key = relPath.replace(/\\/g, '/');
     let entry = this.activeBackups.get(key);
     if (!entry) {
@@ -331,7 +416,13 @@ export class WorkspaceFiles {
       };
       this.activeBackups.set(key, entry);
     }
-    entry.afterHash = afterContent !== undefined ? this.digest(afterContent) : undefined;
+    if (afterDeleted) {
+      entry.afterDeleted = true;
+      delete entry.afterHash;
+    } else {
+      entry.afterHash = afterContent !== undefined ? this.digest(afterContent) : undefined;
+      delete entry.afterDeleted;
+    }
   }
   async path(requested: string): Promise<string> {
     const lexical = resolve(this.root, requested);
@@ -469,24 +560,27 @@ export class WorkspaceFiles {
     }
     const slots = new Map<string, Slot>();
     const order: Slot[] = [];
-    const slotFor = async (requested: string, forWrite: boolean): Promise<Slot> => {
-      const file = await this.path(requested);
-      if (forWrite) this.assertNotWindowsReserved(file);
-      let slot = slots.get(file);
-      if (!slot) {
-        slot = { file, relPath: relative(this.root, file), existed: false, mode: 0o644 };
-        try {
-          slot.before = await this.text(file);
-          slot.mode = (await stat(this.statTarget(file))).mode & 0o777;
-          slot.existed = true;
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-        }
-        slots.set(file, slot);
-        order.push(slot);
-      }
-      return slot;
-    };
+	    const slotFor = async (requested: string, forWrite: boolean, checkRevision = true): Promise<Slot> => {
+	      const file = await this.path(requested);
+	      if (forWrite) this.assertNotWindowsReserved(file);
+	      let slot = slots.get(file);
+	      if (!slot) {
+	        slot = { file, relPath: relative(this.root, file), existed: false, mode: 0o644 };
+	        try {
+	          slot.before = await this.text(file);
+	          slot.mode = (await stat(this.statTarget(file))).mode & 0o777;
+	          slot.existed = true;
+	          if (checkRevision && this.revisions.get(file) !== this.digest(slot.before!)) {
+	            throw new Error('Read the current file before patching; it is unread or has changed.');
+	          }
+	        } catch (error) {
+	          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+	        }
+	        slots.set(file, slot);
+	        order.push(slot);
+	      }
+	      return slot;
+	    };
     const currentOf = (slot: Slot): string | undefined =>
       slot.after === undefined ? slot.before : slot.after ?? undefined;
 
@@ -506,9 +600,9 @@ export class WorkspaceFiles {
         const current = currentOf(slot);
         if (current === undefined) throw new Error(`Cannot update ${op.path}: file does not exist.`);
         const next = applyHunksToContent(current, op.hunks, op.path);
-        if (op.moveTo) {
-          const destination = await slotFor(op.moveTo, true);
-          if (destination !== slot) {
+	        if (op.moveTo) {
+	          const destination = await slotFor(op.moveTo, true, false);
+	          if (destination !== slot) {
             if (currentOf(destination) !== undefined) throw new Error(`Cannot move ${op.path} to ${op.moveTo}: destination exists.`);
             destination.mode = slot.mode;
             destination.after = next;
@@ -522,17 +616,28 @@ export class WorkspaceFiles {
       }
     }
 
-    for (const slot of order) {
-      if (slot.after === undefined) continue;
-      if (slot.after === null && !slot.existed) continue; // created and removed within this patch
-      this.recordBackup(slot.relPath, slot.existed, slot.before, slot.existed ? slot.mode : undefined, slot.after ?? undefined);
-      if (slot.after === null) {
-        await unlinkSafe(slot.file);
-        this.revisions.delete(slot.file);
-      } else {
-        await this.writeRaw(slot.file, slot.after, slot.mode, slot.existed);
-      }
-    }
+	    // Validate syntax/AST of every resulting file before touching disk, so a broken patch
+	    // changes nothing (the whole patch is atomic from the caller's point of view).
+	    for (const slot of order) {
+	      if (typeof slot.after === 'string') {
+	        try {
+	          validateSyntax(slot.relPath, slot.after);
+	        } catch (error) {
+	          throw new Error(`Syntax validation failed for ${slot.relPath}: ${(error as Error).message}`);
+	        }
+	      }
+	    }
+	    for (const slot of order) {
+	      if (slot.after === undefined) continue;
+	      if (slot.after === null && !slot.existed) continue; // created and removed within this patch
+	      this.recordBackup(slot.relPath, slot.existed, slot.before, slot.existed ? slot.mode : undefined, slot.after ?? undefined, slot.after === null);
+	      if (slot.after === null) {
+	        await unlinkSafe(slot.file);
+	        this.revisions.delete(slot.file);
+	      } else {
+	        await this.writeRaw(slot.file, slot.after, slot.mode, slot.existed);
+	      }
+	    }
     return summary.join('\n');
   }
   private statTarget(file: string): string {
@@ -553,34 +658,56 @@ export class WorkspaceFiles {
     const deleted: string[] = [];
     const conflicts: string[] = [];
     const pruned: string[] = [];
-    for (const b of backups) {
-      const file = await this.path(b.path);
-      if (!options.force) {
-        let current: string | undefined;
-        let readable = true;
-        try { current = await this.text(file); }
-        catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') readable = false;
-        }
-        // Without an afterHash (deletions, legacy backups) there is nothing to compare against.
-        const conflict = b.afterHash !== undefined
-          && (!readable || (current !== undefined && this.digest(current) !== b.afterHash));
-        if (conflict) {
-          conflicts.push(b.path);
-          continue;
-        }
-      }
-      if (!b.existed) {
-        await unlinkSafe(file).catch(() => {});
-        this.revisions.delete(file);
-        deleted.push(b.path);
-      } else if (b.content !== undefined) {
-        await this.writeRaw(file, b.content, b.mode ?? 0o644, true);
-        restored.push(b.path);
-      } else if (b.pruned) {
-        pruned.push(b.path);
-      }
-    }
+	    for (const b of backups) {
+	      const file = await this.path(b.path);
+	      if (b.afterDeleted) {
+	        let exists = true;
+	        try { await this.text(file); }
+	        catch (error) {
+	          if ((error as NodeJS.ErrnoException).code === 'ENOENT') exists = false;
+	        }
+	        if (!options.force && exists) {
+	          conflicts.push(b.path);
+	          continue;
+	        }
+	        if (!b.existed) {
+	          await unlinkSafe(file).catch(() => {});
+	          this.revisions.delete(file);
+	          deleted.push(b.path);
+	        } else if (b.content !== undefined) {
+	          await this.writeRaw(file, b.content, b.mode ?? 0o644, true);
+	          restored.push(b.path);
+	        } else if (b.pruned) {
+	          pruned.push(b.path);
+	        }
+	        continue;
+	      }
+	      if (!options.force) {
+	        let current2: string | undefined;
+	        let readable2 = true;
+	        try { current2 = await this.text(file); }
+	        catch (error) {
+	          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') readable2 = false;
+	        }
+	        // Without an afterHash (deletions, legacy backups) there is nothing to compare against.
+	        const conflict = b.afterHash !== undefined
+	          && (!readable2 || (current2 !== undefined && this.digest(current2) !== b.afterHash));
+	        if (conflict) {
+	          conflicts.push(b.path);
+	          continue;
+	        }
+	      }
+	      if (!b.existed) {
+	        await unlinkSafe(file).catch(() => {});
+	        this.revisions.delete(file);
+	        deleted.push(b.path);
+	      } else if (b.content !== undefined) {
+	        await this.writeRaw(file, b.content, b.mode ?? 0o644, true);
+	        restored.push(b.path);
+	      } else if (b.pruned) {
+	        pruned.push(b.path);
+	      }
+	    }
     return { restored, deleted, conflicts, pruned };
   }
   async listWorkspaceFiles(maxFiles = 500): Promise<string[]> {

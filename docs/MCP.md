@@ -20,6 +20,8 @@ and pipes are not expanded. Stdio starts in the selected workspace.
       "args": ["/absolute/path/to/server.mjs"],
       "envFrom": { "SERVICE_API_KEY": "MY_SERVICE_KEY" },
       "readOnlyTools": [],
+      "net": false,
+      "allowNet": false,
       "timeoutMs": 30000,
       "disabled": true
     },
@@ -28,6 +30,8 @@ and pipes are not expanded. Stdio starts in the selected workspace.
       "url": "https://YOUR_MCP_HOST/mcp",
       "bearerEnv": "MY_MCP_TOKEN",
       "readOnlyTools": [],
+      "net": false,
+      "allowNet": false,
       "timeoutMs": 30000,
       "disabled": true
     }
@@ -58,14 +62,28 @@ loaded when at least one server is enabled.
 
 All tools require approval unless their **original** names appear in that
 server's `readOnlyTools`. Inspect a server and its actual behavior before adding
-entries. Server-provided readOnlyHint annotations do not grant this exemption.
-Read-only mode exposes only built-in read tools, research delegation and MCP
-allowlisted tools. This is tool policy, not an OS sandbox: MCP processes run as
-this user, and starting a server can itself perform I/O. Remote tools execute on
-the remote service. Goon cannot enforce remote filesystem containment.
+entries. Server-provided annotations are untrusted metadata and may only
+escalate: `destructiveHint`/`openWorldHint` raise a tool to high risk, and
+`readOnlyHint` still leaves it at the medium floor. `trust: true` auto-approves
+only medium/low-risk calls; it never lowers risk and never makes a tool
+read-only. Only the user-controlled `readOnlyTools` list lowers a tool to low and
+exposes it in `--read-only`. Read-only mode exposes only built-in read tools,
+research delegation and MCP allowlisted tools. This is tool policy, not an OS
+sandbox: MCP processes run as this user, and starting a server can itself perform
+I/O. Remote tools execute on the remote service. Goon cannot enforce remote
+filesystem containment.
+
+Network policy (v0.5): a tool is marked `net` when the server sets `net: true`
+or the tool declares `openWorldHint: true`. Such tools are denied by the
+execution policy before approval unless network access is permitted globally
+(`--allow-net` / `allowNet: true`) or for that server (`allowNet: true`). HTTP
+transport alone does not mark every tool as network. A server allowlist in
+`--allow-net-hosts` does not exempt MCP tools because their destination hosts are
+not knowable from metadata.
 
 JSON Schema arguments are validated locally before dispatch. Results are bounded
-at 32k characters; non-text blocks are represented by markers. A tool result with
+to 32 KiB (UTF-8 bytes, head+tail) via the execution policy; non-text blocks are
+represented by markers. A tool result with
 isError becomes an error result for the model. External tool descriptions and
 output remain external data, not permission to change the user's task.
 

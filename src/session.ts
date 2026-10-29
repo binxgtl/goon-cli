@@ -11,6 +11,8 @@ export const fileBackupSchema = z.object({
   content: z.string().optional(),
   mode: z.number().int().optional(),
   afterHash: z.string().optional(),
+  /** Set when the agent deleted the file; restore keeps it absent or restores the original. */
+  afterDeleted: z.boolean().optional(),
   /** Content dropped to keep the session file bounded (see pruneCheckpointBackups). */
   pruned: z.boolean().optional(),
 });
@@ -22,6 +24,8 @@ export const turnCheckpointSchema = z.object({
   prompt: z.string(),
   messageIndex: z.number().int().nonnegative(),
   tokensBefore: z.number().nonnegative(),
+  /** Cost in USD before the turn began, for rollback accounting. */
+  costUsdBefore: z.number().nonnegative().optional(),
   files: z.array(fileBackupSchema),
 });
 export type TurnCheckpoint = z.infer<typeof turnCheckpointSchema>;
@@ -212,6 +216,8 @@ const sessionSchema = z.object({
   checkpoints: z.array(turnCheckpointSchema).optional(),
   todos: z.array(todoItemSchema).optional(),
   goal: sessionGoalSchema.optional(),
+  costUsd: z.number().nonnegative().optional(),
+  rejectedSignatures: z.record(z.string(), z.number().int().nonnegative()).optional(),
 });
 export type Session = z.infer<typeof sessionSchema>;
 export type SessionSummary = Pick<Session, 'id' | 'cwd' | 'updatedAt' | 'model' | 'title'> & {
@@ -308,6 +314,19 @@ export function sameWorkspace(a: string, b: string): boolean {
   return process.platform === 'win32' ? na.toLowerCase() === nb.toLowerCase() : na === nb;
 }
 
+/**
+ * Deletes the append-only event log, its sequence sidecar (`.seq`) and any in-flight temporary
+ * sidecar written by a concurrent append. A missing directory (older data layouts) is fine.
+ */
+async function removeEventLogArtifacts(root: string, id: string): Promise<void> {
+  let names: string[];
+  try { names = await readdir(root); } catch { return; }
+  const prefix = `${id}.events.jsonl`;
+  await Promise.all(names
+    .filter(name => name === prefix || name.startsWith(`${prefix}.`))
+    .map(name => unlink(join(root, name)).catch(() => {})));
+}
+
 export class SessionStore {
   private closed = false;
   private constructor(readonly root: string, readonly session: Session, private readonly lock: string) {}
@@ -375,7 +394,7 @@ export class SessionStore {
       // structural typing permits extra fields such as credentials at runtime.
       const route = { cwd: input.cwd, provider: input.provider, model: input.model, baseUrl: input.baseUrl };
       const session: Session = resume ? parseSession(await readFile(join(root, `${id}.json`), 'utf8')) : {
-        version: 1, id, ...route, createdAt: now, updatedAt: now, messages: [], tokens: 0, compactions: 0,
+        version: 1, id, ...route, createdAt: now, updatedAt: now, messages: [], tokens: 0, compactions: 0, costUsd: 0, rejectedSignatures: {},
       };
       if (session.id !== id || !sameWorkspace(await realpath(session.cwd), input.cwd)) throw new Error('Session belongs to a different workspace.');
       const store = new SessionStore(root, session, lock);
@@ -459,6 +478,7 @@ export class SessionStore {
     } catch {
       // ignore
     }
+    await removeEventLogArtifacts(root, match.id);
     return match.id;
   }
   async forkToNewFile(title?: string): Promise<string> {

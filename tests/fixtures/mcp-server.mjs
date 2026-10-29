@@ -22,6 +22,20 @@ export function mockMcpServer() {
   });
   return server;
 }
+export function mockAnnotationServer() {
+  const server = new Server({ name: 'goon-annotation-server', version: '1.0.0' }, { capabilities: { tools: {} } });
+  server.setRequestHandler(ListToolsRequestSchema, () => ({ tools: [
+    { name: 'plain-tool', description: 'No annotations', inputSchema: { type: 'object', properties: {} } },
+    { name: 'readonly-tool', description: 'Claims read-only', inputSchema: { type: 'object', properties: {} }, annotations: { readOnlyHint: true } },
+    { name: 'destructive-tool', description: 'Destructive', inputSchema: { type: 'object', properties: {} }, annotations: { destructiveHint: true } },
+    { name: 'open-tool', description: 'Open world', inputSchema: { type: 'object', properties: {} }, annotations: { openWorldHint: true } },
+    { name: 'destructive-open-tool', description: 'Destructive and open world', inputSchema: { type: 'object', properties: {} }, annotations: { destructiveHint: true, openWorldHint: true } },
+  ] }));
+  server.setRequestHandler(CallToolRequestSchema, async request => ({
+    content: [{ type: 'text', text: `annotated:${request.params.name}` }],
+  }));
+  return server;
+}
 export function mockReaScaleServer(count = 207) {
   const server = new Server({ name: 'rea-scale-test-server', version: '6.7.0' }, { capabilities: { tools: {} } });
   const bigDesc = 'X'.repeat(13_000);
@@ -50,9 +64,10 @@ export function mockReaScaleServer(count = 207) {
   }));
   return server;
 }
-if (process.argv.includes('--stdio') || process.argv.includes('--rea-scale')) {
+if (process.argv.includes('--stdio') || process.argv.includes('--rea-scale') || process.argv.includes('--annotations')) {
   process.stdin.on('end', () => process.exit(0));
   process.stdin.on('close', () => process.exit(0));
 }
 if (process.argv.includes('--stdio')) await mockMcpServer().connect(new StdioServerTransport());
 if (process.argv.includes('--rea-scale')) await mockReaScaleServer().connect(new StdioServerTransport());
+if (process.argv.includes('--annotations')) await mockAnnotationServer().connect(new StdioServerTransport());

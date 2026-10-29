@@ -1,0 +1,4 @@
+{"v":1,"turns":[
+{"match":"read the file","toolCalls":[{"id":"call-read-1","name":"read_file","input":{"path":"notes.txt"}}],"usage":{"inputTokens":50,"outputTokens":5,"totalTokens":55}},
+{"text":["Read complete."],"usage":{"inputTokens":60,"outputTokens":4,"totalTokens":64}}
+]}

@@ -514,7 +514,7 @@ test('welcomeBanner is a short unboxed block that wraps cleanly with NFD Vietnam
 test('Windows nul device bug prevention: sanitizeBashCommand, WorkspaceFiles rejection, and unlinkSafe', async () => {
   const { sanitizeBashCommand, WorkspaceFiles, WINDOWS_RESERVED_DEVICE_RE, toWinExtendedPath } =
     await import('../dist/index.js');
-  const { mkdtemp, rm } = await import('node:fs/promises');
+  const { mkdtemp, rm, realpath } = await import('node:fs/promises');
   const { tmpdir } = await import('node:os');
   const { join } = await import('node:path');
 
@@ -531,7 +531,7 @@ test('Windows nul device bug prevention: sanitizeBashCommand, WorkspaceFiles rej
     assert.match(toWinExtendedPath('D:\\testcli\\nul'), /^\\\\\?\\D:\\testcli\\nul$/i);
   }
 
-  const dir = await mkdtemp(join(tmpdir(), 'goon-nul-test-'));
+  const dir = await realpath(await mkdtemp(join(tmpdir(), 'goon-nul-test-')));
   try {
     const files = new WorkspaceFiles(dir);
     await assert.rejects(() => files.write('nul', 'bad'), /Windows reserved device name/);
@@ -746,10 +746,10 @@ test('redesign: formatTokenCount and readGitBranch agree with independent oracle
   assert.equal(formatTokenCount(48_210), '48k');
   assert.equal(formatTokenCount(2_500_000), '2.5M');
 
-  const { mkdtemp, mkdir, writeFile, rm } = await import('node:fs/promises');
+  const { mkdtemp, mkdir, writeFile, rm, realpath } = await import('node:fs/promises');
   const { tmpdir } = await import('node:os');
   const { join } = await import('node:path');
-  const root = await mkdtemp(join(tmpdir(), 'goon-branch-'));
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'goon-branch-')));
   t.after(() => rm(root, { recursive: true, force: true }));
   // Normal repo, nested cwd.
   await mkdir(join(root, 'repo', '.git'), { recursive: true });
@@ -1114,4 +1114,17 @@ test('Codex /goal system: formatting, draft parsing, get_goal/create_goal/update
   }
   assert.equal(cliStep, 4, 'CLI should run Turn 1 (2 model calls) + automatic Continuation Turn 2 (2 model calls)');
   assert.equal(sawContinuationXml, true, 'Continuation turn must include Codex goal continuation XML');
+});
+
+test('TUI renders verify events with fail glyph and skip is silent', async t => {
+  const tty = terminal(t);
+  tty.ui.event({ type: 'verify_start', files: ['src/a.ts', 'src/b.ts'], commands: ['npm test'] });
+  tty.ui.event({ type: 'verify_result', status: 'fail', stage: 'test', reason: '1 failing test', errors: [], warnings: [], durationMs: 5 });
+  tty.ui.event({ type: 'verify_rollback', reason: 'Verification failed (attempt 2/2)', restored: ['src/a.ts'], deleted: ['src/new.ts'], conflicts: [] });
+  tty.ui.event({ type: 'verify_result', status: 'skip', reason: 'approval denied', errors: [], warnings: [], durationMs: 0 });
+  await new Promise(resolve => setTimeout(resolve, 40));
+  assert.ok(tty.written.includes('Verify 2 file(s) · npm test'), 'verify_start row missing');
+  assert.ok(tty.written.includes('Verify fail: 1 failing test'), 'verify_result row missing');
+  assert.ok(tty.written.includes('Verify rollback'), 'verify_rollback row missing');
+  assert.ok(!tty.written.includes('approval denied'), 'skip must not render a row');
 });

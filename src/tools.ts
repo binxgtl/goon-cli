@@ -1,28 +1,46 @@
 import { join, relative } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { tool, jsonSchema, type FlexibleSchema, type ToolSet } from 'ai';
 import { Ajv } from 'ajv';
 import { z } from 'zod';
 import { WorkspaceFiles, limitText, unlinkSafe } from './files.js';
-import { runCommand } from './process.js';
+import { DEFAULT_COMMAND_TIMEOUT_MS, MAX_COMMAND_TIMEOUT_MS, runCommand } from './process.js';
+import { isNetworkAllowedForCommand, networkDeniedMessage, type ExecutionPolicy } from './policy.js';
 import { todoItemSchema, type SessionGoal, type TodoItem } from './session.js';
+import type { RiskClass } from './risk.js';
+import { classifyBashRisk } from './risk.js';
+import type { CostLedger } from './cost.js';
 
 export function sanitizeBashCommand(command: string, platform = process.platform): string {
   if (platform !== 'win32') return command;
   return command.replace(/((?:^|[\s;&|()])(?:\d+|&)?>>?\s*)(?:nul|\/dev\/nul)(?=$|[\s;&|()><])/gi, '$1/dev/null');
 }
 
-export { bashApprovalPrefix, isApprovedBashPrefix } from './approval.js';
+export { bashApprovalPrefix, isApprovedBashPrefix, bashApprovalExact, isApprovedBashExact } from './approval.js';
 
-export interface Approval { tool: string; input: unknown; signal: AbortSignal }
+export interface Approval { tool: string; input: unknown; signal: AbortSignal; risk?: RiskClass; trusted?: boolean }
 export type Approve = (request: Approval) => Promise<boolean>;
 export interface ToolCall { toolCallId: string; toolName: string; input: unknown }
 export interface ToolDefinition<Input = unknown> {
   description: string; schema: z.ZodType<Input>; readOnly: boolean;
+  risk?: RiskClass; net?: boolean; trusted?: boolean;
   execute: (input: Input, signal: AbortSignal) => Promise<string>;
 }
-export interface RunBudget { spent: number; limit: number }
+export interface RunBudget { spent: number; limit: number; costSpent?: number; costLimit?: number; startedAt?: number; timeLimitMs?: number; ledger?: unknown }
 export class PermissionDeniedError extends Error {}
+
+/**
+ * Whether `name` is admitted by an explicit tool allowlist: exact names plus trailing-`*`
+ * wildcards (`mcp__*` admits every MCP tool). Used by child registries so a delegated or
+ * DAG agent can only see (and call) the tools its caller pinned for it.
+ */
+export function toolAllowedBySet(allowed: ReadonlySet<string>, name: string): boolean {
+  if (allowed.has(name)) return true;
+  for (const entry of allowed) {
+    if (entry.endsWith('*') && name.startsWith(entry.slice(0, -1))) return true;
+  }
+  return false;
+}
 const PEER_TOOLS = new Set(['peer_list', 'peer_send', 'peer_broadcast', 'peer_read']);
 const COLLAB_TOOLS = new Set([
   'spawn_agent', 'wait_agent', 'send_input', 'close_agent', 'resume_agent', 'list_agents',
@@ -32,6 +50,7 @@ const COLLAB_TOOLS = new Set([
 ]);
 interface RegisteredTool {
   description: string; schema: FlexibleSchema<unknown>; readOnly: boolean;
+  risk?: RiskClass; net?: boolean; trusted?: boolean;
   parse: (input: unknown) => unknown;
   execute: (input: unknown, signal: AbortSignal) => Promise<string>;
 }
@@ -350,9 +369,37 @@ export function normalizeToolInput(toolName: string, input: unknown): unknown {
   return obj;
 }
 
+/** Durable rejection bookkeeping owned by the caller (CLI session, tests). */
+export interface RejectionGuard {
+  recordDenied(signature: string): number | Promise<number>;
+  reset(signature: string): void | Promise<void>;
+}
+
+function stableStringify(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? String(value);
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
+  const entries = Object.entries(value as Record<string, unknown>)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([key, v]) => `${JSON.stringify(key)}:${stableStringify(v)}`);
+  return `{${entries.join(',')}}`;
+}
+
+/** Stable identity of a tool call, used to stop repeated identical denials. */
+/**
+ * Stable identity of a tool call for the rejection-loop guard. It is persisted in the session file,
+ * so the input is hashed: a denied command line may carry credentials (`curl -H 'Authorization: …'`).
+ */
+export function toolApprovalSignature(tool: string, input: unknown): string {
+  return `${tool}:${createHash('sha256').update(stableStringify(input)).digest('hex').slice(0, 32)}`;
+}
+
 export class ToolRegistry {
   readonly files: WorkspaceFiles;
   budget?: RunBudget;
+  costLedger?: CostLedger;
+  rejectionGuard?: RejectionGuard;
+  /** Execution policy (network + process limits) shared by parent, child and workflow registries. */
+  policy?: ExecutionPolicy;
   planMode = false;
   allowPeerToolsInReadOnly = false;
   onlyPeerTools = false;
@@ -364,7 +411,7 @@ export class ToolRegistry {
   askUser?: (questions: UserInputQuestion[], signal: AbortSignal) => Promise<Record<string, string[]>>;
   pendingImages: Array<{ path: string; mimeType: string; bytes: Uint8Array }> = [];
   private definitions = new Map<string, RegisteredTool>();
-  constructor(readonly cwd: string, readonly approve: Approve, public readOnly = false) {
+  constructor(readonly cwd: string, readonly approve: Approve, public readOnly = false, public allowedTools?: ReadonlySet<string>) {
     this.files = new WorkspaceFiles(cwd);
     this.register('read_file', {
       description: 'Read a workspace text file with line numbers. Read an existing file before editing or overwriting it.',
@@ -614,17 +661,26 @@ export class ToolRegistry {
       readOnly: false, execute: input => this.files.edit(input.path, input.oldText, input.newText, input.replaceAll),
     });
     this.register('apply_patch', {
-      description: 'Apply a multi-hunk or multi-file patch ("*** Begin Patch" ... "*** Update File: <path>" / "*** Add File: <path>" / "*** Delete File: <path>" ... "*** End Patch").',
+      description: 'Apply a multi-hunk or multi-file patch ("*** Begin Patch" ... "*** Update File: <path>" / "*** Add File: <path>" / "*** Delete File: <path>" ... "*** End Patch"). Existing files must be read before patching; every hunk must match exactly once.',
       schema: z.object({ patch: z.string().min(1) }), readOnly: false,
       execute: input => this.files.applyPatch(input.patch),
     });
     this.register('bash', {
       description: 'Execute a POSIX bash command in the workspace (Git Bash on Windows, NOT cmd.exe). Always use POSIX syntax and /dev/null (never >nul or 2>nul). Output is bounded; do not start persistent background servers.',
-      schema: z.object({ command: z.string().min(1), timeoutMs: z.number().int().min(1000).max(600_000).default(120_000) }),
+      schema: z.object({ command: z.string().min(1), timeoutMs: z.number().int().min(1000).max(MAX_COMMAND_TIMEOUT_MS).optional() }),
       readOnly: false, execute: async (input, signal) => {
         const safeCmd = sanitizeBashCommand(input.command);
         try {
-          const result = await runCommand('bash', ['-c', safeCmd], { cwd, signal, timeoutMs: input.timeoutMs });
+          const limits = this.policy?.limits;
+          const requestedTimeout = input.timeoutMs ?? limits?.defaultToolTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS;
+          const timeoutMs = Math.max(1000, Math.min(requestedTimeout, limits?.maxToolTimeoutMs ?? MAX_COMMAND_TIMEOUT_MS));
+          const result = await runCommand('bash', ['-c', safeCmd], {
+            cwd,
+            signal,
+            timeoutMs,
+            outputLimitBytes: limits?.maxOutputBytes,
+            hardOutputBytes: limits?.hardOutputBytes,
+          });
           return `Exit code: ${result.code}\n${result.output}`;
         } finally {
           if (process.platform === 'win32') {
@@ -677,8 +733,15 @@ export class ToolRegistry {
   resolveToolName(name: string): string {
     return normalizeToolName(name, n => this.definitions.has(n));
   }
+  /** Names of tools currently offered to the model (same rule `schemas()` uses). */
+  exposedToolNames(): string[] {
+    return [...this.definitions].filter(([name, d]) => this.isExposed(name, d)).map(([name]) => name);
+  }
   /** Whether a tool is offered to the model in the current mode. execute() enforces the same rule. */
   private isExposed(name: string, d: RegisteredTool): boolean {
+    // A pinned allowlist (child registries, DAG roles) hides everything else first: schemas()
+    // omits the tool and execute() rejects the call even when the model names it directly.
+    if (this.allowedTools && !toolAllowedBySet(this.allowedTools, name)) return false;
     if (this.onlyPeerTools) return PEER_TOOLS.has(name);
     if (name === 'exit_plan_mode' && !this.planMode) return false;
     if ((name === 'get_goal' || name === 'create_goal' || name === 'update_goal') && (!this.getGoal || this.planMode)) return false;
@@ -708,7 +771,19 @@ export class ToolRegistry {
     }
     return this.definitions.get(canonical)?.readOnly === true;
   }
-  async execute(call: ToolCall, signal: AbortSignal): Promise<{ text: string; denied?: boolean }> {
+  /** Risk class used by execute() and callers that render approval prompts. */
+  riskOf(name: string, input?: unknown): RiskClass {
+    const canonical = this.resolveToolName(name);
+    if (canonical === 'bash' && input && typeof input === 'object' && 'command' in input) {
+      const command = (input as { command?: unknown }).command;
+      if (typeof command === 'string') return classifyBashRisk(command);
+    }
+    const definition = this.definitions.get(canonical);
+    if (definition?.risk) return definition.risk;
+    return definition?.readOnly ? 'low' : 'medium';
+  }
+
+  async execute(call: ToolCall, signal: AbortSignal): Promise<{ text: string; denied?: boolean; loop?: boolean }> {
     signal.throwIfAborted();
     const canonicalName = this.resolveToolName(call.toolName);
     const definition = this.definitions.get(canonicalName);
@@ -720,15 +795,62 @@ export class ToolRegistry {
     }
     const normalizedInput = normalizeToolInput(canonicalName, call.input);
     const input = definition.parse(normalizedInput);
-    if (!definition.readOnly && !await this.approve({ tool: canonicalName, input, signal })) {
-      return { text: 'Permission denied by the user. Stop this run.', denied: true };
+    const risk = this.riskOf(canonicalName, input);
+    const callKey = toolApprovalSignature(canonicalName, normalizedInput);
+    const deny = async (message: string) => {
+      const count = await this.rejectionGuard?.recordDenied(callKey);
+      const loop = typeof count === 'number' && count >= 3;
+      const text = loop ? message + ' Repeated denials for identical arguments; stop this run.' : message;
+      return { text, denied: true, ...(loop ? { loop: true } : {}) };
+    };
+    // Critical operations are denied before any approval callback, including auto mode.
+    if (risk === 'critical') {
+      return deny(`Permission denied: ${canonicalName} is critical risk and cannot run. Stop this run.`);
     }
+    // Network default-deny (v0.5, P12): the policy gate runs before approval, so a denied network
+    // operation never reaches the approval prompt and cannot be remembered by "always allow".
+    if (this.policy) {
+      if (canonicalName === 'bash') {
+        const inputCommand = input && typeof input === 'object' ? (input as { command?: unknown }).command : undefined;
+        if (typeof inputCommand === 'string' && !isNetworkAllowedForCommand(this.policy, inputCommand)) {
+          return deny(networkDeniedMessage(inputCommand));
+        }
+      } else if (definition.net === true && this.policy.network.mode !== 'allow') {
+        // MCP tools whose server-level allowNet/global --allow-net did not exempt them.
+        return deny(
+          'Permission denied: this MCP tool is marked as network/open-world and network access is '
+          + 'not permitted. Use --allow-net or set allowNet on the MCP server.',
+        );
+      }
+    }
+    // Trusted MCP tools may run medium/low-risk calls without a prompt; nothing else auto-approves.
+    const trustedAuto = definition.trusted === true && (risk === 'medium' || risk === 'low');
+    const needsApproval = !definition.readOnly || risk !== 'low';
+    if (needsApproval && !trustedAuto) {
+      const approved = await this.approve({
+        tool: canonicalName,
+        input,
+        signal,
+        risk,
+        trusted: definition.trusted === true,
+      });
+      if (!approved) return deny('Permission denied by the user. Stop this run.');
+    }
+    // A later approval/execution of the same call clears an earlier rejection streak.
+    await this.rejectionGuard?.reset(callKey);
     signal.throwIfAborted();
     try { return { text: await definition.execute(input, signal) }; }
     catch (error) {
-      if (error instanceof PermissionDeniedError) return { text: error.message, denied: true };
+      if (error instanceof PermissionDeniedError) return deny(error.message);
       throw error;
     }
+  }
+
+  /** Runs `fn` with `budget` as the active run budget, restoring the previous value afterwards. */
+  async withBudget<T>(budget: RunBudget, fn: () => Promise<T>): Promise<T> {
+    const previous = this.budget;
+    this.budget = budget;
+    try { return await fn(); } finally { this.budget = previous; }
   }
 }
 

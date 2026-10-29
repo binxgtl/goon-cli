@@ -45,7 +45,18 @@ try:
     wait_for('Created by TUI.')
     time.sleep(0.1)
     os.write(master, b'/exit\r')
-    child.wait(timeout=5)
+    # Keep draining the pty while the child exits: a full pty buffer (small on macOS) would
+    # otherwise block the child's final writes and turn a clean exit into a timeout.
+    deadline = time.monotonic() + 15
+    while child.poll() is None and time.monotonic() < deadline:
+        ready, _, _ = select.select([master], [], [], 0.1)
+        if ready:
+            try:
+                output.extend(os.read(master, 65536))
+            except OSError as error:
+                if error.errno != errno.EIO:
+                    raise
+    child.wait(timeout=1)
     while select.select([master], [], [], 0)[0]:
         try:
             data = os.read(master, 65536)

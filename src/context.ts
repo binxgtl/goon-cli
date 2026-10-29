@@ -7,6 +7,7 @@ import type { SessionGoal, SessionStore } from './session.js';
 import { limitText, type WorkspaceFiles } from './files.js';
 import { auxiliaryEffortHeaders, buildProviderOptions, resolveModelCapabilities } from './provider.js';
 import { visibleAnswer } from './reasoning.js';
+import { toUsageSplit, type UsageSplit } from './cost.js';
 
 export interface SkillInfo {
   name: string;
@@ -274,8 +275,10 @@ export async function expandFileMentions(
   /**
    * `allowOutsideWorkspace: false` is used for prompts the model wrote (subagent tasks): those may
    * only attach workspace images. Prompts typed by the user may attach images from anywhere.
+   * `maxChars` bounds the total characters of `<referenced_file>` blocks (default 32_000);
+   * the harness passes a share of the context budget (P18).
    */
-  options?: { model?: string; supportsVision?: boolean; allowOutsideWorkspace?: boolean },
+  options?: { model?: string; supportsVision?: boolean; allowOutsideWorkspace?: boolean; maxChars?: number },
 ): Promise<{ expandedPrompt: string; text: string; attachedPaths: string[]; mentioned: string[]; imageParts: ImagePart[] }> {
   const skillExpanded = await expandSkillMentions(prompt, files.root);
   const candidates = extractCandidatePaths(prompt);
@@ -296,6 +299,7 @@ export async function expandFileMentions(
   const blocks: string[] = [];
   const imageParts: ImagePart[] = [];
   let workingPrompt = skillExpanded.text;
+  let blockChars = 0;
 
   for (const item of candidates) {
     const rawPath = item.path;
@@ -326,7 +330,14 @@ export async function expandFileMentions(
     try {
       const content = await files.read(rawPath, 1, 250);
       attachedPaths.push(rawPath);
-      blocks.push(`<referenced_file path="${rawPath}">\n${limitText(content, 12_000)}\n</referenced_file>`);
+      const remaining = Math.max(0, (options?.maxChars ?? 32_000) - blockChars);
+      if (remaining <= 64) {
+        blocks.push(`[referenced file @${rawPath} omitted: the attached-file context budget is used up; use read_file if needed]`);
+        continue;
+      }
+      const body = limitText(content, Math.min(12_000, remaining));
+      blockChars += body.length;
+      blocks.push(`<referenced_file path="${rawPath}">\n${body}\n</referenced_file>`);
     } catch {
       // Ignore @tokens that are not valid workspace files
     }
@@ -619,11 +630,13 @@ function cleanSummaryText(raw: string, inlineReasoning: RuntimeConfig['inlineRea
   return visible.replace(/<analysis>[\s\S]*?<\/analysis>\s*/gi, '').trim();
 }
 
-export async function compactIfNeeded(store: SessionStore, config: RuntimeConfig, model: LanguageModel,
-  system: string, signal: AbortSignal, measuredInput = 0): Promise<number> {
+export async function compactIfNeededDetailed(store: SessionStore, config: RuntimeConfig, model: LanguageModel,
+  system: string, signal: AbortSignal, measuredInput = 0): Promise<{ tokens: number; usage: UsageSplit }> {
   const messages = store.session.messages;
   const threshold = config.contextWindow * 0.7 - config.maxOutputTokens;
-  if (Math.max(estimatedTokens(messages, system), measuredInput) < threshold) return 0;
+  if (Math.max(estimatedTokens(messages, system), measuredInput) < threshold) {
+    return { tokens: 0, usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 } };
+  }
   let cut = Math.max(2, messages.length - 4);
   // Preserve recent work while cutting only before an assistant/user boundary.
   // A single long turn still needs compaction, not just many short user turns.
@@ -651,10 +664,11 @@ export async function compactIfNeeded(store: SessionStore, config: RuntimeConfig
   await atomicJson(join(store.root, `${store.session.id}.compact-${store.session.compactions + 1}.json`), store.session, { compact: true });
   store.session.messages = next;
   store.session.compactions++;
-  const tokens = summary.usage.totalTokens ?? 0;
+  const usage = toUsageSplit(summary.usage, 0, 0);
+  const tokens = usage.totalTokens;
   store.session.tokens += tokens;
   await store.save();
-  return tokens;
+  return { tokens, usage };
 }
 
 export async function compactNow(
@@ -663,7 +677,7 @@ export async function compactNow(
   model: LanguageModel,
   signal: AbortSignal,
   focus?: string,
-): Promise<{ tokens: number; compactions: number }> {
+): Promise<{ tokens: number; compactions: number; usage: UsageSplit }> {
   const messages = store.session.messages;
   if (messages.length < 2) throw new Error('Not enough conversation history to compact yet.');
   let cut = Math.max(1, messages.length - 2);
@@ -696,10 +710,11 @@ export async function compactNow(
   await atomicJson(join(store.root, `${store.session.id}.compact-${store.session.compactions + 1}.json`), store.session, { compact: true });
   store.session.messages = next;
   store.session.compactions++;
-  const tokens = summary.usage.totalTokens ?? 0;
+  const usage = toUsageSplit(summary.usage, 0, 0);
+  const tokens = usage.totalTokens;
   store.session.tokens += tokens;
   await store.save();
-  return { tokens, compactions: store.session.compactions };
+  return { tokens, compactions: store.session.compactions, usage };
 }
 
 export async function recapSession(
@@ -707,10 +722,10 @@ export async function recapSession(
   config: RuntimeConfig,
   model: LanguageModel,
   signal: AbortSignal,
-): Promise<{ text: string; tokens: number }> {
+): Promise<{ text: string; tokens: number; usage: UsageSplit }> {
   const messages = store.session.messages;
   if (!messages.length) {
-    return { text: 'No conversation history in this session yet.', tokens: 0 };
+    return { text: 'No conversation history in this session yet.', tokens: 0, usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 } };
   }
   const compactProviderOptions = buildProviderOptions({
     provider: config.provider,
@@ -728,8 +743,16 @@ export async function recapSession(
   });
   signal.throwIfAborted();
   const text = cleanSummaryText(summary.text, config.inlineReasoning) || summary.text.trim();
-  const tokens = summary.usage.totalTokens ?? 0;
-  return { text, tokens };
+  const usage = toUsageSplit(summary.usage, 0, 0);
+  const tokens = usage.totalTokens;
+  return { text, tokens, usage };
+}
+
+/** Backward-compatible wrapper: callers that only need token counts keep the number return. */
+export async function compactIfNeeded(store: SessionStore, config: RuntimeConfig, model: LanguageModel,
+  system: string, signal: AbortSignal, measuredInput = 0): Promise<number> {
+  const result = await compactIfNeededDetailed(store, config, model, system, signal, measuredInput);
+  return result.tokens;
 }
 
 

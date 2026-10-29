@@ -4,8 +4,38 @@ import { SessionStore, repairInterrupted, type SessionGoal, type TodoItem, type 
 import { ToolRegistry, normalizeToolInput, normalizeToolName, type ToolCall, type RunBudget } from './tools.js';
 import { auxiliaryEffortHeaders, buildProviderOptions, createModel, resolveModelCapabilities } from './provider.js';
 import { safeError } from './errors.js';
-import { buildGoalBudgetLimitPrompt, compactIfNeeded, compactNow, estimatedTokens, expandFileMentions, recapSession, systemPrompt, type SystemPromptCache } from './context.js';
+import { buildGoalBudgetLimitPrompt, compactIfNeededDetailed, compactNow, estimatedTokens, expandFileMentions, recapSession, systemPrompt, type SystemPromptCache } from './context.js';
+import { allocateContextBudget, prepareContextBudget, renderMemoryContext } from './context-budget.js';
+import type { MemoryEvent, MemoryPromptContext, MemoryStore } from './memory.js';
+import type { CandidateEvent, DagEvent, ScopeEvent } from './coord.js';
+import type { WorkflowEvent } from './workflow.js';
+import { CostLedger, createRunBudget, toUsageSplit, type RawUsage, type UsageSplit } from './cost.js';
 import { AnswerProjection, visibleAnswer, withReasoningReplay, type AnswerPart } from './reasoning.js';
+import {
+  VerificationFailedError,
+  createVerifyRunner,
+  formatVerifyErrors,
+  formatVerifyWarnings,
+  planVerification,
+  assessVerifyPlan,
+  redactText,
+  redactVerdict,
+  runVerification,
+  type VerifyConfig,
+  type VerifyIssue,
+  type VerifyPolicy,
+  type VerifyRunner,
+  type VerifySeverity,
+  type VerifyStage,
+  type VerifyVerdict,
+} from './verify.js';
+
+/** Injection seams for verification and memory. Children (subagent/workflow/network) pass `verify: { enabled: false }` and never receive `memory`. */
+export interface HarnessDeps {
+  verify?: { enabled?: boolean; runner?: VerifyRunner; policy?: VerifyPolicy };
+  /** Memory store (v0.6, P19). Opened by the CLI when `memoryEnabled`; optional everywhere else. */
+  memory?: MemoryStore;
+}
 
 export interface ToolEventMeta {
   kind: 'read' | 'list' | 'search' | 'exec' | 'edit' | 'other';
@@ -24,13 +54,36 @@ export type HarnessEvent =
   | { type: 'reasoning'; text: string; source: 'inline' | 'provider' }
   | { type: 'tool_stream'; name: string; id: string; state: 'start' | 'delta'; preview: string }
   | { type: 'tool'; name: string; id: string; state: 'start' | 'done' | 'error'; meta?: ToolEventMeta }
-  | { type: 'usage'; input: number; output: number; total: number }
+  | { type: 'usage'; input: number; output: number; total: number; cacheRead?: number; cacheWrite?: number; costUsd?: number }
   | { type: 'compaction'; count: number }
   | { type: 'todo'; todos: TodoItem[] }
   | { type: 'goal'; goal?: SessionGoal }
   | { type: 'plan_exit'; plan: string }
   | { type: 'retry'; attempt: number; maxRetries: number; message: string }
-  | { type: 'stopped'; reason: string };
+  | { type: 'verify_start'; files: string[]; commands?: string[] }
+  | {
+    type: 'verify_result';
+    status: VerifySeverity;
+    stage?: VerifyStage;
+    reason: string;
+    errors: VerifyIssue[];
+    warnings: VerifyIssue[];
+    durationMs: number;
+  }
+  | { type: 'verify_rollback'; reason: string; restored: string[]; deleted: string[]; conflicts: string[] }
+  | { type: 'stopped'; reason: string }
+  // v0.6 (P19): memory lifecycle events. Unknown types are ignored by old consumers.
+  | { type: 'memory_indexed'; files: number; chunks: number; durationMs: number }
+  | { type: 'memory_retrieved'; chunks: number; tokens: number }
+  | { type: 'memory_error'; message: string }
+  // v0.6 (P18): context budget allocation for the request about to be sent.
+  | { type: 'context_budget'; inputBudget: number; system: number; conversation: number; files: number; truncated: boolean; reason?: string }
+  // v0.6 (P20/P21): multi-agent DAG lifecycle (emitted by `runDag`/`/dag`, never by children).
+  | DagEvent
+  // v0.7 (P22-P24): dynamic workflow classification, scope loop and multi-candidate cost degrade.
+  | WorkflowEvent
+  | ScopeEvent
+  | CandidateEvent;
 
 export const MAX_API_RETRIES = 3;
 /** Consecutive read-only tool calls from one model step that may run concurrently. */
@@ -261,15 +314,26 @@ export class Harness {
   private running = false;
   private pendingContext: ModelMessage[] = [];
   private readonly model: LanguageModel;
+  readonly costLedger: CostLedger;
   private lastCallSig = '';
   private repeatCount = 0;
   private consecutiveGoalExecFailureTurns = 0;
   private turnHadSuccessfulTool = false;
   private turnHadFailedExec = false;
   private flushGoalProgressHook?: (allowStopped?: boolean) => void;
+  private verifyAttempts = 0;
+  private turnHadEdit = false;
+  private lastVerifyVerdict?: VerifyVerdict;
+  private verifyRolledBack = false;
+  /** P19: the repo index is ensured once per harness (session), never per model step. */
+  private repoIndexedOnce = false;
   constructor(readonly config: RuntimeConfig, readonly store: SessionStore, readonly tools: ToolRegistry,
-    readonly emit: (event: HarnessEvent) => void = () => {}, model?: LanguageModel) {
+    readonly emit: (event: HarnessEvent) => void = () => {}, model?: LanguageModel, readonly deps: HarnessDeps = {}) {
     this.model = model ?? createModel(config, this.store.session.id);
+    const ownLedger = CostLedger.fromConfig(config, config.model);
+    this.costLedger = this.tools.costLedger ?? ownLedger;
+    this.tools.costLedger = this.costLedger;
+    if (this.store.session.costUsd === undefined) this.store.session.costUsd = 0;
     if (this.store.session.todos?.length) {
       this.tools.todos = [...this.store.session.todos];
     }
@@ -303,6 +367,33 @@ export class Harness {
   }
 
   /**
+   * Accounts one provider request against the shared ledger/session. The budget mirror is updated
+   * from the ledger total (never from this session's cost), so a child harness cannot clobber the
+   * parent's shared run budget. Callers that own a run pass the same budget to every request.
+   */
+  accountUsage(
+    usage: RawUsage | undefined,
+    model: string = this.config.model,
+    budget?: RunBudget,
+    fallback: { input?: number; output?: number } = {},
+  ): UsageSplit {
+    const split = toUsageSplit(usage, fallback.input ?? 0, fallback.output ?? 0);
+    const cost = this.costLedger.account(budget, split, model);
+    const session = this.store.session;
+    session.costUsd = (session.costUsd ?? 0) + cost;
+    this.emit({
+      type: 'usage',
+      input: split.inputTokens,
+      output: split.outputTokens,
+      total: split.totalTokens,
+      ...(split.cachedInputTokens ? { cacheRead: split.cachedInputTokens } : {}),
+      ...(split.cacheWriteTokens ? { cacheWrite: split.cacheWriteTokens } : {}),
+      ...(cost > 0 ? { costUsd: cost } : {}),
+    });
+    return split;
+  }
+
+  /**
    * Adds a user-role context message (shell output from `!cmd`, goal updates, notices). While a run
    * is active the message waits for the next safe point — after the current tool results and
    * before the next model request — because inserting it between an assistant tool call and its
@@ -319,25 +410,25 @@ export class Harness {
     return true;
   }
 
-  async compact(signal: AbortSignal, focus?: string): Promise<{ tokens: number; compactions: number }> {
+  async compact(signal: AbortSignal, focus?: string): Promise<{ tokens: number; compactions: number; usage: UsageSplit }> {
     if (this.running) throw new Error('Cannot compact while a run is active.');
     this.running = true;
     try {
       const res = await compactNow(this.store, this.config, this.model, signal, focus);
       this.emit({ type: 'compaction', count: res.compactions });
-      if (res.tokens > 0) this.emit({ type: 'usage', input: 0, output: 0, total: res.tokens });
+      if (res.tokens > 0) this.accountUsage(res.usage, this.config.model);
       return res;
     } finally {
       this.running = false;
       if (this.drainPendingContext()) await this.store.save().catch(() => {});
     }
   }
-  async recap(signal: AbortSignal): Promise<{ text: string; tokens: number }> {
+  async recap(signal: AbortSignal): Promise<{ text: string; tokens: number; usage: UsageSplit }> {
     const res = await recapSession(this.store, this.config, this.model, signal);
-    if (res.tokens > 0) this.emit({ type: 'usage', input: 0, output: 0, total: res.tokens });
+    if (res.tokens > 0) this.accountUsage(res.usage, this.config.model);
     return res;
   }
-  async askSideQuestion(question: string, signal: AbortSignal): Promise<{ text: string; tokens: number }> {
+  async askSideQuestion(question: string, signal: AbortSignal): Promise<{ text: string; tokens: number; usage: UsageSplit }> {
     const clonedHistory: ModelMessage[] = structuredClone(this.store.session.messages);
     repairInterrupted(clonedHistory);
     const { expandedPrompt } = await expandFileMentions(question, this.tools.files, { model: this.config.model });
@@ -368,8 +459,10 @@ export class Harness {
     }
     const usage = await result.usage;
     const text = visibleAnswer(raw, this.config.inlineReasoning).trim() || raw.trim();
-    const tokens = usage.totalTokens ?? 0;
-    return { text, tokens };
+    const split = toUsageSplit(usage, 0, 0);
+    const tokens = split.totalTokens;
+    this.accountUsage(usage, this.config.model);
+    return { text, tokens, usage: split };
   }
   async revert(options?: { steps?: number; scope?: 'both' | 'code' | 'messages'; force?: boolean }): Promise<RevertResult> {
     if (this.running) throw new Error('Cannot revert while a run is active.');
@@ -435,25 +528,144 @@ export class Harness {
       unrecoverableFiles: [...prunedSet],
     };
   }
+  /**
+   * P19 memory seam: fire-and-forget event delivery. `MemoryStore.handleEvent` redacts, serializes
+   * writes and never rejects; a rejection still only surfaces as a `memory_error` event, never a
+   * failed run. The event must already be emitted to the UI before this is called.
+   */
+  private memoryEvent(event: MemoryEvent): void {
+    const memory = this.deps.memory;
+    if (!memory) return;
+    void memory.handleEvent(event).catch(() => {
+      this.emit({ type: 'memory_error', message: 'memory store rejected an event.' });
+    });
+  }
+
+  /** Assistant final message: redacted and truncated before it reaches memory. */
+  private rememberAssistantMessage(text: string): void {
+    if (!this.deps.memory || !text.trim()) return;
+    const clean = redactText(text, [this.config.apiKey]).trim();
+    if (clean) this.memoryEvent({ type: 'assistant_message', text: clean.slice(0, 2000) });
+  }
+
+  /** Retrieved memory context for this model step, bounded by the files budget. */
+  private async retrieveMemory(query: string, budgetTokens: number): Promise<MemoryPromptContext | undefined> {
+    const memory = this.deps.memory;
+    if (!memory) return undefined;
+    try {
+      const context = await memory.retrieve(query, budgetTokens);
+      const rendered = renderMemoryContext(context);
+      this.emit({ type: 'memory_retrieved', chunks: context.rag.length, tokens: rendered ? Math.ceil(rendered.length / 2) : 0 });
+      return context;
+    } catch (error) {
+      this.emit({ type: 'memory_error', message: safeError(error, this.config.apiKey) });
+      return undefined;
+    }
+  }
+
+  /** Ensures the lexical repo index exists once per session (only when `ragEnabled`). */
+  private async ensureRepoIndexOnce(): Promise<void> {
+    const memory = this.deps.memory;
+    if (!memory || !this.config.ragEnabled || this.repoIndexedOnce) return;
+    this.repoIndexedOnce = true;
+    try {
+      const indexed = await memory.ensureRepoIndexed(this.config.cwd);
+      this.emit({ type: 'memory_indexed', files: indexed.files, chunks: indexed.chunks, durationMs: indexed.durationMs });
+    } catch (error) {
+      this.emit({ type: 'memory_error', message: safeError(error, this.config.apiKey) });
+    }
+  }
+
+  /**
+   * P19 "patch reindex": after a run with tracked edits, refresh the lexical index (mtime/size
+   * partial re-index, deduped in-flight) so the next retrieval sees the new content. Fire-and-forget.
+   * Uses the live turn backups, not `turnHadEdit` (which the verify hook clears per batch).
+   */
+  private schedulePatchReindex(): void {
+    const memory = this.deps.memory;
+    if (!memory || !this.config.ragEnabled || !this.tools.files.hasTurnChanges()) return;
+    void memory.ensureRepoIndexed(this.config.cwd)
+      .then(indexed => {
+        if (indexed.reindexed !== 'none') {
+          this.emit({ type: 'memory_indexed', files: indexed.files, chunks: indexed.chunks, durationMs: indexed.durationMs });
+        }
+      })
+      .catch(error => this.emit({ type: 'memory_error', message: safeError(error, this.config.apiKey) }));
+  }
+
+  /** patch_applied event: per-file byte delta, never file contents. */
+  private async rememberPatchApplied(call: ToolCall): Promise<void> {
+    const memory = this.deps.memory;
+    if (!memory) return;
+    const canonical = normalizeToolName(call.toolName);
+    const norm = normalizeToolInput(canonical, call.input);
+    const rec = norm && typeof norm === 'object' ? (norm as Record<string, unknown>) : {};
+    const paths = canonical === 'apply_patch'
+      ? (typeof rec.patch === 'string'
+        ? [...rec.patch.matchAll(/^\*\*\* (?:Update|Add|Delete) File:\s*(.+)$/gm)].map(m => m[1].trim())
+        : [])
+      : typeof rec.path === 'string' ? [rec.path] : [];
+    if (!paths.length) return;
+    const backups = new Map(this.tools.files.peekTurnBackups().map(backup => [backup.path, backup] as const));
+    for (const rawPath of paths) {
+      const key = rawPath.replace(/\\/g, '/');
+      const before = backups.get(key)?.content;
+      let bytes = 0;
+      try {
+        const after = await this.tools.files.text(await this.tools.files.path(rawPath));
+        bytes = Buffer.byteLength(after) - (before !== undefined ? Buffer.byteLength(before) : 0);
+      } catch {
+        bytes = backups.get(key)?.afterDeleted && before !== undefined ? -Buffer.byteLength(before) : 0;
+      }
+      this.memoryEvent({ type: 'patch_applied', path: key, bytes });
+    }
+  }
+
   async run(prompt: string, signal: AbortSignal, sharedBudget?: RunBudget): Promise<string> {
     if (this.running) throw new Error('This harness already has an active run.');
     this.running = true;
     this.lastCallSig = '';
     this.repeatCount = 0;
     let text = '', spent = 0, measuredInput = 0;
-    const budget = sharedBudget ?? { spent: 0, limit: this.config.runTokenBudget };
-    this.tools.budget = budget;
-    const account = (tokens: number) => { spent += tokens; budget.spent += tokens; };
-    const exhausted = () => (this.config.runTokenBudget > 0 && spent >= this.config.runTokenBudget) || (budget.limit > 0 && budget.spent >= budget.limit);
+    let runError: unknown;
     const session = this.store.session;
+    const budget = sharedBudget ?? createRunBudget(this.config);
+    this.tools.budget = budget;
+    // A shared budget mirrors the shared ledger. Never seed it from a child session's own counter:
+    // a freshly opened child starts at 0 and would clobber the parent's mirror.
+    if (budget.costSpent === undefined) {
+      budget.costSpent = budget.ledger instanceof CostLedger ? budget.ledger.total : session.costUsd ?? 0;
+    }
+    this.costLedger.registerRun(budget, Date.now());
+    const account = (tokens: number) => { spent += tokens; budget.spent += tokens; };
+    const budgetExceededReason = (): string | undefined => {
+      if (this.config.runTokenBudget > 0 && spent >= this.config.runTokenBudget) return 'Run token budget reached. Resume with a new prompt or increase --run-token-budget.';
+      if (budget.limit > 0 && budget.spent >= budget.limit) return 'Run token budget reached. Resume with a new prompt or increase --run-token-budget.';
+      const cap = this.costLedger.hardCapExceeded(budget);
+      if (cap.exceeded) return cap.reason;
+      return undefined;
+    };
+    // The run deadline shortens each provider/tool wait; a stale tool timeout cannot outlive it.
+    const runAbortSignal = (): AbortSignal => {
+      const limit = budget.timeLimitMs ?? 0;
+      const remaining = limit > 0 && budget.startedAt
+        ? Math.max(1, budget.startedAt + limit - Date.now())
+        : this.config.timeoutMs;
+      return AbortSignal.any([signal, AbortSignal.timeout(Math.min(this.config.timeoutMs, remaining))]);
+    };
     const messageIndexBeforeTurn = session.messages.length;
     const tokensBeforeTurn = session.tokens;
+    const costUsdBeforeTurn = session.costUsd ?? 0;
     const turnStartedAt = new Date().toISOString();
     let lastGoalAccountMs = Date.now();
     let lastGoalAccountTokens = session.tokens;
     let budgetLimitSteered = false;
     this.turnHadSuccessfulTool = false;
     this.turnHadFailedExec = false;
+    this.verifyAttempts = 0;
+    this.turnHadEdit = false;
+    this.lastVerifyVerdict = undefined;
+    this.verifyRolledBack = false;
     const flushGoalTurnProgress = (allowStopped = false) => {
       const goal = session.goal;
       if (!goal || this.tools.planMode) return;
@@ -477,9 +689,15 @@ export class Harness {
     try {
       signal.throwIfAborted();
       this.drainPendingContext();
+      // P19: index the repo once per session (opt-in via ragEnabled), then record the task.
+      await this.ensureRepoIndexOnce();
+      this.memoryEvent({ type: 'task_started', task: prompt });
+      // P18: bound the total referenced-file expansion by a share of the context budget.
+      const preBudget = allocateContextBudget(this.config, '');
       const { expandedPrompt, imageParts } = await expandFileMentions(prompt, this.tools.files, {
         model: this.config.model,
         allowOutsideWorkspace: !this.untrustedPrompts,
+        maxChars: preBudget.files * 3,
       });
       if (imageParts.length > 0) {
         session.messages.push({
@@ -496,12 +714,30 @@ export class Harness {
         signal.throwIfAborted();
         // Safe point: the previous step's tool results are recorded, the next request not yet sent.
         if (this.drainPendingContext()) await this.store.save();
-        if (exhausted()) throw new Error('Run token budget reached. Resume with a new prompt or increase --run-token-budget.');
+        const capReason = budgetExceededReason();
+        if (capReason) throw new Error(capReason);
         const system = await systemPrompt(this.config, this.tools.readOnly, this.tools.planMode, session.goal, promptCache);
+        // P18: allocate the request budget, retrieve memory context, compact the store, then
+        // prepare a pruned clone for the request. The store never sees the RAG block.
+        const contextBudget = allocateContextBudget(this.config, system);
+        const memoryContext = await this.retrieveMemory(expandedPrompt, contextBudget.files);
         const oldCount = session.compactions;
-        account(await compactIfNeeded(this.store, this.config, this.model, system, signal, measuredInput));
+        const compacted = await compactIfNeededDetailed(this.store, this.config, this.model, system, signal, measuredInput);
+        account(compacted.tokens);
+        if (compacted.usage.totalTokens > 0) this.accountUsage(compacted.usage, this.config.model, budget);
         if (session.compactions !== oldCount) { measuredInput = 0; this.emit({ type: 'compaction', count: session.compactions }); }
-        if (exhausted()) throw new Error('Run token budget reached during compaction. Original history is archived; resume to continue.');
+        const compactCapReason = budgetExceededReason();
+        if (compactCapReason) throw new Error(`${compactCapReason} Original history is archived; resume to continue.`);
+        const prepared = prepareContextBudget({ messages: session.messages, system, config: this.config, context: memoryContext });
+        this.emit({
+          type: 'context_budget',
+          inputBudget: prepared.stats.inputBudget,
+          system: prepared.stats.systemBudget,
+          conversation: prepared.stats.conversation,
+          files: prepared.stats.files,
+          truncated: prepared.stats.truncated,
+          ...(prepared.stats.reason ? { reason: prepared.stats.reason } : {}),
+        });
         let stepText = '';
         let calls: ToolCall[] = [];
         for (let attempt = 0; ; attempt++) {
@@ -509,10 +745,10 @@ export class Harness {
           calls = [];
           try {
             const result = streamText({
-              model: this.model, system, messages: withReasoningReplay(session.messages, this.config.provider, this.config.effort), tools: this.tools.schemas(),
+              model: this.model, system: prepared.system, messages: withReasoningReplay(prepared.messages, this.config.provider, this.config.effort), tools: this.tools.schemas(),
               maxOutputTokens: this.config.maxOutputTokens, maxRetries: 0,
               ...(providerOptions ? { providerOptions } : {}),
-              abortSignal: AbortSignal.any([signal, AbortSignal.timeout(this.config.timeoutMs)]),
+              abortSignal: runAbortSignal(),
               // The SDK's default handler logs the raw upstream error. CLI owns
               // error presentation so credentials can be redacted before output.
               onError: () => {},
@@ -572,12 +808,12 @@ export class Harness {
             }
             if (calls.length > 32 || new Set(calls.map(c => c.toolCallId)).size !== calls.length) throw new Error('Invalid or excessive tool call batch. No tools executed.');
             const usage = await result.usage;
-            const input = usage.inputTokens ?? estimatedTokens(session.messages, system);
+            const input = usage.inputTokens ?? estimatedTokens(prepared.messages, prepared.system);
             const output = usage.outputTokens ?? Math.ceil(JSON.stringify(assistantMessages).length / 2);
             const tokens = usage.totalTokens ?? input + output;
             account(tokens); session.tokens += tokens; measuredInput = input;
             flushGoalTurnProgress();
-            this.emit({ type: 'usage', input, output, total: tokens });
+            this.accountUsage(usage, this.config.model, budget, { input, output });
             session.messages.push(...assistantMessages);
             text += stepText;
             await this.store.save(); // Persist tool declarations before any side effect.
@@ -604,11 +840,28 @@ export class Harness {
         }
         // A successful terminal step needs its own answer. Reasoning may be
         // opaque to the adapter, and earlier tool narration is not completion.
+        if (!calls.length) await this.enforceFinalVerification();
         if (!calls.length && !stepText.trim()) throw new Error('Model finished without a visible answer.');
-        if (!calls.length) return text;
-        const outcome = await this.executeBatch(calls, signal);
-        if (outcome.denied) { this.emit({ type: 'stopped', reason: 'Permission denied.' }); return text; }
+        if (!calls.length) {
+          this.rememberAssistantMessage(text);
+          return text;
+        }
+        const outcome = await this.executeBatch(calls, runAbortSignal());
+        if (outcome.denied) {
+          const reason = outcome.loop ? 'Repeated denials for identical arguments; stopping this run.' : 'Permission denied.';
+          this.emit({ type: 'stopped', reason });
+          await this.enforceFinalVerification();
+          this.rememberAssistantMessage(text);
+          return text;
+        }
         flushGoalTurnProgress();
+        // Verify once per batch that contained an edit, not once per following read-only batch
+        // (otherwise reads between a failure and its repair would burn repair attempts).
+        try {
+          await this.runVerificationHook(runAbortSignal());
+        } finally {
+          this.turnHadEdit = false;
+        }
         if (session.goal?.status === 'budget_limited' && !budgetLimitSteered) {
           budgetLimitSteered = true;
           session.messages.push({
@@ -634,10 +887,19 @@ export class Harness {
       repairInterrupted(session.messages);
       this.drainPendingContext();
       await this.store.save();
+      runError = error;
       throw error;
     } finally {
       this.flushGoalProgressHook = undefined;
       flushGoalTurnProgress();
+      // P19: close the memory task (success or failure) and refresh the lexical index after edits.
+      if (this.deps.memory) {
+        const outcome = runError
+          ? `error: ${safeError(runError, this.config.apiKey).slice(0, 300)}`
+          : (text.trim().slice(-400) || 'completed');
+        this.memoryEvent({ type: 'task_completed', outcome });
+      }
+      this.schedulePatchReindex();
       if (session.goal?.status === 'active' && !signal.aborted) {
         if (this.turnHadFailedExec && !this.turnHadSuccessfulTool) {
           this.consecutiveGoalExecFailureTurns++;
@@ -657,6 +919,7 @@ export class Harness {
         prompt: prompt.startsWith('<codex_internal_context source="goal">') ? (session.goal ? `[goal] ${session.goal.objective}` : '[goal continuation]') : prompt,
         messageIndex: messageIndexBeforeTurn,
         tokensBefore: tokensBeforeTurn,
+        costUsdBefore: costUsdBeforeTurn,
         files,
       };
       session.checkpoints.push(cp);
@@ -667,9 +930,137 @@ export class Harness {
     }
   }
 
-  private async executeBatch(calls: ToolCall[], signal: AbortSignal): Promise<{ denied: boolean }> {
+  /**
+   * Terminal verification guard: a model that gives up after a failed check must not leave the
+   * broken edit on disk. Roll back and reject the run (CLI maps this to exit 1, not 2).
+   */
+  private async enforceFinalVerification(): Promise<void> {
+    if (this.verifyRolledBack || this.lastVerifyVerdict?.severity !== 'fail') return;
+    const verdict = this.lastVerifyVerdict;
+    await this.rollbackTurn('Model ended the turn with unresolved verification failures.');
+    throw new VerificationFailedError(verdict);
+  }
+
+  private async runVerificationHook(signal: AbortSignal): Promise<void> {
+    // Manual/legacy RuntimeConfig objects (embedders, tests) may predate `verify`: stay disabled
+    // rather than auto-detecting commands in an environment that did not opt in.
+    const verifyConfig = this.config.verify as VerifyConfig | undefined;
+    if (!verifyConfig) return;
+    const enabled = this.deps.verify?.enabled ?? verifyConfig.enabled;
+    if (!enabled || !this.turnHadEdit || this.tools.effectiveReadOnly) return;
+    // Only workspace writes are tracked (v0.4). Bash/MCP side effects are out of scope, so a turn
+    // that produced no tracked edit is reported as a skip instead of pretending it was verified.
+    const files = this.tools.files.turnChangedFiles();
+    if (!files.length) {
+      this.emit({ type: 'verify_result', status: 'skip', reason: 'no tracked files', errors: [], warnings: [], durationMs: 0 });
+      this.memoryEvent({ type: 'verify_result', status: 'skip', issues: 0 });
+      this.lastVerifyVerdict = undefined;
+      this.verifyAttempts = 0;
+      return;
+    }
+    const policy = this.deps.verify?.policy ?? verifyConfig.policy;
+    const plan = planVerification(this.config.cwd, files, verifyConfig, policy);
+    const commands = plan.commands.map(command => command.display);
+    this.emit({ type: 'verify_start', files, commands });
+    if (plan.commands.length > 0) {
+      const assessment = assessVerifyPlan(plan, this.tools.policy);
+      const allowed = !assessment.denied && await this.tools.approve({
+        tool: 'verify',
+        input: { files, commands },
+        signal,
+        risk: assessment.risk,
+        trusted: false,
+      });
+      if (!allowed) {
+        this.emit({
+          type: 'verify_result',
+          status: 'skip',
+          reason: assessment.denied ?? 'approval denied',
+          errors: [],
+          warnings: [],
+          durationMs: 0,
+        });
+        this.memoryEvent({ type: 'verify_result', status: 'skip', issues: 0 });
+        this.lastVerifyVerdict = undefined;
+        this.verifyAttempts = 0;
+        return;
+      }
+      plan.approved = true;
+    }
+    const runner = this.deps.verify?.runner ?? createVerifyRunner();
+    const startedMs = Date.now();
+    let verdict = await runVerification(this.config.cwd, files, verifyConfig, policy, runner, signal, plan);
+    // Redaction happens before the verdict reaches any event or the session file.
+    verdict = redactVerdict(verdict, [this.config.apiKey]);
+    this.emit({
+      type: 'verify_result',
+      status: verdict.severity,
+      stage: verdict.stages.find(stage => stage.severity === 'fail')?.stage,
+      reason: verdict.reason,
+      errors: verdict.errors,
+      warnings: verdict.warnings,
+      durationMs: Date.now() - startedMs,
+    });
+    this.memoryEvent({ type: 'verify_result', status: verdict.severity, issues: verdict.errors.length + verdict.warnings.length });
+    if (verdict.severity === 'fail') {
+      this.verifyAttempts++;
+      this.lastVerifyVerdict = verdict;
+      const maxRounds = Math.max(1, verifyConfig.maxRepairRounds);
+      const errorText = redactText(formatVerifyErrors(verdict), [this.config.apiKey]);
+      this.store.session.messages.push({
+        role: 'user',
+        content: `[Verification failed (attempt ${this.verifyAttempts}/${maxRounds})]\n${errorText}`,
+      });
+      await this.store.save();
+      if (this.verifyAttempts >= maxRounds) {
+        await this.rollbackTurn('Verification failed after the allowed repair attempts.');
+        throw new VerificationFailedError(verdict);
+      }
+      return;
+    }
+    this.verifyAttempts = 0;
+    this.lastVerifyVerdict = undefined;
+    if (verdict.warnings.length > 0) {
+      const warningText = redactText(formatVerifyWarnings(verdict), [this.config.apiKey]);
+      this.store.session.messages.push({ role: 'user', content: warningText });
+      await this.store.save();
+    }
+  }
+
+  /**
+   * Restores the turn's backups without overwriting files a user changed afterwards. Conflicts are
+   * retained in the active backup set so the turn checkpoint (written in `finally`) can still
+   * restore them with an explicit `/revert`.
+   */
+  private async rollbackTurn(reason: string): Promise<void> {
+    this.verifyRolledBack = true;
+    const backups = this.tools.files.peekTurnBackups();
+    const result = await this.tools.files.restoreBackups(backups, { force: false });
+    const conflicts = new Set(result.conflicts.map(path => path.replace(/\\/g, '/')));
+    this.tools.files.replaceTurnBackups(backups.filter(backup => conflicts.has(backup.path.replace(/\\/g, '/'))));
+    this.emit({
+      type: 'verify_rollback',
+      reason,
+      restored: result.restored,
+      deleted: result.deleted,
+      conflicts: result.conflicts,
+    });
+    const lines = [`[Verification rollback] ${reason}`];
+    if (result.restored.length) lines.push(`Restored: ${result.restored.join(', ')}`);
+    if (result.deleted.length) lines.push(`Deleted: ${result.deleted.join(', ')}`);
+    if (result.conflicts.length) lines.push(`Kept (changed by user): ${result.conflicts.join(', ')}`);
+    if (result.pruned.length) lines.push(`Skipped (backup pruned): ${result.pruned.join(', ')}`);
+    this.store.session.messages.push({
+      role: 'user',
+      content: redactText(lines.join('\n'), [this.config.apiKey]),
+    });
+    await this.store.save();
+  }
+
+  private async executeBatch(calls: ToolCall[], signal: AbortSignal): Promise<{ denied: boolean; loop?: boolean }> {
     const content: ToolResultPart[] = [];
     let denied = false;
+    let loop = false;
     const execute = async (call: ToolCall) => {
       let output: ToolResultPart['output'];
       const meta = buildToolMeta(call.toolName, call.input);
@@ -692,8 +1083,14 @@ export class Harness {
         this.emit({ type: 'tool', name: call.toolName, id: call.toolCallId, state: 'start', meta });
         const result = await this.tools.execute(call, signal);
         denied ||= result.denied === true;
+        loop ||= result.loop === true;
         meta.durationMs = Date.now() - startedMs;
         if (!result.denied) {
+          if (meta.kind === 'edit') {
+            this.turnHadEdit = true;
+            // P19: patch_applied (path + byte delta only, never file contents).
+            void this.rememberPatchApplied(call);
+          }
           const isFailedBash = meta.kind === 'exec' && /^Exit code:\s*(?!0\b)\d+/m.test(result.text);
           if (isFailedBash) {
             this.turnHadFailedExec = true;
@@ -702,6 +1099,9 @@ export class Harness {
             this.consecutiveGoalExecFailureTurns = 0;
           }
         }
+        // P19: tool_result memory event carries the bounded summary only (the store redacts it);
+        // raw tool output never reaches memory.
+        this.memoryEvent({ type: 'tool_result', tool: call.toolName, summary: result.denied ? `${meta.summary} (denied)` : meta.summary });
         if (meta.kind === 'exec' && result.text) {
           const allLines = result.text.split(/\r?\n/).map(l => l.trimEnd()).filter(Boolean);
           meta.outputPreview = allLines.slice(0, 80);
@@ -754,7 +1154,7 @@ export class Harness {
       }
     }
     signal.throwIfAborted();
-    return { denied };
+    return { denied, loop };
   }
 }
 

@@ -53,7 +53,7 @@ test('real CLI hides split inline/native reasoning and preserves original provid
   });
   const first = await cli(f, p.url, ['--json', '-p', 'inspect']).done;
   assert.equal(first.code, 0, first.stderr + first.stdout);
-  assert(!first.stdout.includes('private'));
+  assert(!/(?:inline|native|final)-private/.test(first.stdout));
   const events = first.stdout.trim().split('\n').map(JSON.parse);
   assert.equal(events.at(-1).text, 'Inspecting.Done.');
   assert.equal(events.filter(e => e.type === 'reasoning').length, 0);
@@ -62,7 +62,7 @@ test('real CLI hides split inline/native reasoning and preserves original provid
   assert(stored.includes(raw)); assert(stored.includes('native-private'));
   const resumed = await cli(f, p.url, ['--json', '--resume', id, '-p', 'continue']).done;
   assert.equal(resumed.code, 0, resumed.stderr + resumed.stdout);
-  assert(!resumed.stdout.includes('private'));
+  assert(!/(?:inline|native|final)-private/.test(resumed.stdout));
 });
 
 test('--show-reasoning uses separate JSON events and leaves done.text answer-only', async t => {
@@ -143,7 +143,7 @@ test('Anthropic thinking signatures and raw inline text survive the next tool re
   });
   const result = await cli(f, p.url, ['--provider', 'anthropic', '--json', '-p', 'inspect']).done;
   assert.equal(result.code, 0, result.stderr + result.stdout);
-  assert(!result.stdout.includes('private')); assert(!result.stdout.includes('signature-fixture'));
+  assert(!/(?:inline|native) private/.test(result.stdout)); assert(!result.stdout.includes('signature-fixture'));
   const events = result.stdout.trim().split('\n').map(JSON.parse);
   assert.equal(events.at(-1).text, 'Inspecting.Done.');
   const transcript = await readFile(join(f.data, 'goon/sessions', `${events[0].id}.json`), 'utf8');

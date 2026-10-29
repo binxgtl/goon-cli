@@ -5,6 +5,7 @@ import { z } from 'zod';
 import { Harness, type HarnessEvent } from './harness.js';
 import { SessionStore } from './session.js';
 import { ToolRegistry, PermissionDeniedError, type RunBudget } from './tools.js';
+import { createRunBudget } from './cost.js';
 import { type RuntimeConfig } from './config.js';
 import { limitText } from './files.js';
 import { safeError } from './errors.js';
@@ -16,7 +17,21 @@ import {
   formatBrainstormReport,
 } from './network.js';
 
-export type SubagentProgress = Exclude<HarnessEvent, { type: 'text' | 'reasoning' | 'tool_stream' }>;
+/**
+ * Child progress channel: control events only. Text/reasoning belong to the child transcript, and
+ * per-request diagnostics (`context_budget`, `memory_*`) describe the child's internal request
+ * sizing — the parent emits its own, so forwarding them would double the parent's event stream.
+ */
+export type SubagentProgress = Exclude<HarnessEvent,
+  { type: 'text' | 'reasoning' | 'tool_stream' }
+  | { type: 'context_budget' }
+  | { type: 'memory_indexed' | 'memory_retrieved' | 'memory_error' }>;
+
+function isChildProgressEvent(event: HarnessEvent): event is SubagentProgress {
+  return event.type !== 'text' && event.type !== 'reasoning' && event.type !== 'tool_stream'
+    && event.type !== 'context_budget'
+    && event.type !== 'memory_indexed' && event.type !== 'memory_retrieved' && event.type !== 'memory_error';
+}
 export type SubagentEvent =
   | { type: 'subagent'; id: string; state: 'start'; task: string }
   | { type: 'subagent'; id: string; state: 'progress'; event: SubagentProgress }
@@ -29,7 +44,7 @@ export const CODEX_AGENT_NICKNAMES = [
   'Sagan', 'Socrates', 'Plato', 'Aristotle', 'Kant', 'Godel', 'Nash', 'Ramanujan', 'Erdos',
 ] as const;
 
-export type AgentRoleType = 'default' | 'explorer' | 'worker';
+export type AgentRoleType = 'default' | 'explorer' | 'worker' | 'planner' | 'coder' | 'reviewer' | 'tester' | 'researcher';
 
 export type CodexAgentStatusPayload =
   | 'running'
@@ -155,6 +170,8 @@ function formatStatusPayload(agent: ManagedSubagent | undefined): CodexAgentStat
 }
 
 function buildRolePrompt(role: AgentRoleType, task: string): string {
+  // Every role prompt starts with the same marker: callers (and tests) detect a delegated
+  // child by the "You are a delegated agent." prefix.
   if (role === 'explorer') {
     return (
       `You are a delegated agent. Role: explorer. Inspect the codebase using read-only tools (read_file, list_files, search) to answer the question below quickly and authoritatively with exact file and line evidence. Do not ask other agents.\n\n${task}`
@@ -163,6 +180,31 @@ function buildRolePrompt(role: AgentRoleType, task: string): string {
   if (role === 'worker') {
     return (
       `You are a delegated agent. Role: worker. Complete the assigned implementation or verification task below. Respect file ownership boundaries, do not revert unrelated changes made by other agents, and return a concise report listing changed files and verification evidence. Do not ask other agents.\n\n${task}`
+    );
+  }
+  if (role === 'planner') {
+    return (
+      `You are a delegated agent. Role: planner. Using read-only tools (read_file, list_files, search), analyze the codebase for the task below and return a structured, actionable plan with concrete steps and file references. Do not modify files and do not ask other agents.\n\n${task}`
+    );
+  }
+  if (role === 'coder') {
+    return (
+      `You are a delegated agent. Role: coder. Implement exactly the task below in this workspace with write/edit tools, keep the change minimal, and do not revert unrelated changes made by other agents. Return a concise report listing changed files and evidence. Do not ask other agents.\n\n${task}`
+    );
+  }
+  if (role === 'reviewer') {
+    return (
+      `You are a delegated agent. Role: reviewer. Using read-only tools (read_file, list_files, search), review the work described below for correctness, edge cases, and regressions, and return a verdict (approve or reject) with evidence. Do not modify files and do not ask other agents.\n\n${task}`
+    );
+  }
+  if (role === 'tester') {
+    return (
+      `You are a delegated agent. Role: tester. Verify the change described below by reading the affected files and running the relevant tests with bash. Shell commands still require the same user approval as anywhere else. Return a pass/fail verdict with evidence. Do not ask other agents.\n\n${task}`
+    );
+  }
+  if (role === 'researcher') {
+    return (
+      `You are a delegated agent. Role: researcher. Using read-only tools (read_file, list_files, search), research the question below and return a factual report with exact file and line evidence. Do not modify files and do not ask other agents.\n\n${task}`
     );
   }
   return `You are a delegated agent. Complete this task and return a concise report with evidence. Do not ask other agents.\n\n${task}`;
@@ -212,6 +254,20 @@ export class Subagents {
     return fallback;
   }
 
+  /**
+   * The shared run budget for every child in this session. Children must inherit the parent's
+   * budget object so token, cost and time caps are enforced across the whole tree; only when no
+   * run is active (background agent tools called outside a turn) do we create one seeded with the
+   * parent session's already-spent cost.
+   */
+  private runBudget(): RunBudget {
+    return this.registry.budget ?? createRunBudget(this.config, {
+      spent: 0,
+      limit: this.config.runTokenBudget,
+      costSpent: this.parent.session.costUsd ?? 0,
+    });
+  }
+
   private resolveManagedAgent(target: string): ManagedSubagent | undefined {
     const clean = target.trim();
     const direct = this.spawned.get(clean);
@@ -238,7 +294,7 @@ export class Subagents {
           'Delegate up to four independent research/review tasks to agents with separate context. Two run concurrently. They can only read this workspace. Include all needed context; they do not inherit this conversation. Returns reports and saved session IDs.',
         schema: tasksSchema,
         readOnly: true,
-        execute: (input, signal) => this.run(input.tasks, true, signal),
+        execute: (input, signal) => this.runTasks(input.tasks, { readOnly: true, signal, role: 'explorer' }),
       }),
     );
 
@@ -248,7 +304,7 @@ export class Subagents {
           'Delegate up to four coding tasks to separate agents in this workspace. Tasks run sequentially; child writes/shell require the same approval policy. Children cannot spawn agents or access MCP. Include context and precise file ownership.',
         schema: tasksSchema,
         readOnly: false,
-        execute: (input, signal) => this.run(input.tasks, false, signal),
+        execute: (input, signal) => this.runTasks(input.tasks, { readOnly: false, signal, role: 'worker' }),
       }),
     );
 
@@ -326,7 +382,7 @@ export class Subagents {
         schema: agentNetworkToolSchema,
         readOnly: false,
         execute: async (input, signal) => {
-          const budget = this.registry.budget ?? { spent: 0, limit: this.config.runTokenBudget };
+          const budget = this.runBudget();
           const res = await this.network.brainstorm({
             topic: input.topic,
             roles: input.roles,
@@ -334,6 +390,7 @@ export class Subagents {
             exploreCodebase: input.explore_codebase,
             signal,
             budget,
+            policy: this.registry.policy,
           });
           return limitText(formatBrainstormReport(res), 24_000);
         },
@@ -445,7 +502,7 @@ export class Subagents {
       task: input.message.slice(0, 120),
     });
 
-    const budget = this.registry.budget ?? { spent: 0, limit: this.config.runTokenBudget };
+    const budget = this.runBudget();
     const formattedPrompt = buildRolePrompt(role, input.message);
 
     const runPromise = this.executeManagedTurn(managed, childConfig, formattedPrompt, budget).finally(() => {
@@ -500,17 +557,30 @@ export class Subagents {
         managed.readOnly || this.registry.readOnly,
       );
       tools.allowPeerToolsInReadOnly = true;
+      tools.policy = this.registry.policy;
+      tools.costLedger = this.registry.costLedger;
       this.bus.registerPeerTools(tools, managed.nickname, managed.agentType);
       const peerInbox = this.bus.drainUnreadPromptBlock(managed.nickname);
       const effectivePrompt = peerInbox ? `${prompt}\n${peerInbox}` : prompt;
       const childHarness = new Harness(childConfig, store, tools, event => {
-        if (event.type !== 'text' && event.type !== 'reasoning' && event.type !== 'tool_stream') {
+        if (isChildProgressEvent(event)) {
           this.emit({ type: 'subagent', id: managed.id, state: 'progress', event });
         }
-      });
+      }, undefined, { verify: { enabled: false } });
       // The task text was written by the parent model, not typed by the user.
       childHarness.untrustedPrompts = true;
-      await childHarness.run(effectivePrompt, signal, budget);
+      const managedCostBefore = store.session.costUsd ?? 0;
+      try {
+        await childHarness.run(effectivePrompt, signal, budget);
+      } finally {
+        // Per-child session counter, not a shared-ledger snapshot: concurrent children would
+        // otherwise both count each other's overlapping spend.
+        const managedDelta = (store.session.costUsd ?? 0) - managedCostBefore;
+        if (managedDelta > 0) {
+          this.parent.session.costUsd = (this.parent.session.costUsd ?? 0) + managedDelta;
+          await this.parent.save().catch(() => {});
+        }
+      }
       if (denied) throw new PermissionDeniedError('Permission denied in a subagent. Stop this run.');
       const answer = lastAssistantAnswer(store.session.messages, childConfig.inlineReasoning);
       managed.lastOutput = limitText(answer, 12_000);
@@ -648,7 +718,7 @@ export class Subagents {
       model: agent.model,
       ...(agent.effort ? { effort: agent.effort } : {}),
     };
-    const budget = this.registry.budget ?? { spent: 0, limit: this.config.runTokenBudget };
+    const budget = this.runBudget();
     const runPromise = this.executeManagedTurn(agent, childConfig, input.message, budget).finally(() => {
       parentSignal.removeEventListener('abort', onParentAbort);
     });
@@ -806,7 +876,60 @@ export class Subagents {
     }
   }
 
-  private async child(task: string, readOnly: boolean, signal: AbortSignal, budget: RunBudget): Promise<string> {
+  /**
+   * Public spawn path for delegated tasks and for the v0.6 DAG (`/dag`, `runDag`). Everything
+   * a child may do is pinned here: `allowedTools` restricts the child `ToolRegistry` (and is
+   * enforced again by `execute()`), `budget` is the shared run budget object, and `role` only
+   * shapes the prompt. The parameter never comes from model input — the delegate tool schemas
+   * expose `tasks` only, and runDag passes role toolsets from `ROLE_TOOLSETS`.
+   */
+  async runTasks(
+    tasks: string[],
+    opts: {
+      readOnly: boolean;
+      signal: AbortSignal;
+      budget?: RunBudget;
+      allowedTools?: ReadonlySet<string>;
+      role?: AgentRoleType;
+    },
+  ): Promise<string> {
+    if (!opts.readOnly && this.registry.readOnly) throw new Error('Writable subagents unavailable in read-only mode.');
+    // Default pin: exactly the toolset the parent currently exposes, so a child can never
+    // self-escalate to tools its parent does not have.
+    const allowedTools = opts.allowedTools ?? new Set(this.registry.exposedToolNames());
+    const budget = opts.budget ?? this.runBudget();
+    const results: string[] = Array.from({ length: tasks.length }, () => 'Skipped.');
+    let next = 0;
+    let denied = false;
+    const worker = async () => {
+      while (next < tasks.length && !opts.signal.aborted && !denied) {
+        const index = next++;
+        try {
+          results[index] = await this.child(tasks[index]!, opts.readOnly, opts.signal, budget, opts.role, allowedTools);
+        } catch (error) {
+          if (error instanceof PermissionDeniedError) denied = true;
+          results[index] = `Task failed: ${safeError(error, this.config.apiKey)}`;
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: opts.readOnly ? Math.min(2, tasks.length) : 1 }, worker));
+    opts.signal.throwIfAborted();
+    if (denied) throw new PermissionDeniedError('Permission denied in a subagent. Stop this run.');
+    return limitText(results.join('\n\n'), 32_000);
+  }
+
+  private async run(tasks: string[], readOnly: boolean, signal: AbortSignal) {
+    return this.runTasks(tasks, { readOnly, signal });
+  }
+
+  private async child(
+    task: string,
+    readOnly: boolean,
+    signal: AbortSignal,
+    budget: RunBudget,
+    role: AgentRoleType = readOnly ? 'explorer' : 'worker',
+    allowedTools?: ReadonlySet<string>,
+  ): Promise<string> {
     await this.acquire(signal);
     let store: SessionStore | undefined;
     let denied = false;
@@ -817,7 +940,6 @@ export class Subagents {
       store = await SessionStore.open(this.subagentsRoot, this.config);
       const id = store.session.id;
       const nickname = this.allocateNickname();
-      const role: AgentRoleType = readOnly ? 'explorer' : 'worker';
       this.metadataById.set(id, { nickname, role, task });
       this.emit({ type: 'subagent', id, task, state: 'start' });
       const tools = new ToolRegistry(
@@ -828,22 +950,31 @@ export class Subagents {
           return allowed;
         },
         readOnly || this.registry.readOnly,
+        allowedTools,
       );
       // No delegation tools are registered in children: depth is exactly one.
+      tools.policy = this.registry.policy;
+      tools.costLedger = this.registry.costLedger;
       const config = { ...this.config };
       const childHarness = new Harness(config, store, tools, event => {
         // Parent progress is a control channel. The complete text/reasoning
         // belongs to the child transcript, never a per-token parent mirror.
-        if (event.type !== 'text' && event.type !== 'reasoning' && event.type !== 'tool_stream') {
+        if (isChildProgressEvent(event)) {
           this.emit({ type: 'subagent', id, state: 'progress', event });
         }
-      });
+      }, undefined, { verify: { enabled: false } });
       childHarness.untrustedPrompts = true;
-      await childHarness.run(
-        `You are a delegated agent. Complete this task and return a concise report with evidence. Do not ask other agents.\n\n${task}`,
-        signal,
-        budget,
-      );
+      const childCostBefore = store.session.costUsd ?? 0;
+      try {
+        await childHarness.run(buildRolePrompt(role, task), signal, budget);
+      } finally {
+        // Per-child session counter; a shared ledger snapshot double-counts parallel workers.
+        const childDelta = (store.session.costUsd ?? 0) - childCostBefore;
+        if (childDelta > 0) {
+          this.parent.session.costUsd = (this.parent.session.costUsd ?? 0) + childDelta;
+          await this.parent.save().catch(() => {});
+        }
+      }
       if (denied) throw new PermissionDeniedError('Permission denied in a subagent. Stop this run.');
       report = `Session ${id}\nTask: ${task}\n${limitText(lastAssistantAnswer(store.session.messages, config.inlineReasoning), 12_000)}`;
     } catch (error) {
@@ -867,27 +998,5 @@ export class Subagents {
     if (failure) throw failure.error;
     return report;
   }
-
-  private async run(tasks: string[], readOnly: boolean, signal: AbortSignal) {
-    if (!readOnly && this.registry.readOnly) throw new Error('Writable subagents unavailable in read-only mode.');
-    const budget = this.registry.budget ?? { spent: 0, limit: this.config.runTokenBudget };
-    const results: string[] = Array.from({ length: tasks.length }, () => 'Skipped.');
-    let next = 0;
-    let denied = false;
-    const worker = async () => {
-      while (next < tasks.length && !signal.aborted && !denied) {
-        const index = next++;
-        try {
-          results[index] = await this.child(tasks[index], readOnly, signal, budget);
-        } catch (error) {
-          if (error instanceof PermissionDeniedError) denied = true;
-          results[index] = `Task failed: ${safeError(error, this.config.apiKey)}`;
-        }
-      }
-    };
-    await Promise.all(Array.from({ length: readOnly ? Math.min(2, tasks.length) : 1 }, worker));
-    signal.throwIfAborted();
-    if (denied) throw new PermissionDeniedError('Permission denied in a subagent. Stop this run.');
-    return limitText(results.join('\n\n'), 32_000);
-  }
 }
+
