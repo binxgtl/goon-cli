@@ -136,13 +136,17 @@ pub fn register(reg: &tools::ToolRegistry, name: &str, read_only: bool, risk: Op
 
 /// A runtime config for an OpenAI-compatible endpoint, like the objects the JS tests built.
 pub fn runtime(cwd: &Path, data: &Path, base_url: &str, extra: Value) -> Arc<config::RuntimeConfig> {
+    runtime_keyed(cwd, data, base_url, extra, "fake")
+}
+
+pub fn runtime_keyed(cwd: &Path, data: &Path, base_url: &str, extra: Value, api_key: &str) -> Arc<config::RuntimeConfig> {
     let mut raw = json!({ "provider": "openai-compatible", "model": "test-model", "baseUrl": base_url, "contextWindow": 128000, "maxOutputTokens": 8192, "timeoutMs": 5000 });
     for (k, v) in extra.as_object().cloned().unwrap_or_default() {
         raw[k] = v;
     }
     let config = config::parse_config(&raw).unwrap();
     let model = config.model.clone().unwrap_or_default();
-    Arc::new(config::RuntimeConfig { config, cwd: cwd.to_path_buf(), api_key: "fake".into(), data_dir: data.to_path_buf(), base_url: base_url.into(), model, stub_cursor: None })
+    Arc::new(config::RuntimeConfig { config, cwd: cwd.to_path_buf(), api_key: api_key.into(), data_dir: data.to_path_buf(), base_url: base_url.into(), model, stub_cursor: None })
 }
 
 pub fn store(rt: &config::RuntimeConfig) -> Arc<session::SessionStore> {

@@ -20,3 +20,7 @@ mod memory;
 mod memory_integration;
 mod embedder;
 mod mcp;
+mod verify;
+mod harness_verify;
+mod scheduler;
+mod stub_provider;
