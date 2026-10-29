@@ -218,6 +218,7 @@ pub fn format_goal_summary_lines(goal: &SessionGoal, current_session_tokens: f64
     lines.join("\n")
 }
 
+#[derive(Clone, Debug, PartialEq)]
 pub enum GoalDraft {
     Ok { objective: String, token_budget: Option<f64> },
     Error(String),
