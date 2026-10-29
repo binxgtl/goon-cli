@@ -522,11 +522,28 @@ goon --run-token-budget 200000 -p 'Tác vụ có giới hạn ngân sách token'
 
 ## Phát triển & Kiểm thử
 
+Hướng dẫn đầy đủ (môi trường, vòng lặp phát triển, chạy riêng một test, stub provider, debug, cách
+phát hành) nằm ở [CONTRIBUTING.md](CONTRIBUTING.md). Tóm tắt:
+
+```bash
+npm ci
+npm run check                              # lint + build + test đơn vị + e2e (~1 phút)
+npm run watch                              # tsc --watch khi đang sửa src/
+npm run test:one -- tests/risk.test.mjs    # build rồi chạy riêng một file test
+npm run dev -- --stub -p 'xin chào'        # build rồi chạy CLI từ source, không cần mạng/API key
+```
+
+`bin/goon.mjs` và mọi test chạy trên `dist/` (không commit): sửa `src/` xong phải build lại
+(`npm run build`, hoặc để `npm run watch` chạy nền).
+
+CI chạy từng bước riêng, bạn có thể chạy đúng như vậy:
+
 ```bash
 npm ci
 npm run typecheck
 npm run lint
 npm test
+node --test --test-concurrency=4 "tests/e2e/*.test.mjs"            # e2e với stub provider; CI chỉ chạy trên Linux
 (umask 027; node --test --test-concurrency=4 "tests/*.test.mjs")   # POSIX only
 (umask 007; node --test --test-concurrency=4 "tests/*.test.mjs")   # POSIX only
 npm run build
@@ -535,7 +552,8 @@ npm install -g . --omit=dev
 
 CI chạy matrix 3 hệ điều hành (Ubuntu, Windows, macOS) × Node 22.16/24. Trên Windows,
 các test chỉ có ý nghĩa POSIX được skip: mode bit/umask (`tests/files.test.mjs`) và shim
-`gh` trong `tests/publish.test.mjs`; PTY test trong `tests/tui.test.mjs` cũng skip. Dấu
+`gh` trong `tests/publish.test.mjs`; các test PTY trong `tests/tui.test.mjs` và
+`tests/audit.test.mjs` cũng skip (trên POSIX chúng cần `python3`). Dấu
 ngoặc kép quanh glob để Node tự mở rộng trên cmd.exe/PowerShell.
 
 `--test-concurrency=4` giới hạn số file test chạy song song: mỗi file là một process Node
@@ -576,13 +594,20 @@ giữ CRLF.
 | `src/verify.ts`, `src/syntax.ts` | Verify hook sau edit (syntax/lint/test/typecheck), redaction, rollback byte-exact |
 | `src/eventlog.ts`, `src/redact.ts` | Event log JSONL append-only (envelope/seq sidecar/torn tail), replay, redaction dùng chung |
 | `src/stub-provider.ts`, `src/stub-fixtures.ts` | Stub `LanguageModelV3` tất định, fixture zod (tối đa 1 MiB), không mạng/không API key |
+| `src/config.ts` | Schema config (zod `.strict()` + giá trị mặc định), thứ tự ưu tiên cờ > `GOON_*` > file, ghi nguyên tử `config.json` / `credentials.json` (`0600`), thư mục config/data theo `XDG_*` |
+| `src/context-budget.ts` | Chia ngân sách ngữ cảnh (reserve / system / hội thoại / file), prune kết quả tool theo cặp, chèn memory dạng `<untrusted_context>`; thuần, không sửa session |
+| `src/coord.ts` | Multi-agent DAG (`validatePlan`, `Scheduler`, `merge`, `runDag`), scope loop và multi-candidate; không tự gọi model/shell, mọi I/O đi qua hook do CLI cấp |
+| `src/memory.ts`, `src/rag.ts`, `src/embedder.ts` | Memory store 6 loại (opt-in), lexical RAG (chunking, `HashEmbedder`, `.goonignore`), embedder seam `hash` / `openai` / `ollama` |
+| `src/index.ts`, `src/errors.ts`, `src/version.ts` | API công khai của package (`exports`), `safeError`, `VERSION` đọc từ `package.json` |
 
 ## Repository & Tự động Release
 
 - Source: [binxgtl/goon-cli](https://github.com/binxgtl/goon-cli)
 - Bản cài và checksum: [GitHub Releases](https://github.com/binxgtl/goon-cli/releases)
+- Đóng góp & phát triển: [CONTRIBUTING.md](CONTRIBUTING.md)
 
 Mỗi lần push lên `main` (trừ khi commit có `[skip ci]`), workflow `Check and release`
-sẽ chạy toàn bộ typecheck, lint, test (Node 22.16 & Node 24 + restrictive umasks),
+sẽ chạy toàn bộ typecheck, lint, test (Node 22.16 & Node 24 + restrictive umasks, e2e trên Linux),
 tự động tăng phiên bản patch, đóng gói `.tgz` kèm `SHA256SUMS.txt` và phát hành
-GitHub Release mới.
+GitHub Release mới. Chi tiết cách chọn số phiên bản và cách tăng minor/major: xem
+[CONTRIBUTING.md](CONTRIBUTING.md#12-phát-hành).
