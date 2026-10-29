@@ -138,14 +138,19 @@ impl<F: serde_json::ser::Formatter> serde_json::ser::Formatter for JsNumbers<F> 
 
 fn write_js<F: serde_json::ser::Formatter>(value: &Value, formatter: F) -> String {
     use serde::Serialize;
-    let mut clone = value.clone();
-    normalize_numbers(&mut clone);
     let mut out = Vec::new();
     let mut ser = serde_json::Serializer::with_formatter(&mut out, JsNumbers(formatter));
-    if clone.serialize(&mut ser).is_err() {
+    if value.serialize(&mut ser).is_err() {
         return "null".into();
     }
     String::from_utf8(out).unwrap_or_else(|_| "null".into())
+}
+
+/// Streams `JSON.stringify(value)` into `writer` without building the string.
+pub fn write_json<W: std::io::Write>(writer: W, value: &Value) -> std::io::Result<()> {
+    use serde::Serialize;
+    let mut ser = serde_json::Serializer::with_formatter(writer, JsNumbers(serde_json::ser::CompactFormatter));
+    value.serialize(&mut ser).map_err(std::io::Error::other)
 }
 
 /// `JSON.stringify(value)` (compact) with JS number formatting.

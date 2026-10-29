@@ -223,8 +223,12 @@ fn dedup_tool_result_values(messages: &mut [Value]) -> bool {
 
 /// Blanks oldest tool outputs, then drops oldest pair-safe runs; never the newest user message.
 pub fn prune_conversation(messages: &[Value], budget: u64) -> Result<Vec<Value>, ContextBudgetError> {
+    use crate::context::{message_size, tokens_from_sizes};
     let mut current = messages.to_vec();
-    if estimated_tokens(&current, "") <= budget {
+    // Per-message sizes are kept in step with `current`, so each check is O(messages), not a full
+    // re-serialization of the conversation.
+    let mut sizes: Vec<(usize, u64)> = current.iter().map(message_size).collect();
+    if tokens_from_sizes(&sizes, "") <= budget {
         return Ok(current);
     }
     for i in 0..current.len() {
@@ -239,8 +243,10 @@ pub fn prune_conversation(messages: &[Value], budget: u64) -> Result<Vec<Value>,
                 }
             }
         }
-        let _ = changed;
-        if estimated_tokens(&current, "") <= budget {
+        if changed {
+            sizes[i] = message_size(&current[i]);
+        }
+        if tokens_from_sizes(&sizes, "") <= budget {
             return Ok(current);
         }
     }
@@ -255,7 +261,8 @@ pub fn prune_conversation(messages: &[Value], budget: u64) -> Result<Vec<Value>,
             break;
         }
         current.drain(..end);
-        if estimated_tokens(&current, "") <= budget {
+        sizes.drain(..end);
+        if tokens_from_sizes(&sizes, "") <= budget {
             return Ok(current);
         }
     }

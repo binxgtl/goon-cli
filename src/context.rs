@@ -624,8 +624,20 @@ impl std::io::Write for Utf16Counter {
 
 fn json_len(value: &Value) -> usize {
     let mut counter = Utf16Counter(0);
-    let _ = serde_json::to_writer(&mut counter, value);
+    let _ = crate::jsutil::write_json(&mut counter, value);
     counter.0
+}
+
+/// `(serialized UTF-16 length, binary part count)` of one message, as `estimated_tokens` counts it.
+pub fn message_size(message: &Value) -> (usize, u64) {
+    measure_message(message)
+}
+
+/// `estimated_tokens` from precomputed `message_size` values.
+pub fn tokens_from_sizes(sizes: &[(usize, u64)], system: &str) -> u64 {
+    let chars = sizes.len() + 1 + sizes.iter().map(|s| s.0).sum::<usize>();
+    let binary: u64 = sizes.iter().map(|s| s.1).sum();
+    (chars + utf16_len(system)).div_ceil(2) as u64 + binary * IMAGE_TOKEN_ESTIMATE
 }
 
 fn measure_message(message: &Value) -> (usize, u64) {

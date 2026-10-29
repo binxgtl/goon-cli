@@ -150,7 +150,14 @@ pub fn create_run_budget(config: &Config, shared: Option<SharedBudget>) -> Share
     match shared {
         Some(b) => {
             {
+                // `costLimit ??= …` / `timeLimitMs ??= …`: a zero cap on a shared budget means unset.
                 let mut budget = b.lock().unwrap();
+                if budget.cost_limit == 0.0 {
+                    budget.cost_limit = config.max_cost_usd;
+                }
+                if budget.time_limit_ms == 0 {
+                    budget.time_limit_ms = config.max_time_ms;
+                }
                 if budget.started_at.is_none() {
                     budget.started_at = Some(crate::jsutil::now_millis());
                 }
