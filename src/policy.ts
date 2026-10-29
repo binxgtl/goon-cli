@@ -13,7 +13,7 @@
  *   a trailing dot.
  */
 import type { Config } from './config.js';
-import { baseName, peelWrappers, scanShell, tokenize } from './risk.js';
+import { baseName, isGenericRunner, peelWrappers, scanShell, tokenize } from './risk.js';
 import type { McpServerConfig } from './mcp.js';
 import {
   DEFAULT_COMMAND_TIMEOUT_MS,
@@ -311,14 +311,28 @@ function packageSubcommand(rest: string[]): string | undefined {
   return undefined;
 }
 
-function analyzeSegment(tokens: string[]): NetworkAssessment {
+function analyzeSegment(tokens: string[], depth = 0): NetworkAssessment {
   const peeled = peelWrappers(tokens);
   if (!peeled.tokens.length) return NO_NETWORK;
   const cmd = baseName(peeled.tokens[0]);
   const rest = peeled.tokens.slice(1);
 
   // BusyBox/ToyBox dispatch applets (`busybox wget ...`); inspect the applet command line.
-  if ((cmd === 'busybox' || cmd === 'toybox') && rest.length) return analyzeSegment(rest);
+  if ((cmd === 'busybox' || cmd === 'toybox') && rest.length && depth < 5) return analyzeSegment(rest, depth + 1);
+
+  // Command runners (`watch curl x`, `flock /tmp/l curl x`, `su -c 'curl x'`, `trap 'curl x' EXIT`)
+  // hide the real program in their arguments. Any network use inside is treated as an unknown
+  // target so allowlists fail closed.
+  if (isGenericRunner(cmd)) {
+    if (depth >= 5) return { network: true, hosts: [], unknown: true };
+    for (let i = 0; i < rest.length; i++) {
+      const token = rest[i];
+      const nested = /\s/.test(token) ? assessNested(token, depth + 1) : NO_NETWORK;
+      const suffix = token.startsWith('-') ? NO_NETWORK : analyzeSegment(rest.slice(i), depth + 1);
+      if (nested.network || suffix.network) return { network: true, hosts: [], unknown: true };
+    }
+    return NO_NETWORK;
+  }
 
   if (NETWORK_PACKAGE_RUNNERS.has(cmd)) {
     // The package name is not a host, and the runner may contact a registry plus script hosts.
@@ -401,6 +415,10 @@ function analyzeSegment(tokens: string[]): NetworkAssessment {
  * segment is inspected.
  */
 export function assessCommandNetwork(input: string): NetworkAssessment {
+  return assessNested(input, 0);
+}
+
+function assessNested(input: string, depth: number): NetworkAssessment {
   if (typeof input !== 'string' || !input.trim()) return NO_NETWORK;
   const scan = scanShell(input);
   const hosts: string[] = [];
@@ -409,7 +427,7 @@ export function assessCommandNetwork(input: string): NetworkAssessment {
   for (const segment of scan.segments) {
     const tokens = tokenize(segment);
     if (!tokens.length) continue;
-    const result = analyzeSegment(tokens);
+    const result = analyzeSegment(tokens, depth);
     if (!result.network) continue;
     network = true;
     unknown ||= result.unknown;

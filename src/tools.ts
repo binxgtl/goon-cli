@@ -1,5 +1,5 @@
 import { join, relative } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { tool, jsonSchema, type FlexibleSchema, type ToolSet } from 'ai';
 import { Ajv } from 'ajv';
 import { z } from 'zod';
@@ -385,8 +385,12 @@ function stableStringify(value: unknown): string {
 }
 
 /** Stable identity of a tool call, used to stop repeated identical denials. */
+/**
+ * Stable identity of a tool call for the rejection-loop guard. It is persisted in the session file,
+ * so the input is hashed: a denied command line may carry credentials (`curl -H 'Authorization: …'`).
+ */
 export function toolApprovalSignature(tool: string, input: unknown): string {
-  return `${tool}:${stableStringify(input)}`;
+  return `${tool}:${createHash('sha256').update(stableStringify(input)).digest('hex').slice(0, 32)}`;
 }
 
 export class ToolRegistry {

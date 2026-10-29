@@ -17,6 +17,7 @@ import {
   formatVerifyErrors,
   formatVerifyWarnings,
   planVerification,
+  assessVerifyPlan,
   redactText,
   redactVerdict,
   runVerification,
@@ -962,16 +963,19 @@ export class Harness {
     const commands = plan.commands.map(command => command.display);
     this.emit({ type: 'verify_start', files, commands });
     if (plan.commands.length > 0) {
-      const allowed = await this.tools.approve({
+      const assessment = assessVerifyPlan(plan, this.tools.policy);
+      const allowed = !assessment.denied && await this.tools.approve({
         tool: 'verify',
         input: { files, commands },
         signal,
+        risk: assessment.risk,
+        trusted: false,
       });
       if (!allowed) {
         this.emit({
           type: 'verify_result',
           status: 'skip',
-          reason: 'approval denied',
+          reason: assessment.denied ?? 'approval denied',
           errors: [],
           warnings: [],
           durationMs: 0,

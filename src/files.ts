@@ -96,15 +96,19 @@ export function limitTextBytes(text: string, maxBytes = 64 * 1024): string {
   const total = Buffer.byteLength(text, 'utf8');
   if (total <= maxBytes) return text;
   const budget = Math.max(0, maxBytes - 128);
-  const head = sliceByBytes(text, Math.floor(budget * 0.65), false);
-  const tail = sliceByBytes(text, budget - Math.floor(budget * 0.65), true);
+  let head = sliceByBytes(text, Math.floor(budget * 0.65), false);
+  let tail = sliceByBytes(text, budget - Math.floor(budget * 0.65), true);
   const omitted = total - Buffer.byteLength(head, 'utf8') - Buffer.byteLength(tail, 'utf8');
-  let result = `${head}\n...[truncated ${omitted} bytes; narrow the request]...\n${tail}`;
-  // Defensive: if the marker pushed us over the limit (many-byte omitted count), drop tail chars.
-  while (Buffer.byteLength(result, 'utf8') > maxBytes && tail.length > 0) {
-    result = `${head}\n...[truncated ${omitted} bytes; narrow the request]...\n${tail.slice(0, -1)}`;
+  const marker = `\n...[truncated ${omitted} bytes; narrow the request]...\n`;
+  // Defensive: if the marker pushed us over the limit (tiny maxBytes), shrink tail, then head.
+  // Each pass removes a whole code point, so the loop always terminates.
+  const size = () => Buffer.byteLength(head, 'utf8') + Buffer.byteLength(marker, 'utf8') + Buffer.byteLength(tail, 'utf8');
+  while (size() > maxBytes && (tail.length > 0 || head.length > 0)) {
+    if (tail.length > 0) tail = tail.slice(Array.from(tail)[0]!.length);
+    else head = head.slice(0, head.length - Array.from(head).pop()!.length);
   }
-  return result;
+  const result = `${head}${marker}${tail}`;
+  return Buffer.byteLength(result, 'utf8') <= maxBytes ? result : marker.trim().slice(0, Math.max(0, maxBytes));
 }
 
 export function computeUnifiedDiff(path: string, before: string, after: string, contextLines = 3): string {

@@ -9,7 +9,7 @@ export interface CommandResult { code: number; output: string; truncated: boolea
  * child process (bash tool, `!cmd`, ripgrep, git) so a command (or a prompt-injected model asking
  * for `env` / `curl ...$GOON_API_KEY`) can never read or exfiltrate the key.
  */
-const secretEnvNames = new Set<string>(['GOON_API_KEY']);
+const secretEnvNames = new Set<string>(['GOON_API_KEY', 'GOON_EMBEDDER_API_KEY']);
 export function protectSecretEnv(...names: Array<string | undefined>): void {
   for (const name of names) if (name) secretEnvNames.add(name);
 }

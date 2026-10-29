@@ -202,3 +202,20 @@ export function createEmbedder(options: EmbedderFactoryOptions): Embedder {
   };
   return provider === 'openai' ? new OpenAIEmbedder(shared) : new OllamaEmbedder(shared);
 }
+
+/**
+ * The chat provider key is only sent to the embedder when the embedder lives on the same origin
+ * as the chat endpoint; a different host must bring its own key (GOON_EMBEDDER_API_KEY) so a
+ * misconfigured or injected embedder URL cannot receive the provider credential.
+ */
+export function embedderApiKey(embedderBaseUrl: string | undefined, chatBaseUrl: string | undefined, chatKey: string | undefined): string | undefined {
+  const dedicated = process.env.GOON_EMBEDDER_API_KEY?.trim();
+  if (dedicated) return dedicated;
+  if (!chatKey) return undefined;
+  if (!embedderBaseUrl) return chatKey;
+  try {
+    return chatBaseUrl && new URL(embedderBaseUrl).origin === new URL(chatBaseUrl).origin ? chatKey : undefined;
+  } catch {
+    return undefined;
+  }
+}

@@ -34,6 +34,30 @@ const WRAPPERS = new Set([
 const HIGH_FLOOR_WRAPPERS = new Set(['sudo', 'doas', 'xargs']);
 const ENV_ASSIGNMENT_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
 
+/**
+ * Programs that run another program given somewhere in their arguments (`watch rm -rf /`,
+ * `flock /tmp/l rm -rf /`, `strace -f rm -rf /`). Their option grammars differ too much to peel
+ * reliably, so the classifier inspects every argument suffix (and every whitespace-containing
+ * argument as a nested command line) and never rates them below high.
+ */
+const GENERIC_RUNNERS = new Set([
+  'watch', 'ionice', 'strace', 'ltrace', 'chroot', 'flock', 'unbuffer', 'chrt', 'taskset',
+  'numactl', 'nsenter', 'unshare', 'firejail', 'proot', 'fakeroot', 'fakechroot', 'caffeinate',
+  'systemd-run', 'runuser', 'su', 'tsu', 'script', 'parallel', 'entr', 'cpulimit', 'faketime',
+  'torsocks', 'proxychains', 'proxychains4', 'catchsegv', 'valgrind', 'gdb', 'expect',
+]);
+/** True for programs that run another command named anywhere in their arguments. */
+export function isGenericRunner(cmd: string): boolean {
+  return GENERIC_RUNNERS.has(cmd) || cmd === 'trap';
+}
+/** Multi-call binaries whose first argument is the real applet (`busybox wget`, `toybox rm`). */
+const MULTICALL_BINARIES = new Set(['busybox', 'toybox']);
+/** Interpreters whose inline-code flags execute arbitrary code. */
+const INLINE_CODE_FLAGS: Record<string, readonly string[]> = {
+  perl: ['-e', '-E'], ruby: ['-e'], php: ['-r'], lua: ['-e'], luajit: ['-e'], osascript: ['-e'],
+  rscript: ['-e'], tclsh: ['-c'], deno: ['eval'], bun: ['-e', '--eval'],
+};
+
 const SHELL_INTERPRETERS = new Set([
   'bash', 'sh', 'zsh', 'fish', 'dash', 'ksh', 'mksh', 'tcsh', 'csh', 'pwsh', 'powershell',
   'powershell.exe', 'cmd', 'cmd.exe',
@@ -245,7 +269,7 @@ function decodeAnsiEscape(segment: string, afterBackslash: number): { char: stri
     if (value <= 0x10ffff) return { char: String.fromCodePoint(value), consumed: index - afterBackslash };
     return { char: lead, consumed: 1 };
   }
-  const simple: Record<string, string> = { n: '\n', r: '\r', t: '\t', a: '\a', b: '\b', e: '\x1b', f: '\f', v: '\v', '\\': '\\', "'": "'", '"': '"', '?': '?' };
+  const simple: Record<string, string> = { n: '\n', r: '\r', t: '\t', a: '\x07', b: '\b', e: '\x1b', E: '\x1b', f: '\f', v: '\v', '\\': '\\', "'": "'", '"': '"', '?': '?' };
   const mapped = simple[lead];
   return { char: mapped !== undefined ? mapped : lead, consumed: 1 };
 }
@@ -465,13 +489,31 @@ function classifyAwk(rest: string[]): RiskClass {
 function classifySed(rest: string[]): RiskClass {
   const inPlace = hasFlag(rest, 'i', '--in-place');
   const scripts = rest.filter(t => !t.startsWith('-'));
-  const executes = scripts.some(s => /(?:^|[;\s])e(?:[\s;]|$)/.test(s) || /\/e(?:[;\s]|$)/.test(s));
+  // GNU sed `e` runs a shell command: bare (`e cmd`), after an address (`1e id`, `$e`, `/x/e`)
+  // or as an `s///e` flag. `w`/`W` write arbitrary files.
+  const executes = scripts.some(s => /(?:^|[;\s\d$/!},])e(?:[\s;]|$)/.test(s)
+    || /\/[gpIiMm0-9w]*e[gpIiMm0-9]*(?:[;\s]|$)/.test(s));
   if (executes) return 'high';
-  return inPlace ? 'medium' : 'low';
+  const writes = scripts.some(s => /(?:^|[;\s\d$/!},])[wW]\s+\S/.test(s) || /\/[gpIiMm0-9e]*w\s+\S/.test(s));
+  return inPlace || writes ? 'medium' : 'low';
 }
 
-function classifyBase(cmd: string, rest: string[]): RiskClass {
+function classifyBase(cmd: string, rest: string[], depth = 0): RiskClass {
   if (['eval', 'source', '.'].includes(cmd)) return 'critical';
+  if (MULTICALL_BINARIES.has(cmd)) {
+    if (!rest.length || depth > 4) return 'medium';
+    const peeled = peelWrappers(rest);
+    if (!peeled.tokens.length) return maxRisk('medium', peeled.floor);
+    return maxRisk(peeled.floor, classifyBase(baseName(peeled.tokens[0]), peeled.tokens.slice(1), depth + 1));
+  }
+  if (GENERIC_RUNNERS.has(cmd)) return classifyGenericRunner(rest, depth);
+  if (cmd === 'trap') {
+    // `trap 'cmd' SIGNAL` runs the handler later in this shell.
+    const handler = rest.find(t => !t.startsWith('-'));
+    return handler && depth <= 4 ? maxRisk('medium', classifyBashRiskAt(handler, depth + 1)) : 'medium';
+  }
+  const inlineFlags = INLINE_CODE_FLAGS[cmd];
+  if (inlineFlags && rest.some(t => inlineFlags.includes(t))) return 'high';
   if (SHELL_INTERPRETERS.has(cmd)) {
     return rest.some(t => t === '-c' || t === '/c' || t === '-Command' || t === '-command') ? 'critical' : 'high';
   }
@@ -531,11 +573,31 @@ function classifyBase(cmd: string, rest: string[]): RiskClass {
   return 'medium';
 }
 
+function classifyGenericRunner(rest: string[], depth: number): RiskClass {
+  let risk: RiskClass = 'high';
+  if (depth > 4) return risk;
+  for (let i = 0; i < rest.length; i++) {
+    const token = rest[i];
+    // A quoted argument such as `watch "rm -rf /"` or `su -c 'rm -rf /'` is a command line.
+    if (/\s/.test(token)) risk = maxRisk(risk, classifyBashRiskAt(token, depth + 1));
+    if (token.startsWith('-')) continue;
+    const peeled = peelWrappers(rest.slice(i));
+    if (!peeled.tokens.length) continue;
+    risk = maxRisk(risk, maxRisk(peeled.floor, classifyBase(baseName(peeled.tokens[0]), peeled.tokens.slice(1), depth + 1)));
+    if (risk === 'critical') return risk;
+  }
+  return risk;
+}
+
 /**
  * Classify a shell command line. Compound commands take the maximum risk of their segments;
  * redirection raises the floor to medium; unquoted substitutions are critical.
  */
 export function classifyBashRisk(command: string): RiskClass {
+  return classifyBashRiskAt(command, 0);
+}
+
+function classifyBashRiskAt(command: string, depth: number): RiskClass {
   if (typeof command !== 'string' || !command.trim()) return 'medium';
   const scan = scanShell(command);
   if (scan.criticalEscape) return 'critical';
@@ -550,7 +612,7 @@ export function classifyBashRisk(command: string): RiskClass {
     }
     const cmd = baseName(peeled.tokens[0]);
     const innerRest = peeled.tokens.slice(1);
-    risk = maxRisk(risk, maxRisk(peeled.floor, classifyBase(cmd, innerRest)));
+    risk = maxRisk(risk, maxRisk(peeled.floor, classifyBase(cmd, innerRest, depth)));
   }
   return risk;
 }

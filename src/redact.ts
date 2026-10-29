@@ -73,8 +73,11 @@ export function redactObject<T>(value: T, secrets?: Iterable<string>): T {
   return walk(value, 0) as T;
 }
 
-const SENSITIVE_BASENAMES = new Set(['.npmrc', '.netrc', '.git-credentials']);
-const SENSITIVE_SEGMENTS = new Set(['.ssh', '.aws', '.gnupg', 'gcloud', 'secrets']);
+const SENSITIVE_BASENAMES = new Set([
+  '.npmrc', '.netrc', '.git-credentials', '.pypirc', '.pgpass', '.htpasswd', '.dockercfg',
+  'credentials', 'credentials.json', 'service-account.json',
+]);
+const SENSITIVE_SEGMENTS = new Set(['.ssh', '.aws', '.gnupg', 'gcloud', 'secrets', '.kube', '.docker', '.azure']);
 
 /** True for paths whose contents must never be logged, indexed or sent to a model. */
 export function isSensitivePath(filePath: string): boolean {
@@ -84,7 +87,7 @@ export function isSensitivePath(filePath: string): boolean {
   const base = segments[segments.length - 1];
   if (SENSITIVE_BASENAMES.has(base)) return true;
   if (base.startsWith('.env')) return true;
-  if (/\.(?:pem|key|p12|pfx)$/i.test(base)) return true;
+  if (/\.(?:pem|key|p12|pfx|jks|keystore|ppk|kdbx)$/i.test(base)) return true;
   if (/^id_(?:rsa|dsa|ecdsa|ed25519)(?:\.|$)/i.test(base)) return true;
   return segments.slice(0, -1).some(segment => SENSITIVE_SEGMENTS.has(segment));
 }

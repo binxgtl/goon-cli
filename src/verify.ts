@@ -14,6 +14,8 @@ import { readFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { runCommand } from './process.js';
 import { validateSyntax } from './syntax.js';
+import { classifyBashRisk, riskLevel, type RiskClass } from './risk.js';
+import { isNetworkAllowedForCommand, type ExecutionPolicy } from './policy.js';
 
 export type VerifySeverity = 'pass' | 'fail' | 'warn' | 'skip';
 export type VerifyStage = 'syntax' | 'format' | 'lint' | 'typecheck' | 'build' | 'test';
@@ -324,6 +326,41 @@ export function parseConfiguredCommand(raw: string): VerifyCommand | undefined {
   }
   const [command, ...args] = trimmed.split(/\s+/);
   return { stage: inferConfiguredStage(trimmed), command, args, display: trimmed };
+}
+
+/** Shell-equivalent command line for a verify command (used for risk and network checks). */
+export function verifyCommandLine(command: VerifyCommand): string {
+  if (command.command === 'bash' && command.args[0] === '-c' && command.args.length === 2) return command.args[1];
+  const quote = (part: string) => (/^[A-Za-z0-9_@%+=:,./-]+$/.test(part) ? part : `'${part.replace(/'/g, `'\\''`)}'`);
+  return [command.command, ...command.args].map(quote).join(' ');
+}
+
+export interface VerifyPlanAssessment {
+  /** Highest risk among the plan's commands (low for an empty plan). */
+  risk: RiskClass;
+  /** Set when a command must not run at all (critical risk or blocked by the execution policy). */
+  denied?: string;
+}
+
+/**
+ * Verification commands are shell commands too: they get the same critical-risk and network
+ * execution-policy gates as the bash tool before anything is offered for approval. The returned
+ * risk is passed to the approval callback so auto mode never runs a high-risk verify plan.
+ */
+export function assessVerifyPlan(plan: Pick<VerifyPlan, 'commands'>, policy?: ExecutionPolicy): VerifyPlanAssessment {
+  let risk: RiskClass = 'low';
+  for (const command of plan.commands) {
+    const line = verifyCommandLine(command);
+    const commandRisk = classifyBashRisk(line);
+    if (riskLevel(commandRisk) > riskLevel(risk)) risk = commandRisk;
+    if (commandRisk === 'critical') {
+      return { risk: 'critical', denied: `verification command is critical risk and cannot run: ${command.display}` };
+    }
+    if (policy && !isNetworkAllowedForCommand(policy, line)) {
+      return { risk, denied: `verification command needs network access blocked by the execution policy: ${command.display}` };
+    }
+  }
+  return { risk };
 }
 
 function dedupeCommands(commands: VerifyCommand[]): VerifyCommand[] {

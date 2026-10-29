@@ -9,7 +9,8 @@
  * and binary/non-text or oversized files are skipped.
  */
 import { createHash } from 'node:crypto';
-import { lstat, mkdir, readdir, readFile, realpath } from 'node:fs/promises';
+import { constants as fsConstants } from 'node:fs';
+import { lstat, mkdir, open, readdir, readFile, realpath } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { atomicJson } from './config.js';
 import { isSensitivePath, redactSecrets } from './redact.js';
@@ -466,6 +467,33 @@ export async function walkRepo(root: string, options: WalkOptions = {}): Promise
   return { files, truncated };
 }
 
+/**
+ * Opens without following a final symlink (where the platform supports O_NOFOLLOW), requires a
+ * regular file within the size cap whose real path is still inside `rootReal`, and reads at most
+ * the size observed on the open handle.
+ */
+async function readWorkspaceFileSafely(path: string, rootReal: string, maxBytes: number): Promise<Buffer | undefined> {
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    handle = await open(path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+    const info = await handle.stat();
+    if (!info.isFile() || info.size > maxBytes) return undefined;
+    if (!isWithinRoot(rootReal, await realpath(path))) return undefined;
+    const buffer = Buffer.alloc(info.size);
+    let offset = 0;
+    while (offset < buffer.length) {
+      const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, offset);
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+    return buffer.subarray(0, offset);
+  } catch {
+    return undefined;
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+}
+
 const BINARY_SNIFF_BYTES = 8192;
 
 /** True when the buffer looks binary (NUL byte in the first 8 KiB, or mostly non-printable). */
@@ -519,13 +547,14 @@ export async function indexRepo(root: string, options: IndexRepoOptions = {}): P
   const walk = await walkRepo(root, options);
   const files: Record<string, RagFileRecord> = {};
   let chunkCount = 0;
+  let rootReal = resolve(root);
+  try { rootReal = await realpath(root); } catch { /* walkRepo used the same fallback */ }
+  const maxFileBytes = options.maxFileBytes ?? 1_048_576;
   for (const file of walk.files) {
-    let buffer: Buffer;
-    try {
-      buffer = await readFile(file.absolutePath);
-    } catch {
-      continue;
-    }
+    // The walk and the read are separate steps: re-check at read time so a file swapped for a
+    // symlink (or an ancestor re-linked) in between cannot pull content from outside the root.
+    const buffer = await readWorkspaceFileSafely(file.absolutePath, rootReal, maxFileBytes);
+    if (!buffer) continue;
     if (looksBinary(buffer)) continue;
     const content = buffer.toString('utf8');
     const chunks = chunkFile(file.path, content, options.chunkOptions)

@@ -882,13 +882,13 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         // header and is never logged.
         let embedder: import('./rag.js').Embedder | undefined;
         if ((runtime.embedderProvider ?? 'hash') !== 'hash') {
-          const { createEmbedder } = await import('./embedder.js');
+          const { createEmbedder, embedderApiKey } = await import('./embedder.js');
           try {
             embedder = createEmbedder({
               provider: runtime.embedderProvider ?? 'hash',
               ...(runtime.embedderModel ? { model: runtime.embedderModel } : {}),
               ...(runtime.embedderProvider === 'openai'
-                ? { baseUrl: runtime.embedderBaseUrl ?? runtime.baseUrl, apiKey: apiKey || undefined }
+                ? { baseUrl: runtime.embedderBaseUrl ?? runtime.baseUrl, apiKey: embedderApiKey(runtime.embedderBaseUrl, runtime.baseUrl, apiKey) }
                 : runtime.embedderBaseUrl
                   ? { baseUrl: runtime.embedderBaseUrl }
                   : {}),
@@ -1052,27 +1052,27 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         else if (event.type === 'compaction') stderr.write('\n[Context compacted; original history archived.]\n');
         else if (event.type === 'verify_start') {
           const commands = event.commands?.length ? ` · ${event.commands.join(' · ')}` : '';
-          stderr.write(`\n[verify: ${event.files.length} file(s)${commands}]\n`);
+          stderr.write(cleanTerminal(`\n[verify: ${event.files.length} file(s)${commands}]\n`));
         } else if (event.type === 'verify_result') {
-          stderr.write(`\n[verify ${event.status}: ${event.reason}]\n`);
+          stderr.write(cleanTerminal(`\n[verify ${event.status}: ${event.reason}]\n`));
         } else if (event.type === 'verify_rollback') {
           const kept = event.conflicts.length ? `; kept ${event.conflicts.length} conflicting file(s)` : '';
-          stderr.write(`\n[verify rollback: ${event.reason}${kept}]\n`);
+          stderr.write(cleanTerminal(`\n[verify rollback: ${event.reason}${kept}]\n`));
         } else if (event.type === 'dag_plan_invalid') {
-          stderr.write(`\n[dag plan invalid: ${event.message}]\n`);
+          stderr.write(cleanTerminal(`\n[dag plan invalid: ${event.message}]\n`));
         } else if (event.type === 'dag_plan_ready') {
-          stderr.write(`\n[dag plan ready: ${event.todos} todo(s)]\n`);
+          stderr.write(cleanTerminal(`\n[dag plan ready: ${event.todos} todo(s)]\n`));
         } else if (event.type === 'dag_todo_update') {
-          stderr.write(`\n[dag ${event.todoId}: ${event.status} (${event.role})]\n`);
+          stderr.write(cleanTerminal(`\n[dag ${event.todoId}: ${event.status} (${event.role})]\n`));
         } else if (event.type === 'dag_merge') {
           const detail = [event.conflicts ? `${event.conflicts} conflict(s)` : '', event.reason].filter(Boolean).join(' — ');
-          stderr.write(`\n[dag merge: ${event.verified ? 'verified' : 'NOT verified'}${detail ? `: ${detail}` : ''}]\n`);
+          stderr.write(cleanTerminal(`\n[dag merge: ${event.verified ? 'verified' : 'NOT verified'}${detail ? `: ${detail}` : ''}]\n`));
         } else if (event.type === 'workflow_classified') {
-          stderr.write(`\n[workflow ${event.mode}: ${event.reason}]\n`);
+          stderr.write(cleanTerminal(`\n[workflow ${event.mode}: ${event.reason}]\n`));
         } else if (event.type === 'scope_round') {
-          stderr.write(`\n[scope round ${event.round} ${event.action}: ${event.reason}]\n`);
+          stderr.write(cleanTerminal(`\n[scope round ${event.round} ${event.action}: ${event.reason}]\n`));
         } else if (event.type === 'cost_degrade') {
-          stderr.write(`\n[cost degrade: ${event.reason} — ${event.candidates} candidate(s)]\n`);
+          stderr.write(cleanTerminal(`\n[cost degrade: ${event.reason} — ${event.candidates} candidate(s)]\n`));
         }
         else if (event.type === 'stopped') stderr.write(`\n${event.reason}\n`);
       };
@@ -1227,7 +1227,14 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         reg.rejectionGuard = {
           recordDenied: async signature => {
             const map = store.session.rejectedSignatures ??= {};
-            map[signature] = (map[signature] ?? 0) + 1;
+            const count = (map[signature] ?? 0) + 1;
+            delete map[signature]; // re-insert so the newest denial is last in insertion order
+            map[signature] = count;
+            // Bound the persisted map: keep the most recent distinct denials only.
+            const keys = Object.keys(map);
+            for (const stale of keys.slice(0, Math.max(0, keys.length - 200))) {
+              if (stale !== signature) delete map[stale];
+            }
             await store.save().catch(() => {});
             return map[signature];
           },
@@ -1385,7 +1392,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         tui?.setMode(mode);
         config.approvalMode = mode;
         void saveConfig(config).catch(() => {});
-        const label = mode === 'auto' ? 'auto-approve (all tools & commands auto-approved)' : mode;
+        const label = mode === 'auto' ? 'auto-approve (low/medium risk auto-approved; high risk still asks, critical always denied)' : mode;
         if (tui) tui.setNotice(`Mode: ${label}`);
         display(`\n[Mode switched to: ${label}]\n`);
       };
@@ -1653,16 +1660,25 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       const runDagCore = async (goal: string, budget: RunBudget, sig: AbortSignal): Promise<string> => {
         if (!subagents) throw new Error('DAG requires subagents; restart without --no-subagents.');
         const { runDag } = await import('./coord.js');
-        const { planVerification, redactVerdict, runVerification, createVerifyRunner } = await import('./verify.js');
+        const { planVerification, redactVerdict, runVerification, createVerifyRunner, assessVerifyPlan } = await import('./verify.js');
         const { streamText } = await import('ai');
         const { createModel } = await import('./provider.js');
         const dagSubagents = subagents;
-        const approveVerifyPlan = (files: string[], approveSig: AbortSignal) => async (plan: { commands: Array<{ display: string }> }) =>
-          tools.approve({
+        const approveVerifyPlan = (files: string[], approveSig: AbortSignal) => async (plan: import('./verify.js').VerifyPlan) => {
+          // Same critical/network gates as the bash tool; the risk drives auto-mode approval.
+          const assessment = assessVerifyPlan(plan, tools.policy);
+          if (assessment.denied) {
+            stderr.write(`\n[verify blocked: ${cleanTerminal(assessment.denied)}]\n`);
+            return false;
+          }
+          return tools.approve({
             tool: 'verify',
             input: { files, commands: plan.commands.map(command => command.display) },
             signal: approveSig,
+            risk: assessment.risk,
+            trusted: false,
           });
+        };
         // Per-todo test and final verification both run through runVerification with the exact
         // commands offered to the parent approval policy. A plan with commands and no way to
         // approve stays fail-closed (VerificationApprovalError from runVerification).
