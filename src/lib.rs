@@ -4,6 +4,7 @@
 pub mod approval;
 pub mod config;
 pub mod context;
+pub mod coord;
 pub mod context_budget;
 pub mod cost;
 pub mod errors;
