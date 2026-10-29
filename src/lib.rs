@@ -3,6 +3,7 @@
 
 pub mod approval;
 pub mod config;
+pub mod embedder;
 pub mod context;
 pub mod coord;
 pub mod context_budget;
@@ -15,6 +16,7 @@ pub mod harness;
 pub mod help;
 pub mod jsutil;
 pub mod mcp;
+pub mod memory;
 pub mod network;
 pub mod mcp_client;
 pub mod model;
@@ -23,6 +25,7 @@ pub mod process;
 pub mod prompts;
 pub mod provider;
 pub mod providers;
+pub mod rag;
 pub mod reasoning;
 pub mod redact;
 pub mod risk;
