@@ -336,3 +336,119 @@ async fn auto_mode_switch_approves_pending_prompt_once() {
     tty.ui.set_mode("auto");
     assert_eq!(q.await.unwrap().unwrap(), "y");
 }
+
+#[tokio::test]
+async fn auto_mode_switch_approves_a_pending_transient_approval_once() {
+    let tty = Tty::new(60, 20);
+    let ui = tty.ui.clone();
+    let answer = tokio::spawn(async move { ui.ask_transient("Allow bash?", "[y/N/a(lways)] ", None, QuestionOpts::default()).await });
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    tty.ui.set_mode("auto");
+    assert_eq!(answer.await.unwrap().unwrap(), "y");
+    tty.ui.close();
+}
+
+#[tokio::test]
+async fn masked_questions_never_render_the_typed_secret() {
+    let tty = Tty::new(60, 20);
+    let ui = tty.ui.clone();
+    let answer = tokio::spawn(async move { ui.question("API Key: ", None, false, QuestionOpts { mask: true, ..Default::default() }).await });
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    tty.text("sk-super-secret");
+    let frame = tty.frame();
+    assert!(!tty.written().contains("sk-super-secret"));
+    assert!(!frame.contains("sk-super-secret"));
+    assert!(frame.contains(&"•".repeat(5)));
+    tty.key("return");
+    assert_eq!(answer.await.unwrap().unwrap(), "sk-super-secret");
+    assert!(!tty.written().contains("sk-super-secret"));
+    tty.ui.close();
+}
+
+#[tokio::test]
+async fn incremental_rendering_is_identical_to_a_full_re_render() {
+    let tty = Tty::new(70, 24);
+    let pieces = ["Hello **bold** ", "\n", "- item\n", "```ts\nconst a = 1;\n", "```\n", "| a | bb |\n", "|---|---|\n", "| ccc | d |\n", "> quote\n", "# Title\n", "tiếng Việt 中文 😀 ", &"word ".repeat(20)];
+    let mut seed: u64 = 7;
+    let mut rnd = move || {
+        seed = (seed * 1103515245 + 12345) % 2147483648;
+        seed as f64 / 2147483648.0
+    };
+    for step in 0..600 {
+        let r = rnd();
+        if r < 0.6 {
+            let piece = pieces[(rnd() * pieces.len() as f64) as usize];
+            tty.ui.event(&serde_json::json!({ "type": "text", "text": piece }));
+        } else if r < 0.7 {
+            let piece = pieces[(rnd() * pieces.len() as f64) as usize];
+            tty.ui.event(&serde_json::json!({ "type": "reasoning", "text": format!("thinking {piece}"), "source": "provider" }));
+        } else if r < 0.8 {
+            tty.ui.event(&serde_json::json!({ "type": "tool", "name": "edit_file", "id": format!("e{step}"), "state": "done", "meta": { "kind": "edit", "summary": "a.ts", "diff": "--- a/a.ts\n+++ b/a.ts\n@@ -1,2 +1,2 @@\n-x\n+y\n z", "added": 1, "removed": 1 } }));
+        } else if r < 0.88 {
+            tty.ui.write(&format!("\n> prompt {step}\n"));
+        } else if r < 0.92 {
+            tty.ui.set_view_mode(if rnd() < 0.5 { "normal" } else { "verbose" });
+        } else {
+            tty.size.lock().unwrap().0 = 40 + (rnd() * 60.0) as usize;
+        }
+        let cols = tty.size.lock().unwrap().0 - 1;
+        let mut st = tty.ui.state.lock().unwrap();
+        let incremental = tty.ui.render_styled_body_lines(&mut st, cols, true);
+        let cached = st.body_cache.take();
+        let full = tty.ui.render_styled_body_lines(&mut st, cols, true);
+        assert_eq!(incremental, full, "step {step}");
+        st.body_cache = cached;
+    }
+    tty.ui.close();
+}
+
+#[tokio::test]
+async fn picker_tabs_arrows_filtering_enter_and_escape() {
+    let tty = Tty::new(90, 24);
+    let item = |id: &str, label: &str, meta: &str, detail: Option<&str>| PickerItem { id: id.into(), label: label.into(), meta: Some(meta.into()), detail: detail.map(Into::into), search: None };
+    let tabs = vec![
+        PickerTab { label: "This folder".into(), items: vec![item("a", "fix checkout", "2h", None), item("b", "add retry", "1d", None)], empty: None },
+        PickerTab { label: "All projects".into(), items: vec![item("c", "docs site", "web   3d", None), item("d", "billing bug", "api   4d", Some("/home/dev/api"))], empty: None },
+    ];
+    let spawn = |tabs: Vec<PickerTab>| {
+        let ui = tty.ui.clone();
+        tokio::spawn(async move { ui.pick("Resume", tabs, 0, "resume").await })
+    };
+    let picking = spawn(tabs.clone());
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let frame = tty.frame();
+    assert_match(&frame, r"Resume {3}This folder 2 {3}All projects 2");
+    assert_match(&frame, r"› fix checkout");
+    assert_match(&frame, r"enter resume {3}esc cancel");
+    tty.key("down");
+    tty.key("return");
+    assert_eq!(picking.await.unwrap().unwrap().1.id, "b");
+
+    let picking = spawn(tabs.clone());
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    tty.key("right");
+    tty.key("down");
+    let frame = tty.frame();
+    assert_match(&frame, r"› billing bug\s+api {3}4d");
+    assert_match(&frame, r"/home/dev/api");
+    tty.key("tab");
+    tty.key("left");
+    tty.text("docs");
+    let frame = tty.frame();
+    assert_match(&frame, r"All projects 1");
+    assert_match(&frame, r"› docs");
+    tty.key("return");
+    let (tab, chosen) = picking.await.unwrap().unwrap();
+    assert_eq!((tab, chosen.id.as_str()), (1, "c"));
+
+    let picking = spawn(tabs);
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    tty.key("escape");
+    assert!(picking.await.unwrap().is_none());
+    assert!(!tty.ui.is_picking());
+    tty.ui.close();
+}
+
+fn assert_match(text: &str, pattern: &str) {
+    assert!(regex::Regex::new(pattern).unwrap().is_match(text), "{pattern:?} did not match:\n{text}");
+}
