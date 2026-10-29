@@ -37,6 +37,11 @@ jobs:
       - run: npm run typecheck
       - run: npm run lint
       - run: npm test
+      - name: End-to-end tests (stub provider, offline)
+        # Verified on Linux only (Node 22.16 and 24); widen once they have run green on the
+        # Windows and macOS runners. Reuses the dist/ built by `npm test`.
+        if: runner.os == 'Linux'
+        run: node --test --test-concurrency=4 "tests/e2e/*.test.mjs"
       - name: Test restrictive umasks
         if: runner.os != 'Windows'
         run: |
