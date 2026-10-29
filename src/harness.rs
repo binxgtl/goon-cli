@@ -869,7 +869,7 @@ impl Harness {
                     if let Some(m) = provider_metadata {
                         content[i]["providerOptions"] = m;
                     }
-                    if show_reasoning {
+                    if show_reasoning && !delta.is_empty() {
                         self.emit(json!({ "type": "reasoning", "text": delta, "source": "provider" }));
                     }
                 }

@@ -61,3 +61,52 @@ pub async fn generate_text(model: &dyn LanguageModel, request: ModelRequest, max
         }
     }
 }
+
+/// `streamText` collected to completion: retries only establishing the stream (like the AI SDK);
+/// an error part mid-stream fails the call.
+pub async fn stream_text(model: &dyn LanguageModel, request: ModelRequest, max_retries: u32) -> Result<GenerateResponse, ApiError> {
+    use crate::model::{FinishReason, StreamPart, Usage};
+    use futures_util::StreamExt;
+    let mut delay = 2000.0;
+    let mut attempts = 0u32;
+    let mut parts = loop {
+        match model.stream(request.clone()).await {
+            Ok(parts) => break parts,
+            Err(error) => {
+                attempts += 1;
+                if error.aborted || request.cancel.is_cancelled() || max_retries == 0 {
+                    return Err(error);
+                }
+                if !error.retryable {
+                    if attempts == 1 {
+                        return Err(error);
+                    }
+                    return Err(ApiError { message: format!("Failed after {attempts} attempts with non-retryable error: '{}'", error.message), ..error });
+                }
+                if attempts > max_retries {
+                    return Err(ApiError { message: format!("Failed after {attempts} attempts. Last error: {}", error.message), ..error });
+                }
+                let wait = retry_delay(&error, delay);
+                tokio::select! {
+                    _ = tokio::time::sleep(wait) => {}
+                    _ = request.cancel.cancelled() => return Err(ApiError::aborted()),
+                }
+                delay *= 2.0;
+            }
+        }
+    };
+    let mut out = GenerateResponse { text: String::new(), reasoning: String::new(), finish_reason: FinishReason::Unknown, usage: Usage::default() };
+    while let Some(part) = parts.next().await {
+        match part {
+            StreamPart::TextDelta { delta, .. } => out.text.push_str(&delta),
+            StreamPart::ReasoningDelta { delta, .. } => out.reasoning.push_str(&delta),
+            StreamPart::Finish { usage, finish_reason } => {
+                out.usage = usage;
+                out.finish_reason = finish_reason;
+            }
+            StreamPart::Error(error) => return Err(error),
+            _ => {}
+        }
+    }
+    Ok(out)
+}

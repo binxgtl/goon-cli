@@ -339,7 +339,6 @@ impl LanguageModel for AnthropicModel {
                                     parts.push(StreamPart::ReasoningEnd { id, provider_metadata: meta });
                                 }
                                 Some(OpenBlock::Redacted { id, data }) => {
-                                    parts.push(StreamPart::ReasoningDelta { id: id.clone(), delta: String::new(), provider_metadata: None });
                                     parts.push(StreamPart::ReasoningEnd { id, provider_metadata: Some(json!({ "anthropic": { "redactedData": data } })) });
                                 }
                                 Some(OpenBlock::Tool { id, name, json }) => {

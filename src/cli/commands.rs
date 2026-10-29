@@ -341,7 +341,7 @@ impl App {
                         cancel: planner_sig.clone(),
                         timeout: std::time::Duration::from_millis(runtime.timeout_ms),
                     };
-                    let response = crate::generate::generate_text(&*model, request, 2).await.map_err(anyhow::Error::from)?;
+                    let response = crate::generate::stream_text(&*model, request, 2).await.map_err(anyhow::Error::from)?;
                     app.harness().account_usage(Some(&response.usage), Some(&runtime.model), Some(&budget), 0, 0);
                     let raw = response.text;
                     let (Some(start), Some(end)) = (raw.find('{'), raw.rfind('}')) else { bail!("Planner did not return a JSON plan.") };
