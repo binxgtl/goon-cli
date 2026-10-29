@@ -243,7 +243,7 @@ pub fn without_stream(mut body: Value) -> Value {
     body
 }
 
-fn network_message(error: &reqwest::Error) -> String {
+pub fn network_message(error: &reqwest::Error) -> String {
     let mut message = error.to_string();
     let mut source = std::error::Error::source(error);
     while let Some(inner) = source {
