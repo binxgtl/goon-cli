@@ -1,0 +1,907 @@
+{
+ "read_file": {
+  "description": "Read a workspace text file with line numbers. Read an existing file before editing or overwriting it.",
+  "readOnly": true,
+  "parameters": {
+   "$schema": "http://json-schema.org/draft-07/schema#",
+   "type": "object",
+   "properties": {
+    "path": {
+     "type": "string"
+    },
+    "offset": {
+     "default": 1,
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 9007199254740991
+    },
+    "lines": {
+     "default": 200,
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 500
+    }
+   },
+   "required": [
+    "path"
+   ],
+   "additionalProperties": false
+  }
+ },
+ "list_files": {
+  "description": "List one workspace directory. Directories end in /, symlinks in @.",
+  "readOnly": true,
+  "parameters": {
+   "$schema": "http://json-schema.org/draft-07/schema#",
+   "type": "object",
+   "properties": {
+    "path": {
+     "default": ".",
+     "type": "string"
+    }
+   },
+   "additionalProperties": false
+  }
+ },
+ "search": {
+  "description": "Search for literal text within a workspace directory. Uses system ripgrep when available, with a bounded portable fallback.",
+  "readOnly": true,
+  "parameters": {
+   "$schema": "http://json-schema.org/draft-07/schema#",
+   "type": "object",
+   "properties": {
+    "query": {
+     "type": "string",
+     "minLength": 1
+    },
+    "path": {
+     "default": ".",
+     "type": "string"
+    }
+   },
+   "required": [
+    "query"
+   ],
+   "additionalProperties": false
+  }
+ },
+ "todo_write": {
+  "description": "Record and update the complete task checklist to track multi-step implementation progress. Pass the full updated list of todos.",
+  "readOnly": true,
+  "parameters": {
+   "$schema": "http://json-schema.org/draft-07/schema#",
+   "type": "object",
+   "properties": {
+    "todos": {
+     "type": "array",
+     "items": {
+      "type": "object",
+      "properties": {
+       "content": {
+        "type": "string",
+        "minLength": 1
+       },
+       "status": {
+        "type": "string",
+        "enum": [
+         "pending",
+         "in_progress",
+         "completed"
+        ]
+       },
+       "priority": {
+        "default": "medium",
+        "type": "string",
+        "enum": [
+         "high",
+         "medium",
+         "low"
+        ]
+       }
+      },
+      "required": [
+       "content",
+       "status"
+      ],
+      "additionalProperties": false
+     }
+    }
+   },
+   "required": [
+    "todos"
+   ],
+   "additionalProperties": false
+  }
+ },
+ "todo_read": {
+  "description": "Read the current session task checklist.",
+  "readOnly": true,
+  "parameters": {
+   "$schema": "http://json-schema.org/draft-07/schema#",
+   "type": "object",
+   "properties": {},
+   "additionalProperties": false
+  }
+ },
+ "update_plan": {
+  "description": "Updates the task plan (Codex-compatible). Provide an optional explanation and a list of plan items, each with a step and status (pending, in_progress, completed). At most one step should be in_progress at a time.",
+  "readOnly": true,
+  "parameters": {
+   "$schema": "http://json-schema.org/draft-07/schema#",
+   "type": "object",
+   "properties": {
+    "explanation": {
+     "description": "Optional note explaining why the plan changed.",
+     "type": "string"
+    },
+    "plan": {
+     "type": "array",
+     "items": {
+      "type": "object",
+      "properties": {
+       "step": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Task step text."
+       },
+       "status": {
+        "type": "string",
+        "enum": [
+         "pending",
+         "in_progress",
+         "completed"
+        ],
+        "description": "Step status."
+       }
+      },
+      "required": [
+       "step",
+       "status"
+      ],
+      "additionalProperties": false
+     },
+     "description": "The list of plan steps."
+    }
+   },
+   "required": [
+    "plan"
+   ],
+   "additionalProperties": false
+  }
+ },
+ "get_goal": {
+  "description": "Get the current goal for this thread, including status, budgets, token and elapsed-time usage, and remaining token budget.",
+  "readOnly": true,
+  "parameters": {
+   "$schema": "http://json-schema.org/draft-07/schema#",
+   "type": "object",
+   "properties": {},
+   "additionalProperties": false
+  }
+ },
+ "create_goal": {
+  "description": "Create a goal only when explicitly requested by the user or system/developer instructions; do not infer goals from ordinary tasks. Set token_budget only when an explicit token budget is requested. Fails if an unfinished goal exists; use update_goal only for status.",
+  "readOnly": true,
+  "parameters": {
+   "$schema": "http://json-schema.org/draft-07/schema#",
+   "type": "object",
+   "properties": {
+    "objective": {
+     "type": "string",
+     "minLength": 1,
+     "description": "Required. The concrete objective to start pursuing. This starts a new active goal when no goal exists or replaces the current goal when it is complete."
+    },
+    "token_budget": {
+     "description": "Positive token budget for the new goal. Omit unless explicitly requested.",
+     "type": "integer",
+     "exclusiveMinimum": 0,
+     "maximum": 9007199254740991
+    }
+   },
+   "required": [
+    "objective"
+   ],
+   "additionalProperties": false
+  }
+ },
+ "update_goal": {
+  "description": "Update the existing goal. Set status to `paused` only at the user's explicit request to pause this goal, never on your own initiative. Set status to `complete` only when the objective has actually been achieved and no required work remains. Set status to `blocked` only when the same blocking condition has repeated for at least three consecutive goal turns and the agent cannot make meaningful progress without user input or an external-state change. Do not mark a goal complete merely because its budget is nearly exhausted or because you are stopping work.",
+  "readOnly": true,
+  "parameters": {
+   "$schema": "http://json-schema.org/draft-07/schema#",
+   "type": "object",
+   "properties": {
+    "status": {
+     "type": "string",
+     "enum": [
+      "complete",
+      "blocked",
+      "paused"
+     ],
+     "description": "Required. `paused` requires an explicit user request. Set to `complete` only when the objective is achieved and no required work remains. Set to `blocked` only after the same blocking condition has recurred for at least three consecutive goal turns and the agent is at an impasse."
+    }
+   },
+   "required": [
+    "status"
+   ],
+   "additionalProperties": false
+  }
+ },
+ "request_user_input": {
+  "description": "Request user input for one to three short multiple-choice questions and wait for the response.",
+  "readOnly": true,
+  "parameters": {
+   "$schema": "http://json-schema.org/draft-07/schema#",
+   "type": "object",
+   "properties": {
+    "questions": {
+     "minItems": 1,
+     "maxItems": 3,
+     "type": "array",
+     "items": {
+      "type": "object",
+      "properties": {
+       "id": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Stable identifier for mapping answers (snake_case)."
+       },
+       "header": {
+        "default": "Question",
+        "description": "Short header label shown in the UI (12 or fewer chars).",
+        "type": "string"
+       },
+       "question": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Single-sentence prompt shown to the user."
+       },
+       "options": {
+        "minItems": 1,
+        "type": "array",
+        "items": {
+         "type": "object",
+         "properties": {
+          "label": {
+           "type": "string",
+           "minLength": 1,
+           "description": "User-facing option label (1-5 words)."
+          },
+          "description": {
+           "default": "",
+           "description": "One short sentence explaining impact/tradeoff if selected.",
+           "type": "string"
+          }
+         },
+         "required": [
+          "label"
+         ],
+         "additionalProperties": false
+        },
+        "description": "2-3 choices. Put the recommended option first with \"(Recommended)\"."
+       }
+      },
+      "required": [
+       "id",
+       "question",
+       "options"
+      ],
+      "additionalProperties": false
+     },
+     "description": "Questions to show the user. Prefer 1 and do not exceed 3."
+    }
+   },
+   "required": [
+    "questions"
+   ],
+   "additionalProperties": false
+  }
+ },
+ "view_image": {
+  "description": "Attach a local image from the filesystem (PNG, JPEG, WEBP, GIF) to the conversation context so you can inspect it visually.",
+  "readOnly": true,
+  "parameters": {
+   "$schema": "http://json-schema.org/draft-07/schema#",
+   "type": "object",
+   "properties": {
+    "path": {
+     "type": "string",
+     "minLength": 1,
+     "description": "Local filesystem path to an image file."
+    },
+    "detail": {
+     "description": "Optional detail override.",
+     "type": "string",
+     "enum": [
+      "high",
+      "original"
+     ]
+    }
+   },
+   "required": [
+    "path"
+   ],
+   "additionalProperties": false
+  }
+ },
+ "exit_plan_mode": {
+  "description": "Use in plan mode when your implementation plan is complete. Presents the Markdown plan for user approval and exits plan mode upon approval so you can begin coding.",
+  "readOnly": true,
+  "parameters": {
+   "$schema": "http://json-schema.org/draft-07/schema#",
+   "type": "object",
+   "properties": {
+    "plan": {
+     "type": "string",
+     "minLength": 1
+    }
+   },
+   "required": [
+    "plan"
+   ],
+   "additionalProperties": false
+  }
+ },
+ "write_file": {
+  "description": "Create or overwrite a workspace UTF-8 file. Existing files must first be read. Use edit_file for small changes.",
+  "readOnly": false,
+  "parameters": {
+   "$schema": "http://json-schema.org/draft-07/schema#",
+   "type": "object",
+   "properties": {
+    "path": {
+     "type": "string"
+    },
+    "content": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "path",
+    "content"
+   ],
+   "additionalProperties": false
+  }
+ },
+ "edit_file": {
+  "description": "Replace exact text in a previously read file. Refuses stale reads and ambiguous matches.",
+  "readOnly": false,
+  "parameters": {
+   "$schema": "http://json-schema.org/draft-07/schema#",
+   "type": "object",
+   "properties": {
+    "path": {
+     "type": "string"
+    },
+    "oldText": {
+     "type": "string",
+     "minLength": 1
+    },
+    "newText": {
+     "type": "string"
+    },
+    "replaceAll": {
+     "default": false,
+     "type": "boolean"
+    }
+   },
+   "required": [
+    "path",
+    "oldText",
+    "newText"
+   ],
+   "additionalProperties": false
+  }
+ },
+ "apply_patch": {
+  "description": "Apply a multi-hunk or multi-file patch (\"*** Begin Patch\" ... \"*** Update File: <path>\" / \"*** Add File: <path>\" / \"*** Delete File: <path>\" ... \"*** End Patch\"). Existing files must be read before patching; every hunk must match exactly once.",
+  "readOnly": false,
+  "parameters": {
+   "$schema": "http://json-schema.org/draft-07/schema#",
+   "type": "object",
+   "properties": {
+    "patch": {
+     "type": "string",
+     "minLength": 1
+    }
+   },
+   "required": [
+    "patch"
+   ],
+   "additionalProperties": false
+  }
+ },
+ "bash": {
+  "description": "Execute a POSIX bash command in the workspace (Git Bash on Windows, NOT cmd.exe). Always use POSIX syntax and /dev/null (never >nul or 2>nul). Output is bounded; do not start persistent background servers.",
+  "readOnly": false,
+  "parameters": {
+   "$schema": "http://json-schema.org/draft-07/schema#",
+   "type": "object",
+   "properties": {
+    "command": {
+     "type": "string",
+     "minLength": 1
+    },
+    "timeoutMs": {
+     "type": "integer",
+     "minimum": 1000,
+     "maximum": 600000
+    }
+   },
+   "required": [
+    "command"
+   ],
+   "additionalProperties": false
+  }
+ },
+ "delegate_task": {
+  "description": "Delegate up to four independent research/review tasks to agents with separate context. Two run concurrently. They can only read this workspace. Include all needed context; they do not inherit this conversation. Returns reports and saved session IDs.",
+  "readOnly": true,
+  "parameters": {
+   "$schema": "http://json-schema.org/draft-07/schema#",
+   "type": "object",
+   "properties": {
+    "tasks": {
+     "minItems": 1,
+     "maxItems": 8,
+     "type": "array",
+     "items": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 16000
+     },
+     "description": "List of independent task prompts (1 to 4 tasks) to run in isolated sub-agents."
+    }
+   },
+   "required": [
+    "tasks"
+   ],
+   "additionalProperties": false
+  }
+ },
+ "delegate_edit": {
+  "description": "Delegate up to four coding tasks to separate agents in this workspace. Tasks run sequentially; child writes/shell require the same approval policy. Children cannot spawn agents or access MCP. Include context and precise file ownership.",
+  "readOnly": false,
+  "parameters": {
+   "$schema": "http://json-schema.org/draft-07/schema#",
+   "type": "object",
+   "properties": {
+    "tasks": {
+     "minItems": 1,
+     "maxItems": 8,
+     "type": "array",
+     "items": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 16000
+     },
+     "description": "List of independent task prompts (1 to 4 tasks) to run in isolated sub-agents."
+    }
+   },
+   "required": [
+    "tasks"
+   ],
+   "additionalProperties": false
+  }
+ },
+ "spawn_agent": {
+  "description": "Spawn a sub-agent (Codex multi-agent workflow) for a well-scoped task. Returns `{ agent_id, nickname, agent_type, status }` immediately so you can spawn multiple agents in parallel and then call `wait_agent({ targets: [agent_id] })` to collect their final reports. Available roles (`agent_type`): `explorer` (fast read-only codebase research), `worker` (coding/execution with explicit file ownership), `default`.",
+  "readOnly": true,
+  "parameters": {
+   "$schema": "http://json-schema.org/draft-07/schema#",
+   "type": "object",
+   "properties": {
+    "message": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 32000,
+     "description": "Initial task instructions for the new sub-agent. Include purpose, constraints, and file paths."
+    },
+    "agent_type": {
+     "description": "Sub-agent role: \"explorer\" (fast read-only codebase exploration), \"worker\" (coding/execution with explicit file ownership), or \"default\".",
+     "type": "string",
+     "enum": [
+      "default",
+      "explorer",
+      "worker",
+      "research",
+      "self"
+     ]
+    },
+    "nickname": {
+     "description": "Optional human-readable nickname for the sub-agent.",
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 64
+    },
+    "fork_context": {
+     "description": "When true, fork the current conversation history into the child sub-agent before sending the initial message.",
+     "type": "boolean"
+    },
+    "model": {
+     "description": "Optional model override for this sub-agent.",
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 128
+    },
+    "reasoning_effort": {
+     "description": "Optional reasoning effort override for this sub-agent.",
+     "type": "string",
+     "enum": [
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max"
+     ]
+    },
+    "wait": {
+     "description": "When true, wait for the sub-agent to complete and return its report immediately instead of running in the background.",
+     "type": "boolean"
+    }
+   },
+   "required": [
+    "message"
+   ],
+   "additionalProperties": false
+  }
+ },
+ "wait_agent": {
+  "description": "Wait for spawned sub-agents to reach a final status (`completed` or `errored`) and return their reports. Pass `targets: [agent_id, ...]` (or omit `targets` to wait for all active spawned agents).",
+  "readOnly": true,
+  "parameters": {
+   "$schema": "http://json-schema.org/draft-07/schema#",
+   "type": "object",
+   "properties": {
+    "targets": {
+     "description": "Agent IDs or nicknames to wait for. Omit to wait for all currently running sub-agents.",
+     "type": "array",
+     "items": {
+      "type": "string",
+      "minLength": 1
+     }
+    },
+    "timeout_ms": {
+     "default": 120000,
+     "description": "Maximum wait time in milliseconds (default 120000).",
+     "type": "integer",
+     "minimum": 100,
+     "maximum": 600000
+    }
+   },
+   "additionalProperties": false
+  }
+ },
+ "send_input": {
+  "description": "Send a follow-up message or task to an existing spawned sub-agent by `agent_id` or `nickname`, preserving its conversation history. Use `interrupt: true` to redirect work immediately, and then call `wait_agent` to collect its reply.",
+  "readOnly": true,
+  "parameters": {
+   "$schema": "http://json-schema.org/draft-07/schema#",
+   "type": "object",
+   "properties": {
+    "target": {
+     "type": "string",
+     "minLength": 1,
+     "description": "Agent ID or nickname to message."
+    },
+    "message": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 32000,
+     "description": "Follow-up message or task instructions to send to the sub-agent."
+    },
+    "interrupt": {
+     "default": false,
+     "description": "When true, interrupt the sub-agent current turn and start the new instruction immediately.",
+     "type": "boolean"
+    },
+    "wait": {
+     "default": false,
+     "description": "When true, wait for the sub-agent turn to finish and return its output immediately.",
+     "type": "boolean"
+    }
+   },
+   "required": [
+    "target",
+    "message"
+   ],
+   "additionalProperties": false
+  }
+ },
+ "close_agent": {
+  "description": "Close a spawned sub-agent by `target` (`agent_id` or `nickname`) when it is no longer needed and return its previous status.",
+  "readOnly": true,
+  "parameters": {
+   "$schema": "http://json-schema.org/draft-07/schema#",
+   "type": "object",
+   "properties": {
+    "target": {
+     "type": "string",
+     "minLength": 1,
+     "description": "Agent ID or nickname to close or resume."
+    }
+   },
+   "required": [
+    "target"
+   ],
+   "additionalProperties": false
+  }
+ },
+ "resume_agent": {
+  "description": "Resume a previously closed sub-agent by `id` (`agent_id` or `nickname`) so it can receive `send_input` and `wait_agent` calls.",
+  "readOnly": true,
+  "parameters": {
+   "$schema": "http://json-schema.org/draft-07/schema#",
+   "type": "object",
+   "properties": {
+    "target": {
+     "type": "string",
+     "minLength": 1,
+     "description": "Agent ID or nickname to close or resume."
+    }
+   },
+   "required": [
+    "target"
+   ],
+   "additionalProperties": false
+  }
+ },
+ "list_agents": {
+  "description": "List all spawned sub-agents in the current session with their IDs, nicknames, roles, and statuses.",
+  "readOnly": true,
+  "parameters": {
+   "$schema": "http://json-schema.org/draft-07/schema#",
+   "type": "object",
+   "properties": {},
+   "additionalProperties": false
+  }
+ },
+ "agent_network": {
+  "description": "Convene a multi-agent Agent Network (Brainstorm / Council Room) where specialized personas (Architect, Researcher, Critic, Pragmatist, Security) explore the codebase, debate ideas peer-to-peer across rounds, and synthesize a consensus blueprint.",
+  "readOnly": false,
+  "parameters": {
+   "$schema": "http://json-schema.org/draft-07/schema#",
+   "type": "object",
+   "properties": {
+    "topic": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 16000,
+     "description": "The problem, feature idea, architecture question, or design challenge for the Agent Network to brainstorm and debate."
+    },
+    "roles": {
+     "description": "Agent personas to include (default: [\"architect\", \"researcher\", \"critic\", \"pragmatist\"]). Custom role names are also supported.",
+     "minItems": 2,
+     "maxItems": 5,
+     "type": "array",
+     "items": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+     }
+    },
+    "rounds": {
+     "default": 2,
+     "description": "Number of deliberation rounds (1 = independent proposals + synthesis, 2+ = cross-critique & peer debate rounds).",
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 4
+    },
+    "explore_codebase": {
+     "default": true,
+     "description": "When true, agents can use read-only codebase tools (read_file, list_files, search) while formulating ideas.",
+     "type": "boolean"
+    }
+   },
+   "required": [
+    "topic"
+   ],
+   "additionalProperties": false
+  }
+ },
+ "peer_list": {
+  "description": "List all agents in the Agent Network, including their nicknames, roles, statuses, and blackboard activity.",
+  "readOnly": true,
+  "parameters": {
+   "$schema": "http://json-schema.org/draft-07/schema#",
+   "type": "object",
+   "properties": {},
+   "additionalProperties": false
+  }
+ },
+ "peer_send": {
+  "description": "Send a direct peer-to-peer message (idea, question, critique, finding) to another agent in the network by nickname/ID, or \"*\" to broadcast.",
+  "readOnly": true,
+  "parameters": {
+   "$schema": "http://json-schema.org/draft-07/schema#",
+   "type": "object",
+   "properties": {
+    "to": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 64,
+     "description": "Target agent nickname or ID (or \"*\" to broadcast to all agents in the network)."
+    },
+    "message": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 8000,
+     "description": "Message, idea, critique, or question to send to the peer agent."
+    },
+    "kind": {
+     "default": "message",
+     "description": "Category of the message.",
+     "type": "string",
+     "enum": [
+      "idea",
+      "question",
+      "critique",
+      "finding",
+      "consensus",
+      "message"
+     ]
+    },
+    "topic": {
+     "description": "Optional short topic tag.",
+     "type": "string",
+     "maxLength": 120
+    }
+   },
+   "required": [
+    "to",
+    "message"
+   ],
+   "additionalProperties": false
+  }
+ },
+ "peer_broadcast": {
+  "description": "Post an idea, design proposal, codebase finding, or critique onto the shared Agent Network blackboard for all agents to read and build upon.",
+  "readOnly": true,
+  "parameters": {
+   "$schema": "http://json-schema.org/draft-07/schema#",
+   "type": "object",
+   "properties": {
+    "topic": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 120,
+     "description": "Short title or topic for this shared blackboard entry."
+    },
+    "message": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 12000,
+     "description": "Idea, proposal, finding, or critique to post on the shared Agent Network blackboard."
+    },
+    "kind": {
+     "default": "idea",
+     "description": "Type of contribution.",
+     "type": "string",
+     "enum": [
+      "idea",
+      "question",
+      "critique",
+      "finding",
+      "consensus",
+      "message"
+     ]
+    }
+   },
+   "required": [
+    "topic",
+    "message"
+   ],
+   "additionalProperties": false
+  }
+ },
+ "peer_read": {
+  "description": "Read direct messages sent to you by other agents and view the shared Agent Network blackboard.",
+  "readOnly": true,
+  "parameters": {
+   "$schema": "http://json-schema.org/draft-07/schema#",
+   "type": "object",
+   "properties": {
+    "include_read": {
+     "default": false,
+     "description": "When true, return all messages instead of only unread direct messages.",
+     "type": "boolean"
+    },
+    "include_blackboard": {
+     "default": true,
+     "description": "When true, also return shared blackboard entries posted by all agents.",
+     "type": "boolean"
+    }
+   },
+   "additionalProperties": false
+  }
+ },
+ "run_workflow": {
+  "description": "Execute a multi-step custom or built-in workflow (e.g. \"feature-dev\", \"bug-hunt\", \"tdd-cycle\", \"security-audit\").",
+  "readOnly": false,
+  "parameters": {
+   "$schema": "http://json-schema.org/draft-07/schema#",
+   "type": "object",
+   "properties": {
+    "name": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 64,
+     "description": "Name of the workflow to execute (e.g. \"feature-dev\", \"bug-hunt\", \"tdd-cycle\", or a custom workflow name)."
+    },
+    "input": {
+     "default": "",
+     "description": "Input arguments or task description passed to the workflow ($input, $1, key=value).",
+     "type": "string",
+     "maxLength": 16000
+    }
+   },
+   "required": [
+    "name"
+   ],
+   "additionalProperties": false
+  }
+ },
+ "list_mcp_resources": {
+  "description": "Lists resources provided by connected MCP servers.",
+  "readOnly": true,
+  "parameters": {
+   "$schema": "http://json-schema.org/draft-07/schema#",
+   "type": "object",
+   "properties": {
+    "server": {
+     "description": "Optional MCP server name filter.",
+     "type": "string"
+    },
+    "cursor": {
+     "description": "Opaque pagination cursor.",
+     "type": "string"
+    }
+   },
+   "additionalProperties": false
+  }
+ },
+ "list_mcp_resource_templates": {
+  "description": "Lists parameterized resource templates provided by connected MCP servers.",
+  "readOnly": true,
+  "parameters": {
+   "$schema": "http://json-schema.org/draft-07/schema#",
+   "type": "object",
+   "properties": {
+    "server": {
+     "description": "Optional MCP server name filter.",
+     "type": "string"
+    },
+    "cursor": {
+     "description": "Opaque pagination cursor.",
+     "type": "string"
+    }
+   },
+   "additionalProperties": false
+  }
+ },
+ "read_mcp_resource": {
+  "description": "Read a specific resource from an MCP server by server name and resource URI.",
+  "readOnly": true,
+  "parameters": {
+   "$schema": "http://json-schema.org/draft-07/schema#",
+   "type": "object",
+   "properties": {
+    "server": {
+     "type": "string",
+     "minLength": 1,
+     "description": "MCP server name."
+    },
+    "uri": {
+     "type": "string",
+     "minLength": 1,
+     "description": "Resource URI to read."
+    }
+   },
+   "required": [
+    "server",
+    "uri"
+   ],
+   "additionalProperties": false
+  }
+ }
+}
