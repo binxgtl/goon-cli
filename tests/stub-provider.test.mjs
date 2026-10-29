@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, realpath } from 'node:fs/promises';
 import { readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -181,7 +181,7 @@ test('stub-provider: reasoning, tool calls and usage are emitted', async () => {
 
 test('stub-provider: fixture schema and 1 MiB cap', async () => {
   assert.throws(() => stubFixtureSchema.parse({ v: 1, turns: [{ extra: true }] }));
-  const root = await mkdtemp(join(tmpdir(), 'goon-stub-'));
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'goon-stub-')));
   try {
     const big = join(root, 'big.json');
     writeFileSync(big, JSON.stringify({ v: 1, turns: [{ text: ['x'.repeat(1_100_000)] }] }));

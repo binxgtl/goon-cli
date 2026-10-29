@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { rm, mkdtemp, readFile } from 'node:fs/promises';
+import { rm, mkdtemp, readFile, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -24,7 +24,7 @@ const verdict = (severity, warnings = [], reason = severity) => ({
 });
 
 const emptyWorkspace = async (t) => {
-  const dir = await mkdtemp(join(tmpdir(), 'goon-cand-'));
+  const dir = await realpath(await mkdtemp(join(tmpdir(), 'goon-cand-')));
   t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }));
   return new WorkspaceFiles(dir);
 };

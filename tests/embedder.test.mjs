@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { rm, mkdtemp, writeFile } from 'node:fs/promises';
+import { rm, mkdtemp, writeFile, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createEmbedder, EmbedderError } from '../dist/embedder.js';
@@ -118,7 +118,7 @@ test('factory fails closed on missing model or baseUrl without touching credenti
 });
 
 test('config: embedderProvider defaults to hash and old configs still parse', async t => {
-  const dir = await mkdtemp(join(tmpdir(), 'goon-embedder-cfg-'));
+  const dir = await realpath(await mkdtemp(join(tmpdir(), 'goon-embedder-cfg-')));
   t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }));
   await writeFile(join(dir, 'config.json'), JSON.stringify({}));
   const previousXdg = process.env.XDG_CONFIG_HOME;

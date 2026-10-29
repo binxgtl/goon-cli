@@ -9,7 +9,7 @@
  * - Assertions never touch volatile fields (session ids, timestamps, durations).
  */
 import { spawn } from 'node:child_process';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -28,7 +28,7 @@ const STRIPPED_ENV = [
 ];
 
 export async function e2eFixture(t) {
-  const root = await mkdtemp(join(tmpdir(), 'goon-e2e-'));
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'goon-e2e-')));
   const workspace = join(root, 'workspace');
   await mkdir(workspace);
   t.after(() => rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));

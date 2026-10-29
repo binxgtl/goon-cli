@@ -1,11 +1,11 @@
 import { createServer } from 'node:http';
-import { mkdtemp, mkdir, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawn } from 'node:child_process';
 
 export async function fixture(t) {
-  const root = await mkdtemp(join(tmpdir(), 'goon-test-'));
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'goon-test-')));
   const cwd = join(root, 'workspace');
   await mkdir(cwd);
   t.after(() => rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }));

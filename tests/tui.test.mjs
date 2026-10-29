@@ -514,7 +514,7 @@ test('welcomeBanner is a short unboxed block that wraps cleanly with NFD Vietnam
 test('Windows nul device bug prevention: sanitizeBashCommand, WorkspaceFiles rejection, and unlinkSafe', async () => {
   const { sanitizeBashCommand, WorkspaceFiles, WINDOWS_RESERVED_DEVICE_RE, toWinExtendedPath } =
     await import('../dist/index.js');
-  const { mkdtemp, rm } = await import('node:fs/promises');
+  const { mkdtemp, rm, realpath } = await import('node:fs/promises');
   const { tmpdir } = await import('node:os');
   const { join } = await import('node:path');
 
@@ -531,7 +531,7 @@ test('Windows nul device bug prevention: sanitizeBashCommand, WorkspaceFiles rej
     assert.match(toWinExtendedPath('D:\\testcli\\nul'), /^\\\\\?\\D:\\testcli\\nul$/i);
   }
 
-  const dir = await mkdtemp(join(tmpdir(), 'goon-nul-test-'));
+  const dir = await realpath(await mkdtemp(join(tmpdir(), 'goon-nul-test-')));
   try {
     const files = new WorkspaceFiles(dir);
     await assert.rejects(() => files.write('nul', 'bad'), /Windows reserved device name/);
@@ -746,10 +746,10 @@ test('redesign: formatTokenCount and readGitBranch agree with independent oracle
   assert.equal(formatTokenCount(48_210), '48k');
   assert.equal(formatTokenCount(2_500_000), '2.5M');
 
-  const { mkdtemp, mkdir, writeFile, rm } = await import('node:fs/promises');
+  const { mkdtemp, mkdir, writeFile, rm, realpath } = await import('node:fs/promises');
   const { tmpdir } = await import('node:os');
   const { join } = await import('node:path');
-  const root = await mkdtemp(join(tmpdir(), 'goon-branch-'));
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'goon-branch-')));
   t.after(() => rm(root, { recursive: true, force: true }));
   // Normal repo, nested cwd.
   await mkdir(join(root, 'repo', '.git'), { recursive: true });

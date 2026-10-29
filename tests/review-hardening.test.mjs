@@ -1,7 +1,7 @@
 // Regression tests for the security review of the v0.4-v0.7 roadmap PR.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { symlink, writeFile, mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { symlink, writeFile, mkdir, mkdtemp, rm, realpath } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { classifyBashRisk, tokenize } from '../dist/risk.js';
@@ -98,7 +98,7 @@ test('review: the provider key only reaches a same-origin embedder', () => {
 });
 
 test('review: RAG indexing never reads through symlinks outside the root', { skip: process.platform === 'win32' && 'symlinks need privileges on Windows' }, async t => {
-  const base = await mkdtemp(join(tmpdir(), 'goon-rag-review-'));
+  const base = await realpath(await mkdtemp(join(tmpdir(), 'goon-rag-review-')));
   t.after(() => rm(base, { recursive: true, force: true }));
   const root = join(base, 'repo');
   await mkdir(root);

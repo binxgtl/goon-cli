@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile, rm, mkdtemp } from 'node:fs/promises';
+import { readFile, rm, mkdtemp, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CostLedger } from '../dist/cost.js';
@@ -32,7 +32,7 @@ const fakeRunner = (codes) => {
 };
 
 async function tempWorkspace(t) {
-  const dir = await mkdtemp(join(tmpdir(), 'goon-scope-'));
+  const dir = await realpath(await mkdtemp(join(tmpdir(), 'goon-scope-')));
   t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }));
   return dir;
 }

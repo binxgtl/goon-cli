@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { mkdir, mkdtemp, writeFile, readFile, copyFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, writeFile, readFile, copyFile, rm, realpath } from 'node:fs/promises';
 import { join, delimiter } from 'node:path';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
@@ -10,7 +10,7 @@ import { pathToFileURL } from 'node:url';
 const exec = promisify(execFile);
 test('publishing creates the first tag, bumps on update and repairs a rerun without another bump', { timeout: 60000 }, async t => {
   if (process.platform === 'win32') { t.skip('the fake gh executable shim is POSIX-only'); return; }
-  const root = await mkdtemp(join(tmpdir(), 'goon-publish-test-'));
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'goon-publish-test-')));
   t.after(() => rm(root, { recursive: true, force: true }));
   const work = join(root, 'work'), remote = join(root, 'remote.git'), bin = join(root, 'fake-bin');
   await mkdir(join(work, 'scripts'), { recursive: true });
