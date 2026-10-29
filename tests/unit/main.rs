@@ -25,3 +25,4 @@ mod harness_verify;
 mod scheduler;
 mod stub_provider;
 mod subagents;
+mod dag;
