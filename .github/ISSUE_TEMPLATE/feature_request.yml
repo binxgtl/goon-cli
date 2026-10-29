@@ -1,0 +1,30 @@
+name: Đề xuất tính năng
+description: Đề xuất lệnh, cờ hoặc hành vi mới
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Vấn đề bạn muốn giải quyết
+      description: Bạn đang làm gì và vướng ở đâu?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Đề xuất
+      description: Hành vi mong muốn, ví dụ lệnh/cờ/cấu hình cụ thể.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Giải pháp thay thế đã cân nhắc
+  - type: checkboxes
+    id: constraints
+    attributes:
+      label: Ràng buộc của dự án
+      description: Goon ưu tiên Termux, không addon native và mặc định an toàn (xem docs/SPEC.md).
+      options:
+        - label: Đề xuất không cần dependency native và chạy được trên Termux
+        - label: Đề xuất không làm yếu approval, redaction hay execution policy

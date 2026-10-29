@@ -1,0 +1,58 @@
+name: Báo lỗi
+description: Goon chạy sai, treo hoặc thoát với lỗi không mong muốn
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Cảm ơn bạn đã báo lỗi. **Không dán API key hay secret** vào issue; kiểm tra lại log trước khi gửi.
+  - type: input
+    id: version
+    attributes:
+      label: Phiên bản goon
+      description: Kết quả của `goon --version`.
+      placeholder: goon cli 0.3.2
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Môi trường
+      description: Dán kết quả `goon doctor` (đã xoá thông tin riêng tư) hoặc ghi hệ điều hành, Node (`node --version`), terminal; Termux hay máy thường.
+      render: shell
+    validations:
+      required: true
+  - type: dropdown
+    id: provider
+    attributes:
+      label: Provider
+      options:
+        - openai-compatible
+        - openai-responses
+        - anthropic
+        - stub (--stub)
+        - Không liên quan tới provider
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Cách tái hiện
+      description: Lệnh hoặc các bước cụ thể. Nếu tái hiện được với `--stub` và một fixture nhỏ thì càng tốt (xem CONTRIBUTING.md).
+      placeholder: |
+        1. goon --stub --stub-fixture repro.json -p '...'
+        2. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Kết quả mong đợi và kết quả thực tế
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log / event log
+      description: Đầu ra lỗi, hoặc phần liên quan của `goon replay <ID>` (chạy với `--event-log`). Event log đã redact secret nhưng vẫn nên đọc lại.
+      render: shell
