@@ -34,6 +34,11 @@
     "typecheck": "tsc --noEmit",
     "lint": "oxlint src tests bin scripts",
     "test": "npm run build && node --test --test-concurrency=4 \"tests/*.test.mjs\"",
+    "test:e2e": "npm run build && node --test --test-concurrency=4 \"tests/e2e/*.test.mjs\"",
+    "test:one": "npm run build && node --test",
+    "check": "npm run lint && npm run build && node --test --test-concurrency=4 \"tests/*.test.mjs\" \"tests/e2e/*.test.mjs\"",
+    "watch": "tsc --watch --preserveWatchOutput",
+    "dev": "npm run build && node bin/goon.mjs",
     "prepack": "npm run build",
     "release:pack": "node scripts/pack-release.mjs"
   },
