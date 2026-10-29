@@ -333,3 +333,15 @@ mod tests {
         assert_eq!(slice_chars("abcdef", 1, 3), "bc");
     }
 }
+
+/// `String(value)` for a JSON value.
+pub fn js_string(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        Value::Null => "null".into(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(_) => stringify(value),
+        Value::Array(items) => items.iter().map(|v| if v.is_null() { String::new() } else { js_string(v) }).collect::<Vec<_>>().join(","),
+        Value::Object(_) => "[object Object]".into(),
+    }
+}

@@ -102,7 +102,7 @@ pub fn normalize_pricing(pricing: Option<&Value>) -> CostPricingTable {
 pub fn to_usage_split(usage: Option<&crate::model::Usage>, fallback_input: u64, fallback_output: u64) -> UsageSplit {
     let input = usage.and_then(|u| u.input_tokens).unwrap_or(fallback_input);
     let output = usage.and_then(|u| u.output_tokens).unwrap_or(fallback_output);
-    let total = usage.and_then(|u| u.total_tokens()).filter(|_| usage.map(|u| u.input_tokens.is_some() || u.output_tokens.is_some()).unwrap_or(false)).map(|_| input + output).unwrap_or(input + output);
+    let total = usage.and_then(|u| u.total_tokens()).unwrap_or(input + output);
     let cached = usage.and_then(|u| u.cache_read_tokens).unwrap_or(0);
     let cache_write = usage.and_then(|u| u.cache_write_tokens).unwrap_or(0);
     UsageSplit {

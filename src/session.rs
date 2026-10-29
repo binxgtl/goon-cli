@@ -31,6 +31,9 @@ pub struct TurnCheckpoint {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct TodoItem {
+    /// Set by `update_plan` (written to the session file, dropped again on load like zod did).
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     pub content: String,
     pub status: String,
     #[serde(default = "default_priority")]
