@@ -501,6 +501,13 @@ pub struct SessionRoute {
     pub base_url: String,
 }
 
+impl SessionRoute {
+    /// The explicit allowlist of runtime fields a session records (never credentials).
+    pub fn from_runtime(config: &crate::config::RuntimeConfig) -> SessionRoute {
+        SessionRoute { cwd: config.cwd.to_string_lossy().to_string(), provider: config.provider.clone(), model: config.model.clone(), base_url: config.base_url.clone() }
+    }
+}
+
 fn acquire(lock: &Path) -> std::io::Result<()> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);

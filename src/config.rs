@@ -810,7 +810,12 @@ pub fn load_config(overrides: &Map<String, Value>) -> Result<Config> {
         merged.insert(k.clone(), v.clone());
     }
     for (k, v) in overrides.iter() {
-        merged.insert(k.clone(), v.clone());
+        // `undefined` in a TS override object (`{ ...config, effort: undefined }`) clears the key.
+        if v.is_null() {
+            merged.remove(k);
+        } else {
+            merged.insert(k.clone(), v.clone());
+        }
     }
     // `verify` is nested: merge per key so one env var or flag never drops the other fields.
     let override_verify = overrides.get("verify").and_then(Value::as_object).cloned();
