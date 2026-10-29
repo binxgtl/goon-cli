@@ -16,3 +16,5 @@ mod scope_loop;
 mod rag;
 mod eventlog;
 mod session;
+mod memory;
+mod memory_integration;

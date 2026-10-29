@@ -347,3 +347,84 @@ pub fn assert_match(text: &str, pattern: &str) {
     let re = regex::Regex::new(pattern).unwrap();
     assert!(re.is_match(text), "expected {text:?} to match /{pattern}/");
 }
+
+// ---------------------------------------------------------------------------------------------
+// Scripted in-process model (the JS `makeFakeModel(turns)` helper)
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Clone, Default)]
+pub struct Turn {
+    pub text: String,
+    pub calls: Vec<ToolCallSpec>,
+    pub reasoning: String,
+}
+
+pub fn say(text: &str) -> Turn {
+    Turn { text: text.into(), ..Default::default() }
+}
+
+pub fn invoke(list: Vec<ToolCallSpec>) -> Turn {
+    Turn { calls: list, ..Default::default() }
+}
+
+pub struct FakeModel {
+    pub turns: Mutex<std::collections::VecDeque<Turn>>,
+    pub requests: Mutex<Vec<model::ModelRequest>>,
+}
+
+impl FakeModel {
+    pub fn new(turns: Vec<Turn>) -> Arc<FakeModel> {
+        Arc::new(FakeModel { turns: Mutex::new(turns.into()), requests: Mutex::new(vec![]) })
+    }
+    pub fn request_count(&self) -> usize {
+        self.requests.lock().unwrap().len()
+    }
+}
+
+impl model::LanguageModel for FakeModel {
+    fn model_id(&self) -> &str {
+        "test-model"
+    }
+    fn provider(&self) -> &str {
+        "test"
+    }
+    fn stream(&self, request: model::ModelRequest) -> BoxFuture<'static, Result<model::PartStream, model::ApiError>> {
+        let cancel = request.cancel.clone();
+        self.requests.lock().unwrap().push(request);
+        let turn = self.turns.lock().unwrap().pop_front().unwrap_or_else(|| say("[stub] script exhausted"));
+        Box::pin(async move {
+            if cancel.is_cancelled() {
+                return Err(model::ApiError::aborted());
+            }
+            use model::StreamPart as P;
+            let mut parts = vec![];
+            if !turn.reasoning.is_empty() {
+                parts.push(P::ReasoningDelta { id: "r1".into(), delta: turn.reasoning.clone(), provider_metadata: None });
+                parts.push(P::ReasoningEnd { id: "r1".into(), provider_metadata: None });
+            }
+            if !turn.text.is_empty() {
+                parts.push(P::TextDelta { id: "t1".into(), delta: turn.text.clone(), provider_metadata: None });
+                parts.push(P::TextEnd { id: "t1".into(), provider_metadata: None });
+            }
+            for (i, call) in turn.calls.iter().enumerate() {
+                let id = if call.id.is_empty() { format!("call-{i}") } else { call.id.clone() };
+                let input = jsutil::stringify(&call.input);
+                parts.push(P::ToolInputStart { id: id.clone(), tool_name: call.name.clone() });
+                parts.push(P::ToolInputDelta { id: id.clone(), delta: input.clone() });
+                parts.push(P::ToolCall { id, tool_name: call.name.clone(), input, provider_metadata: None });
+            }
+            let finish_reason = if turn.calls.is_empty() { model::FinishReason::Stop } else { model::FinishReason::ToolCalls };
+            parts.push(P::Finish { usage: model::Usage { input_tokens: Some(10), output_tokens: Some(5), ..Default::default() }, finish_reason });
+            Ok(Box::pin(futures_util::stream::iter(parts)) as model::PartStream)
+        })
+    }
+}
+
+/// A verify runner that always succeeds.
+pub struct PassRunner;
+
+impl verify::VerifyRunner for PassRunner {
+    fn run(&self, _command: String, _args: Vec<String>, _opts: verify::RunnerOptions) -> BoxFuture<'static, verify::RunnerResult> {
+        Box::pin(async { verify::RunnerResult { code: 0, output: String::new(), timed_out: false, not_found: false } })
+    }
+}

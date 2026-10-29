@@ -345,6 +345,9 @@ pub struct Harness {
     pub untrusted_prompts: Mutex<bool>,
     state: Mutex<HarnessState>,
     goal_clock: Arc<Mutex<GoalClock>>,
+    /// Background memory deliveries (events, patch reindex) awaited before a run returns, so
+    /// the store has seen everything a run produced (the TS single-writer chain guarantee).
+    memory_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 /// Mirrors goal time/token usage for the active turn; `allow_stopped` also flushes paused goals.
@@ -458,7 +461,7 @@ impl Harness {
             let emit_p = emit.clone();
             cbs.on_plan_exit = Some(Arc::new(move |plan| emit_p(json!({ "type": "plan_exit", "plan": plan }))));
         }
-        Ok(Arc::new(Harness { config, store, tools, emit, model, cost_ledger, deps, untrusted_prompts: Mutex::new(false), state: Mutex::new(HarnessState::default()), goal_clock }))
+        Ok(Arc::new(Harness { config, store, tools, emit, model, cost_ledger, deps, untrusted_prompts: Mutex::new(false), state: Mutex::new(HarnessState::default()), goal_clock, memory_tasks: Mutex::new(vec![]) }))
     }
 
     pub fn busy(&self) -> bool {
@@ -677,11 +680,27 @@ impl Harness {
     fn memory_event(&self, event: Value) {
         let Some(memory) = self.deps.memory.clone() else { return };
         let emit = self.emit.clone();
-        tokio::spawn(async move {
-            if memory.handle_event(event).await.is_err() {
+        // The hook applies the event when called (keeping event order); the future persists it.
+        let delivery = memory.handle_event(event);
+        let handle = tokio::spawn(async move {
+            if delivery.await.is_err() {
                 emit(json!({ "type": "memory_error", "message": "memory store rejected an event." }));
             }
         });
+        self.memory_tasks.lock().unwrap().push(handle);
+    }
+
+    /// Awaits every background memory delivery started so far.
+    async fn drain_memory_tasks(&self) {
+        loop {
+            let pending: Vec<_> = std::mem::take(&mut *self.memory_tasks.lock().unwrap());
+            if pending.is_empty() {
+                return;
+            }
+            for handle in pending {
+                let _ = handle.await;
+            }
+        }
     }
 
     fn remember_assistant_message(&self, text: &str) {
@@ -733,13 +752,14 @@ impl Harness {
         let emit = self.emit.clone();
         let cwd = self.config.cwd.clone();
         let key = self.config.api_key.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             match memory.ensure_repo_indexed(cwd).await {
                 Ok(i) if i.reindexed != "none" => emit(json!({ "type": "memory_indexed", "files": i.files, "chunks": i.chunks, "durationMs": i.duration_ms })),
                 Ok(_) => {}
                 Err(error) => emit(json!({ "type": "memory_error", "message": safe_error(&error.to_string(), Some(&key)) })),
             }
         });
+        self.memory_tasks.lock().unwrap().push(handle);
     }
 
     fn remember_patch_applied(&self, call: &ToolCall) {
@@ -1048,6 +1068,7 @@ impl Harness {
         }
         self.drain_pending_context();
         let _ = self.store.save();
+        self.drain_memory_tasks().await;
         self.state.lock().unwrap().running = false;
         self.tools.set_budget(None);
         result
@@ -1404,10 +1425,10 @@ impl Harness {
                 d.1 |= result.loop_detected;
             }
             meta.insert("durationMs".into(), json!((now_millis() - started).max(0)));
+            let edited = !result.denied && meta["kind"] == "edit";
             if !result.denied {
-                if meta["kind"] == "edit" {
+                if edited {
                     self.state.lock().unwrap().turn_had_edit = true;
-                    self.remember_patch_applied(&call);
                 }
                 static FAILED: OnceLock<Regex> = OnceLock::new();
                 let failed_re = FAILED.get_or_init(|| Regex::new(r"(?m)^Exit code:\s*(\d+)").unwrap());
@@ -1422,6 +1443,11 @@ impl Harness {
             }
             let summary = meta["summary"].as_str().unwrap_or("").to_string();
             self.memory_event(json!({ "type": "tool_result", "tool": call.tool_name, "summary": if result.denied { format!("{summary} (denied)") } else { summary } }));
+            // patch_applied (path + byte delta only) follows tool_result, as in the TS build where
+            // it was delivered after the asynchronous size check.
+            if edited {
+                self.remember_patch_applied(&call);
+            }
             if meta["kind"] == "exec" && !result.text.is_empty() {
                 let lines: Vec<String> = result.text.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l).trim_end().to_string()).filter(|l| !l.is_empty()).collect();
                 meta.insert("outputPreview".into(), json!(lines.iter().take(80).collect::<Vec<_>>()));

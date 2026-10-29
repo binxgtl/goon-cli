@@ -193,7 +193,10 @@ impl KnowledgeMemory {
         let root_str = root.to_string_lossy().to_string();
         if s.snapshot.as_ref().map(|x| x.cwd != root_str).unwrap_or(true) {
             let result = index_repo(root, self.max_files, self.max_file_bytes, &self.secrets);
-            let docs = snapshot_docs(Some(&result.snapshot));
+            let mut docs = snapshot_docs(Some(&result.snapshot));
+            // Fixed vs TS: a full rebuild clears the index, so stored insights are re-added
+            // instead of vanishing from retrieval until the next restart.
+            docs.extend(insight_docs(&s.insights));
             s.snapshot = Some(result.snapshot);
             let index = s.index.as_mut().unwrap();
             index.clear();
@@ -433,6 +436,16 @@ impl MemoryStore {
         self.repo.lock().unwrap().0.clone()
     }
 
+    /// The rolling exec lessons, oldest first.
+    pub fn exec_lessons(&self) -> Vec<ExecLesson> {
+        self.exec.lock().unwrap().clone()
+    }
+
+    /// Replaces the cached repo tree summary (already sized by the caller).
+    pub fn refresh_repo_tree(&self, tree: &str) {
+        *self.repo.lock().unwrap() = (Some(tree.to_string()), Some(now_iso()));
+    }
+
     fn append_lesson(&self, text: &str) {
         let clean = truncate(text, 400);
         if clean.is_empty() {
@@ -579,11 +592,10 @@ pub struct MemoryAdapter(pub Arc<MemoryStore>);
 
 impl MemoryHooks for MemoryAdapter {
     fn handle_event(&self, event: Value) -> BoxFuture<'static, Result<()>> {
+        // Applied synchronously so events land in call order; persistence runs in the chain.
+        self.0.apply_event(&event);
         let store = self.0.clone();
-        Box::pin(async move {
-            store.handle_event(event).await;
-            Ok(())
-        })
+        Box::pin(async move { store.persist().await })
     }
 
     fn retrieve(&self, query: String, budget_tokens: u64) -> BoxFuture<'static, Result<MemoryPromptContext>> {
