@@ -704,7 +704,8 @@ impl WorkspaceFiles {
                 use std::os::unix::fs::PermissionsExt;
                 handle.set_permissions(std::fs::Permissions::from_mode(mode))?;
             }
-            let _ = existing;
+            #[cfg(not(unix))]
+            let _ = (mode, existing);
             handle.sync_all()?;
             drop(handle);
             std::fs::rename(&temporary, file)

@@ -1,6 +1,8 @@
 //! Library-level tests, ported from the TypeScript `node:test` unit suite. CLI-level behaviour
 //! stays covered by `tests/*.test.mjs`, which run against the native binary.
 #![allow(clippy::type_complexity)]
+// Helpers and imports used only by the POSIX-only tests (file modes, symlinks, signals).
+#![cfg_attr(not(unix), allow(unused_imports, dead_code))]
 mod audit;
 mod cli_support;
 mod common;
