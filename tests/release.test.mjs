@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
+import { readFile, mkdir, mkdtemp, writeFile, copyFile, rm, realpath } from 'node:fs/promises';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { selectVersion, setManifestVersion, parseVersion, setCargoVersion, cargoVersions } from '../scripts/release-version.mjs';
@@ -63,4 +65,31 @@ test('CLI version comes from the installed package manifest', async () => {
   assert.deepEqual(cargoVersions(await readFile('Cargo.toml', 'utf8'), await readFile('Cargo.lock', 'utf8')), { manifest: manifest.version, lock: manifest.version }, 'Cargo.toml and Cargo.lock must match package.json');
   const { stdout } = await promisify(execFile)(process.execPath, ['bin/goon.mjs', '--version']);
   assert.equal(stdout.trim(), `goon cli ${manifest.version}`);
+});
+
+test('the CI plan entry point runs on its own and picks the next version from the tags', { timeout: 30000 }, async t => {
+  const exec = promisify(execFile);
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'goon-plan-test-')));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const work = join(root, 'work'), remote = join(root, 'remote.git');
+  const git = (...args) => exec('git', args, { cwd: work });
+  await exec('git', ['init', '--bare', '--initial-branch=main', remote]);
+  await mkdir(join(work, 'scripts'), { recursive: true });
+  await git('init', '-b', 'main');
+  await git('config', 'user.name', 'Plan Test');
+  await git('config', 'user.email', 'test@example.invalid');
+  await git('remote', 'add', 'origin', remote);
+  await writeFile(join(work, 'package.json'), JSON.stringify({ name: 'goon-cli', version: '0.1.0' }));
+  for (const file of ['release-version.mjs', 'pack-release.mjs', 'install.mjs']) await copyFile(join('scripts', file), join(work, 'scripts', file));
+  await git('add', '.');
+  await git('commit', '-m', 'initial');
+  await git('tag', 'v0.1.0');
+  await writeFile(join(work, 'change.txt'), 'x');
+  await git('add', '.');
+  await git('commit', '-m', 'change');
+  await git('push', 'origin', 'main', '--tags');
+  // Run as CI does: a fresh process whose entry module is release-version.mjs (an import cycle
+  // with pack-release.mjs once deadlocked here and exited 13).
+  const { stdout } = await exec(process.execPath, ['scripts/release-version.mjs', 'plan'], { cwd: work });
+  assert.deepEqual(JSON.parse(stdout), { skip: false, version: '0.1.1', reason: '' });
 });

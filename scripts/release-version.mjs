@@ -91,8 +91,12 @@ export async function planRelease(root, git) {
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href && process.argv[2] === 'plan') {
-  const { command } = await import('./pack-release.mjs');
+  // Not pack-release.mjs's `command`: that module imports this one, and awaiting it from here
+  // deadlocks the module graph (Node exits 13 with an unsettled top-level await).
+  const { execFile } = await import('node:child_process');
+  const { promisify } = await import('node:util');
   const root = fileURLToPath(new URL('..', import.meta.url));
-  const plan = await planRelease(root, (...args) => command('git', args, root));
+  const git = async (...args) => (await promisify(execFile)('git', args, { cwd: root, maxBuffer: 16 * 1024 * 1024 })).stdout.trim();
+  const plan = await planRelease(root, git);
   console.log(JSON.stringify({ skip: plan.skip, version: plan.version ?? '', reason: plan.reason ?? '' }));
 }
