@@ -606,7 +606,12 @@ impl WorkspaceFiles {
         let mut parent = lexical.clone();
         let mut suffix: Vec<std::ffi::OsString> = vec![];
         loop {
-            match std::fs::canonicalize(&parent) {
+            // Windows resolves `nul`, `con`, … to devices (canonicalize fails with "parameter is
+            // incorrect"); treat them as not-yet-existing names so the caller's reserved-name
+            // check reports them.
+            let device = cfg!(windows) && parent.file_name().is_some_and(|n| windows_reserved_device_re().is_match(&n.to_string_lossy()));
+            let canonical = if device { Err(std::io::Error::from(std::io::ErrorKind::NotFound)) } else { std::fs::canonicalize(&parent) };
+            match canonical {
                 Ok(resolved) => {
                     let resolved = crate::config::strip_verbatim(resolved);
                     self.assert_within(&resolved)?;

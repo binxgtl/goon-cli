@@ -475,7 +475,9 @@ pub fn same_workspace(a: &str, b: &str) -> bool {
     let na: String = a.nfc().collect::<String>().trim_end_matches(['/', '\\']).to_string();
     let nb: String = b.nfc().collect::<String>().trim_end_matches(['/', '\\']).to_string();
     if crate::jsutil::is_windows() {
-        na.to_lowercase() == nb.to_lowercase()
+        // `\\?\C:\x` (Rust's canonical form) and `C:\x` (Node's realpath) name the same folder.
+        let plain = |s: &str| crate::config::strip_verbatim(PathBuf::from(s)).to_string_lossy().to_lowercase();
+        plain(&na) == plain(&nb)
     } else {
         na == nb
     }

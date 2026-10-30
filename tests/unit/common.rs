@@ -24,7 +24,8 @@ pub struct Fixture {
 
 pub fn fixture() -> Fixture {
     let dir = tempfile::Builder::new().prefix("goon-test-").tempdir().unwrap();
-    let root = std::fs::canonicalize(dir.path()).unwrap();
+    // Node-style real path (no `\\?\` prefix on Windows), as the CLI resolves its workspace.
+    let root = goon::config::realpath(dir.path()).unwrap();
     let cwd = root.join("workspace");
     std::fs::create_dir_all(&cwd).unwrap();
     Fixture { config: root.join("config"), data: root.join("data"), cwd, root, dir }
