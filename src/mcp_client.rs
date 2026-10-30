@@ -83,7 +83,8 @@ struct HttpTransport {
 }
 
 enum Transport {
-    Stdio(StdioTransport),
+    // Boxed: tokio's `Child` is several hundred bytes on Windows.
+    Stdio(Box<StdioTransport>),
     Http(HttpTransport),
 }
 
@@ -368,7 +369,7 @@ fn start_stdio(command: &str, args: &[String], env: &BTreeMap<String, String>, c
     let rpc = Arc::new(Rpc {
         next_id: AtomicI64::new(0),
         pending: Mutex::new(HashMap::new()),
-        transport: Transport::Stdio(StdioTransport { stdin: tokio::sync::Mutex::new(stdin), child: tokio::sync::Mutex::new(Some(child)) }),
+        transport: Transport::Stdio(Box::new(StdioTransport { stdin: tokio::sync::Mutex::new(stdin), child: tokio::sync::Mutex::new(Some(child)) })),
         closed: CancellationToken::new(),
         close_reason: Mutex::new(None),
     });
