@@ -4,6 +4,7 @@ release-out/
 release-bin/
 dist-bin/
 vendor/
+THIRD-PARTY-NOTICES.txt
 *.tgz
 !release/*.tgz
 .env

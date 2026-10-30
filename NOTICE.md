@@ -15,8 +15,12 @@ Design references inspected for version 0.1.0:
   interfaces, bounded parallel-safe tool scheduling, exclusive mutation
   barriers, ordered results and conservative recovery after interruption.
 
-Goon uses the Vercel AI SDK and its provider adapters for protocol handling.
-Dependencies retain their own licenses in their installed package directories.
+Goon is written in Rust and implements the model protocols itself. The release
+binaries statically link third-party crates under their own licenses (MIT,
+Apache-2.0, ISC, BSD-3-Clause, Zlib, Unicode-3.0, CDLA-Permissive-2.0 and
+similar); `THIRD-PARTY-NOTICES.txt`, shipped in the npm package and attached to
+every release, lists each crate with its license texts. Versions before the Rust
+rewrite used the Vercel AI SDK and its provider adapters for protocol handling.
 The implementation and build process use no official Claude Code binary.
 
 A deeper stream/subagent review for 0.2.1 rechecked ZCode at the same commit

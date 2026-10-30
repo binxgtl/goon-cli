@@ -4,7 +4,7 @@
 
 ## Kiểm tra
 
-- [ ] `npm run check` pass (lint + build + test đơn vị + e2e)
+- [ ] `npm run check` pass (rustfmt + clippy + oxlint + cargo test + test Node + e2e)
 - [ ] Có test đi kèm thay đổi hành vi (hoặc giải thích bên dưới vì sao không)
 - [ ] Đã ghi vào `CHANGELOG.md` (mục `## Unreleased`) và README nếu thêm lệnh, cờ, biến môi trường hoặc event
 - [ ] Không thêm dependency mới (hoặc nêu lý do bên dưới); không để API key/secret trong code, test, fixture

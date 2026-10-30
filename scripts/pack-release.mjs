@@ -42,6 +42,8 @@ export async function packRelease(root = resolve(dirname(fileURLToPath(import.me
   const binaries = resolve(root, options.binaries ?? process.env.GOON_RELEASE_BINARIES ?? 'release-bin');
   const repository = options.repository ?? process.env.GITHUB_REPOSITORY ?? 'binxgtl/goon-cli';
   const manifest = await binaryManifest(binaries, version, repository);
+  const notices = join(root, 'THIRD-PARTY-NOTICES.txt');
+  if (!(await readFile(notices, 'utf8').catch(() => '')).trim()) throw new Error('THIRD-PARTY-NOTICES.txt is missing; run node scripts/third-party-notices.mjs first.');
   await mkdir(join(root, 'vendor'), { recursive: true });
   await writeFile(join(root, 'vendor', 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);
 
@@ -52,7 +54,9 @@ export async function packRelease(root = resolve(dirname(fileURLToPath(import.me
   const filename = `goon-cli-${version}.tgz`;
   if (packed.length !== 1 || packed[0].filename !== filename) throw new Error('Unexpected npm pack output.');
   const packedFiles = packed[0].files.map(f => f.path);
-  if (!packedFiles.includes('vendor/manifest.json')) throw new Error('The npm package must contain vendor/manifest.json.');
+  for (const required of ['vendor/manifest.json', 'THIRD-PARTY-NOTICES.txt']) {
+    if (!packedFiles.includes(required)) throw new Error(`The npm package must contain ${required}.`);
+  }
   if (packedFiles.some(p => /^vendor\/.+\/goon(\.exe)?$/.test(p))) throw new Error('Native binaries must not be packed into the npm package.');
   const archive = join(output, filename);
 
@@ -77,6 +81,9 @@ export async function packRelease(root = resolve(dirname(fileURLToPath(import.me
     files.push(join(output, file));
     sums.push(`${manifest.assets[triple].gzSha256}  ${file}`);
   }
+  await copyFile(notices, join(output, 'THIRD-PARTY-NOTICES.txt'));
+  files.push(join(output, 'THIRD-PARTY-NOTICES.txt'));
+  sums.push(`${sha256(await readFile(notices))}  THIRD-PARTY-NOTICES.txt`);
   const checksums = join(output, 'SHA256SUMS.txt');
   await writeFile(checksums, `${sums.join('\n')}\n`);
   files.push(checksums);
