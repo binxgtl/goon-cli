@@ -8,52 +8,34 @@
   "bin": {
     "goon": "bin/goon.mjs"
   },
-  "exports": {
-    ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
-    }
-  },
   "engines": {
     "node": ">=22.16.0"
   },
   "files": [
     "bin",
-    "dist",
-    "src",
-    "docs",
-    "scripts",
-    "tsconfig.json",
+    "scripts/install.mjs",
+    "vendor/manifest.json",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE",
-    "NOTICE.md",
-    "npm-shrinkwrap.json"
+    "THIRD-PARTY-NOTICES.txt",
+    "NOTICE.md"
   ],
   "scripts": {
-    "build": "tsc",
-    "typecheck": "tsc --noEmit",
-    "lint": "oxlint src tests bin scripts",
-    "test": "npm run build && node --test --test-concurrency=4 \"tests/*.test.mjs\"",
-    "test:e2e": "npm run build && node --test --test-concurrency=4 \"tests/e2e/*.test.mjs\"",
-    "test:one": "npm run build && node --test",
-    "check": "npm run lint && npm run build && node --test --test-concurrency=4 \"tests/*.test.mjs\" \"tests/e2e/*.test.mjs\"",
-    "watch": "tsc --watch --preserveWatchOutput",
-    "dev": "npm run build && node bin/goon.mjs",
-    "prepack": "npm run build",
+    "postinstall": "node scripts/install.mjs",
+    "build": "cargo build",
+    "build:release": "cargo build --release",
+    "lint": "cargo fmt --check && cargo clippy --all-targets --locked -- -D warnings && oxlint tests bin scripts",
+    "test": "cargo build --locked && node --test --test-concurrency=4 \"tests/*.test.mjs\"",
+    "test:rust": "cargo test --locked",
+    "test:e2e": "cargo build --locked && node --test --test-concurrency=4 \"tests/e2e/*.test.mjs\"",
+    "test:one": "cargo build --locked && node --test",
+    "check": "npm run lint && cargo test --locked && node --test --test-concurrency=4 \"tests/*.test.mjs\" \"tests/e2e/*.test.mjs\"",
+    "dev": "cargo build --locked && node bin/goon.mjs",
     "release:pack": "node scripts/pack-release.mjs"
   },
-  "dependencies": {
-    "@ai-sdk/anthropic": "3.0.135",
-    "@ai-sdk/openai": "3.0.131",
-    "@ai-sdk/openai-compatible": "2.0.87",
-    "@modelcontextprotocol/sdk": "1.32.1",
-    "ai": "6.0.312",
-    "ajv": "8.20.0",
-    "zod": "4.6.7"
-  },
   "devDependencies": {
-    "@types/node": "^22.0.0",
-    "oxlint": "^1.57.0",
-    "typescript": "~5.9.3"
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "oxlint": "^1.57.0"
   }
 }

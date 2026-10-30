@@ -1,6 +1,10 @@
 node_modules/
 dist/
 release-out/
+release-bin/
+dist-bin/
+vendor/
+THIRD-PARTY-NOTICES.txt
 *.tgz
 !release/*.tgz
 .env
@@ -14,3 +18,4 @@ release-out/
 .idea/
 .vscode/
 .claude/worktrees/
+target/

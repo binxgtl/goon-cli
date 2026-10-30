@@ -15,7 +15,7 @@ tools and persistence. No ZCode runtime source is copied or loaded.
 - SessionStore owns atomic JSON checkpoints and a process lock. A session is
   bound to its real workspace. Loading repairs interrupted tool calls with error
   results; it never replays a side effect. A live lock is never stolen.
-- Provider owns HTTP/model protocol handling through AI SDK: OpenAI chat,
+- Provider owns HTTP/model protocol handling (`src/providers/`): OpenAI chat,
   OpenAI Responses, Anthropic Messages. Two retries; configurable request timeout.
 - Tools own file/shell I/O. File paths resolve within the real workspace;
   symlink escapes fail. Existing files must be read before overwrite/edit;

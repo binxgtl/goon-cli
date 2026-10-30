@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+### Native Rust rewrite
+- goon is now a single native binary written in Rust; the TypeScript implementation, its build and
+  its runtime dependencies are gone. The install command is unchanged
+  (`npm install -g https://github.com/binxgtl/goon-cli/releases/latest/download/goon-cli.tgz --omit=dev`):
+  the npm package is a small wrapper that downloads the binary for the platform from the same
+  release on install (or on first run with `--ignore-scripts`), verifies it against the SHA-256
+  recorded in the package and relays signals to it. Node >=22.16 is only needed for that wrapper.
+- Prebuilt binaries for Termux/Android (`aarch64`, `armv7`, `x86_64`), Linux (`x86_64`, `aarch64`,
+  static musl), macOS (Intel, Apple Silicon) and Windows `x86_64` are attached to every release as
+  `goon-<target>.gz`, listed in `SHA256SUMS.txt`. `GOON_DOWNLOAD_BASE` points the wrapper at a
+  mirror URL or a local directory of those assets; `GOON_BINARY` runs a given binary.
+- On-disk formats are unchanged: `config.json`, `credentials.json`, sessions, checkpoints, event
+  logs, the memory store and `mcp.json` written by the TypeScript build load as before, and the
+  Rust build writes them byte-compatibly (JavaScript number formatting, key order and V8's
+  `JSON.parse` error messages are reproduced). Flags, slash commands, events and exit codes are
+  the same; the golden event streams in `tests/golden/` did not change.
+- Old TypeScript bugs fixed during the port:
+  - `git config` of keys that run programs later (`core.hooksPath`, `core.pager`, …) is high risk
+    instead of medium.
+  - `rm -rf ${HOME}` and `rm -rf "$HOME/"` are recognised as deleting the home directory, like the
+    bare `$HOME` spelling.
+  - The shell tokenizer decodes ANSI-C `$'\xHH'` escapes to the real bytes, so `rm $'\x2drf' /`
+    is classified as `rm -rf /` instead of a harmless `-drf`.
+  - A full memory reindex no longer drops stored insights from the search index.
+- Tests: the library-level `node:test` suite was ported to Rust (`cargo test`: unit tests in
+  `src/**`, `tests/unit/`), and `tests/parity.rs` replays about 10,000 calls recorded from the
+  TypeScript build against the Rust port (only the fixes above may differ). The CLI-level Node
+  tests and `tests/e2e/` run unchanged against the binary.
+- CI checks rustfmt, clippy (`-D warnings`) and the tests on Linux, macOS and Windows, cross-builds
+  the eight targets with the release version stamped in, and the release smoke test installs the
+  packed `.tgz` and lets the wrapper download, verify and run the binary.
+
 ### Security review fixes (PR #2)
 - Command runners (`watch`, `flock`, `strace`, `chroot`, `ionice`, `unbuffer`, `proot`, `su -c`, `trap`, `busybox`/`toybox` …) no longer hide critical commands from the risk classifier or network commands from the execution policy; inline interpreter code (`perl -e`, `ruby -e`, `php -r`, `lua -e`) is high risk; GNU `sed` `e`/`w` commands are detected.
 - Verification commands pass the same critical-risk and network execution-policy gates as the bash tool, and their risk reaches the approval callback (auto mode never runs a high-risk verify plan).

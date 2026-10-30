@@ -1,0 +1,56 @@
+[package]
+name = "goon-cli"
+version = "0.3.3"
+edition = "2021"
+description = "A small independent coding harness for Termux and external model APIs"
+license = "MIT"
+repository = "https://github.com/binxgtl/goon-cli"
+publish = false
+default-run = "goon"
+
+[lib]
+name = "goon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "goon"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+crossterm = "0.29"
+fancy-regex = "0.14"
+futures-util = "0.3"
+hex = "0.4"
+indexmap = { version = "2", features = ["serde"] }
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json", "http2"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "io-util", "io-std", "time", "sync", "signal", "net"] }
+tokio-util = "0.7"
+unicode-normalization = "0.1"
+unicode-width = "0.2"
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+# Small, single-unit release builds: ~4 MB gzipped per target. opt-level "s" measured within
+# noise of opt-level 3 on the parity corpus, and the download matters on phones.
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "unwind"

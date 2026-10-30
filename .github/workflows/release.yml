@@ -14,16 +14,62 @@ concurrency:
   group: goon-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+
 jobs:
+  plan:
+    name: Plan version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      release: ${{ steps.plan.outputs.release }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+      - name: Choose the release version
+        id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          version=$(node -p "require('./package.json').version")
+          release=false
+          if [ "$EVENT" != pull_request ] && [ "$REF" = refs/heads/main ] && [ "$REPOSITORY" = binxgtl/goon-cli ]; then
+            plan=$(node scripts/release-version.mjs plan)
+            echo "$plan"
+            if [ "$(node -p "JSON.parse(process.argv[1]).skip" "$plan")" = false ]; then
+              version=$(node -p "JSON.parse(process.argv[1]).version" "$plan")
+              release=true
+            fi
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+          echo "Building $version (release: $release)"
+
   check:
     name: Check ${{ matrix.os }} Node ${{ matrix.node }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-        node: ['22.16.0', '24']
+        include:
+          - { os: ubuntu-latest, node: '22.16.0' }
+          - { os: ubuntu-latest, node: '24' }
+          - { os: windows-latest, node: '24' }
+          - { os: macos-latest, node: '24' }
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -33,25 +79,135 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: npm
           cache-dependency-path: npm-shrinkwrap.json
+      - name: Install the Rust toolchain
+        run: rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" --profile minimal --component clippy,rustfmt
+      - uses: actions/cache@a7833574556fa59680c1b7cb190c1735db73ebf0 # v5.0.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: check-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: check-${{ runner.os }}-
       - run: npm ci --ignore-scripts --no-audit --no-fund
-      - run: npm run typecheck
-      - run: npm run lint
-      - run: npm test
-      - name: End-to-end tests (stub provider, offline)
-        # Verified on Linux only (Node 22.16 and 24); widen once they have run green on the
-        # Windows and macOS runners. Reuses the dist/ built by `npm test`.
+      - name: Lint
         if: runner.os == 'Linux'
-        run: node --test --test-concurrency=4 "tests/e2e/*.test.mjs"
+        run: |
+          cargo fmt --check
+          npx oxlint tests bin scripts
+      - name: Clippy
+        env:
+          CARGO_TERM_COLOR: never
+        run: |
+          echo "::add-matcher::.github/rust-problem-matcher.json"
+          cargo clippy --all-targets --locked --message-format=short -- -D warnings 2>&1 | tee clippy.log
+      - name: Rust tests
+        run: cargo test --locked 2>&1 | tee cargo-test.log
+      - name: End-to-end tests against the binary
+        run: |
+          export GOON_BINARY="$PWD/target/debug/goon$([ "$RUNNER_OS" = Windows ] && echo .exe)"
+          node --test --test-concurrency=4 "tests/*.test.mjs" "tests/e2e/*.test.mjs" 2>&1 | tee node-test.log
       - name: Test restrictive umasks
         if: runner.os != 'Windows'
         run: |
-          (umask 027; node --test --test-concurrency=4 "tests/*.test.mjs")
-          (umask 007; node --test --test-concurrency=4 "tests/*.test.mjs")
+          export GOON_BINARY="$PWD/target/debug/goon"
+          (umask 027; node --test --test-concurrency=4 "tests/*.test.mjs") 2>&1 | tee umask-test.log
+          (umask 007; node --test --test-concurrency=4 "tests/*.test.mjs") 2>&1 | tee -a umask-test.log
+      - name: Report test failures
+        if: failure()
+        run: node scripts/ci-report.mjs clippy.log cargo-test.log node-test.log umask-test.log
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: plan
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: aarch64-linux-android, os: ubuntu-24.04, ndk: aarch64-linux-android24-clang }
+          - { target: armv7-linux-androideabi, os: ubuntu-24.04, ndk: armv7a-linux-androideabi24-clang }
+          - { target: x86_64-linux-android, os: ubuntu-24.04, ndk: x86_64-linux-android24-clang }
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-24.04, musl: true, run: true }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm, musl: true, run: true }
+          - { target: x86_64-apple-darwin, os: macos-latest }
+          - { target: aarch64-apple-darwin, os: macos-latest, run: true }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest, run: true, exe: .exe }
+    defaults:
+      run:
+        shell: bash
+    env:
+      GOON_VERSION: ${{ needs.plan.outputs.version }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install the Rust toolchain
+        run: |
+          toolchain=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$toolchain" --profile minimal --target "$TARGET"
+      - uses: actions/cache@a7833574556fa59680c1b7cb190c1735db73ebf0 # v5.0.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: registry-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: registry-${{ runner.os }}-${{ runner.arch }}-
+      - name: Configure the musl C toolchain
+        if: matrix.musl
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q musl-tools
+          env_target=$(echo "$TARGET" | tr '-' '_')
+          echo "CC_${env_target}=musl-gcc" >> "$GITHUB_ENV"
+      - name: Configure the Android NDK
+        if: matrix.ndk
+        run: |
+          bin="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          test -x "$bin/${{ matrix.ndk }}"
+          env_target=$(echo "$TARGET" | tr '-' '_')
+          upper=$(echo "$env_target" | tr '[:lower:]' '[:upper:]')
+          {
+            echo "CARGO_TARGET_${upper}_LINKER=$bin/${{ matrix.ndk }}"
+            echo "CC_${env_target}=$bin/${{ matrix.ndk }}"
+            echo "AR_${env_target}=$bin/llvm-ar"
+          } >> "$GITHUB_ENV"
+      - name: Link the Windows C runtime statically
+        if: runner.os == 'Windows'
+        run: echo "RUSTFLAGS=-C target-feature=+crt-static" >> "$GITHUB_ENV"
+      - name: Build
+        env:
+          CARGO_TERM_COLOR: never
+        run: |
+          echo "::add-matcher::.github/rust-problem-matcher.json"
+          cargo build --release --locked --target "$TARGET" --message-format=short
+      - name: Smoke test
+        if: matrix.run
+        run: |
+          reported=$("target/$TARGET/release/goon${{ matrix.exe }}" --version)
+          echo "$reported"
+          test "$reported" = "goon cli $GOON_VERSION"
+          "target/$TARGET/release/goon${{ matrix.exe }}" --help > /dev/null
+      - name: Compress
+        run: |
+          mkdir -p dist-bin
+          gzip -9 -n -c "target/$TARGET/release/goon${{ matrix.exe }}" > "dist-bin/goon-$TARGET.gz"
+          ls -l "target/$TARGET/release/goon${{ matrix.exe }}" "dist-bin/goon-$TARGET.gz"
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: bin-${{ matrix.target }}
+          path: dist-bin/goon-${{ matrix.target }}.gz
+          if-no-files-found: error
+          retention-days: 7
 
   release:
     name: Publish GitHub Release
-    needs: check
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && github.repository == 'binxgtl/goon-cli'
+    needs: [plan, check, build]
+    if: needs.plan.outputs.release == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -63,11 +219,18 @@ jobs:
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: '24'
-          cache: npm
-          cache-dependency-path: npm-shrinkwrap.json
-      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Install the Rust toolchain
+        run: rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" --profile minimal
+      - name: Collect third-party license notices
+        run: node scripts/third-party-notices.mjs
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: bin-*
+          path: release-bin
+          merge-multiple: true
       - name: Version, pack, smoke test, tag and publish
         run: node scripts/publish-release.mjs
         env:
           GH_TOKEN: ${{ github.token }}
           SOURCE_SHA: ${{ github.sha }}
+          RELEASE_VERSION: ${{ needs.plan.outputs.version }}

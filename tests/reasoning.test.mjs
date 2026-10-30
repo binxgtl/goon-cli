@@ -2,43 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { AnswerProjection, visibleAnswer } from '../dist/reasoning.js';
 import { fixture, provider, sse, cli } from './helpers.mjs';
-
-function project(chunks, policy) {
-  const projection = new AnswerProjection(policy);
-  const parts = chunks.flatMap(text => projection.push(text)); parts.push(...projection.finish());
-  return { answer: parts.filter(p => p.type === 'text').map(p => p.text).join(''), reasoning: parts.filter(p => p.type === 'reasoning').map(p => p.text).join('') };
-}
-
-for (const [name, input, answer, reasoning] of [
-  ['split markers and Unicode', '\n<think>ẩn 🐧\nsecond line</think>Answer ✓', 'Answer ✓', 'ẩn 🐧\nsecond line'],
-  ['multiple leading blocks', '<think>one</think>\n<THINK>two</THINK>\nAnswer', '\nAnswer', 'onetwo'],
-  ['nested blocks', '<think>outer<think>inner</think>end</think>Answer', 'Answer', 'outerinnerend'],
-  ['unclosed block', '<think>private</thi', '', 'private</thi'],
-  ['empty reasoning', '<think></think>Answer', 'Answer', ''],
-  ['literal code fence', '```xml\n<think>literal</think>\n```', '```xml\n<think>literal</think>\n```', ''],
-  ['literal later in answer', 'Use `<think>...</think>` literally.', 'Use `<think>...</think>` literally.', ''],
-  ['partial opening at clean end', '  <thi', '  <thi', ''],
-  ['no markers, exact whitespace', '\n  ordinary < than\n', '\n  ordinary < than\n', ''],
-]) {
-  test(`inline reasoning projection: ${name}, invariant across every chunk boundary`, () => {
-    for (let cut = 0; cut <= input.length; cut++) assert.deepEqual(project([input.slice(0, cut), input.slice(cut)]), { answer, reasoning });
-    assert.deepEqual(project([...input]), { answer, reasoning });
-  });
-}
-
-test('inline extraction off preserves literal leading tags', () => {
-  const raw = '<think>literal document element</think> body';
-  assert.equal(visibleAnswer(raw, 'off'), raw);
-});
-
-test('large token-sized reasoning stream is discarded without losing the final answer', () => {
-  const p = new AnswerProjection();
-  assert.deepEqual(p.push('<think>'), []);
-  for (let i = 0; i < 20_000; i++) assert.deepEqual(p.push('x'), [{ type: 'reasoning', text: 'x' }]);
-  assert.deepEqual(p.push('</think>done'), [{ type: 'text', text: 'done' }]);
-});
 
 test('real CLI hides split inline/native reasoning and preserves original provider history through tools and resume', async t => {
   const f = await fixture(t);
@@ -210,4 +174,3 @@ test('thinking mode with explicit --effort attaches empty reasoning_content even
   const run = await cli(f, p.url, ['--json', '--effort', 'high', '-p', 'read a']).done;
   assert.equal(run.code, 0, run.stderr + run.stdout);
 });
-

@@ -16,11 +16,23 @@ npm install -g https://github.com/binxgtl/goon-cli/releases/latest/download/goon
 goon --version
 ```
 
-Cần Node **22.16 trở lên**; Node 24 cũng được. Bản npm đã chứa JS biên dịch sẵn;
-không cần compiler, pnpm, proot, glibc hay addon native. Thiếu `ripgrep` vẫn có
-search JavaScript dự phòng giới hạn kích thước.
+goon là một binary native viết bằng Rust. Gói npm chỉ là lớp vỏ nhỏ: khi cài, nó tải binary
+đúng nền tảng từ cùng GitHub Release và kiểm tra SHA-256 ghi trong gói trước khi dùng (cài với
+`--ignore-scripts` thì việc tải diễn ra ở lần chạy đầu). Lệnh cài, cấu hình, session, event log và
+`mcp.json` giữ nguyên như bản TypeScript trước đây, nên cập nhật đè lên bản cũ không cần làm gì thêm.
 
-Runtime dependencies được tải từ npm khi cài; gói này không kèm `node_modules`.
+- Cần Node **22.16 trở lên** (Node 24 cũng được) chỉ để chạy lớp vỏ npm; không cần compiler,
+  pnpm, proot, glibc hay addon native. Thiếu `ripgrep` vẫn có search dự phòng giới hạn kích thước.
+- Binary có sẵn cho Termux/Android (`aarch64`, `armv7`, `x86_64`), Linux (`x86_64`, `aarch64`,
+  liên kết tĩnh với musl), macOS (Intel và Apple Silicon) và Windows `x86_64` (cả Windows on ARM
+  qua giả lập).
+- Không muốn dùng npm? Tải thẳng `goon-<target>.gz` trong trang Release, giải nén bằng `gunzip`,
+  `chmod +x` rồi đặt vào `PATH`. Checksum nằm trong `SHA256SUMS.txt`.
+- Build từ source: `cargo build --release` (Termux: `pkg install rust`), binary nằm ở
+  `target/release/goon`. Xem [CONTRIBUTING.md](CONTRIBUTING.md).
+- Máy không ra được GitHub? Đặt `GOON_DOWNLOAD_BASE` là URL mirror hoặc thư mục chứa các file
+  `goon-<target>.gz`; `GOON_BINARY` trỏ thẳng tới một binary có sẵn.
+
 Trên Termux, hãy làm việc trong `$HOME` để có đầy đủ quyền file và executable bit.
 
 ## Thiết lập nhanh (`goon setup` hoặc `goon init`)
@@ -236,7 +248,7 @@ tên lệnh, `$1`…`$9` là từng từ, `$$` là ký tự `$`.
 - Lưu ý: approval và network policy **không phải sandbox của hệ điều hành**; lệnh shell đã duyệt chạy với quyền của user hiện tại.
 - **Network default-deny (v0.5)**: mọi lệnh `bash`/workflow shell được phân loại là network (`curl`, `wget`, `ssh`, `git push/pull/fetch/clone`, `npm install`, …) bị **từ chối trước bước approval** khi chưa cấp quyền. Bật toàn bộ bằng `--allow-net` (hoặc `GOON_ALLOW_NET=1`, `"allowNet": true`); chỉ mở một số host bằng `--allow-net-hosts=api.example.com` (lặp lại hoặc phân tách bằng dấu phẩy) hoặc `"allowNetHosts": [...]`. Host so khớp **chính xác** (không wildcard/hậu tố); lệnh network không xác định được host (ví dụ `git push origin`, `npm install`) bị từ chối theo kiểu fail-closed. Policy không hạ mức rủi ro: host được allowlist vẫn cần approval như thường.
 - **MCP annotations là dữ liệu không tin cậy**: chúng chỉ có thể *nâng* rủi ro (`destructiveHint`/`openWorldHint` → high; `openWorldHint` đánh dấu network). `trust: true` chỉ tự động duyệt tool rủi ro medium/low, **không** biến tool thành read-only và không hạ risk; chỉ `readOnlyTools` (do bạn đặt) mới đưa tool về low và mới expose tool trong `--read-only`.
-- Lưu ý: trong chế độ `auto`/`--yes`, các lệnh package-manager "an toàn" như `npm test`, `npm run build`, `npm run lint` được xếp **low** và chạy không hỏi. **Quyết định rủi ro đã chấp nhận (known issue 7)**: `npm test` thực thi cả lifecycle script (`pretest`/`posttest`) mà model có thể sửa trong phiên (`edit_file` là medium, cũng auto-approve), nhưng auto mode vốn đã tự động chạy `node <script>.js` (medium) nên mức rủi ro dư là tương đương và được chấp nhận rõ ràng. Điều **không bao giờ** được thừa hưởng trust đó: script tên lạ (`npm run pretest`, `npm run deploy` → medium), lệnh đổi hướng bằng flag (`npm --prefix <dir> test`, `yarn --cwd <dir> test` → medium, không bao giờ low), thực thi tuỳ ý (`npm exec`, `npx`, `pnpx` → high), và mọi chuỗi nối thêm segment network/phá hủy (`&& curl …`, redirect → **high**, không bao giờ tự chạy và không được nhớ vào allowlist phiên). Có test red-team khóa toàn bộ các biến thể này (`tests/risk.test.mjs`).
+- Lưu ý: trong chế độ `auto`/`--yes`, các lệnh package-manager "an toàn" như `npm test`, `npm run build`, `npm run lint` được xếp **low** và chạy không hỏi. **Quyết định rủi ro đã chấp nhận (known issue 7)**: `npm test` thực thi cả lifecycle script (`pretest`/`posttest`) mà model có thể sửa trong phiên (`edit_file` là medium, cũng auto-approve), nhưng auto mode vốn đã tự động chạy `node <script>.js` (medium) nên mức rủi ro dư là tương đương và được chấp nhận rõ ràng. Điều **không bao giờ** được thừa hưởng trust đó: script tên lạ (`npm run pretest`, `npm run deploy` → medium), lệnh đổi hướng bằng flag (`npm --prefix <dir> test`, `yarn --cwd <dir> test` → medium, không bao giờ low), thực thi tuỳ ý (`npm exec`, `npx`, `pnpx` → high), và mọi chuỗi nối thêm segment network/phá hủy (`&& curl …`, redirect → **high**, không bao giờ tự chạy và không được nhớ vào allowlist phiên). Có test red-team khóa toàn bộ các biến thể này (`tests/unit/risk.rs`).
 
 ## Reasoning, Thinking Replay & Gateway Inline Think
 
@@ -296,7 +308,7 @@ Xem [docs/MCP.md](docs/MCP.md) để biết chi tiết cấu hình stdio, biến
 
 ```bash
 goon --read-only -p 'Dùng spawn_agent hoặc delegate_task để khảo sát cấu trúc repo và tìm rủi ro trong test'
-goon -p 'Dùng delegate_edit để sửa lỗi trong src/files.ts và bổ sung regression test'
+goon -p 'Dùng delegate_edit để sửa lỗi trong src/files.rs và bổ sung regression test'
 goon --no-subagents -p 'Đọc repo và làm trực tiếp'
 ```
 
@@ -331,8 +343,8 @@ goon --no-subagents -p 'Đọc repo và làm trực tiếp'
 
 ## Workflow động, scope loop & multi-candidate (v0.7)
 
-- **Classifier workflow thuần TS (không gọi model)**: `classifyWorkflowComplexity(prompt, context)`
-  trong `src/workflow.ts` chấm điểm tín hiệu — số động từ mệnh lệnh (kể cả tiếng Việt: thêm/sửa/cập
+- **Classifier workflow thuần (không gọi model)**: `classify_workflow_complexity(prompt, file_count)`
+  trong `src/workflow.rs` chấm điểm tín hiệu — số động từ mệnh lệnh (kể cả tiếng Việt: thêm/sửa/cập
   nhật/kiểm tra/…), chuỗi nối tuần tự ("then", "sau đó", "after that", "tiếp theo"), số path được
   nhắc tới và từ khoá "plan/workflow/multi-step/pipeline". **Bảo thủ theo mặc định**: thiếu tín hiệu
   rõ → `single`, nên workflow cũ tuyến tính chạy y nguyên.
@@ -341,7 +353,7 @@ goon --no-subagents -p 'Đọc repo và làm trực tiếp'
   (hook `runDag` — CLI nối vào cùng lõi `/dag`) khi **cả ba** điều kiện đạt: classifier trả `multi`,
   `multiAgentMode !== "off"`, và hook `runDag` khả dụng. Ngược lại bước chạy như một prompt tuyến
   tính. Mỗi lần phân loại phát sự kiện additive `workflow_classified { mode, reason }`.
-- **Scope loop** (`runScopeLoop` trong `src/coord.ts`): vòng lặp sửa-lỗi dẫn đường bởi verify —
+- **Scope loop** (`run_scope_loop` trong `src/coord.rs`): vòng lặp sửa-lỗi dẫn đường bởi verify —
   attempt → verify → fail thì **mở rộng** ngữ cảnh (output verify đã redact + file liên quan + lệnh)
   cho vòng sau, pass thì **thu hẹp**. Tối đa `min(verify.maxRepairRounds + 1, 4)` vòng; dừng khi
   pass, không còn thay đổi, chạm trần token/cost/time của `RunBudget` dùng chung (kiểm tra trước
@@ -349,8 +361,8 @@ goon --no-subagents -p 'Đọc repo và làm trực tiếp'
   lệnh hiển thị — có lệnh mà thiếu callback → `VerificationApprovalError` (fail-closed); plan chỉ
   AST vẫn chạy không cần duyệt. Terminal fail → rollback toàn bộ snapshot theo §5.1 (không đè
   thay đổi của người dùng). Sự kiện additive: `scope_round { round, action: expand|contract|stop }`.
-- **Multi-candidate reflection** (`runCandidates`, `reflect`, `rerank`, `costDegrade` trong
-  `src/coord.ts`): mỗi candidate chạy cô lập trên snapshot riêng (`beginTurn`/`takeTurnBackups`),
+- **Multi-candidate reflection** (`run_candidates`, `reflect`, `rerank`, `cost_degrade` trong
+  `src/coord.rs`): mỗi candidate chạy cô lập trên snapshot riêng (`beginTurn`/`takeTurnBackups`),
   verify xong — fail thì rollback ngay để candidate sau khởi từ cùng trạng thái gốc, candidate
   đầu tiên không fail được giữ lại (winner) và snapshot của nó được merge vào cửa sổ turn để
   checkpoint vẫn revert được. **Cap 2 candidate** (`MAX_CANDIDATES`); khi còn dưới 20% ngân sách
@@ -384,10 +396,10 @@ goon --no-subagents -p 'Đọc repo và làm trực tiếp'
   event `session` đầu, các `user`, `done`/`error` cuối. Log bị cắt trước `done` vẫn dựng được
   phần user (partial). Chạy lại cho cùng nội dung.
 - **Xoá phiên** (`/delete` hoặc `deleteSession`) xoá luôn `.events.jsonl`, `.seq` và file tạm.
-- **Stub provider**: `--stub` dùng `LanguageModelV3` tất định, không mạng và không đọc API key;
-  `--stub-fixture FILE` nạp kịch bản JSON (tối đa 1 MiB, validate bằng zod). Mỗi turn chọn theo
+- **Stub provider**: `--stub` dùng model tất định, không mạng và không đọc API key;
+  `--stub-fixture FILE` nạp kịch bản JSON (tối đa 1 MiB, schema chặt: khoá lạ bị từ chối). Mỗi turn chọn theo
   `match`/`fixture.input`, fallback `auxiliary`, hết kịch bản trả `[stub] script exhausted`.
-  Fixture hỗ trợ `reasoning`, `text[]`, `toolCalls[]`, `usage` và `error` (ném `APICallError`).
+  Fixture hỗ trợ `reasoning`, `text[]`, `toolCalls[]`, `usage` và `error` (trả lỗi API với `statusCode`/`retryable`).
   Đây là công cụ test/CI; không dùng cho phiên thật.
 
 ```json
@@ -441,7 +453,7 @@ goon --no-subagents -p 'Đọc repo và làm trực tiếp'
 
 ## Context budget & memory wiring (v0.6, P18-P19)
 
-- **Ngân sách context**: mỗi request được chuẩn bị qua `src/context-budget.ts` (thuần, không sửa
+- **Ngân sách context**: mỗi request được chuẩn bị qua `src/context_budget.rs` (thuần, không sửa
   session). `inputBudget = max(1024, contextWindow - maxOutputTokens)` được chia thành reserve
   (`contextReserveRatio`, mặc định 0.15), system prompt (sàn 15% / trần 35% của input budget),
   hội thoại (`contextConversationRatio`, mặc định 0.45) và context bơm vào (`contextFilesRatio`,
@@ -526,47 +538,48 @@ Hướng dẫn đầy đủ (môi trường, vòng lặp phát triển, chạy r
 phát hành) nằm ở [CONTRIBUTING.md](CONTRIBUTING.md). Tóm tắt:
 
 ```bash
-npm ci
-npm run check                              # lint + build + test đơn vị + e2e (~1 phút)
-npm run watch                              # tsc --watch khi đang sửa src/
-npm run test:one -- tests/risk.test.mjs    # build rồi chạy riêng một file test
+npm ci --ignore-scripts                    # dev dependency cho test Node (MCP SDK, oxlint)
+npm run check                              # rustfmt + clippy + oxlint + cargo test + test Node + e2e
+cargo test --test unit risk::              # một nhóm test Rust
+npm run test:one -- tests/runtime.test.mjs # build rồi chạy riêng một file test Node
 npm run dev -- --stub -p 'xin chào'        # build rồi chạy CLI từ source, không cần mạng/API key
 ```
 
-`bin/goon.mjs` và mọi test chạy trên `dist/` (không commit): sửa `src/` xong phải build lại
-(`npm run build`, hoặc để `npm run watch` chạy nền).
+`bin/goon.mjs` chạy binary theo thứ tự: `GOON_BINARY`, `vendor/<target>/goon` (bản đã cài), rồi
+bản build cục bộ mới nhất trong `target/release` hoặc `target/debug`. Nên trong bản clone, test Node
+luôn chạy trên lần `cargo build` gần nhất; các script npm ở trên đã tự build.
 
-CI chạy từng bước riêng, bạn có thể chạy đúng như vậy:
+Có hai tầng test:
+
+- `cargo test`: test thư viện trong `src/**` và `tests/unit/` (port từ bộ test TypeScript cũ),
+  cộng `tests/parity.rs` phát lại khoảng 10 nghìn lời gọi đã ghi từ bản TypeScript để so kết quả
+  từng input (xem `tests/parity/README.md`).
+- `node --test`: `tests/*.test.mjs` và `tests/e2e/*.test.mjs` chạy CLI thật như người dùng (server
+  model giả, PTY, tín hiệu, MCP, gói release).
+
+CI chạy đúng các bước sau trên Ubuntu (Node 22.16 và 24), Windows và macOS (Node 24):
 
 ```bash
-npm ci
-npm run typecheck
-npm run lint
-npm test
-node --test --test-concurrency=4 "tests/e2e/*.test.mjs"            # e2e với stub provider; CI chỉ chạy trên Linux
-(umask 027; node --test --test-concurrency=4 "tests/*.test.mjs")   # POSIX only
-(umask 007; node --test --test-concurrency=4 "tests/*.test.mjs")   # POSIX only
-npm run build
-npm install -g . --omit=dev
+npm ci --ignore-scripts --no-audit --no-fund
+cargo fmt --check && npx oxlint tests bin scripts                   # chỉ trên Linux
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --locked
+GOON_BINARY=target/debug/goon node --test --test-concurrency=4 "tests/*.test.mjs" "tests/e2e/*.test.mjs"
+(umask 027; GOON_BINARY=target/debug/goon node --test --test-concurrency=4 "tests/*.test.mjs")   # POSIX
+(umask 007; GOON_BINARY=target/debug/goon node --test --test-concurrency=4 "tests/*.test.mjs")   # POSIX
 ```
 
-CI chạy matrix 3 hệ điều hành (Ubuntu, Windows, macOS) × Node 22.16/24. Trên Windows,
-các test chỉ có ý nghĩa POSIX được skip: mode bit/umask (`tests/files.test.mjs`) và shim
-`gh` trong `tests/publish.test.mjs`; các test PTY trong `tests/tui.test.mjs` và
-`tests/audit.test.mjs` cũng skip (trên POSIX chúng cần `python3`). Dấu
-ngoặc kép quanh glob để Node tự mở rộng trên cmd.exe/PowerShell.
-
-`--test-concurrency=4` giới hạn số file test chạy song song: mỗi file là một process Node
-riêng, và trên Windows chạy không giới hạn (7-8 process cùng lúc) có thể cạn commit charge
-của hệ thống — process test chết với `FATAL ERROR: Committing semi space failed`, kéo theo
-các test còn lại của file đó không chạy. Giới hạn 4 giữ nguyên độ phủ, chỉ chậm hơn không
-đáng kể.
+Trên Windows, các test chỉ có ý nghĩa POSIX được skip (mode bit/umask, shim `gh` trong
+`tests/publish.test.mjs`, các test PTY cần `python3`). Đặt glob trong ngoặc kép để Node tự mở
+rộng trên cmd.exe/PowerShell. `--test-concurrency=4` giới hạn số process Node chạy song song:
+trên Windows chạy không giới hạn có thể cạn commit charge (`FATAL ERROR: Committing semi space
+failed`).
 
 Smoke test Termux (chạy thủ công trên thiết bị, không thuộc CI):
 
 ```bash
-bash scripts/smoke-termux.sh              # npm ci + build + eventlog/stub-provider/golden
-bash scripts/smoke-termux.sh --no-install # dùng lại node_modules hiện có
+bash scripts/smoke-termux.sh --build   # cargo build --release, rồi stub-provider/golden/e2e
+bash scripts/smoke-termux.sh           # dùng binary sẵn có (GOON_BINARY hoặc target/)
 ```
 
 `.gitattributes` chuẩn hoá LF cho source và đánh dấu binary; script `.bat`/`.cmd`/`.ps1`
@@ -574,31 +587,32 @@ giữ CRLF.
 
 | File | Trách nhiệm |
 |---|---|
-| `src/harness.ts` | Agent loop, retry API, điều phối tool, checkpoint, `/btw`, usage, cancellation |
-| `src/provider.ts` | Chọn adapter API, quét `/models`, truyền `reasoningEffort` / thinking budget |
-| `src/setup.ts` | Setup wizard tương tác (`Esc` để huỷ), quét `/models` động, lưu `credentials.json` |
-| `src/tools.ts`, `src/approval.ts` | Registry, schema, alias chuẩn hoá, `sanitizeBashCommand`, approval và duyệt theo tiền tố lệnh |
-| `src/prompts.ts`, `src/help.ts` | Prompt tuỳ biến `/prompts:<tên>`; nội dung `--help` (nạp nhanh, không kéo SDK) |
-| `src/files.ts`, `src/process.ts` | File I/O, unified diff, patch, backup cho /undo, bảo vệ `nul`, subprocess và lọc biến môi trường bí mật |
-| `src/session.ts` | Lock, checkpoint, rewind, resume và sửa lịch sử bị ngắt |
-| `src/context.ts` | System prompt, `AGENTS.md`, `SKILL.md`, `memories.json`, `presets.json` và compaction |
-| `src/cli.ts`, `src/tui.ts` | Flags, giao diện TUI, Transcript Mode (`Ctrl+T`), popup `/slash` |
-| `src/mcp.ts` | MCP client, stdio/HTTP transport, resources, `import-codex`, lifecycle |
-| `src/subagents.ts` | `spawn_agent`/`wait_agent` & `delegate_task`/`delegate_edit`, concurrency, budget |
-| `src/network.ts` | `AgentNetwork` (Brainstorm / Council Room đa vòng) & `AgentNetworkBus` (P2P `peer_send`, `peer_broadcast`, `peer_read`, `peer_list`) |
-| `src/workflow.ts` | Custom Workflow engine (`.json` & `.md`), biến nội suy (`$input`, `$1`, `$prev`), bước `prompt`/`shell`/`subagent`/`network`/`approval` |
-| `src/pair.ts` | Ghép đôi thiết bị qua Cloudflared Tunnel miễn phí, bộ tạo mã QR ISO/IEC 18004 thuần TypeScript và giao diện Mobile Web/SSE |
-| `src/reasoning.ts` | `withReasoningReplay` (`reasoning_content`), `AnswerProjection`, giữ transcript gốc |
-| `src/risk.ts`, `src/cost.ts` | Phân loại rủi ro shell/MCP (low→critical), ledger chi phí, trần token/cost/time mỗi lượt |
-| `src/policy.ts` | Execution policy (v0.5): network default-deny/allowlist, host extraction (peel `sudo`/`env`/`time`), giới hạn output/timeout dùng chung |
-| `src/verify.ts`, `src/syntax.ts` | Verify hook sau edit (syntax/lint/test/typecheck), redaction, rollback byte-exact |
-| `src/eventlog.ts`, `src/redact.ts` | Event log JSONL append-only (envelope/seq sidecar/torn tail), replay, redaction dùng chung |
-| `src/stub-provider.ts`, `src/stub-fixtures.ts` | Stub `LanguageModelV3` tất định, fixture zod (tối đa 1 MiB), không mạng/không API key |
-| `src/config.ts` | Schema config (zod `.strict()` + giá trị mặc định), thứ tự ưu tiên cờ > `GOON_*` > file, ghi nguyên tử `config.json` / `credentials.json` (`0600`), thư mục config/data theo `XDG_*` |
-| `src/context-budget.ts` | Chia ngân sách ngữ cảnh (reserve / system / hội thoại / file), prune kết quả tool theo cặp, chèn memory dạng `<untrusted_context>`; thuần, không sửa session |
-| `src/coord.ts` | Multi-agent DAG (`validatePlan`, `Scheduler`, `merge`, `runDag`), scope loop và multi-candidate; không tự gọi model/shell, mọi I/O đi qua hook do CLI cấp |
-| `src/memory.ts`, `src/rag.ts`, `src/embedder.ts` | Memory store 6 loại (opt-in), lexical RAG (chunking, `HashEmbedder`, `.goonignore`), embedder seam `hash` / `openai` / `ollama` |
-| `src/index.ts`, `src/errors.ts`, `src/version.ts` | API công khai của package (`exports`), `safeError`, `VERSION` đọc từ `package.json` |
+| `src/main.rs`, `src/cli/` | Điểm vào, flags, lệnh con, vòng đời phiên, lệnh slash |
+| `src/harness.rs` | Agent loop, retry API, điều phối tool, checkpoint, `/btw`, usage, cancellation |
+| `src/model.rs`, `src/providers/`, `src/provider.rs`, `src/generate.rs` | Giao diện model và adapter OpenAI-compatible / Anthropic / Responses / stub, quét `/models`, `reasoning_effort` / thinking budget, retry theo `retry-after` |
+| `src/setup.rs` | Setup wizard tương tác (`Esc` để huỷ), quét `/models` động, lưu `credentials.json` |
+| `src/tools.rs`, `src/schema.rs`, `src/approval.rs`, `src/builtin_tools.json` | Registry, JSON schema của tool, alias chuẩn hoá, `sanitize_bash_command`, approval và duyệt theo tiền tố lệnh |
+| `src/prompts.rs`, `src/help.rs` | Prompt tuỳ biến `/prompts:<tên>`; nội dung `--help` |
+| `src/files.rs`, `src/process.rs` | File I/O, unified diff, patch, backup cho /undo, bảo vệ `nul`, subprocess và lọc biến môi trường bí mật |
+| `src/session.rs` | Lock, checkpoint, rewind, resume và sửa lịch sử bị ngắt |
+| `src/context.rs` | System prompt, `AGENTS.md`, `SKILL.md`, `memories.json`, `presets.json` và compaction |
+| `src/tui/`, `src/term.rs` | Giao diện TUI, Transcript Mode (`Ctrl+T`), popup `/slash`, đọc phím và chế độ terminal |
+| `src/mcp.rs`, `src/mcp_client.rs` | Cấu hình MCP, `import-codex`; client stdio/Streamable HTTP, resources, lifecycle |
+| `src/subagents.rs` | `spawn_agent`/`wait_agent` & `delegate_task`/`delegate_edit`, concurrency, budget |
+| `src/network.rs` | Agent network (Brainstorm / Council Room đa vòng) và bus P2P (`peer_send`, `peer_broadcast`, `peer_read`, `peer_list`) |
+| `src/workflow.rs` | Custom Workflow engine (`.json` & `.md`), biến nội suy (`$input`, `$1`, `$prev`), bước `prompt`/`shell`/`subagent`/`network`/`approval`/`dag` |
+| `src/pair.rs`, `src/pair_mobile.html` | Ghép đôi thiết bị qua Cloudflared Tunnel miễn phí, bộ tạo mã QR ISO/IEC 18004 tự viết và giao diện Mobile Web/SSE |
+| `src/reasoning.rs` | Phát lại `reasoning_content`, tách câu trả lời khỏi phần suy nghĩ, giữ transcript gốc |
+| `src/risk.rs`, `src/cost.rs` | Phân loại rủi ro shell/MCP (low→critical), ledger chi phí, trần token/cost/time mỗi lượt |
+| `src/policy.rs` | Execution policy: network default-deny/allowlist, tách host (bóc `sudo`/`env`/`time`), giới hạn output/timeout dùng chung |
+| `src/verify.rs`, `src/syntax.rs` | Verify hook sau edit (syntax/lint/test/typecheck), redaction, rollback byte-exact |
+| `src/eventlog.rs`, `src/redact.rs` | Event log JSONL append-only (envelope/seq sidecar/torn tail), replay, redaction dùng chung |
+| `src/config.rs` | Schema config (khoá lạ bị từ chối, có giá trị mặc định), thứ tự ưu tiên cờ > `GOON_*` > file, ghi nguyên tử `config.json` / `credentials.json` (`0600`), thư mục theo `XDG_*` |
+| `src/context_budget.rs` | Chia ngân sách ngữ cảnh (reserve / system / hội thoại / file), prune kết quả tool theo cặp, chèn memory dạng `<untrusted_context>`; thuần, không sửa session |
+| `src/coord.rs` | Multi-agent DAG (kiểm tra plan, scheduler, merge), scope loop và multi-candidate; mọi I/O đi qua hook do CLI cấp |
+| `src/memory.rs`, `src/rag.rs`, `src/embedder.rs` | Memory store 6 loại (opt-in), lexical RAG (chunking, hash embedder, `.goonignore`), embedder `hash` / `openai` / `ollama` |
+| `src/jsutil.rs`, `src/errors.rs`, `src/version.rs` | Số, JSON và `toFixed` giống hệt JavaScript (giữ đúng định dạng file cũ), `safe_error`, `VERSION` |
+| `bin/goon.mjs`, `scripts/install.mjs` | Lớp vỏ npm: chọn, tải, kiểm SHA-256 và chạy binary; chuyển tiếp tín hiệu |
 
 ## Repository & Tự động Release
 
@@ -607,7 +621,7 @@ giữ CRLF.
 - Đóng góp & phát triển: [CONTRIBUTING.md](CONTRIBUTING.md)
 
 Mỗi lần push lên `main` (trừ khi commit có `[skip ci]`), workflow `Check and release`
-sẽ chạy toàn bộ typecheck, lint, test (Node 22.16 & Node 24 + restrictive umasks, e2e trên Linux),
-tự động tăng phiên bản patch, đóng gói `.tgz` kèm `SHA256SUMS.txt` và phát hành
-GitHub Release mới. Chi tiết cách chọn số phiên bản và cách tăng minor/major: xem
+chạy rustfmt, clippy, `cargo test` và test Node (Ubuntu/Windows/macOS, restrictive umask), build
+binary cho 8 target, tự động tăng phiên bản patch, đóng gói `goon-cli.tgz` cùng các
+`goon-<target>.gz` và `SHA256SUMS.txt`, rồi phát hành GitHub Release mới. Chi tiết cách chọn số phiên bản và cách tăng minor/major: xem
 [CONTRIBUTING.md](CONTRIBUTING.md#12-phát-hành).

@@ -71,3 +71,31 @@ if (process.argv.includes('--stdio') || process.argv.includes('--rea-scale') || 
 if (process.argv.includes('--stdio')) await mockMcpServer().connect(new StdioServerTransport());
 if (process.argv.includes('--rea-scale')) await mockReaScaleServer().connect(new StdioServerTransport());
 if (process.argv.includes('--annotations')) await mockAnnotationServer().connect(new StdioServerTransport());
+// `--http` serves the mock over Streamable HTTP (JSON responses) and prints its port; the bearer
+// token in MCP_FIXTURE_TOKEN is required when set. `--http-reject` answers every request with a
+// 401 that echoes the token, for redaction tests. Both exit when stdin closes.
+if (process.argv.includes('--http') || process.argv.includes('--http-reject')) {
+  const { createServer } = await import('node:http');
+  const { StreamableHTTPServerTransport } = await import('@modelcontextprotocol/sdk/server/streamableHttp.js');
+  const token = process.env.MCP_FIXTURE_TOKEN;
+  const reject = process.argv.includes('--http-reject');
+  const http = createServer(async (request, response) => {
+    if (reject) {
+      for await (const _ of request) { /* drain */ }
+      response.writeHead(401, { 'content-type': 'text/plain' });
+      response.end(`Rejected ${token}`);
+      return;
+    }
+    if (token && request.headers.authorization !== `Bearer ${token}`) { response.writeHead(401).end('bad token'); return; }
+    if (request.method !== 'POST') { response.writeHead(405).end(); return; }
+    const server = mockMcpServer();
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
+    await server.connect(transport);
+    await transport.handleRequest(request, response);
+    response.on('close', () => server.close());
+  });
+  http.listen(0, '127.0.0.1', () => process.stdout.write(`${http.address().port}\n`));
+  process.stdin.on('end', () => process.exit(0));
+  process.stdin.on('close', () => process.exit(0));
+  process.stdin.resume();
+}

@@ -1,15 +1,21 @@
 #!/usr/bin/env bash
-# Termux smoke test (v0.5, P15). Run manually on a device:
-#   bash scripts/smoke-termux.sh              # install dependencies, then build and test
-#   bash scripts/smoke-termux.sh --no-install # reuse an existing node_modules
+# Termux smoke test. Run manually on a device:
+#   bash scripts/smoke-termux.sh            # test the binary bin/goon.mjs resolves (GOON_BINARY,
+#                                           # an installed vendor/ binary or a local cargo build)
+#   bash scripts/smoke-termux.sh --build    # build from source first (pkg install rust)
 #
-# This is not part of CI; it exercises the Termux-first paths that need a real Android
-# environment (process groups, POSIX modes, no native addons).
+# This is not part of CI; it exercises the Termux paths that need a real Android environment
+# (process groups, POSIX modes, the Termux shell and TMPDIR).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-if [ "${1:-}" != "--no-install" ]; then
-  npm ci --ignore-scripts --no-audit --no-fund
+if [ "${1:-}" = "--build" ]; then
+  cargo build --release --locked
 fi
-npm run build
-node --test tests/eventlog.test.mjs tests/stub-provider.test.mjs tests/golden.test.mjs
+if [ -z "${GOON_BINARY:-}" ] && [ ! -x target/release/goon ] && [ ! -x target/debug/goon ]; then
+  echo "No goon binary: run with --build, or set GOON_BINARY to an installed goon." >&2
+  exit 1
+fi
+npm ci --ignore-scripts --no-audit --no-fund
+node bin/goon.mjs --version
+node --test tests/stub-provider.test.mjs tests/golden.test.mjs "tests/e2e/*.test.mjs"
