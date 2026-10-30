@@ -101,11 +101,14 @@ export async function ensureBinary(root = join(dirname(fileURLToPath(import.meta
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  const root = join(dirname(fileURLToPath(import.meta.url)), '..');
   try {
-    const binary = await ensureBinary();
+    const binary = await ensureBinary(root);
     if (process.argv.includes('--print')) console.log(binary);
   } catch (error) {
-    // Never fail npm install: bin/goon.mjs retries the download on first run.
-    console.warn(`goon: ${error instanceof Error ? error.message : String(error)}`);
+    // Never fail npm install: bin/goon.mjs retries the download on first run. A source checkout
+    // has no release manifest; it runs the local cargo build instead.
+    if (existsSync(join(root, 'Cargo.toml'))) console.warn('goon: no binary yet; run "cargo build" (see CONTRIBUTING.md).');
+    else console.warn(`goon: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
