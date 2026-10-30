@@ -1,6 +1,6 @@
 [package]
 name = "goon-cli"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2021"
 description = "A small independent coding harness for Termux and external model APIs"
 license = "MIT"
