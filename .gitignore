@@ -1,6 +1,9 @@
 node_modules/
 dist/
 release-out/
+release-bin/
+dist-bin/
+vendor/
 *.tgz
 !release/*.tgz
 .env

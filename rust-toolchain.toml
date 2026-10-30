@@ -1,0 +1,6 @@
+# The toolchain CI builds and lints with. rustup installs it on first use; a cargo without rustup
+# (for example Termux's `pkg install rust`) ignores this file and uses whatever it has.
+[toolchain]
+channel = "1.97.0"
+components = ["clippy", "rustfmt"]
+profile = "minimal"
