@@ -1,9 +1,10 @@
 # MCP tools
 
-Goon is an MCP client, using `@modelcontextprotocol/sdk` 1.32.1. It supports
-stdio processes and Streamable HTTP endpoints. Servers are configured only in
-`$XDG_CONFIG_HOME/goon/mcp.json` (default `~/.config/goon/mcp.json`). Provider
-`goon init` does not change this file. Project-local MCP config is not loaded.
+Goon has its own MCP client (protocol revisions 2024-10-07 through 2025-11-25,
+negotiated at connect). It supports stdio processes and Streamable HTTP
+endpoints. Servers are configured only in `$XDG_CONFIG_HOME/goon/mcp.json`
+(default `~/.config/goon/mcp.json`). Provider `goon init` does not change this
+file. Project-local MCP config is not loaded.
 
 ## Example
 
