@@ -97,9 +97,11 @@ jobs:
           cargo fmt --check
           npx oxlint tests bin scripts
       - name: Clippy
+        env:
+          CARGO_TERM_COLOR: never
         run: |
           echo "::add-matcher::.github/rust-problem-matcher.json"
-          cargo clippy --all-targets --locked --message-format=short -- -D warnings
+          cargo clippy --all-targets --locked --message-format=short -- -D warnings 2>&1 | tee clippy.log
       - name: Rust tests
         run: cargo test --locked 2>&1 | tee cargo-test.log
       - name: End-to-end tests against the binary
@@ -114,7 +116,7 @@ jobs:
           (umask 007; node --test --test-concurrency=4 "tests/*.test.mjs") 2>&1 | tee -a umask-test.log
       - name: Report test failures
         if: failure()
-        run: node scripts/ci-report.mjs cargo-test.log node-test.log umask-test.log
+        run: node scripts/ci-report.mjs clippy.log cargo-test.log node-test.log umask-test.log
 
   build:
     name: Build ${{ matrix.target }}
@@ -178,6 +180,8 @@ jobs:
         if: runner.os == 'Windows'
         run: echo "RUSTFLAGS=-C target-feature=+crt-static" >> "$GITHUB_ENV"
       - name: Build
+        env:
+          CARGO_TERM_COLOR: never
         run: |
           echo "::add-matcher::.github/rust-problem-matcher.json"
           cargo build --release --locked --target "$TARGET" --message-format=short
