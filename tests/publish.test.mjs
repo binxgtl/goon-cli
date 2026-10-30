@@ -6,9 +6,12 @@ import { mkdir, mkdtemp, writeFile, readFile, copyFile, rm, realpath } from 'nod
 import { join, delimiter } from 'node:path';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
+import { gzipSync } from 'node:zlib';
+import { randomBytes } from 'node:crypto';
+import { TARGETS, assetName } from '../scripts/install.mjs';
 
 const exec = promisify(execFile);
-test('publishing creates the first tag, bumps on update and repairs a rerun without another bump', { timeout: 60000 }, async t => {
+test('publishing creates the first tag, bumps every version file on update and repairs a rerun without another bump', { timeout: 60000 }, async t => {
   if (process.platform === 'win32') { t.skip('the fake gh executable shim is POSIX-only'); return; }
   const root = await realpath(await mkdtemp(join(tmpdir(), 'goon-publish-test-')));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -22,12 +25,16 @@ test('publishing creates the first tag, bumps on update and repairs a rerun with
   await git('config', 'user.name', 'Release Test');
   await git('config', 'user.email', 'test@example.invalid');
   await git('remote', 'add', 'origin', remote);
-  const manifest = { name: 'goon-cli', version: '0.1.0', private: true, type: 'module', bin: { goon: 'bin/goon.mjs' }, files: ['bin'], scripts: { build: 'node --version' } };
+  const manifest = { name: 'goon-cli', version: '0.1.0', private: true, type: 'module', bin: { goon: 'bin/goon.mjs' }, files: ['bin', 'vendor/manifest.json'] };
   await writeFile(join(work, 'package.json'), JSON.stringify(manifest));
   await writeFile(join(work, 'npm-shrinkwrap.json'), JSON.stringify({ name: 'goon-cli', version: '0.1.0', lockfileVersion: 3, requires: true, packages: { '': { name: 'goon-cli', version: '0.1.0' } } }));
-  await writeFile(join(work, '.gitignore'), 'node_modules/\nrelease-out/\n');
+  await writeFile(join(work, 'Cargo.toml'), '[package]\nname = "goon-cli"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\nserde = { version = "1" }\n');
+  await writeFile(join(work, 'Cargo.lock'), '# generated\nversion = 4\n\n[[package]]\nname = "goon-cli"\nversion = "0.1.0"\n\n[[package]]\nname = "serde"\nversion = "1.0.0"\n');
+  await writeFile(join(work, '.gitignore'), 'node_modules/\nrelease-out/\nrelease-bin/\nvendor/\n');
+  await mkdir(join(work, 'release-bin'));
+  for (const triple of TARGETS) await writeFile(join(work, 'release-bin', assetName(triple)), gzipSync(randomBytes(4096)));
   await writeFile(join(work, 'bin/goon.mjs'), "#!/usr/bin/env node\nimport {readFileSync} from 'node:fs'; const p=JSON.parse(readFileSync(new URL('../package.json',import.meta.url),'utf8')); console.log('goon cli '+p.version);\n");
-  for (const file of ['pack-release.mjs', 'publish-release.mjs', 'release-version.mjs']) await copyFile(join('scripts', file), join(work, 'scripts', file));
+  for (const file of ['pack-release.mjs', 'publish-release.mjs', 'release-version.mjs', 'install.mjs']) await copyFile(join('scripts', file), join(work, 'scripts', file));
   const state = join(root, 'releases.json'), log = join(root, 'gh.log');
   await writeFile(state, '{}');
   await writeFile(join(bin, 'gh'), `#!/usr/bin/env node
@@ -72,11 +79,22 @@ globalThis.fetch=async url=>{
   assert.equal((await exec('git', ['--git-dir', remote, 'rev-parse', 'refs/heads/main'])).stdout.trim(), released);
   assert.equal(JSON.parse(await readFile(join(work, 'package.json'), 'utf8')).version, '0.1.1');
   assert.equal(JSON.parse(await readFile(join(work, 'npm-shrinkwrap.json'), 'utf8')).packages[''].version, '0.1.1');
+  assert.match(await readFile(join(work, 'Cargo.toml'), 'utf8'), /^\[package\]\nname = "goon-cli"\nversion = "0\.1\.1"\n/);
+  const cargoLock = await readFile(join(work, 'Cargo.lock'), 'utf8');
+  assert.match(cargoLock, /name = "goon-cli"\nversion = "0\.1\.1"/);
+  assert.match(cargoLock, /name = "serde"\nversion = "1\.0\.0"/, 'other lock entries are untouched');
+  assert.deepEqual((await git('show', '--name-only', '--format=', 'HEAD')).split('\n').sort(), ['Cargo.lock', 'Cargo.toml', 'npm-shrinkwrap.json', 'package.json']);
+  const vendored = JSON.parse(await readFile(join(work, 'vendor', 'manifest.json'), 'utf8'));
+  assert.equal(vendored.version, '0.1.1');
+  assert.deepEqual(Object.keys(vendored.assets).sort(), [...TARGETS].sort());
   await git('checkout', '--detach', update);
   await publish(update);
   assert.equal(await git('rev-parse', 'HEAD'), released);
   assert.deepEqual((await git('tag', '--list')).split('\n'), ['v0.1.0', 'v0.1.1']);
   const calls = (await readFile(log, 'utf8')).trim().split('\n').map(JSON.parse);
   assert.equal(calls.filter(args => args[1] === 'create').length, 2);
-  assert.equal(calls.filter(args => args[1] === 'upload').length, 3);
+  const uploads = calls.filter(args => args[1] === 'upload');
+  assert.equal(uploads.length, 3);
+  const uploaded = uploads[0].slice(3, uploads[0].indexOf('--repo')).map(f => f.split(/[\\/]/).at(-1));
+  assert.deepEqual(uploaded.sort(), ['SHA256SUMS.txt', 'goon-cli-0.1.0.tgz', 'goon-cli.tgz', ...TARGETS.map(assetName)].sort());
 });

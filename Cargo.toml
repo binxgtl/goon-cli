@@ -47,9 +47,11 @@ windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_
 [dev-dependencies]
 tempfile = "3"
 
+# Small, single-unit release builds: ~4 MB gzipped per target. opt-level "s" measured within
+# noise of opt-level 3 on the parity corpus, and the download matters on phones.
 [profile.release]
-opt-level = 3
-lto = "thin"
-codegen-units = 4
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
 strip = true
 panic = "unwind"

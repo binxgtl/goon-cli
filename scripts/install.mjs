@@ -7,22 +7,29 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { gunzipSync } from 'node:zlib';
 
+const TABLE = {
+  'android-arm64': 'aarch64-linux-android',
+  'android-arm': 'armv7-linux-androideabi',
+  'android-x64': 'x86_64-linux-android',
+  'linux-x64': 'x86_64-unknown-linux-musl',
+  'linux-arm64': 'aarch64-unknown-linux-musl',
+  'darwin-x64': 'x86_64-apple-darwin',
+  'darwin-arm64': 'aarch64-apple-darwin',
+  'win32-x64': 'x86_64-pc-windows-msvc',
+  // Windows on ARM runs the x64 build under emulation.
+  'win32-arm64': 'x86_64-pc-windows-msvc',
+};
+
+/** Every target a release ships a binary for. */
+export const TARGETS = [...new Set(Object.values(TABLE))];
+
 /** Rust target triple of the binary that runs on this Node platform/arch. */
 export function targetTriple(platform = process.platform, arch = process.arch) {
-  const table = {
-    'android-arm64': 'aarch64-linux-android',
-    'android-arm': 'armv7-linux-androideabi',
-    'android-x64': 'x86_64-linux-android',
-    'linux-x64': 'x86_64-unknown-linux-musl',
-    'linux-arm64': 'aarch64-unknown-linux-musl',
-    'darwin-x64': 'x86_64-apple-darwin',
-    'darwin-arm64': 'aarch64-apple-darwin',
-    'win32-x64': 'x86_64-pc-windows-msvc',
-    // Windows on ARM runs the x64 build under emulation.
-    'win32-arm64': 'x86_64-pc-windows-msvc',
-  };
-  return table[`${platform}-${arch}`];
+  return TABLE[`${platform}-${arch}`];
 }
+
+/** Release asset name of a target's gzip-compressed binary. */
+export const assetName = triple => `goon-${triple}.gz`;
 
 const exe = platform => (platform === 'win32' ? 'goon.exe' : 'goon');
 
@@ -50,10 +57,17 @@ async function download(root, triple, destination) {
   const asset = manifest?.assets?.[triple];
   if (!manifest || !asset) return false;
   const repository = manifest.repository ?? 'binxgtl/goon-cli';
-  const url = `https://github.com/${repository}/releases/download/v${manifest.version}/${asset.file}`;
-  const response = await fetch(url, { redirect: 'follow', signal: AbortSignal.timeout(120_000) });
-  if (!response.ok) throw new Error(`downloading ${url} failed: HTTP ${response.status}`);
-  const packed = Buffer.from(await response.arrayBuffer());
+  // GOON_DOWNLOAD_BASE points at a mirror (URL) or a local directory holding the release assets.
+  const base = process.env.GOON_DOWNLOAD_BASE || `https://github.com/${repository}/releases/download/v${manifest.version}`;
+  let packed;
+  if (/^https?:\/\//i.test(base)) {
+    const url = `${base.replace(/\/+$/, '')}/${asset.file}`;
+    const response = await fetch(url, { redirect: 'follow', signal: AbortSignal.timeout(120_000) });
+    if (!response.ok) throw new Error(`downloading ${url} failed: HTTP ${response.status}`);
+    packed = Buffer.from(await response.arrayBuffer());
+  } else {
+    packed = readFileSync(join(base, asset.file));
+  }
   const bytes = asset.file.endsWith('.gz') ? gunzipSync(packed) : packed;
   const digest = createHash('sha256').update(bytes).digest('hex');
   if (digest !== asset.sha256) throw new Error(`checksum mismatch for ${asset.file} (expected ${asset.sha256}, got ${digest})`);
