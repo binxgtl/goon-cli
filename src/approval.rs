@@ -19,16 +19,53 @@ fn shell_meta_re() -> &'static Regex {
 const LAUNCHER_SUBCOMMANDS: &[&str] = &["run", "exec", "x", "dlx", "-m"];
 /// Commands that run other commands or rewrite their environment: never approvable by prefix.
 const ALWAYS_EXPLICIT: &[&str] = &[
-    "env", "sudo", "doas", "su", "xargs", "eval", "exec", "command", "builtin", "source", ".", "nohup", "time", "nice", "timeout",
-    "watch", "ssh", "find", "bash", "sh", "zsh", "fish", "dash", "pwsh", "powershell", "flock", "strace", "ltrace", "chroot",
-    "ionice", "unbuffer", "setsid", "stdbuf", "busybox", "toybox", "proot", "tsu", "script", "parallel", "trap",
+    "env",
+    "sudo",
+    "doas",
+    "su",
+    "xargs",
+    "eval",
+    "exec",
+    "command",
+    "builtin",
+    "source",
+    ".",
+    "nohup",
+    "time",
+    "nice",
+    "timeout",
+    "watch",
+    "ssh",
+    "find",
+    "bash",
+    "sh",
+    "zsh",
+    "fish",
+    "dash",
+    "pwsh",
+    "powershell",
+    "flock",
+    "strace",
+    "ltrace",
+    "chroot",
+    "ionice",
+    "unbuffer",
+    "setsid",
+    "stdbuf",
+    "busybox",
+    "toybox",
+    "proot",
+    "tsu",
+    "script",
+    "parallel",
+    "trap",
 ];
 /// Interpreters may be approved for a specific script/module, never as a bare single-word prefix.
 const INTERPRETERS: &[&str] = &["python", "python3", "node", "deno", "bun", "ruby", "perl", "php", "awk", "sed", "git"];
 /// Commands whose arguments decide everything: only the exact same command line is remembered.
 const EXACT_ONLY: &[&str] = &[
-    "rm", "rmdir", "mv", "cp", "ln", "chmod", "chown", "chgrp", "dd", "truncate", "shred", "mkfs", "curl", "wget", "scp", "rsync",
-    "nc", "ncat", "kill", "pkill", "killall", "docker", "podman", "kubectl",
+    "rm", "rmdir", "mv", "cp", "ln", "chmod", "chown", "chgrp", "dd", "truncate", "shred", "mkfs", "curl", "wget", "scp", "rsync", "nc", "ncat", "kill", "pkill", "killall", "docker", "podman",
+    "kubectl",
 ];
 const PACKAGE_MANAGERS: &[&str] = &["npm", "pnpm", "yarn", "bun", "pip", "pip3", "uv", "poetry", "cargo", "go", "gem", "composer", "apt", "apt-get", "pkg", "brew", "dnf", "pacman"];
 const INSTALL_SUBCOMMANDS: &[&str] = &["install", "i", "add", "ci", "update", "upgrade", "up", "get", "remove", "rm", "uninstall", "un", "sync"];
@@ -60,8 +97,7 @@ fn leaves_workspace(token: &str) -> bool {
     };
     static ABS: OnceLock<Regex> = OnceLock::new();
     static PARENT: OnceLock<Regex> = OnceLock::new();
-    ABS.get_or_init(|| Regex::new(r"^(?:/|~|[A-Za-z]:[\\/]|\\\\)").unwrap()).is_match(value)
-        || PARENT.get_or_init(|| Regex::new(r"(?:^|[\\/])\.\.(?:[\\/]|$)").unwrap()).is_match(value)
+    ABS.get_or_init(|| Regex::new(r"^(?:/|~|[A-Za-z]:[\\/]|\\\\)").unwrap()).is_match(value) || PARENT.get_or_init(|| Regex::new(r"(?:^|[\\/])\.\.(?:[\\/]|$)").unwrap()).is_match(value)
 }
 
 fn command_name(token: &str) -> String {

@@ -19,7 +19,8 @@ async fn workflow_subagent_steps_stay_pinned_to_the_shared_budget_between_harnes
     let tools = registry(&f.cwd, tools::approve_all(), false);
     let subs = subagents::Subagents::new(rt, st, tools.clone(), harness::noop_emit());
     subs.register().unwrap();
-    let budget: cost::SharedBudget = Arc::new(Mutex::new(cost::RunBudget { spent: 0, limit: 110, cost_spent: 0.0, cost_limit: 0.0, started_at: Some(jsutil::now_millis()), time_limit_ms: 600_000, ledger: None }));
+    let budget: cost::SharedBudget =
+        Arc::new(Mutex::new(cost::RunBudget { spent: 0, limit: 110, cost_spent: 0.0, cost_limit: 0.0, started_at: Some(jsutil::now_millis()), time_limit_ms: 600_000, ledger: None }));
     let delegate = |task: &'static str| {
         let tools = tools.clone();
         let budget = budget.clone();

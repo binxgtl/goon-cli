@@ -19,20 +19,8 @@ pub const COMPACT_BULK_SCHEMA_MAX_BYTES: usize = 6_000;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum McpTransport {
-    Stdio {
-        command: String,
-        args: Vec<String>,
-        cwd: Option<String>,
-        env: Map<String, Value>,
-        env_vars: Vec<String>,
-        env_from: Map<String, Value>,
-    },
-    Http {
-        url: String,
-        bearer_env: Option<String>,
-        headers: Map<String, Value>,
-        env_headers: Map<String, Value>,
-    },
+    Stdio { command: String, args: Vec<String>, cwd: Option<String>, env: Map<String, Value>, env_vars: Vec<String>, env_from: Map<String, Value> },
+    Http { url: String, bearer_env: Option<String>, headers: Map<String, Value>, env_headers: Map<String, Value> },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -180,8 +168,7 @@ fn normalize_server_raw(raw: &Value) -> Value {
     alias("enabled_tools", "enabledTools", &mut obj, |_| true);
     alias("disabled_tools", "disabledTools", &mut obj, |_| true);
     alias("default_tools_approval_mode", "defaultToolsApprovalMode", &mut obj, |_| true);
-    let auto = obj.get("autoApprove") == Some(&json!(true))
-        || matches!(obj.get("defaultToolsApprovalMode").and_then(Value::as_str), Some("auto") | Some("approve"));
+    let auto = obj.get("autoApprove") == Some(&json!(true)) || matches!(obj.get("defaultToolsApprovalMode").and_then(Value::as_str), Some("auto") | Some("approve"));
     if auto {
         obj.insert("trust".into(), json!(true));
     }
@@ -276,7 +263,22 @@ pub fn parse_server(raw: &Value) -> Result<McpServerConfig> {
     let Some(m) = normalized.as_object() else { bail!("Invalid MCP server: expected an object") };
     let mut errors = vec![];
     let transport_name = m.get("transport").and_then(Value::as_str).unwrap_or("").to_string();
-    let common_keys = ["disabled", "required", "trust", "net", "allowNet", "readOnlyTools", "enabledTools", "disabledTools", "timeoutMs", "toolTimeoutMs", "maxBufferSize", "maxTools", "toolInputSchemaMaxBytes", "transport"];
+    let common_keys = [
+        "disabled",
+        "required",
+        "trust",
+        "net",
+        "allowNet",
+        "readOnlyTools",
+        "enabledTools",
+        "disabledTools",
+        "timeoutMs",
+        "toolTimeoutMs",
+        "maxBufferSize",
+        "maxTools",
+        "toolInputSchemaMaxBytes",
+        "transport",
+    ];
     let specific: &[&str] = match transport_name.as_str() {
         "stdio" => &["command", "args", "cwd", "env", "envVars", "envFrom"],
         "http" => &["url", "bearerEnv", "headers", "envHeaders"],
@@ -327,12 +329,7 @@ pub fn parse_server(raw: &Value) -> Result<McpServerConfig> {
                 errors.push("bearerEnv: invalid environment variable name".into());
             }
         }
-        McpTransport::Http {
-            url,
-            bearer_env,
-            headers: string_record(m, "headers", false, false, &mut errors),
-            env_headers: string_record(m, "envHeaders", true, false, &mut errors),
-        }
+        McpTransport::Http { url, bearer_env, headers: string_record(m, "headers", false, false, &mut errors), env_headers: string_record(m, "envHeaders", true, false, &mut errors) }
     };
     let config = McpServerConfig {
         disabled: opt_bool(m, "disabled", false, &mut errors),

@@ -71,35 +71,175 @@ fn unknown_network() -> NetworkAssessment {
 
 const NETWORK_CLIENTS: &[&str] = &["curl", "wget", "ssh", "scp", "sftp", "rsync", "nc", "ncat", "netcat", "ftp", "telnet", "socat", "tnftp", "lftp"];
 const PACKAGE_MANAGERS: &[&str] = &["npm", "pnpm", "yarn", "bun", "pip", "pip3", "uv", "poetry", "cargo", "go", "gem", "composer", "apt", "apt-get", "pkg", "brew", "dnf", "pacman", "apk", "yum"];
-const PACKAGE_NETWORK_SUBCOMMANDS: &[&str] = &["install", "i", "add", "ci", "update", "upgrade", "up", "get", "remove", "rm", "uninstall", "un", "sync", "publish", "audit", "view", "info", "outdated", "fetch", "download", "exec", "x", "dlx"];
+const PACKAGE_NETWORK_SUBCOMMANDS: &[&str] = &[
+    "install",
+    "i",
+    "add",
+    "ci",
+    "update",
+    "upgrade",
+    "up",
+    "get",
+    "remove",
+    "rm",
+    "uninstall",
+    "un",
+    "sync",
+    "publish",
+    "audit",
+    "view",
+    "info",
+    "outdated",
+    "fetch",
+    "download",
+    "exec",
+    "x",
+    "dlx",
+];
 const NETWORK_PACKAGE_RUNNERS: &[&str] = &["npx", "pnpx", "bunx"];
 const NETWORK_GIT_SUBCOMMANDS: &[&str] = &["push", "pull", "fetch", "clone", "ls-remote", "submodule", "request-pull", "archive"];
 const CURL_VALUE_FLAGS: &[&str] = &[
-    "-o", "--output", "-H", "--header", "-d", "--data", "--data-raw", "--data-binary", "--data-urlencode", "-X", "--request", "-u",
-    "--user", "-A", "--user-agent", "-e", "--referer", "-b", "--cookie", "-c", "--cookie-jar", "-F", "--form", "-T", "--upload-file",
-    "-x", "--proxy", "-m", "--max-time", "--connect-timeout", "-r", "--range", "-w", "--write-out", "-K", "--config", "-E", "--cert",
-    "--key", "--cacert", "--capath", "--resolve", "--connect-to", "--retry", "--retry-delay", "--retry-max-time", "--url",
-    "--unix-socket", "--interface", "--limit-rate", "--max-filesize", "--speed-limit", "--speed-time", "--max-redirs", "--local-port",
-    "--dns-servers", "--expect100-timeout", "--happy-eyeballs-timeout-ms", "--keepalive-time",
+    "-o",
+    "--output",
+    "-H",
+    "--header",
+    "-d",
+    "--data",
+    "--data-raw",
+    "--data-binary",
+    "--data-urlencode",
+    "-X",
+    "--request",
+    "-u",
+    "--user",
+    "-A",
+    "--user-agent",
+    "-e",
+    "--referer",
+    "-b",
+    "--cookie",
+    "-c",
+    "--cookie-jar",
+    "-F",
+    "--form",
+    "-T",
+    "--upload-file",
+    "-x",
+    "--proxy",
+    "-m",
+    "--max-time",
+    "--connect-timeout",
+    "-r",
+    "--range",
+    "-w",
+    "--write-out",
+    "-K",
+    "--config",
+    "-E",
+    "--cert",
+    "--key",
+    "--cacert",
+    "--capath",
+    "--resolve",
+    "--connect-to",
+    "--retry",
+    "--retry-delay",
+    "--retry-max-time",
+    "--url",
+    "--unix-socket",
+    "--interface",
+    "--limit-rate",
+    "--max-filesize",
+    "--speed-limit",
+    "--speed-time",
+    "--max-redirs",
+    "--local-port",
+    "--dns-servers",
+    "--expect100-timeout",
+    "--happy-eyeballs-timeout-ms",
+    "--keepalive-time",
 ];
 const WGET_VALUE_FLAGS: &[&str] = &[
-    "-O", "--output-document", "-o", "--output-file", "-P", "--directory-prefix", "-U", "--user-agent", "-T", "--timeout", "-t",
-    "--tries", "-w", "--wait", "-e", "--execute", "-a", "--append-output", "-i", "--input-file", "-B", "--base", "-D", "--domains",
-    "-H", "--header", "-Y", "--proxy", "-Q", "--quota", "-l", "--level", "-A", "--accept", "-R", "--reject", "--post-data",
-    "--post-file", "--method", "--body-data", "--body-file",
+    "-O",
+    "--output-document",
+    "-o",
+    "--output-file",
+    "-P",
+    "--directory-prefix",
+    "-U",
+    "--user-agent",
+    "-T",
+    "--timeout",
+    "-t",
+    "--tries",
+    "-w",
+    "--wait",
+    "-e",
+    "--execute",
+    "-a",
+    "--append-output",
+    "-i",
+    "--input-file",
+    "-B",
+    "--base",
+    "-D",
+    "--domains",
+    "-H",
+    "--header",
+    "-Y",
+    "--proxy",
+    "-Q",
+    "--quota",
+    "-l",
+    "--level",
+    "-A",
+    "--accept",
+    "-R",
+    "--reject",
+    "--post-data",
+    "--post-file",
+    "--method",
+    "--body-data",
+    "--body-file",
 ];
 const SSH_VALUE_FLAGS: &[&str] = &["-p", "-i", "-l", "-o", "-F", "-J", "-L", "-R", "-D", "-W", "-b", "-c", "-E", "-I", "-m", "-O", "-Q", "-S", "-w", "-e", "-B"];
 const COPY_VALUE_FLAGS: &[&str] = &["-e", "--rsh", "-i", "--identity-file", "-P", "-p", "-o", "-F", "-S", "-l"];
 const NETCAT_VALUE_FLAGS: &[&str] = &["-p", "-s", "-w", "-i", "-x", "-X", "-c", "-q", "-T", "-O", "-m", "-I", "-e"];
 const FTP_VALUE_FLAGS: &[&str] = &["-p", "-P", "-u", "-w", "-o", "-N", "-t", "-r", "-g"];
 const GIT_VALUE_FLAGS: &[&str] = &["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix"];
-const GIT_SUB_VALUE_FLAGS: &[&str] = &["--depth", "--branch", "-b", "--origin", "-o", "--config", "--reference", "--separate-git-dir", "--jobs", "-j", "--filter", "--shallow-since", "--shallow-exclude", "--repo", "--server-option"];
+const GIT_SUB_VALUE_FLAGS: &[&str] =
+    &["--depth", "--branch", "-b", "--origin", "-o", "--config", "--reference", "--separate-git-dir", "--jobs", "-j", "--filter", "--shallow-since", "--shallow-exclude", "--repo", "--server-option"];
 const PACKAGE_VALUE_FLAGS: &[&str] = &[
-    "--prefix", "--registry", "--cache", "--userconfig", "--globalconfig", "--cwd", "--dir", "--workspace", "-w", "--filter",
-    "--loglevel", "--target", "--index-url", "-i", "--extra-index-url", "--python", "--root", "--manifest-path", "--features", "-F",
-    "--package", "-p", "--toolchain", "--config", "--repository", "--source", "--build-dir",
+    "--prefix",
+    "--registry",
+    "--cache",
+    "--userconfig",
+    "--globalconfig",
+    "--cwd",
+    "--dir",
+    "--workspace",
+    "-w",
+    "--filter",
+    "--loglevel",
+    "--target",
+    "--index-url",
+    "-i",
+    "--extra-index-url",
+    "--python",
+    "--root",
+    "--manifest-path",
+    "--features",
+    "-F",
+    "--package",
+    "-p",
+    "--toolchain",
+    "--config",
+    "--repository",
+    "--source",
+    "--build-dir",
 ];
-const CURL_REDIRECT_FLAGS: &[&str] = &["-x", "--proxy", "--preproxy", "--socks4", "--socks4a", "--socks5", "--socks5-hostname", "--resolve", "--connect-to", "--unix-socket", "--abstract-unix-socket", "--doh-url", "-K", "--config"];
+const CURL_REDIRECT_FLAGS: &[&str] =
+    &["-x", "--proxy", "--preproxy", "--socks4", "--socks4a", "--socks5", "--socks5-hostname", "--resolve", "--connect-to", "--unix-socket", "--abstract-unix-socket", "--doh-url", "-K", "--config"];
 const WGET_REDIRECT_FLAGS: &[&str] = &["-e", "--execute"];
 const SSH_REDIRECT_FLAGS: &[&str] = &["-o", "-J", "-L", "-R", "-D", "-W", "-F", "-w"];
 const COPY_REDIRECT_FLAGS: &[&str] = &["-o", "-F", "-J", "-S"];
@@ -202,7 +342,13 @@ pub fn resolve_execution_policy(config: &Config, flag_allow_net: bool, flag_host
     let config_hosts = parse_network_host_list(config.allow_net_hosts.iter().map(String::as_str));
     let hosts: BTreeSet<String> = config_hosts.into_iter().chain(flag_hosts).collect();
     let allow_all = flag_allow_net || config.allow_net;
-    let mode = if allow_all { NetworkMode::Allow } else if !hosts.is_empty() { NetworkMode::Allowlist } else { NetworkMode::Deny };
+    let mode = if allow_all {
+        NetworkMode::Allow
+    } else if !hosts.is_empty() {
+        NetworkMode::Allowlist
+    } else {
+        NetworkMode::Deny
+    };
     ExecutionPolicy { mode, hosts, limits: default_limits(), allow_all }
 }
 
@@ -387,9 +533,7 @@ fn analyze_segment(tokens: &[String], depth: usize) -> NetworkAssessment {
             for token in positionals(&rest, value_flags).into_iter().chain(inline_values(&rest, &["--url"])) {
                 add_host(&mut hosts, host_from_token(&token, true));
             }
-            let redirect = has_flag(&rest, redirect_flags)
-                || (cmd == "curl" && has_attached_short_flag(&rest, "-x"))
-                || (cmd == "wget" && has_attached_short_flag(&rest, "-e"));
+            let redirect = has_flag(&rest, redirect_flags) || (cmd == "curl" && has_attached_short_flag(&rest, "-x")) || (cmd == "wget" && has_attached_short_flag(&rest, "-e"));
             let unknown = hosts.is_empty() || redirect;
             return NetworkAssessment { network: true, hosts, unknown };
         }
@@ -518,7 +662,20 @@ mod tests {
 
     #[test]
     fn deny_mode_blocks_network() {
-        for cmd in ["curl https://evil.test", "git push", "npm install", "npx x", "watch curl evil.test", "flock /tmp/l curl x", "su -c \"wget x\"", "trap \"curl x\" EXIT", "strace -f git push", "busybox wget x", "ssh host", "scp a host:b"] {
+        for cmd in [
+            "curl https://evil.test",
+            "git push",
+            "npm install",
+            "npx x",
+            "watch curl evil.test",
+            "flock /tmp/l curl x",
+            "su -c \"wget x\"",
+            "trap \"curl x\" EXIT",
+            "strace -f git push",
+            "busybox wget x",
+            "ssh host",
+            "scp a host:b",
+        ] {
             assert!(!is_network_allowed_for_command(&deny(), cmd), "{cmd}");
         }
         for cmd in ["ls", "npm test", "git status", "watch ls", "scp a b"] {

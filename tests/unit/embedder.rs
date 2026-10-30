@@ -27,7 +27,9 @@ async fn hash_provider_is_byte_for_byte_the_hash_embedder() {
 
 #[tokio::test]
 async fn openai_provider_batches_requests_sends_the_bearer_header_and_maps_by_index() {
-    let p = provider(|body, _| json_response(200, json!({ "data": body["input"].as_array().unwrap().iter().enumerate().map(|(i, _)| json!({ "index": i, "embedding": [1, 0, 0] })).collect::<Vec<_>>() }))).await;
+    let p =
+        provider(|body, _| json_response(200, json!({ "data": body["input"].as_array().unwrap().iter().enumerate().map(|(i, _)| json!({ "index": i, "embedding": [1, 0, 0] })).collect::<Vec<_>>() })))
+            .await;
     let mut o = opts("openai", Some("text-embedding-3-small"), Some(&p.url), Some(KEY));
     o.batch_size = Some(2);
     let vectors = create_embedder(o).unwrap().embed(texts(&["a", "b", "c"]), None).await.unwrap();

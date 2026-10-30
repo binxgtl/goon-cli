@@ -2,7 +2,17 @@ use crate::common::*;
 use goon::coord::*;
 
 fn todo(id: &str, role: &str, deps: &[&str]) -> Todo {
-    Todo { id: id.into(), title: id.into(), acceptance: String::new(), depends_on: deps.iter().map(|d| d.to_string()).collect(), status: "pending".into(), role: role.into(), assignee: None, artifacts: vec![], rework_cycles: 0 }
+    Todo {
+        id: id.into(),
+        title: id.into(),
+        acceptance: String::new(),
+        depends_on: deps.iter().map(|d| d.to_string()).collect(),
+        status: "pending".into(),
+        role: role.into(),
+        assignee: None,
+        artifacts: vec![],
+        rework_cycles: 0,
+    }
 }
 
 fn plan(todos: Vec<Todo>) -> Plan {
@@ -40,7 +50,9 @@ fn validate_plan_rejects_invalid_roles() {
 
 #[test]
 fn plan_from_planner_applies_defaults_and_dedupes_deps() {
-    let p = plan_from_planner(&json!({ "goal": "g", "todos": [{ "id": "t1", "title": "a", "role": "coder", "dependsOn": ["t2", "t2"] }, { "id": "t2", "title": "b", "role": "researcher" }] }), "plan-x").unwrap();
+    let p =
+        plan_from_planner(&json!({ "goal": "g", "todos": [{ "id": "t1", "title": "a", "role": "coder", "dependsOn": ["t2", "t2"] }, { "id": "t2", "title": "b", "role": "researcher" }] }), "plan-x")
+            .unwrap();
     assert_eq!(p.id, "plan-x");
     assert_eq!(p.todos[0].depends_on, vec!["t2"]);
     assert_eq!(p.todos[0].status, "pending");
@@ -214,7 +226,16 @@ async fn run_dag_validate_failure_emits_dag_plan_invalid_and_never_spawns() {
         test: None,
         verify: None,
     };
-    let opts = DagOptions { config: DagConfig::default(), cancel: token(), files: Arc::new(files::WorkspaceFiles::new(&f.cwd)), budget: None, allowed_mcp_tools: vec![], allow_empty: false, write_concurrency: None, emit: Some(emit) };
+    let opts = DagOptions {
+        config: DagConfig::default(),
+        cancel: token(),
+        files: Arc::new(files::WorkspaceFiles::new(&f.cwd)),
+        budget: None,
+        allowed_mcp_tools: vec![],
+        allow_empty: false,
+        write_concurrency: None,
+        emit: Some(emit),
+    };
     let error = run_dag("g", hooks, opts).await.err().expect("plan validation error");
     assert!(error.downcast_ref::<PlanValidationError>().is_some(), "{error}");
     assert_eq!(spawned.load(Ordering::SeqCst), 0);

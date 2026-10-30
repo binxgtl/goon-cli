@@ -61,7 +61,13 @@ pub fn normalize_event_envelope(value: &Value, session_id: Option<&str>, seq: Op
         bail!("Unsupported event log version {shown}; expected {EVENT_LOG_VERSION}.");
     }
     let seq = safe_seq(raw.get("seq")).or(seq).ok_or_else(|| anyhow!("Invalid event envelope: missing or invalid seq."))?;
-    let session_id = raw.get("sessionId").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string).or(session_id.map(str::to_string)).ok_or_else(|| anyhow!("Invalid event envelope: missing sessionId."))?;
+    let session_id = raw
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or(session_id.map(str::to_string))
+        .ok_or_else(|| anyhow!("Invalid event envelope: missing sessionId."))?;
     let kind = raw.get("type").and_then(Value::as_str).filter(|s| !s.is_empty()).ok_or_else(|| anyhow!("Invalid event envelope: missing type."))?;
     let event = raw.get("event").cloned().ok_or_else(|| anyhow!("Invalid event envelope: missing event body."))?;
     let at = raw.get("at").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string).unwrap_or_else(|| "1970-01-01T00:00:00.000Z".into());
@@ -205,7 +211,11 @@ fn write_sidecar_seq(path: &Path, seq: u64) {
 fn is_valid_envelope_line(line: &str) -> bool {
     let Ok(parsed) = serde_json::from_str::<Value>(line) else { return false };
     let Some(o) = parsed.as_object() else { return false };
-    o.get("v").and_then(Value::as_f64) == Some(1.0) && safe_seq(o.get("seq")).is_some() && o.get("type").map(Value::is_string).unwrap_or(false) && o.get("sessionId").map(Value::is_string).unwrap_or(false) && o.contains_key("event")
+    o.get("v").and_then(Value::as_f64) == Some(1.0)
+        && safe_seq(o.get("seq")).is_some()
+        && o.get("type").map(Value::is_string).unwrap_or(false)
+        && o.get("sessionId").map(Value::is_string).unwrap_or(false)
+        && o.contains_key("event")
 }
 
 /// Drops a half-written final line (or adds the missing newline to a complete one).

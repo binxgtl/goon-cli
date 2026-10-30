@@ -146,7 +146,7 @@ pub fn encode_qr_matrix(text: &str) -> Result<Vec<Vec<bool>>> {
     let total = spec.data_codewords * 8;
     let term = 4.min(total - bits.len());
     push(0, term, &mut bits);
-    while bits.len() % 8 != 0 {
+    while !bits.len().is_multiple_of(8) {
         bits.push(0);
     }
     let mut data = vec![0u8; spec.data_codewords];
@@ -302,8 +302,8 @@ pub fn encode_qr_matrix(text: &str) -> Result<Vec<Vec<bool>>> {
         }
         let f = format_bits(0b01, mask);
         let bit = |i: u32| (f >> i) & 1 == 1;
-        for i in 0..=5 {
-            grid[8][i] = bit(i as u32);
+        for (i, cell) in grid[8].iter_mut().enumerate().take(6) {
+            *cell = bit(i as u32);
         }
         grid[8][7] = bit(6);
         grid[8][8] = bit(7);
@@ -322,10 +322,10 @@ pub fn encode_qr_matrix(text: &str) -> Result<Vec<Vec<bool>>> {
     };
     let penalty = |grid: &Vec<Vec<bool>>| -> u32 {
         let mut score = 0;
-        for r in 0..size {
+        for row in grid.iter() {
             let mut run = 1;
             for c in 1..size {
-                if grid[r][c] == grid[r][c - 1] {
+                if row[c] == row[c - 1] {
                     run += 1;
                     if run == 5 {
                         score += 3;
@@ -337,6 +337,7 @@ pub fn encode_qr_matrix(text: &str) -> Result<Vec<Vec<bool>>> {
                 }
             }
         }
+        #[allow(clippy::needless_range_loop)] // column scan: c indexes every row
         for c in 0..size {
             let mut run = 1;
             for r in 1..size {
@@ -661,7 +662,11 @@ impl PairManager {
         let port = self.state.lock().unwrap().port;
         let binary = resolve_cloudflared_binary().await;
         let mut cmd = tokio::process::Command::new(&binary);
-        cmd.args(["tunnel", "--no-autoupdate", "--url", &format!("http://127.0.0.1:{port}")]).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).kill_on_drop(true);
+        cmd.args(["tunnel", "--no-autoupdate", "--url", &format!("http://127.0.0.1:{port}")])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
         #[cfg(windows)]
         {
             cmd.creation_flags(0x0800_0000);
@@ -671,12 +676,19 @@ impl PairManager {
             Err(e) => {
                 let mut st = self.state.lock().unwrap();
                 st.tunnel_status = "fallback_lan";
-                st.tunnel_error = Some(format!("cloudflared not found or failed (spawn {binary} {}). Run \"/pair lan\" to pair over local Wi-Fi.", if e.kind() == std::io::ErrorKind::NotFound { "ENOENT".to_string() } else { e.to_string() }));
+                st.tunnel_error = Some(format!(
+                    "cloudflared not found or failed (spawn {binary} {}). Run \"/pair lan\" to pair over local Wi-Fi.",
+                    if e.kind() == std::io::ErrorKind::NotFound { "ENOENT".to_string() } else { e.to_string() }
+                ));
                 return;
             }
         };
         let (line_tx, mut line_rx) = mpsc::unbounded_channel::<String>();
-        for stream in [child.stdout.take().map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Unpin + Send>), child.stderr.take().map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Unpin + Send>)].into_iter().flatten() {
+        for stream in
+            [child.stdout.take().map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Unpin + Send>), child.stderr.take().map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Unpin + Send>)]
+                .into_iter()
+                .flatten()
+        {
             let tx = line_tx.clone();
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stream).lines();
@@ -845,7 +857,15 @@ impl PairManager {
         if clean.is_empty() {
             return;
         }
-        if clean.contains("Pair Device via Cloudflared Tunnel") || clean.contains("╭─── goon") || clean.contains("╭─── Resumed Session") || clean.starts_with("↻ Resumed session") || clean.starts_with("Starting Cloudflared tunnel") || clean.starts_with("[answer]\n") || clean.starts_with("[reasoning]\n") || clean.starts_with("> ") {
+        if clean.contains("Pair Device via Cloudflared Tunnel")
+            || clean.contains("╭─── goon")
+            || clean.contains("╭─── Resumed Session")
+            || clean.starts_with("↻ Resumed session")
+            || clean.starts_with("Starting Cloudflared tunnel")
+            || clean.starts_with("[answer]\n")
+            || clean.starts_with("[reasoning]\n")
+            || clean.starts_with("> ")
+        {
             return;
         }
         self.ensure_history_seeded();
@@ -917,7 +937,14 @@ impl PairManager {
             "dag_merge" => {
                 let verified = event.get("verified").and_then(Value::as_bool).unwrap_or(false);
                 let reason = s("reason");
-                tool(self, format!("● [dag] merge {}{}", if verified { "verified" } else { "NOT verified" }, if reason.is_empty() { String::new() } else { format!(": {}", crate::jsutil::slice_chars(&reason, 0, 160)) }));
+                tool(
+                    self,
+                    format!(
+                        "● [dag] merge {}{}",
+                        if verified { "verified" } else { "NOT verified" },
+                        if reason.is_empty() { String::new() } else { format!(": {}", crate::jsutil::slice_chars(&reason, 0, 160)) }
+                    ),
+                );
                 self.sync_state();
             }
             "usage" | "stopped" | "plan_exit" => {
@@ -963,7 +990,13 @@ impl PairManager {
         let s = |k: &str| info.get(k).and_then(Value::as_str).unwrap_or("").to_string();
         let bind = self.listening_host();
         let qr = render_qr_terminal(&s("publicPairUrl"), "  ");
-        let status = if s("tunnelStatus") == "connected" { "Cloudflared Tunnel Active (Free)" } else if bind == "0.0.0.0" { "LAN Mode (0.0.0.0)" } else { "Localhost Only (127.0.0.1)" };
+        let status = if s("tunnelStatus") == "connected" {
+            "Cloudflared Tunnel Active (Free)"
+        } else if bind == "0.0.0.0" {
+            "LAN Mode (0.0.0.0)"
+        } else {
+            "Localhost Only (127.0.0.1)"
+        };
         let mut lines = vec!["╭─── Pair Device via Cloudflared Tunnel ──────────────────────────╮".to_string(), format!("  Status      : {status}")];
         if info.get("tunnelUrl").map(|v| !v.is_null()).unwrap_or(false) {
             lines.push(format!("  Tunnel URL  : {}", s("publicPairUrl")));
@@ -1039,7 +1072,8 @@ impl PairManager {
             Ok(json!({}))
         };
         let mut socket = reader.into_inner();
-        let respond = |status: &str, ctype: &str, body: String, extra: &str| format!("HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n{extra}\r\n{body}", body.len());
+        let respond =
+            |status: &str, ctype: &str, body: String, extra: &str| format!("HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n{extra}\r\n{body}", body.len());
         if method == "GET" && path == "/favicon.ico" {
             socket.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await?;
             return Ok(());
@@ -1108,7 +1142,16 @@ impl PairManager {
                     if prompt.is_empty() {
                         s.write_all(respond("400 Bad Request", "application/json", json!({ "error": "Prompt is required" }).to_string(), "").as_bytes()).await?;
                     } else if is_forbidden_remote_input(&prompt) {
-                        s.write_all(respond("403 Forbidden", "application/json", json!({ "error": "Direct shell execution (!cmd) and auto-approve mode escalation are disabled for remote devices." }).to_string(), "").as_bytes()).await?;
+                        s.write_all(
+                            respond(
+                                "403 Forbidden",
+                                "application/json",
+                                json!({ "error": "Direct shell execution (!cmd) and auto-approve mode escalation are disabled for remote devices." }).to_string(),
+                                "",
+                            )
+                            .as_bytes(),
+                        )
+                        .await?;
                     } else {
                         self.notify_user_prompt(&prompt);
                         (self.callbacks.on_remote_prompt)(prompt);
@@ -1121,7 +1164,8 @@ impl PairManager {
                 Ok((mut s, body)) => {
                     let mode = body.get("mode").and_then(Value::as_str).unwrap_or("").to_string();
                     if mode == "auto" {
-                        s.write_all(respond("403 Forbidden", "application/json", json!({ "error": "Cannot enable auto-approve mode from a remote paired device." }).to_string(), "").as_bytes()).await?;
+                        s.write_all(respond("403 Forbidden", "application/json", json!({ "error": "Cannot enable auto-approve mode from a remote paired device." }).to_string(), "").as_bytes())
+                            .await?;
                     } else if ["ask", "plan", "readonly"].contains(&mode.as_str()) {
                         (self.callbacks.on_remote_mode_change)(mode.clone());
                         self.sync_state();
@@ -1280,7 +1324,9 @@ mod tests {
         let stops = Arc::new(AtomicU64::new(0));
         let (p2, m2, s2) = (prompts.clone(), modes.clone(), stops.clone());
         let pm = PairManager::new(PairCallbacks {
-            get_state: Arc::new(|| json!({ "model": "test-model", "provider": "openai-compatible", "cwd": "/workspace/demo", "sessionId": "12345678-abcd", "mode": "ask", "status": "Ready", "tokens": 420, "contextWindow": 128000 })),
+            get_state: Arc::new(
+                || json!({ "model": "test-model", "provider": "openai-compatible", "cwd": "/workspace/demo", "sessionId": "12345678-abcd", "mode": "ask", "status": "Ready", "tokens": 420, "contextWindow": 128000 }),
+            ),
             get_history: Arc::new(Vec::new),
             on_remote_prompt: Arc::new(move |p| p2.lock().unwrap().push(p)),
             on_remote_mode_change: Arc::new(move |m| m2.lock().unwrap().push(m)),
@@ -1349,7 +1395,8 @@ mod tests {
         pm.notify_event(&json!({ "type": "verify_result", "status": "fail", "stage": "test", "reason": "1 failing test", "errors": [], "warnings": [], "durationMs": 4 }));
         pm.notify_event(&json!({ "type": "verify_rollback", "reason": "Verification failed", "restored": ["src/a.ts"], "deleted": [], "conflicts": [] }));
         let verify: Value = client.get(format!("{base}/api/state?t={token}")).send().await.unwrap().json().await.unwrap();
-        let rows: Vec<String> = verify["entries"].as_array().unwrap().iter().filter(|e| e["kind"] == "tool" && e["text"].as_str().unwrap().contains("[verify")).map(|e| e["text"].as_str().unwrap().to_string()).collect();
+        let rows: Vec<String> =
+            verify["entries"].as_array().unwrap().iter().filter(|e| e["kind"] == "tool" && e["text"].as_str().unwrap().contains("[verify")).map(|e| e["text"].as_str().unwrap().to_string()).collect();
         assert!(rows.iter().any(|t| t.contains("[verify] 1 file(s)")), "{rows:?}");
         assert!(rows.iter().any(|t| t.contains("[verify] fail: 1 failing test")), "{rows:?}");
         assert!(rows.iter().any(|t| t.contains("[verify rollback]")), "{rows:?}");

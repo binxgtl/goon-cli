@@ -2,7 +2,10 @@ use crate::common::*;
 use goon::context::{compact_if_needed, compact_now, estimated_tokens, load_project_instructions};
 
 fn completion(content: &str, total: u64) -> MockResponse {
-    json_response(200, json!({ "id": "summary", "object": "chat.completion", "created": 1, "model": "test-model", "choices": [{ "index": 0, "message": { "role": "assistant", "content": content }, "finish_reason": "stop" }], "usage": { "prompt_tokens": total - 20, "completion_tokens": 20, "total_tokens": total } }))
+    json_response(
+        200,
+        json!({ "id": "summary", "object": "chat.completion", "created": 1, "model": "test-model", "choices": [{ "index": 0, "message": { "role": "assistant", "content": content }, "finish_reason": "stop" }], "usage": { "prompt_tokens": total - 20, "completion_tokens": 20, "total_tokens": total } }),
+    )
 }
 
 fn setup(f: &Fixture, url: &str, window: u64, max_out: u64) -> (Arc<config::RuntimeConfig>, Arc<session::SessionStore>) {
@@ -26,7 +29,9 @@ async fn compaction_archives_full_history_and_preserves_complete_recent_tool_gro
         s.messages.push(json!({ "role": "user", "content": "task-goal: finish the change" }));
         for i in 0..8 {
             s.messages.push(json!({ "role": "assistant", "content": [{ "type": "tool-call", "toolCallId": format!("r{i}"), "toolName": "read_file", "input": { "path": "file" } }] }));
-            s.messages.push(json!({ "role": "tool", "content": [{ "type": "tool-result", "toolCallId": format!("r{i}"), "toolName": "read_file", "output": { "type": "text", "value": "x".repeat(1500) } }] }));
+            s.messages.push(
+                json!({ "role": "tool", "content": [{ "type": "tool-result", "toolCallId": format!("r{i}"), "toolName": "read_file", "output": { "type": "text", "value": "x".repeat(1500) } }] }),
+            );
         }
     }
     st.save().unwrap();

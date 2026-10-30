@@ -330,13 +330,45 @@ fn parse_verify(value: Option<&Value>, issues: &mut Issues) -> VerifyConfig {
 }
 
 const CONFIG_KEYS: &[&str] = &[
-    "provider", "baseUrl", "model", "effort", "keyEnv", "contextWindow", "maxOutputTokens", "timeoutMs",
-    "runTokenBudget", "maxCostUsd", "maxTimeMs", "pricing", "inlineReasoning", "showReasoning", "approvalMode",
-    "allowNet", "allowNetHosts", "viewMode", "verify", "eventLog", "stub", "stubFixture", "memoryEnabled",
-    "ragEnabled", "ragTopK", "ragCapacity", "ragThreshold", "ragIndexMaxFiles", "ragIndexMaxFileBytes",
-    "contextReserveRatio", "contextConversationRatio", "contextFilesRatio", "multiAgentMode",
-    "multiAgentReworkCap", "multiAgentMaxConcurrency", "multiAgentMcpTools", "embedderProvider",
-    "embedderModel", "embedderBaseUrl",
+    "provider",
+    "baseUrl",
+    "model",
+    "effort",
+    "keyEnv",
+    "contextWindow",
+    "maxOutputTokens",
+    "timeoutMs",
+    "runTokenBudget",
+    "maxCostUsd",
+    "maxTimeMs",
+    "pricing",
+    "inlineReasoning",
+    "showReasoning",
+    "approvalMode",
+    "allowNet",
+    "allowNetHosts",
+    "viewMode",
+    "verify",
+    "eventLog",
+    "stub",
+    "stubFixture",
+    "memoryEnabled",
+    "ragEnabled",
+    "ragTopK",
+    "ragCapacity",
+    "ragThreshold",
+    "ragIndexMaxFiles",
+    "ragIndexMaxFileBytes",
+    "contextReserveRatio",
+    "contextConversationRatio",
+    "contextFilesRatio",
+    "multiAgentMode",
+    "multiAgentReworkCap",
+    "multiAgentMaxConcurrency",
+    "multiAgentMcpTools",
+    "embedderProvider",
+    "embedderModel",
+    "embedderBaseUrl",
 ];
 
 /// `configSchema.parse(value)`.
@@ -439,13 +471,45 @@ pub fn parse_config(value: &Value) -> Result<Config> {
         bail!("Invalid config:\n  {}", issues.0.join("\n  "));
     }
     Ok(Config {
-        provider, base_url, model, effort, key_env, context_window, max_output_tokens, timeout_ms,
-        run_token_budget, max_cost_usd, max_time_ms, pricing, inline_reasoning, show_reasoning,
-        approval_mode, allow_net, allow_net_hosts, view_mode, verify, event_log, stub, stub_fixture,
-        memory_enabled, rag_enabled, rag_top_k, rag_capacity, rag_threshold, rag_index_max_files,
-        rag_index_max_file_bytes, context_reserve_ratio, context_conversation_ratio, context_files_ratio,
-        multi_agent_mode, multi_agent_rework_cap, multi_agent_max_concurrency, multi_agent_mcp_tools,
-        embedder_provider, embedder_model, embedder_base_url,
+        provider,
+        base_url,
+        model,
+        effort,
+        key_env,
+        context_window,
+        max_output_tokens,
+        timeout_ms,
+        run_token_budget,
+        max_cost_usd,
+        max_time_ms,
+        pricing,
+        inline_reasoning,
+        show_reasoning,
+        approval_mode,
+        allow_net,
+        allow_net_hosts,
+        view_mode,
+        verify,
+        event_log,
+        stub,
+        stub_fixture,
+        memory_enabled,
+        rag_enabled,
+        rag_top_k,
+        rag_capacity,
+        rag_threshold,
+        rag_index_max_files,
+        rag_index_max_file_bytes,
+        context_reserve_ratio,
+        context_conversation_ratio,
+        context_files_ratio,
+        multi_agent_mode,
+        multi_agent_rework_cap,
+        multi_agent_max_concurrency,
+        multi_agent_mcp_tools,
+        embedder_provider,
+        embedder_model,
+        embedder_base_url,
     })
 }
 
@@ -707,11 +771,20 @@ pub fn load_config(overrides: &Map<String, Value>) -> Result<Config> {
     let validated = parse_config(&stored)?;
     let mut env = Map::new();
     let env_keys: [(&str, &str); 15] = [
-        ("provider", "GOON_PROVIDER"), ("baseUrl", "GOON_BASE_URL"), ("model", "GOON_MODEL"), ("effort", "GOON_EFFORT"),
-        ("keyEnv", "GOON_KEY_ENV"), ("contextWindow", "GOON_CONTEXT_WINDOW"), ("maxOutputTokens", "GOON_MAX_OUTPUT_TOKENS"),
-        ("timeoutMs", "GOON_TIMEOUT_MS"), ("runTokenBudget", "GOON_RUN_TOKEN_BUDGET"), ("maxCostUsd", "GOON_MAX_COST_USD"),
-        ("maxTimeMs", "GOON_MAX_TIME_MS"), ("inlineReasoning", "GOON_INLINE_REASONING"),
-        ("embedderProvider", "GOON_EMBEDDER_PROVIDER"), ("embedderModel", "GOON_EMBEDDER_MODEL"),
+        ("provider", "GOON_PROVIDER"),
+        ("baseUrl", "GOON_BASE_URL"),
+        ("model", "GOON_MODEL"),
+        ("effort", "GOON_EFFORT"),
+        ("keyEnv", "GOON_KEY_ENV"),
+        ("contextWindow", "GOON_CONTEXT_WINDOW"),
+        ("maxOutputTokens", "GOON_MAX_OUTPUT_TOKENS"),
+        ("timeoutMs", "GOON_TIMEOUT_MS"),
+        ("runTokenBudget", "GOON_RUN_TOKEN_BUDGET"),
+        ("maxCostUsd", "GOON_MAX_COST_USD"),
+        ("maxTimeMs", "GOON_MAX_TIME_MS"),
+        ("inlineReasoning", "GOON_INLINE_REASONING"),
+        ("embedderProvider", "GOON_EMBEDDER_PROVIDER"),
+        ("embedderModel", "GOON_EMBEDDER_MODEL"),
         ("embedderBaseUrl", "GOON_EMBEDDER_BASE_URL"),
     ];
     let numeric = ["contextWindow", "maxOutputTokens", "timeoutMs", "runTokenBudget", "maxCostUsd", "maxTimeMs"];
@@ -845,9 +918,7 @@ pub fn load_config(overrides: &Map<String, Value>) -> Result<Config> {
     if !env.contains_key("runTokenBudget") && !overrides.contains_key("runTokenBudget") {
         merged.insert("runTokenBudget".into(), json!(0));
     }
-    let explicit_max_out = stored.as_object().map(|m| m.contains_key("maxOutputTokens")).unwrap_or(false)
-        || env.contains_key("maxOutputTokens")
-        || overrides.contains_key("maxOutputTokens");
+    let explicit_max_out = stored.as_object().map(|m| m.contains_key("maxOutputTokens")).unwrap_or(false) || env.contains_key("maxOutputTokens") || overrides.contains_key("maxOutputTokens");
     if !explicit_max_out {
         let cw = merged.get("contextWindow").and_then(Value::as_f64).unwrap_or(0.0);
         let mo = merged.get("maxOutputTokens").and_then(Value::as_f64).unwrap_or(0.0);
@@ -904,11 +975,7 @@ pub fn resolve_runtime(config: &Config, cwd: &Path) -> Result<RuntimeConfig> {
     let resolved_cwd = realpath(cwd)?;
     if config.stub {
         let key_path = resolved_cwd.to_string_lossy().to_string();
-        let key = format!(
-            "{}\0{}",
-            if cfg!(windows) { key_path.to_lowercase() } else { key_path },
-            config.stub_fixture.clone().unwrap_or_default()
-        );
+        let key = format!("{}\0{}", if cfg!(windows) { key_path.to_lowercase() } else { key_path }, config.stub_fixture.clone().unwrap_or_default());
         let cursors = STUB_CURSORS.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
         let cursor = cursors.lock().unwrap().entry(key).or_insert_with(|| Arc::new(Mutex::new(0))).clone();
         return Ok(RuntimeConfig {

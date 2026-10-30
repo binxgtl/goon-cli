@@ -165,9 +165,7 @@ const MAX_TOTAL_ISSUE_CHARS: usize = 16 * 1024;
 
 fn missing_tool_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"(?i)(?:command not found|is not recognized as an internal or external command|npx canceled due to missing packages|:\s*\d+:\s*[^\n]+:\s*not found)").unwrap()
-    })
+    RE.get_or_init(|| Regex::new(r"(?i)(?:command not found|is not recognized as an internal or external command|npx canceled due to missing packages|:\s*\d+:\s*[^\n]+:\s*not found)").unwrap())
 }
 
 pub fn clamp_verify_timeout(timeout_ms: u64) -> u64 {
@@ -243,10 +241,7 @@ pub fn detect_projects(cwd: &Path, changed_files: &[String]) -> Vec<VerifyProjec
     if kinds.is_empty() {
         return vec![VerifyProject { kind: "unknown", root, files }];
     }
-    kinds
-        .into_iter()
-        .map(|kind| VerifyProject { kind, root: root.clone(), files: files.iter().filter(|f| kind_extensions(kind).contains(&extension_of(f).as_str())).cloned().collect() })
-        .collect()
+    kinds.into_iter().map(|kind| VerifyProject { kind, root: root.clone(), files: files.iter().filter(|f| kind_extensions(kind).contains(&extension_of(f).as_str())).cloned().collect() }).collect()
 }
 
 /// Existing workspace-relative files belonging to the project, deduped and sorted.
@@ -786,9 +781,7 @@ pub async fn run_verification(
             break;
         }
         let started = std::time::Instant::now();
-        let result = runner
-            .run(command.command.clone(), command.args.clone(), RunnerOptions { cwd: cwd.to_path_buf(), timeout_ms, cancel: cancel.clone(), env: env_for_command(command) })
-            .await;
+        let result = runner.run(command.command.clone(), command.args.clone(), RunnerOptions { cwd: cwd.to_path_buf(), timeout_ms, cancel: cancel.clone(), env: env_for_command(command) }).await;
         let mut stage_result = parse_command_result(&command.stage, &result, &config.policy);
         stage_result.duration_ms = started.elapsed().as_millis() as u64;
         let failed = stage_result.severity == Severity::Fail;
@@ -849,7 +842,9 @@ pub fn redact_text(text: &str, secrets: &[&str]) -> String {
     static KV: OnceLock<Regex> = OnceLock::new();
     out = BEARER.get_or_init(|| Regex::new(r"(?i)\b(bearer)\s+[A-Za-z0-9._~+/=-]+").unwrap()).replace_all(&out, "${1} [redacted]").to_string();
     out = KV
-        .get_or_init(|| Regex::new(r#"(?i)("?(?:api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|token|secret|password|passwd|pwd)"?\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s"',}]+)"#).unwrap())
+        .get_or_init(|| {
+            Regex::new(r#"(?i)("?(?:api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|token|secret|password|passwd|pwd)"?\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s"',}]+)"#).unwrap()
+        })
         .replace_all(&out, "${1}[redacted]")
         .to_string();
     out
@@ -878,7 +873,8 @@ pub struct CommandRunner;
 impl VerifyRunner for CommandRunner {
     fn run(&self, command: String, args: Vec<String>, opts: RunnerOptions) -> BoxFuture<'static, RunnerResult> {
         Box::pin(async move {
-            let result = run_command(&command, &args, RunOptions { cwd: &opts.cwd, cancel: &opts.cancel, timeout_ms: opts.timeout_ms, env: opts.env, output_limit_bytes: None, hard_output_bytes: None }).await;
+            let result =
+                run_command(&command, &args, RunOptions { cwd: &opts.cwd, cancel: &opts.cancel, timeout_ms: opts.timeout_ms, env: opts.env, output_limit_bytes: None, hard_output_bytes: None }).await;
             match result {
                 Ok(r) => RunnerResult { code: r.code, output: r.output, ..Default::default() },
                 Err(CommandError::Cancelled) => RunnerResult { code: 130, output: "Command cancelled.".into(), ..Default::default() },

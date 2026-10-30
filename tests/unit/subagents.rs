@@ -226,7 +226,11 @@ async fn codex_tools_skills_side_questions_and_copy_extraction_work_end_to_end()
         if !has_tool_results(body) {
             assert!(body["messages"].to_string().contains("Always check SQL injection and SSRF."));
             return calls(vec![
-                tc("plan-1", "update_plan", json!({ "explanation": "Initial steps", "steps": [{ "step": "Inspect sample.png", "status": "in_progress" }, { "step": "Ask user preference", "status": "pending" }] })),
+                tc(
+                    "plan-1",
+                    "update_plan",
+                    json!({ "explanation": "Initial steps", "steps": [{ "step": "Inspect sample.png", "status": "in_progress" }, { "step": "Ask user preference", "status": "pending" }] }),
+                ),
                 tc("ask-1", "ask_user", json!({ "id": "mode_choice", "question": "Which mode should we use?", "options": ["Strict (Recommended)", "Permissive"] })),
                 tc("img-1", "view_image", json!("sample.png")),
             ]);
@@ -317,7 +321,8 @@ async fn child_registries_inherit_the_parent_network_policy_and_deny_before_appr
     h.tools.set_policy(Some(deny_policy()));
     assert_eq!(h.run("delegate").await.unwrap(), "Parent done.");
     assert_eq!(*approvals.lock().unwrap(), vec!["delegate_edit"]);
-    let transcripts: Vec<String> = std::fs::read_dir(h.child_dir()).unwrap().filter_map(|e| e.ok()).filter(|e| e.file_name().to_string_lossy().ends_with(".json")).map(|e| std::fs::read_to_string(e.path()).unwrap()).collect();
+    let transcripts: Vec<String> =
+        std::fs::read_dir(h.child_dir()).unwrap().filter_map(|e| e.ok()).filter(|e| e.file_name().to_string_lossy().ends_with(".json")).map(|e| std::fs::read_to_string(e.path()).unwrap()).collect();
     assert!(transcripts.iter().any(|t| t.to_lowercase().contains("network access")));
 }
 
@@ -353,7 +358,16 @@ async fn agent_network_shares_the_parent_ledger_and_mirrors_cost_back_to_the_bud
     let budget = price_budget(ledger.clone(), started_at);
     let net = network::AgentNetwork::new(rt.clone(), st.clone(), network::AgentNetworkBus::new());
     let result = net
-        .brainstorm(network::BrainstormOptions { topic: "Review the design".into(), roles: Some(vec!["architect".into(), "critic".into()]), rounds: Some(1), explore_codebase: Some(false), cancel: token(), budget: Some(budget.clone()), policy: Some(deny_policy()), on_progress: None })
+        .brainstorm(network::BrainstormOptions {
+            topic: "Review the design".into(),
+            roles: Some(vec!["architect".into(), "critic".into()]),
+            rounds: Some(1),
+            explore_codebase: Some(false),
+            cancel: token(),
+            budget: Some(budget.clone()),
+            policy: Some(deny_policy()),
+            on_progress: None,
+        })
         .await
         .unwrap();
     assert_eq!(result.participants.len(), 2);

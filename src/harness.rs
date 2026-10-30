@@ -3,6 +3,7 @@
 //! verification hooks with rollback, and per-turn checkpoints.
 
 use crate::config::RuntimeConfig;
+use crate::config::VerifyPolicy;
 use crate::context::{build_goal_budget_limit_prompt, compact_if_needed, compact_now, estimated_tokens, expand_file_mentions, recap_session, system_prompt, MentionOptions, SystemPromptCache};
 use crate::context_budget::{allocate_context_budget, prepare_context_budget, render_memory_context, ContextBudgetConfig, MemoryPromptContext};
 use crate::cost::{create_run_budget, to_usage_split, CostLedger, SharedBudget, UsageSplit};
@@ -14,8 +15,10 @@ use crate::provider::{auxiliary_effort, create_model, resolve_model_capabilities
 use crate::reasoning::{visible_answer, with_reasoning_replay, AnswerPart, AnswerProjection};
 use crate::session::{repair_interrupted, SessionGoal, SessionStore, TurnCheckpoint};
 use crate::tools::{normalize_tool_input, normalize_tool_name, ToolCall, ToolDefinition, ToolRegistry};
-use crate::verify::{assess_verify_plan, format_verify_errors, format_verify_warnings, plan_verification, redact_text, redact_verdict, run_verification, CommandRunner, Severity, VerificationFailed, VerifyRunner, VerifyVerdict};
-use crate::config::VerifyPolicy;
+use crate::verify::{
+    assess_verify_plan, format_verify_errors, format_verify_warnings, plan_verification, redact_text, redact_verdict, run_verification, CommandRunner, Severity, VerificationFailed, VerifyRunner,
+    VerifyVerdict,
+};
 use anyhow::{anyhow, bail, Result};
 use futures_util::future::BoxFuture;
 use futures_util::StreamExt;
@@ -114,7 +117,10 @@ fn is_non_retryable(error: &anyhow::Error, cancel: &CancellationToken) -> bool {
     static RE: OnceLock<Regex> = OnceLock::new();
     let re = RE.get_or_init(|| Regex::new(r"(?i)\b(?:401|403|authentication_error|invalid_api_key|unauthorized)\b").unwrap());
     let msg = error.to_string();
-    re.is_match(&msg) || msg.starts_with("Model response hit the output limit") || msg.starts_with("Invalid or excessive tool call batch") || msg.starts_with("Model stopped unexpectedly (content-filter)")
+    re.is_match(&msg)
+        || msg.starts_with("Model response hit the output limit")
+        || msg.starts_with("Invalid or excessive tool call batch")
+        || msg.starts_with("Model stopped unexpectedly (content-filter)")
 }
 
 pub struct RevertResult {
@@ -177,7 +183,9 @@ pub fn build_tool_meta(tool_name: &str, raw_input: &Value) -> Map<String, Value>
     let (kind, summary) = match canonical.as_str() {
         "read_file" | "view_image" => {
             let range = match rec.get("startLine").and_then(Value::as_f64) {
-                Some(start) => format!(":{}{}", stringify(&crate::jsutil::num(start)), rec.get("endLine").and_then(Value::as_f64).map(|e| format!("-{}", stringify(&crate::jsutil::num(e)))).unwrap_or_default()),
+                Some(start) => {
+                    format!(":{}{}", stringify(&crate::jsutil::num(start)), rec.get("endLine").and_then(Value::as_f64).map(|e| format!("-{}", stringify(&crate::jsutil::num(e)))).unwrap_or_default())
+                }
                 None => String::new(),
             };
             ("read", format!("{path}{range}"))
@@ -271,7 +279,17 @@ pub fn summarize_diff_counts(diff: Option<&str>) -> (u64, u64, &'static str) {
             }
         }
     }
-    (added, removed, if is_deleted { "Deleted" } else if is_new { "Added" } else { "Edited" })
+    (
+        added,
+        removed,
+        if is_deleted {
+            "Deleted"
+        } else if is_new {
+            "Added"
+        } else {
+            "Edited"
+        },
+    )
 }
 
 fn call_signature(call: &ToolCall) -> String {
@@ -447,13 +465,18 @@ impl Harness {
                             s.goal = next.clone();
                         }
                         store_u.save()?;
-                        emit_u(json!({ "type": "goal", "goal": next.map(|g| serde_json::to_value(g).unwrap()) }).as_object().map(|o| {
-                            let mut o = o.clone();
-                            if o.get("goal") == Some(&Value::Null) {
-                                o.remove("goal");
-                            }
-                            Value::Object(o)
-                        }).unwrap());
+                        emit_u(
+                            json!({ "type": "goal", "goal": next.map(|g| serde_json::to_value(g).unwrap()) })
+                                .as_object()
+                                .map(|o| {
+                                    let mut o = o.clone();
+                                    if o.get("goal") == Some(&Value::Null) {
+                                        o.remove("goal");
+                                    }
+                                    Value::Object(o)
+                                })
+                                .unwrap(),
+                        );
                         Ok(())
                     })
                 }));
@@ -461,7 +484,19 @@ impl Harness {
             let emit_p = emit.clone();
             cbs.on_plan_exit = Some(Arc::new(move |plan| emit_p(json!({ "type": "plan_exit", "plan": plan }))));
         }
-        Ok(Arc::new(Harness { config, store, tools, emit, model, cost_ledger, deps, untrusted_prompts: Mutex::new(false), state: Mutex::new(HarnessState::default()), goal_clock, memory_tasks: Mutex::new(vec![]) }))
+        Ok(Arc::new(Harness {
+            config,
+            store,
+            tools,
+            emit,
+            model,
+            cost_ledger,
+            deps,
+            untrusted_prompts: Mutex::new(false),
+            state: Mutex::new(HarnessState::default()),
+            goal_clock,
+            memory_tasks: Mutex::new(vec![]),
+        }))
     }
 
     pub fn busy(&self) -> bool {
@@ -1024,7 +1059,11 @@ impl Harness {
                 Err(e) => format!("error: {}", crate::jsutil::take_chars(&safe_error(&e.to_string(), Some(&self.config.api_key)), 300)),
                 Ok(_) => {
                     let t = text.trim();
-                    if t.is_empty() { "completed".to_string() } else { crate::jsutil::tail_chars(t, 400).to_string() }
+                    if t.is_empty() {
+                        "completed".to_string()
+                    } else {
+                        crate::jsutil::tail_chars(t, 400).to_string()
+                    }
                 }
             };
             self.memory_event(json!({ "type": "task_completed", "outcome": outcome }));
@@ -1088,7 +1127,11 @@ impl Harness {
         let budget_config = ContextBudgetConfig::from_config(&self.config);
         let pre = allocate_context_budget(&budget_config, "");
         let untrusted = *self.untrusted_prompts.lock().unwrap();
-        let expanded = expand_file_mentions(prompt, &self.tools.files, &MentionOptions { model: Some(&self.config.model), supports_vision: None, allow_outside_workspace: !untrusted, max_chars: pre.files as usize * 3 });
+        let expanded = expand_file_mentions(
+            prompt,
+            &self.tools.files,
+            &MentionOptions { model: Some(&self.config.model), supports_vision: None, allow_outside_workspace: !untrusted, max_chars: pre.files as usize * 3 },
+        );
         {
             let mut s = self.store.session.lock().unwrap();
             if expanded.image_parts.is_empty() {
@@ -1206,8 +1249,7 @@ impl Harness {
                             return Err(Aborted::default().into());
                         }
                         let msg = error.to_string();
-                        static STOP: OnceLock<Regex> = OnceLock::new();
-                        let stop = STOP.get_or_init(|| Regex::new(r"(?i)output limit|Model stopped unexpectedly|Invalid or excessive tool call batch").unwrap());
+                        let stop = crate::re!(r"(?i)output limit|Model stopped unexpectedly|Invalid or excessive tool call batch");
                         if attempt >= MAX_API_RETRIES || is_non_retryable(&error, cancel) || stop.is_match(&msg) {
                             return Err(error);
                         }
@@ -1311,7 +1353,16 @@ impl Harness {
             let assessment = assess_verify_plan(&plan, self.tools.policy().as_deref());
             let allowed = match &assessment.denied {
                 Some(_) => false,
-                None => (self.tools.approve)(crate::tools::ApprovalRequest { tool: "verify".into(), input: json!({ "files": files, "commands": commands }), cancel: cancel.clone(), risk: Some(assessment.risk), trusted: Some(false) }).await,
+                None => {
+                    (self.tools.approve)(crate::tools::ApprovalRequest {
+                        tool: "verify".into(),
+                        input: json!({ "files": files, "commands": commands }),
+                        cancel: cancel.clone(),
+                        risk: Some(assessment.risk),
+                        trusted: Some(false),
+                    })
+                    .await
+                }
             };
             if !allowed {
                 skip(assessment.denied.as_deref().unwrap_or("approval denied"), self);

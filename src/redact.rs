@@ -14,9 +14,7 @@ fn secret_env_key() -> &'static Regex {
 
 fn sensitive_key() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"(?i)^(api[_-]?key|apikey|token|secret|password|authorization|access[_-]?token|refresh[_-]?token|client[_-]?secret)$").unwrap()
-    })
+    RE.get_or_init(|| Regex::new(r"(?i)^(api[_-]?key|apikey|token|secret|password|authorization|access[_-]?token|refresh[_-]?token|client[_-]?secret)$").unwrap())
 }
 
 fn bearer_re() -> &'static Regex {
@@ -26,9 +24,7 @@ fn bearer_re() -> &'static Regex {
 
 fn json_key_value_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r#"(?i)("(?:(?:api|access|refresh|client)[_-]?(?:key|token|secret)|token|secret|password|authorization)"\s*:\s*)("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')"#).unwrap()
-    })
+    RE.get_or_init(|| Regex::new(r#"(?i)("(?:(?:api|access|refresh|client)[_-]?(?:key|token|secret)|token|secret|password|authorization)"\s*:\s*)("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')"#).unwrap())
 }
 
 fn key_value_re() -> &'static Regex {
@@ -49,7 +45,7 @@ pub fn collect_secrets_from(env: impl IntoIterator<Item = (String, String)>) -> 
             secrets.push(value);
         }
     }
-    secrets.sort_by(|a, b| b.len().cmp(&a.len()));
+    secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
     secrets
 }
 
@@ -66,7 +62,7 @@ fn normalize_secrets<'a>(secrets: impl IntoIterator<Item = &'a String>) -> Vec<S
             out.push(secret.clone());
         }
     }
-    out.sort_by(|a, b| b.len().cmp(&a.len()));
+    out.sort_by_key(|s| std::cmp::Reverse(s.len()));
     out
 }
 
@@ -114,10 +110,7 @@ pub fn redact_object(value: &Value, secrets: &[String]) -> Value {
     walk(value, &known, 0)
 }
 
-const SENSITIVE_BASENAMES: &[&str] = &[
-    ".npmrc", ".netrc", ".git-credentials", ".pypirc", ".pgpass", ".htpasswd", ".dockercfg",
-    "credentials", "credentials.json", "service-account.json",
-];
+const SENSITIVE_BASENAMES: &[&str] = &[".npmrc", ".netrc", ".git-credentials", ".pypirc", ".pgpass", ".htpasswd", ".dockercfg", "credentials", "credentials.json", "service-account.json"];
 const SENSITIVE_SEGMENTS: &[&str] = &[".ssh", ".aws", ".gnupg", "gcloud", "secrets", ".kube", ".docker", ".azure"];
 
 /// True for paths whose contents must never be logged, indexed or sent to a model.

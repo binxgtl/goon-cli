@@ -60,9 +60,7 @@ pub fn protect_secret_env(name: &str) {
 pub fn child_env(base: Option<&BTreeMap<String, String>>) -> BTreeMap<String, String> {
     let mut env: BTreeMap<String, String> = match base {
         Some(base) => base.clone(),
-        None => std::env::vars_os()
-            .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
-            .collect(),
+        None => std::env::vars_os().filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?))).collect(),
     };
     for name in secret_names().lock().unwrap().iter() {
         env.remove(name);
@@ -153,7 +151,13 @@ fn trim_utf8_end(bytes: &[u8]) -> &[u8] {
             continue;
         }
         if b >= 0b1100_0000 {
-            let needed = if b >= 0b1111_0000 { 4 } else if b >= 0b1110_0000 { 3 } else { 2 };
+            let needed = if b >= 0b1111_0000 {
+                4
+            } else if b >= 0b1110_0000 {
+                3
+            } else {
+                2
+            };
             if back + 1 < needed {
                 return &bytes[..end - 1];
             }
@@ -182,11 +186,7 @@ fn kill_group(pid: u32, signal: i32) {
 
 #[cfg(windows)]
 fn kill_tree(pid: u32) {
-    let _ = std::process::Command::new("taskkill")
-        .args(["/pid", &pid.to_string(), "/T", "/F"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
+    let _ = std::process::Command::new("taskkill").args(["/pid", &pid.to_string(), "/T", "/F"]).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn();
 }
 
 /// Runs a command with a timeout, cancellation and bounded head/tail output capture. The child gets
@@ -350,11 +350,7 @@ pub fn process_alive(pid: u32) -> bool {
 /// Finds an executable on PATH (`which`).
 pub fn which(name: &str) -> Option<std::path::PathBuf> {
     let path = std::env::var_os("PATH")?;
-    let exts: Vec<String> = if cfg!(windows) {
-        std::env::var("PATHEXT").unwrap_or_else(|_| ".EXE;.CMD;.BAT;.COM".into()).split(';').map(|s| s.to_lowercase()).collect()
-    } else {
-        vec![String::new()]
-    };
+    let exts: Vec<String> = if cfg!(windows) { std::env::var("PATHEXT").unwrap_or_else(|_| ".EXE;.CMD;.BAT;.COM".into()).split(';').map(|s| s.to_lowercase()).collect() } else { vec![String::new()] };
     for dir in std::env::split_paths(&path) {
         for ext in &exts {
             let candidate = dir.join(format!("{name}{ext}"));

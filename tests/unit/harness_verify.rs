@@ -141,7 +141,12 @@ async fn rollback_keeps_user_changed_files_as_conflicts() {
     let s = {
         let f = fixture();
         std::fs::create_dir_all(f.cwd.join("src")).unwrap();
-        let rt = runtime(&f.cwd, &f.data, "http://localhost/v1", json!({ "maxOutputTokens": 1024, "inlineReasoning": "off", "verify": { "enabled": true, "commands": ["node -e \"process.exit(0)\""], "maxRepairRounds": 2 } }));
+        let rt = runtime(
+            &f.cwd,
+            &f.data,
+            "http://localhost/v1",
+            json!({ "maxOutputTokens": 1024, "inlineReasoning": "off", "verify": { "enabled": true, "commands": ["node -e \"process.exit(0)\""], "maxRepairRounds": 2 } }),
+        );
         let store = store(&rt);
         let tools = registry(&f.cwd, tools::approve_all(), false);
         let (emit, events) = events();

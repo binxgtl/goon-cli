@@ -14,7 +14,7 @@ use serde_json::Value;
 use std::io::Write;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
-use text::{basename, re};
+use text::basename;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
@@ -46,7 +46,63 @@ pub mod glyph {
 }
 
 pub const SLASH_COMMANDS: &[&str] = &[
-    "/help", "/setup", "/key", "/model", "/effort", "/mode", "/auto", "/yolo", "/view", "/transcript", "/copy", "/btw", "/side", "/goal", "/recap", "/skills", "/prompts", "/memories", "/memory", "/presets", "/mention", "/pair", "/workflow", "/workflows", "/network", "/brainstorm", "/council", "/dag", "/cd", "/pwd", "/mcp", "/subagents", "/agent", "/plan", "/revert", "/undo", "/checkpoints", "/todo", "/resume", "/new", "/delete", "/compact", "/diff", "/review", "/fork", "/rename", "/export", "/init", "/status", "/cost", "/tools", "/sessions", "/debug-config", "/warnings", "/doctor", "/clear", "/exit",
+    "/help",
+    "/setup",
+    "/key",
+    "/model",
+    "/effort",
+    "/mode",
+    "/auto",
+    "/yolo",
+    "/view",
+    "/transcript",
+    "/copy",
+    "/btw",
+    "/side",
+    "/goal",
+    "/recap",
+    "/skills",
+    "/prompts",
+    "/memories",
+    "/memory",
+    "/presets",
+    "/mention",
+    "/pair",
+    "/workflow",
+    "/workflows",
+    "/network",
+    "/brainstorm",
+    "/council",
+    "/dag",
+    "/cd",
+    "/pwd",
+    "/mcp",
+    "/subagents",
+    "/agent",
+    "/plan",
+    "/revert",
+    "/undo",
+    "/checkpoints",
+    "/todo",
+    "/resume",
+    "/new",
+    "/delete",
+    "/compact",
+    "/diff",
+    "/review",
+    "/fork",
+    "/rename",
+    "/export",
+    "/init",
+    "/status",
+    "/cost",
+    "/tools",
+    "/sessions",
+    "/debug-config",
+    "/warnings",
+    "/doctor",
+    "/clear",
+    "/exit",
 ];
 
 pub fn slash_description(cmd: &str) -> &'static str {
@@ -366,7 +422,9 @@ fn chars_of(text: &str) -> Vec<char> {
 }
 
 fn image_path_like(unquoted: &str) -> bool {
-    re!(r"(?i)\.(?:png|jpe?g|webp|gif)$").is_match(unquoted) && (re!(r"^[A-Za-z]:[\\/]").is_match(unquoted) || unquoted.starts_with("\\\\") || unquoted.starts_with('/')) && std::path::Path::new(unquoted).exists()
+    re!(r"(?i)\.(?:png|jpe?g|webp|gif)$").is_match(unquoted)
+        && (re!(r"^[A-Za-z]:[\\/]").is_match(unquoted) || unquoted.starts_with("\\\\") || unquoted.starts_with('/'))
+        && std::path::Path::new(unquoted).exists()
 }
 
 fn unquote(trimmed: &str) -> &str {
@@ -460,7 +518,16 @@ impl Tui {
             title: title.to_string(),
             body_cache: None,
         };
-        let tui = Arc::new_cyclic(|me| Tui { me: me.clone(), state: Mutex::new(state), out: Mutex::new(out), size, cancel, callbacks: Mutex::new(Callbacks::default()), handle: tokio::runtime::Handle::current(), real_terminal });
+        let tui = Arc::new_cyclic(|me| Tui {
+            me: me.clone(),
+            state: Mutex::new(state),
+            out: Mutex::new(out),
+            size,
+            cancel,
+            callbacks: Mutex::new(Callbacks::default()),
+            handle: tokio::runtime::Handle::current(),
+            real_terminal,
+        });
         // Alternate screen, mouse capture off (native selection works), alternate scroll for the
         // wheel, bracketed paste, hidden cursor.
         tui.write_raw("\x1b[?1049h\x1b[?1000l\x1b[?1006l\x1b[?1007h\x1b[?2004h\x1b[?25l");
@@ -958,7 +1025,11 @@ impl Tui {
                     self.append_cell(st, &format!("\n{} Agent {} · {}\n", glyph::AGENT, crate::jsutil::take_chars(&id, 8), crate::jsutil::slice_chars(&s("task"), 0, 160)));
                 } else if state == "done" || state == "error" {
                     self.flush_explore_group(st);
-                    let text = if state == "done" { format!("\n{} Agent {} finished\n", glyph::AGENT, crate::jsutil::take_chars(&id, 8)) } else { format!("\n{} Agent {} failed\n", glyph::FAILED, crate::jsutil::take_chars(&id, 8)) };
+                    let text = if state == "done" {
+                        format!("\n{} Agent {} finished\n", glyph::AGENT, crate::jsutil::take_chars(&id, 8))
+                    } else {
+                        format!("\n{} Agent {} failed\n", glyph::FAILED, crate::jsutil::take_chars(&id, 8))
+                    };
                     self.append_cell(st, &text);
                 }
             }
@@ -1097,7 +1168,15 @@ impl Tui {
                 self.flush_explore_group(st);
                 let verified = event.get("verified").and_then(Value::as_bool).unwrap_or(false);
                 let reason = first_line("reason");
-                self.append_cell(st, &format!("\n{} DAG merge: {}{}\n", if verified { glyph::DONE } else { glyph::FAILED }, if verified { "verified" } else { "NOT verified" }, if s("reason").is_empty() { String::new() } else { format!(" — {reason}") }));
+                self.append_cell(
+                    st,
+                    &format!(
+                        "\n{} DAG merge: {}{}\n",
+                        if verified { glyph::DONE } else { glyph::FAILED },
+                        if verified { "verified" } else { "NOT verified" },
+                        if s("reason").is_empty() { String::new() } else { format!(" — {reason}") }
+                    ),
+                );
             }
             "workflow_classified" => {
                 self.flush_explore_group(st);
@@ -1115,7 +1194,10 @@ impl Tui {
             }
             "cost_degrade" => {
                 self.flush_explore_group(st);
-                self.append_cell(st, &format!("\n{} Cost degrade: {} ({} candidate(s))\n", glyph::ALLOW, first_line("reason"), event.get("candidates").map(crate::jsutil::js_string).unwrap_or_default()));
+                self.append_cell(
+                    st,
+                    &format!("\n{} Cost degrade: {} ({} candidate(s))\n", glyph::ALLOW, first_line("reason"), event.get("candidates").map(crate::jsutil::js_string).unwrap_or_default()),
+                );
             }
             "stopped" => {
                 self.flush_explore_group(st);
@@ -1162,7 +1244,13 @@ impl Tui {
             let preview: Vec<String> = meta.get("outputPreview").and_then(Value::as_array).map(|a| a.iter().map(crate::jsutil::js_string).collect()).unwrap_or_default();
             let mut lines = vec![];
             if !preview.is_empty() {
-                let max = if full { 80 } else if st.view_mode == "verbose" { 15 } else { 5 };
+                let max = if full {
+                    80
+                } else if st.view_mode == "verbose" {
+                    15
+                } else {
+                    5
+                };
                 let shown = &preview[..preview.len().min(max)];
                 for (i, l) in shown.iter().enumerate() {
                     lines.push(format!("  {} {l}", if i == 0 { '└' } else { ' ' }));
@@ -1182,7 +1270,13 @@ impl Tui {
             let added = meta.get("added").and_then(Value::as_u64);
             let removed = meta.get("removed").and_then(Value::as_u64);
             let stats = if added.is_some() || removed.is_some() { format!(" (+{} -{})", added.unwrap_or(0), removed.unwrap_or(0)) } else { String::new() };
-            let max = if full { 500 } else if st.view_mode == "verbose" { 120 } else { 30 };
+            let max = if full {
+                500
+            } else if st.view_mode == "verbose" {
+                120
+            } else {
+                30
+            };
             let diff_lines = meta.get("diff").and_then(Value::as_str).filter(|d| !d.is_empty()).map(|d| text::format_compact_diff(d, max)).unwrap_or_default();
             let diff_block = if diff_lines.is_empty() { String::new() } else { format!("\n{}", diff_lines.join("\n")) };
             self.append_cell(st, &format!("\n{} {verb} {summary}{stats}{diff_block}\n", if state == "error" { glyph::FAILED } else { glyph::EDIT }));
@@ -1273,7 +1367,15 @@ impl Tui {
             // Secrets render as bullets and never enter the prompt history.
             st.masked = opts.mask && !remember;
             st.esc_cancels = opts.esc_cancels;
-            st.esc_hint = opts.esc_hint.clone().unwrap_or_else(|| if opts.esc_cancels { "cancel".into() } else if label.contains("y/N") { "deny".into() } else { "skip".into() });
+            st.esc_hint = opts.esc_hint.clone().unwrap_or_else(|| {
+                if opts.esc_cancels {
+                    "cancel".into()
+                } else if label.contains("y/N") {
+                    "deny".into()
+                } else {
+                    "skip".into()
+                }
+            });
             if remember && !st.queued_prompts.is_empty() {
                 let next = st.queued_prompts.remove(0);
                 let value = self.expand_placeholders(&mut st, &next);
@@ -1362,10 +1464,13 @@ impl Tui {
             let count = tabs.len();
             st.picker = Some(PickerState {
                 title: terminal_text(title),
-                tabs: tabs.into_iter().map(|mut t| {
-                    t.label = terminal_text(&t.label);
-                    t
-                }).collect(),
+                tabs: tabs
+                    .into_iter()
+                    .map(|mut t| {
+                        t.label = terminal_text(&t.label);
+                        t
+                    })
+                    .collect(),
                 tab: initial_tab.min(count.saturating_sub(1)),
                 index: 0,
                 filter: String::new(),
@@ -1398,7 +1503,8 @@ impl Tui {
         items
             .into_iter()
             .filter(|item| {
-                let hay = format!("{} {} {} {} {}", item.label, item.meta.clone().unwrap_or_default(), item.detail.clone().unwrap_or_default(), item.search.clone().unwrap_or_default(), item.id).to_lowercase();
+                let hay = format!("{} {} {} {} {}", item.label, item.meta.clone().unwrap_or_default(), item.detail.clone().unwrap_or_default(), item.search.clone().unwrap_or_default(), item.id)
+                    .to_lowercase();
                 words.iter().all(|w| hay.contains(w))
             })
             .collect()
@@ -1631,7 +1737,9 @@ impl Tui {
             st.cursor = st.input.len();
             return true;
         }
-        let pattern = re!(r#"(?i)(?:"((?:[A-Za-z]:[\\/]|\\\\|/)[^"\r\n]+?\.(?:png|jpe?g|webp|gif))"|'((?:[A-Za-z]:[\\/]|\\\\|/)[^'\r\n]+?\.(?:png|jpe?g|webp|gif))'|((?:[A-Za-z]:[\\/]|\\\\|/)[^\s"']+?\.(?:png|jpe?g|webp|gif)))"#);
+        let pattern = re!(
+            r#"(?i)(?:"((?:[A-Za-z]:[\\/]|\\\\|/)[^"\r\n]+?\.(?:png|jpe?g|webp|gif))"|'((?:[A-Za-z]:[\\/]|\\\\|/)[^'\r\n]+?\.(?:png|jpe?g|webp|gif))'|((?:[A-Za-z]:[\\/]|\\\\|/)[^\s"']+?\.(?:png|jpe?g|webp|gif)))"#
+        );
         let mut changed = false;
         let mut found: Vec<String> = vec![];
         let replaced = pattern.replace_all(&current, |c: &regex::Captures| {
@@ -2328,7 +2436,9 @@ fn input_thread(tui: Weak<Tui>) {
         }
         let Some(t) = tui.upgrade() else { return };
         let keys: Vec<&crossterm::event::KeyEvent> = batch.iter().filter_map(|e| if let Event::Key(k) = e { Some(k) } else { None }).filter(|k| k.kind != KeyEventKind::Release).collect();
-        let only_text = batch.len() > 1 && keys.len() == batch.iter().filter(|e| !matches!(e, Event::Key(k) if k.kind == KeyEventKind::Release)).count() && keys.iter().all(|k| matches!(k.code, KeyCode::Char(_) | KeyCode::Enter | KeyCode::Tab) && !k.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT));
+        let only_text = batch.len() > 1
+            && keys.len() == batch.iter().filter(|e| !matches!(e, Event::Key(k) if k.kind == KeyEventKind::Release)).count()
+            && keys.iter().all(|k| matches!(k.code, KeyCode::Char(_) | KeyCode::Enter | KeyCode::Tab) && !k.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT));
         if only_text {
             let raw: String = keys
                 .iter()

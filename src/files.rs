@@ -151,12 +151,7 @@ pub fn limit_text(text: &str, limit: usize) -> String {
     let head_len = (limit as f64 * 0.65).floor() as usize;
     let tail_len = limit.saturating_sub(head_len);
     let omitted = length - head_len - tail_len;
-    format!(
-        "{}\n...[truncated {} chars; narrow the request]...\n{}",
-        jsutil::take_chars(text, head_len),
-        omitted,
-        jsutil::tail_chars(text, tail_len)
-    )
+    format!("{}\n...[truncated {} chars; narrow the request]...\n{}", jsutil::take_chars(text, head_len), omitted, jsutil::tail_chars(text, tail_len))
 }
 
 pub fn limit_text_default(text: &str) -> String {
@@ -258,11 +253,8 @@ pub fn compute_unified_diff(path: &str, before: &str, after: &str, context_lines
     } else {
         ""
     };
-    let mut out: Vec<String> = vec![
-        format!("--- a/{path} ({kind_prefix}+{} -{})", new_changed.len(), old_changed.len()),
-        format!("+++ b/{path}"),
-        format!("@@ -{old_start},{old_count} +{new_start},{new_count} @@"),
-    ];
+    let mut out: Vec<String> =
+        vec![format!("--- a/{path} ({kind_prefix}+{} -{})", new_changed.len(), old_changed.len()), format!("+++ b/{path}"), format!("@@ -{old_start},{old_count} +{new_start},{new_count} @@")];
     out.extend(before_ctx.iter().map(|l| format!(" {l}")));
     out.extend(old_changed.iter().take(max_diff_lines).map(|l| format!("-{l}")));
     if old_changed.len() > max_diff_lines {
@@ -940,8 +932,7 @@ impl WorkspaceFiles {
                     Ok(text) => (Some(text), true),
                     Err(error) => (None, is_not_found(&error)),
                 };
-                let conflict = b.after_hash.is_some()
-                    && (!readable || current.as_ref().map(|c| Some(digest(c)) != b.after_hash).unwrap_or(false));
+                let conflict = b.after_hash.is_some() && (!readable || current.as_ref().map(|c| Some(digest(c)) != b.after_hash).unwrap_or(false));
                 if conflict {
                     result.conflicts.push(b.path.clone());
                     continue;
@@ -1142,16 +1133,24 @@ impl WorkspaceFiles {
 
     pub fn list(&self, path: &str) -> Result<String> {
         let file = self.path(path)?;
-        let mut entries: Vec<(String, std::fs::FileType)> = std::fs::read_dir(&file)?
-            .flatten()
-            .filter_map(|e| Some((e.file_name().to_string_lossy().to_string(), e.file_type().ok()?)))
-            .collect();
+        let mut entries: Vec<(String, std::fs::FileType)> = std::fs::read_dir(&file)?.flatten().filter_map(|e| Some((e.file_name().to_string_lossy().to_string(), e.file_type().ok()?))).collect();
         entries.sort_by(|a, b| a.0.cmp(&b.0));
         let total = entries.len();
         let lines: Vec<String> = entries
             .iter()
             .take(300)
-            .map(|(name, kind)| format!("{name}{}", if kind.is_dir() { "/" } else if kind.is_symlink() { "@" } else { "" }))
+            .map(|(name, kind)| {
+                format!(
+                    "{name}{}",
+                    if kind.is_dir() {
+                        "/"
+                    } else if kind.is_symlink() {
+                        "@"
+                    } else {
+                        ""
+                    }
+                )
+            })
             .collect();
         let suffix = if total > 300 { "\n...[listing limited to 300 entries]" } else { "" };
         Ok(limit_text_default(&format!("{}{suffix}", lines.join("\n"))))
@@ -1250,9 +1249,7 @@ mod tests {
         let (dir, files) = ws();
         std::fs::write(dir.path().join("old.txt"), "one\ntwo\nthree\n").unwrap();
         files.read("old.txt", 1, 10).unwrap();
-        let summary = files
-            .apply_patch("*** Begin Patch\n*** Update File: old.txt\n*** Move to: new.txt\n@@\n one\n-two\n+TWO\n three\n*** End Patch")
-            .unwrap();
+        let summary = files.apply_patch("*** Begin Patch\n*** Update File: old.txt\n*** Move to: new.txt\n@@\n one\n-two\n+TWO\n three\n*** End Patch").unwrap();
         assert_eq!(summary, "Moved old.txt -> new.txt");
         assert!(!dir.path().join("old.txt").exists());
         assert_eq!(std::fs::read_to_string(dir.path().join("new.txt")).unwrap(), "one\nTWO\nthree\n");

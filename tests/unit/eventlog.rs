@@ -218,7 +218,13 @@ fn normalize_event_envelope_rejects_unsupported_versions() {
 fn delete_session_removes_log_and_sidecar() {
     let f = fixture();
     let root = sessions(&f);
-    let store = session::SessionStore::open(&root, session::SessionRoute { cwd: f.cwd.to_string_lossy().into(), provider: "openai-compatible".into(), model: "m".into(), base_url: "http://127.0.0.1:1/v1".into() }, None, None).unwrap();
+    let store = session::SessionStore::open(
+        &root,
+        session::SessionRoute { cwd: f.cwd.to_string_lossy().into(), provider: "openai-compatible".into(), model: "m".into(), base_url: "http://127.0.0.1:1/v1".into() },
+        None,
+        None,
+    )
+    .unwrap();
     store.save().unwrap();
     let id = store.id();
     store.close().unwrap();

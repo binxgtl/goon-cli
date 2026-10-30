@@ -80,8 +80,7 @@ pub fn fixture_env(f: &Fixture) -> EnvGuard {
     for key in &cleared {
         vars.push((key.as_str(), None));
     }
-    let guard = env(&vars);
-    guard
+    env(&vars)
 }
 
 impl Drop for EnvGuard {
@@ -196,7 +195,10 @@ pub struct Sse<'a> {
 pub fn sse(spec: Sse) -> MockResponse {
     let mut body = String::new();
     let chunk = |body: &mut String, delta: Value| {
-        body.push_str(&format!("data: {}\n\n", json!({ "id": "chatcmpl-test", "object": "chat.completion.chunk", "created": 1, "model": "test-model", "choices": [{ "index": 0, "delta": delta, "finish_reason": null }] })));
+        body.push_str(&format!(
+            "data: {}\n\n",
+            json!({ "id": "chatcmpl-test", "object": "chat.completion.chunk", "created": 1, "model": "test-model", "choices": [{ "index": 0, "delta": delta, "finish_reason": null }] })
+        ));
     };
     chunk(&mut body, json!({ "role": "assistant" }));
     if !spec.reasoning.is_empty() {
@@ -312,10 +314,7 @@ pub async fn provider(handler: impl Fn(&Value, usize) -> MockResponse + Send + S
                         }
                     };
                     let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
-                    let length = head
-                        .lines()
-                        .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0)))
-                        .unwrap_or(0);
+                    let length = head.lines().find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0))).unwrap_or(0);
                     while buf.len() < header_end + length {
                         let mut chunk = [0u8; 8192];
                         let n = socket.read(&mut chunk).await.unwrap_or(0);
@@ -362,10 +361,7 @@ pub async fn provider(handler: impl Fn(&Value, usize) -> MockResponse + Send + S
 
 /// The text of every `role: tool` message the provider received in request `body`.
 pub fn tool_results(body: &Value) -> Vec<String> {
-    body["messages"]
-        .as_array()
-        .map(|m| m.iter().filter(|m| m["role"] == "tool").map(|m| m["content"].as_str().unwrap_or("").to_string()).collect())
-        .unwrap_or_default()
+    body["messages"].as_array().map(|m| m.iter().filter(|m| m["role"] == "tool").map(|m| m["content"].as_str().unwrap_or("").to_string()).collect()).unwrap_or_default()
 }
 
 pub fn assert_match(text: &str, pattern: &str) {

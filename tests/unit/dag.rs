@@ -389,7 +389,9 @@ async fn run_dag_applies_max_cost_to_the_shared_budget_and_the_child_stops_at_th
         *s.lock().unwrap() = Some(req.budget.clone());
         let (r, sb) = (r.clone(), sb.clone());
         Box::pin(async move {
-            let out = sb.run_tasks(vec!["inspect".into()], subagents::RunTasksOptions { read_only: true, cancel: req.cancel.clone(), budget: Some(req.budget.clone()), allowed_tools: None, role: None }).await?;
+            let out = sb
+                .run_tasks(vec!["inspect".into()], subagents::RunTasksOptions { read_only: true, cancel: req.cancel.clone(), budget: Some(req.budget.clone()), allowed_tools: None, role: None })
+                .await?;
             *r.lock().unwrap() = out.clone();
             Ok(out)
         })

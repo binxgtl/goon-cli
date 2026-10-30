@@ -70,7 +70,15 @@ fn cost_degrade_below_twenty_percent_remaining_degrades_to_one_candidate() {
 
 type Generate = Arc<dyn Fn(String, usize, bool, CancellationToken) -> BoxFuture<'static, Result<String>> + Send + Sync>;
 
-async fn run(f: &Fixture, files: &Arc<files::WorkspaceFiles>, generate: Generate, verify: Arc<dyn Fn(Vec<String>) -> VerifyVerdict + Send + Sync>, budget: Option<cost::SharedBudget>, requested: Option<usize>, log: Option<Arc<Mutex<Vec<Value>>>>) -> CandidateRunResult {
+async fn run(
+    f: &Fixture,
+    files: &Arc<files::WorkspaceFiles>,
+    generate: Generate,
+    verify: Arc<dyn Fn(Vec<String>) -> VerifyVerdict + Send + Sync>,
+    budget: Option<cost::SharedBudget>,
+    requested: Option<usize>,
+    log: Option<Arc<Mutex<Vec<Value>>>>,
+) -> CandidateRunResult {
     let _ = f;
     let emit = log.map(|l| move |e: Value| l.lock().unwrap().push(e));
     let emit_ref: Option<&(dyn Fn(Value) + Send + Sync)> = emit.as_ref().map(|e| e as &(dyn Fn(Value) + Send + Sync));

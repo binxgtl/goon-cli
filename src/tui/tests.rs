@@ -28,9 +28,15 @@ impl Tty {
         let s = size.clone();
         let cancelled = Arc::new(AtomicUsize::new(0));
         let c = cancelled.clone();
-        let ui = Tui::with_io("test-model", Arc::new(move || {
-            c.fetch_add(1, Ordering::SeqCst);
-        }), Box::new(sink.clone()), Box::new(move || *s.lock().unwrap()), false);
+        let ui = Tui::with_io(
+            "test-model",
+            Arc::new(move || {
+                c.fetch_add(1, Ordering::SeqCst);
+            }),
+            Box::new(sink.clone()),
+            Box::new(move || *s.lock().unwrap()),
+            false,
+        );
         Tty { ui, sink, size, cancelled }
     }
     fn text(&self, t: &str) {
@@ -287,7 +293,14 @@ async fn picker_filters_switches_tabs_and_resolves() {
     let tty = Tty::new(80, 20);
     let tabs = vec![
         PickerTab { label: "This folder".into(), items: vec![PickerItem { id: "a".into(), label: "alpha".into(), ..Default::default() }], empty: None },
-        PickerTab { label: "All projects".into(), items: vec![PickerItem { id: "a".into(), label: "alpha".into(), ..Default::default() }, PickerItem { id: "b".into(), label: "beta".into(), meta: Some("proj".into()), ..Default::default() }], empty: None },
+        PickerTab {
+            label: "All projects".into(),
+            items: vec![
+                PickerItem { id: "a".into(), label: "alpha".into(), ..Default::default() },
+                PickerItem { id: "b".into(), label: "beta".into(), meta: Some("proj".into()), ..Default::default() },
+            ],
+            empty: None,
+        },
     ];
     let ui = tty.ui.clone();
     let pick = tokio::spawn(async move { ui.pick("Resume", tabs, 0, "resume").await });
@@ -368,7 +381,8 @@ async fn masked_questions_never_render_the_typed_secret() {
 #[tokio::test]
 async fn incremental_rendering_is_identical_to_a_full_re_render() {
     let tty = Tty::new(70, 24);
-    let pieces = ["Hello **bold** ", "\n", "- item\n", "```ts\nconst a = 1;\n", "```\n", "| a | bb |\n", "|---|---|\n", "| ccc | d |\n", "> quote\n", "# Title\n", "tiếng Việt 中文 😀 ", &"word ".repeat(20)];
+    let pieces =
+        ["Hello **bold** ", "\n", "- item\n", "```ts\nconst a = 1;\n", "```\n", "| a | bb |\n", "|---|---|\n", "| ccc | d |\n", "> quote\n", "# Title\n", "tiếng Việt 中文 😀 ", &"word ".repeat(20)];
     let mut seed: u64 = 7;
     let mut rnd = move || {
         seed = (seed * 1103515245 + 12345) % 2147483648;
@@ -763,7 +777,15 @@ async fn no_row_exceeds_the_width_at_any_size_across_every_cell_kind() {
         tty.ui.set_context_window(100_000);
         tty.ui.set_context_usage(Some(42_000));
         tty.ui.set_tokens(123_456.0);
-        tty.ui.write(&crate::cli::welcome_banner("model-with-a-really-long-identifier-v1", "openai-compatible", "https://gateway.example.com/v1", Some("max"), std::path::Path::new("/home/user/project"), "0f40f011-0000-4000-8000-000000000000", "auto"));
+        tty.ui.write(&crate::cli::welcome_banner(
+            "model-with-a-really-long-identifier-v1",
+            "openai-compatible",
+            "https://gateway.example.com/v1",
+            Some("max"),
+            std::path::Path::new("/home/user/project"),
+            "0f40f011-0000-4000-8000-000000000000",
+            "auto",
+        ));
         tty.ui.write(&format!("\n> {}\n", "long user prompt words ".repeat(12)));
         tty.ui.event(&serde_json::json!({ "type": "reasoning", "source": "provider", "text": format!("{}\n", "reasoning words ".repeat(30)) }));
         tty.ui.event(&serde_json::json!({ "type": "tool", "id": "r", "name": "read_file", "state": "done", "meta": { "kind": "read", "summary": format!("src/{}file.ts", "deep/".repeat(20)) } }));

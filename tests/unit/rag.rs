@@ -164,7 +164,7 @@ async fn snapshot_round_trip_recomputes_vectors_on_load() {
     let mut index = LexicalIndex::new(None, Some(100), None);
     let docs: Vec<AddDocument> = loaded.files.values().flat_map(|r| r.chunks.iter().cloned()).map(|chunk| AddDocument { id: None, chunk }).collect();
     index.add(docs).await.unwrap();
-    assert!(index.len() > 0);
+    assert!(!index.is_empty());
     let hits = index.retrieve("login", 3).await.unwrap();
     assert!(!hits.is_empty() && hits[0].score > 0.0);
     let raw: Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
@@ -185,7 +185,11 @@ fn doc(path: &str, content: &str) -> AddDocument {
 async fn lexical_index_ranks_matching_docs_first_with_deterministic_ties() {
     let mut index = LexicalIndex::new(None, Some(10), None);
     index
-        .add(vec![doc("src/render.ts", "rendering viewport css layout engine"), doc("src/auth.ts", "authentication login password session tokens"), doc("src/auth2.ts", "authentication login password session tokens")])
+        .add(vec![
+            doc("src/render.ts", "rendering viewport css layout engine"),
+            doc("src/auth.ts", "authentication login password session tokens"),
+            doc("src/auth2.ts", "authentication login password session tokens"),
+        ])
         .await
         .unwrap();
     let hits = index.retrieve("authentication password", 2).await.unwrap();

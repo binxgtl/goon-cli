@@ -857,7 +857,15 @@ impl App {
         result.had_error = true;
         let terminating = self.st.lock().unwrap().terminating;
         if !self.interactive {
-            set_exit(if result.aborted { if terminating { 143 } else { 130 } } else { 1 });
+            set_exit(if result.aborted {
+                if terminating {
+                    143
+                } else {
+                    130
+                }
+            } else {
+                1
+            });
         }
         let message = super::safe_error(error);
         self.publish_event(&json!({ "type": "error", "message": message }), false);
@@ -1207,7 +1215,12 @@ pub async fn run_session(values: Parsed, mut config: Config, policy: ExecutionPo
     }
     let store = Arc::new(SessionStore::open(&sessions_root, SessionRoute::from_runtime(&runtime), resume_target.as_deref(), None)?);
     let event_writer = config.event_log.then(|| {
-        EventLogWriter::open(&event_log_path(&runtime.data_dir, &store.id()), Some(&store.id()), &[runtime.api_key.clone()].into_iter().filter(|k| !k.is_empty()).collect::<Vec<_>>(), Box::new(|m| stderr_write(&format!("goon: event log: {m}\n"))))
+        EventLogWriter::open(
+            &event_log_path(&runtime.data_dir, &store.id()),
+            Some(&store.id()),
+            &[runtime.api_key.clone()].into_iter().filter(|k| !k.is_empty()).collect::<Vec<_>>(),
+            Box::new(|m| stderr_write(&format!("goon: event log: {m}\n"))),
+        )
     });
     let memory_store = if runtime.memory_enabled { open_memory_store(&runtime).await } else { None };
     let mode = if values.flag("read-only") {
@@ -1232,11 +1245,14 @@ pub async fn run_session(values: Parsed, mut config: Config, policy: ExecutionPo
             }
         };
         let slot = app_slot.clone();
-        let tui = Tui::start(&title, Arc::new(move || {
-            if let Some(app) = slot.get().and_then(Weak::upgrade) {
-                app.stop();
-            }
-        }))?;
+        let tui = Tui::start(
+            &title,
+            Arc::new(move || {
+                if let Some(app) = slot.get().and_then(Weak::upgrade) {
+                    app.stop();
+                }
+            }),
+        )?;
         tui.set_mode(&mode);
         tui.set_view_mode(&view_mode);
         tui.set_effort(runtime.effort.as_deref());
@@ -1271,7 +1287,18 @@ pub async fn run_session(values: Parsed, mut config: Config, policy: ExecutionPo
         subagents: Mutex::new(None),
         pair: Mutex::new(None),
         controller: Mutex::new(None),
-        st: Mutex::new(AppState { mode, pre_plan_mode, view_mode, denied: false, exiting: false, terminating: false, starting: true, goal_deferred: false, rebuild_pending: false, reasoning_source: None }),
+        st: Mutex::new(AppState {
+            mode,
+            pre_plan_mode,
+            view_mode,
+            denied: false,
+            exiting: false,
+            terminating: false,
+            starting: true,
+            goal_deferred: false,
+            rebuild_pending: false,
+            reasoning_source: None,
+        }),
         allowed: Mutex::new(AllowSets::default()),
         event_writer: Mutex::new(event_writer),
         input_cancel: Mutex::new(CancellationToken::new()),
@@ -1583,7 +1610,13 @@ impl App {
                     let runtime = app.runtime();
                     let status = match app.tui() {
                         Some(t) => t.status(),
-                        None => if app.controller().is_some() { "Running".into() } else { "Ready".into() },
+                        None => {
+                            if app.controller().is_some() {
+                                "Running".into()
+                            } else {
+                                "Ready".into()
+                            }
+                        }
                     };
                     let tokens = app.store().session.lock().unwrap().tokens;
                     json!({ "model": runtime.model, "provider": runtime.provider, "cwd": runtime.cwd.to_string_lossy(), "sessionId": app.session_id(), "mode": app.mode(), "status": status, "tokens": jsutil::num(tokens), "contextWindow": runtime.context_window })

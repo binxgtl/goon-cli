@@ -14,7 +14,7 @@ test('real CLI dispatches MCP tools and startup failure releases session locks',
   await writeFile(path, JSON.stringify(stdio({ readOnlyTools: ['echo'] })));
   const p = await provider(t, (body, response, n) => {
     if (body.messages.some(m => m.content === 'bypass broken config')) return sse(response, { text: 'Bypassed.' });
-    const echo = body.tools.map(t => t.function.name).find(name => /^mcp_local_echo/.test(name));
+    const echo = body.tools.map(t => t.function.name).find(name => name.startsWith('mcp_local_echo'));
     if (n === 1) { assert(echo, 'the MCP echo tool is offered'); return sse(response, { calls: [{ id: 'echo1', name: echo, input: { text: 'CLI MCP' } }] }); }
     assert.equal(body.messages.at(-1).content, 'CLI MCP'); return sse(response, { text: 'MCP done.' });
   });

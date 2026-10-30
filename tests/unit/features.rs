@@ -161,7 +161,16 @@ async fn agent_network_bus_isolated_brainstorm_live_round_two_and_cleanup() {
     let st = store(&rt);
     let net = AgentNetwork::new(rt.clone(), st.clone(), bus);
     let result = net
-        .brainstorm(BrainstormOptions { topic: "Design real-time SSE pairing".into(), roles: Some(strings(&["architect", "critic"])), rounds: Some(2), explore_codebase: Some(false), cancel: token(), budget: None, policy: None, on_progress: None })
+        .brainstorm(BrainstormOptions {
+            topic: "Design real-time SSE pairing".into(),
+            roles: Some(strings(&["architect", "critic"])),
+            rounds: Some(2),
+            explore_codebase: Some(false),
+            cancel: token(),
+            budget: None,
+            policy: None,
+            on_progress: None,
+        })
         .await
         .unwrap();
     assert_eq!(result.rounds, 2);

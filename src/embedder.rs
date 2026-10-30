@@ -40,7 +40,11 @@ pub struct RemoteEmbedder {
 impl RemoteEmbedder {
     async fn post(&self, body: Value, cancel: Option<CancellationToken>) -> Result<Value> {
         let path = if self.name == "openai" { "/embeddings" } else { "/api/embed" };
-        let mut request = crate::providers::http_client().post(format!("{}{path}", self.base_url)).header("content-type", "application/json").timeout(Duration::from_millis(self.timeout_ms)).body(crate::jsutil::stringify(&body));
+        let mut request = crate::providers::http_client()
+            .post(format!("{}{path}", self.base_url))
+            .header("content-type", "application/json")
+            .timeout(Duration::from_millis(self.timeout_ms))
+            .body(crate::jsutil::stringify(&body));
         if let Some(k) = &self.api_key {
             request = request.header("authorization", format!("Bearer {k}"));
         }

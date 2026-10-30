@@ -6,7 +6,7 @@
 //! [`ContextBudgetError`] is returned.
 
 use crate::context::{estimated_tokens, without_binary_parts};
-use crate::jsutil::{take_chars, tail_chars, to_fixed, utf16_len};
+use crate::jsutil::{tail_chars, take_chars, to_fixed, utf16_len};
 use regex::Regex;
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -277,14 +277,7 @@ pub fn render_memory_context(context: Option<&MemoryPromptContext>) -> Option<St
     let context = context?;
     let mut sections = vec![];
     for chunk in &context.rag {
-        sections.push(format!(
-            "<chunk path=\"{}\" lines=\"{}-{}\" score=\"{}\">\n{}\n</chunk>",
-            escape_attr(&chunk.path),
-            chunk.start_line,
-            chunk.end_line,
-            to_fixed(chunk.score, 3),
-            chunk.content
-        ));
+        sections.push(format!("<chunk path=\"{}\" lines=\"{}-{}\" score=\"{}\">\n{}\n</chunk>", escape_attr(&chunk.path), chunk.start_line, chunk.end_line, to_fixed(chunk.score, 3), chunk.content));
     }
     if let Some(tree) = context.repo_tree.as_deref().filter(|t| !t.is_empty()) {
         sections.push(format!("<repo_tree>\n{tree}\n</repo_tree>"));

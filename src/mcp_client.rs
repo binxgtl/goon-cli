@@ -7,7 +7,10 @@
 use crate::files::{limit_text, limit_text_bytes};
 use crate::harness::Aborted;
 use crate::jsutil::{stringify, stringify_pretty};
-use crate::mcp::{mcp_tool_name, parse_env_placeholder, resolve_mcp_command, sanitize_and_compact_tool_schema, McpConfig, McpServerConfig, McpTransport, COMPACT_BULK_SCHEMA_MAX_BYTES, DEFAULT_MAX_MCP_TOOLS, DEFAULT_SCHEMA_MAX_BYTES};
+use crate::mcp::{
+    mcp_tool_name, parse_env_placeholder, resolve_mcp_command, sanitize_and_compact_tool_schema, McpConfig, McpServerConfig, McpTransport, COMPACT_BULK_SCHEMA_MAX_BYTES, DEFAULT_MAX_MCP_TOOLS,
+    DEFAULT_SCHEMA_MAX_BYTES,
+};
 use crate::policy::ExecutionPolicy;
 use crate::risk::{classify_mcp_risk, RiskClass};
 use crate::tools::{catalog_definition, ToolExec, ToolRegistry};
@@ -27,7 +30,8 @@ pub const LATEST_PROTOCOL_VERSION: &str = "2025-11-25";
 pub const SUPPORTED_PROTOCOL_VERSIONS: [&str; 5] = [LATEST_PROTOCOL_VERSION, "2025-06-18", "2025-03-26", "2024-11-05", "2024-10-07"];
 
 #[cfg(windows)]
-const DEFAULT_INHERITED_ENV_VARS: &[&str] = &["APPDATA", "HOMEDRIVE", "HOMEPATH", "LOCALAPPDATA", "PATH", "PROCESSOR_ARCHITECTURE", "SYSTEMDRIVE", "SYSTEMROOT", "TEMP", "USERNAME", "USERPROFILE", "PROGRAMFILES"];
+const DEFAULT_INHERITED_ENV_VARS: &[&str] =
+    &["APPDATA", "HOMEDRIVE", "HOMEPATH", "LOCALAPPDATA", "PATH", "PROCESSOR_ARCHITECTURE", "SYSTEMDRIVE", "SYSTEMROOT", "TEMP", "USERNAME", "USERPROFILE", "PROGRAMFILES"];
 #[cfg(not(windows))]
 const DEFAULT_INHERITED_ENV_VARS: &[&str] = &["HOME", "LOGNAME", "PATH", "SHELL", "TERM", "USER"];
 
@@ -187,11 +191,7 @@ impl Rpc {
     }
 
     async fn http_post(self: &Arc<Self>, t: &HttpTransport, message: &Value) -> Result<()> {
-        let request = self
-            .http_request(t, reqwest::Method::POST)
-            .header("content-type", "application/json")
-            .header("accept", "application/json, text/event-stream")
-            .body(stringify(message));
+        let request = self.http_request(t, reqwest::Method::POST).header("content-type", "application/json").header("accept", "application/json, text/event-stream").body(stringify(message));
         let response = self.http_send(t, request).await?;
         if let Some(id) = response.headers().get("mcp-session-id").and_then(|v| v.to_str().ok()) {
             *t.session_id.lock().unwrap() = Some(id.to_string());
@@ -896,7 +896,7 @@ impl McpManager {
             // risk or expose a tool in --read-only mode; trust only auto-approves medium/low.
             let annotations = remote.get("annotations");
             let assessment = classify_mcp_risk(server, &original, annotations, config);
-            let read_only = config.read_only_tools.iter().any(|t| *t == original);
+            let read_only = config.read_only_tools.contains(&original);
             let description = remote.get("description").and_then(Value::as_str).unwrap_or("");
             let exec = self.build_exec(&discovered.connection, &original, call_timeout, discovered.output_schemas.get(&original).cloned());
             specs.push(Spec {
@@ -911,7 +911,16 @@ impl McpManager {
                 net: assessment.net,
                 exec,
             });
-            infos.push(McpToolInfo { server: server.into(), name, original_name: original, read_only, risk: assessment.risk, net: assessment.net, trusted: config.trust, annotations: normalize_annotations(annotations) });
+            infos.push(McpToolInfo {
+                server: server.into(),
+                name,
+                original_name: original,
+                read_only,
+                risk: assessment.risk,
+                net: assessment.net,
+                trusted: config.trust,
+                annotations: normalize_annotations(annotations),
+            });
         }
         let count = specs.len();
         let mut st = self.state.lock().unwrap();
@@ -1023,7 +1032,8 @@ mod tests {
     }
 
     fn node_available() -> bool {
-        std::process::Command::new("node").arg("--version").output().map(|o| o.status.success()).unwrap_or(false) && std::path::Path::new(&format!("{}/node_modules/@modelcontextprotocol/sdk", env!("CARGO_MANIFEST_DIR"))).exists()
+        std::process::Command::new("node").arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
+            && std::path::Path::new(&format!("{}/node_modules/@modelcontextprotocol/sdk", env!("CARGO_MANIFEST_DIR"))).exists()
     }
 
     fn call(name: &str, input: Value) -> ToolCall {
@@ -1038,11 +1048,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let approvals = Arc::new(AtomicUsize::new(0));
         let counter = approvals.clone();
-        let registry = ToolRegistry::new(dir.path(), Arc::new(move |_| {
-            counter.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async { false })
-        }), false, None);
-        let config = parse_mcp_config(&json!({ "servers": { "local": { "transport": "stdio", "command": "node", "args": [fixture(), "--stdio"], "readOnlyTools": ["echo", "wait", "fail"] } } })).unwrap();
+        let registry = ToolRegistry::new(
+            dir.path(),
+            Arc::new(move |_| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { false })
+            }),
+            false,
+            None,
+        );
+        let config =
+            parse_mcp_config(&json!({ "servers": { "local": { "transport": "stdio", "command": "node", "args": [fixture(), "--stdio"], "readOnlyTools": ["echo", "wait", "fail"] } } })).unwrap();
         let manager = McpManager::new(config, dir.path(), None);
         manager.connect(Some(&registry), None).await.unwrap();
         assert_eq!(manager.tools().len(), 4);
@@ -1079,7 +1095,10 @@ mod tests {
         std::env::set_var("GOON_API_KEY", "must-not-inherit");
         std::env::set_var("GOON_TEST_FORWARD", "explicit-value");
         let registry = ToolRegistry::new(dir.path(), crate::tools::approve_all(), true, None);
-        let config = parse_mcp_config(&json!({ "servers": { "local": { "transport": "stdio", "command": "node", "args": [fixture(), "--stdio"], "readOnlyTools": ["echo"], "envFrom": { "FORWARDED": "GOON_TEST_FORWARD" } } } })).unwrap();
+        let config = parse_mcp_config(
+            &json!({ "servers": { "local": { "transport": "stdio", "command": "node", "args": [fixture(), "--stdio"], "readOnlyTools": ["echo"], "envFrom": { "FORWARDED": "GOON_TEST_FORWARD" } } } }),
+        )
+        .unwrap();
         let manager = McpManager::new(config, dir.path(), None);
         manager.connect(Some(&registry), None).await.unwrap();
         assert!(!registry.exposed_tool_names().contains(&mcp_tool_name("local", "danger-tool")));
@@ -1111,10 +1130,13 @@ mod tests {
     fn counting(result: bool) -> (crate::tools::Approve, Arc<AtomicUsize>) {
         let n = Arc::new(AtomicUsize::new(0));
         let c = n.clone();
-        (Arc::new(move |_| {
-            c.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async move { result })
-        }), n)
+        (
+            Arc::new(move |_| {
+                c.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move { result })
+            }),
+            n,
+        )
     }
 
     #[tokio::test]
@@ -1139,7 +1161,10 @@ mod tests {
         assert_eq!(approvals.load(Ordering::SeqCst), 0);
         manager.close().await;
 
-        let filtered = parse_mcp_config(&json!({ "mcpServers": { "rea": { "command": "node", "args": [fixture(), "--rea-scale"], "enabledTools": ["rea_tool_1", "rea_tool_2", "rea_tool_3"], "disabledTools": ["rea_tool_2"] } } })).unwrap();
+        let filtered = parse_mcp_config(
+            &json!({ "mcpServers": { "rea": { "command": "node", "args": [fixture(), "--rea-scale"], "enabledTools": ["rea_tool_1", "rea_tool_2", "rea_tool_3"], "disabledTools": ["rea_tool_2"] } } }),
+        )
+        .unwrap();
         let manager = McpManager::new(filtered, dir.path(), None);
         let tools = manager.connect(None, None).await.unwrap();
         assert_eq!(tools.iter().map(|t| t.original_name.as_str()).collect::<Vec<_>>(), vec!["rea_tool_1", "rea_tool_3"]);

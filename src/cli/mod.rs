@@ -107,14 +107,14 @@ pub fn read_git_branch(cwd: &Path) -> Option<String> {
             let mut git_dir = dot_git.clone();
             if dot_git.is_file() {
                 let text = std::fs::read_to_string(&dot_git).ok()?;
-                let pointer = regex::Regex::new(r"(?m)^gitdir:\s*(.+)$").unwrap().captures(&text)?.get(1)?.as_str().trim().to_string();
+                let pointer = crate::re!(r"(?m)^gitdir:\s*(.+)$").captures(&text)?.get(1)?.as_str().trim().to_string();
                 git_dir = crate::files::resolve_lexical(&dir, &pointer);
             }
             let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?.trim().to_string();
-            if let Some(c) = regex::Regex::new(r"^ref:\s*refs/heads/(.+)$").unwrap().captures(&head) {
+            if let Some(c) = crate::re!(r"^ref:\s*refs/heads/(.+)$").captures(&head) {
                 return Some(c[1].to_string());
             }
-            return regex::Regex::new(r"(?i)^[0-9a-f]{7,}$").unwrap().is_match(&head).then(|| head[..7].to_string());
+            return crate::re!(r"(?i)^[0-9a-f]{7,}$").is_match(&head).then(|| head[..7].to_string());
         }
         let parent = dir.parent()?.to_path_buf();
         if parent == dir {
@@ -209,7 +209,10 @@ pub fn extract_copyable_from_messages(messages: &[Value], selector: &str) -> Opt
 /// Clipboard helpers in preference order (Termux, Wayland, X11, macOS, Windows).
 pub fn clipboard_candidates() -> Vec<(String, Vec<String>)> {
     match jsutil::platform() {
-        "win32" => vec![("powershell.exe".into(), vec!["-NoProfile".into(), "-NonInteractive".into(), "-Command".into(), "[Console]::InputEncoding = [System.Text.Encoding]::UTF8; Set-Clipboard -Value ([Console]::In.ReadToEnd())".into()])],
+        "win32" => vec![(
+            "powershell.exe".into(),
+            vec!["-NoProfile".into(), "-NonInteractive".into(), "-Command".into(), "[Console]::InputEncoding = [System.Text.Encoding]::UTF8; Set-Clipboard -Value ([Console]::In.ReadToEnd())".into()],
+        )],
         "darwin" => vec![("pbcopy".into(), vec![])],
         _ => {
             let mut out = vec![];
@@ -236,7 +239,13 @@ pub async fn copy_text_to_clipboard(text: &str) -> bool {
     }
     for (bin, args) in clipboard_candidates() {
         let mut cmd = tokio::process::Command::new(&bin);
-        cmd.args(&args).env_clear().envs(crate::process::child_env(None)).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).kill_on_drop(true);
+        cmd.args(&args)
+            .env_clear()
+            .envs(crate::process::child_env(None))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
         let Ok(mut child) = cmd.spawn() else { continue };
         if let Some(mut stdin) = child.stdin.take() {
             use tokio::io::AsyncWriteExt;
@@ -699,7 +708,11 @@ async fn mcp_command(positionals: &[String], cwd: PathBuf) -> Result<()> {
     let sub = positionals.get(1).map(String::as_str);
     match sub {
         Some("list") => {
-            let servers: Vec<Value> = mcp_config.servers.iter().map(|(name, s)| json!({ "name": name, "transport": s.transport_name(), "disabled": s.disabled, "trust": s.trust, "readOnlyTools": s.read_only_tools })).collect();
+            let servers: Vec<Value> = mcp_config
+                .servers
+                .iter()
+                .map(|(name, s)| json!({ "name": name, "transport": s.transport_name(), "disabled": s.disabled, "trust": s.trust, "readOnlyTools": s.read_only_tools }))
+                .collect();
             stdout_write(&format!("{}\n", stringify_pretty(&json!({ "path": mcp_config_path().to_string_lossy(), "servers": servers }))));
             Ok(())
         }
@@ -793,7 +806,10 @@ mod tests {
 
     #[test]
     fn helpers_match_ts() {
-        assert_eq!(insecure_base_url_warning(Some("http://example.com:8080/v1")).unwrap(), "Warning: example.com:8080 uses plain http; your API key is sent unencrypted. Use https:// unless this is a trusted local network.");
+        assert_eq!(
+            insecure_base_url_warning(Some("http://example.com:8080/v1")).unwrap(),
+            "Warning: example.com:8080 uses plain http; your API key is sent unencrypted. Use https:// unless this is a trusted local network."
+        );
         assert!(insecure_base_url_warning(Some("http://127.0.0.1:1/v1")).is_none());
         let messages = vec![json!({"role": "assistant", "content": "first"}), json!({"role": "assistant", "content": [{"type": "text", "text": "<think>x</think> two\n```js\ncode()\n```"}]})];
         assert_eq!(extract_copyable_from_messages(&messages, "").unwrap().0, "two\n```js\ncode()\n```");

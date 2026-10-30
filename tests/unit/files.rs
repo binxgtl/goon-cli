@@ -170,7 +170,20 @@ fn apply_patch_supports_add_update_delete_and_restore_backups_reverts_them() {
     f.write("keep.txt", "line1\nline2\nline3\n");
     f.write("remove-me.txt", "goodbye\n");
     files.begin_turn();
-    let patch = ["*** Begin Patch", "*** Update File: keep.txt", "@@", " line1", "-line2", "+line2_patched", " line3", "*** Add File: added.txt", "+hello world", "*** Delete File: remove-me.txt", "*** End Patch"].join("\n");
+    let patch = [
+        "*** Begin Patch",
+        "*** Update File: keep.txt",
+        "@@",
+        " line1",
+        "-line2",
+        "+line2_patched",
+        " line3",
+        "*** Add File: added.txt",
+        "+hello world",
+        "*** Delete File: remove-me.txt",
+        "*** End Patch",
+    ]
+    .join("\n");
     let preview = files.preview_diff("apply_patch", &json!({ "patch": patch })).unwrap();
     assert_match(&preview, r"\+line2_patched");
     assert_match(&preview, r"\+hello world");
@@ -275,7 +288,10 @@ fn apply_patch_validates_plain_json_but_accepts_jsonc_config_paths() {
     lines.extend(jsonc.iter().map(|l| format!("+{l}")));
     lines.push("*** End Patch".into());
     files.apply_patch(&lines.join("\n")).unwrap();
-    assert_match(&err(files.apply_patch(&["*** Begin Patch", "*** Add File: package.json", "+{ \"a\": 1, }", "*** End Patch"].join("\n"))), r"Syntax validation failed for package\.json: invalid JSON");
+    assert_match(
+        &err(files.apply_patch(&["*** Begin Patch", "*** Add File: package.json", "+{ \"a\": 1, }", "*** End Patch"].join("\n"))),
+        r"Syntax validation failed for package\.json: invalid JSON",
+    );
 }
 
 #[test]

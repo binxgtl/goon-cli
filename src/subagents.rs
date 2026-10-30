@@ -23,8 +23,39 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 pub const CODEX_AGENT_NICKNAMES: [&str; 33] = [
-    "Euclid", "Archimedes", "Hypatia", "Galileo", "Descartes", "Pascal", "Fermat", "Leibniz", "Newton", "Euler", "Gauss", "Faraday", "Lovelace", "Boole", "Maxwell", "Curie", "Planck", "Tesla", "Noether", "Hilbert", "Einstein", "Bohr", "Turing", "Feynman",
-    "Sagan", "Socrates", "Plato", "Aristotle", "Kant", "Godel", "Nash", "Ramanujan", "Erdos",
+    "Euclid",
+    "Archimedes",
+    "Hypatia",
+    "Galileo",
+    "Descartes",
+    "Pascal",
+    "Fermat",
+    "Leibniz",
+    "Newton",
+    "Euler",
+    "Gauss",
+    "Faraday",
+    "Lovelace",
+    "Boole",
+    "Maxwell",
+    "Curie",
+    "Planck",
+    "Tesla",
+    "Noether",
+    "Hilbert",
+    "Einstein",
+    "Bohr",
+    "Turing",
+    "Feynman",
+    "Sagan",
+    "Socrates",
+    "Plato",
+    "Aristotle",
+    "Kant",
+    "Godel",
+    "Nash",
+    "Ramanujan",
+    "Erdos",
 ];
 
 /// Child progress is a control channel: text/reasoning and per-request diagnostics stay internal.
@@ -215,7 +246,15 @@ impl Subagents {
         if let Some(b) = self.registry.budget() {
             return b;
         }
-        let seeded = Arc::new(Mutex::new(RunBudget { spent: 0, limit: self.config.run_token_budget, cost_spent: self.parent.session.lock().unwrap().cost(), cost_limit: self.config.max_cost_usd, started_at: None, time_limit_ms: self.config.max_time_ms, ledger: None }));
+        let seeded = Arc::new(Mutex::new(RunBudget {
+            spent: 0,
+            limit: self.config.run_token_budget,
+            cost_spent: self.parent.session.lock().unwrap().cost(),
+            cost_limit: self.config.max_cost_usd,
+            started_at: None,
+            time_limit_ms: self.config.max_time_ms,
+            ledger: None,
+        }));
         create_run_budget(&self.config, Some(seeded))
     }
 
@@ -275,7 +314,8 @@ impl Subagents {
                 Some(sync_exec(weak.clone(), |me, _, _| {
                     Box::pin(async move {
                         let spawned = me.spawned.lock().unwrap();
-                        let agents: Vec<Value> = spawned.values().map(|a| json!({ "agent_id": a.id, "agent_name": a.nickname, "agent_type": a.agent_type, "agent_status": status_payload(Some(a)) })).collect();
+                        let agents: Vec<Value> =
+                            spawned.values().map(|a| json!({ "agent_id": a.id, "agent_name": a.nickname, "agent_type": a.agent_type, "agent_status": status_payload(Some(a)) })).collect();
                         Ok(stringify(&json!({ "agents": agents })))
                     })
                 })),
@@ -742,7 +782,12 @@ impl Subagents {
             None => {
                 let entries = std::fs::read_dir(&root).ok()?;
                 let lower = target.trim().to_lowercase();
-                entries.flatten().map(|e| e.file_name().to_string_lossy().to_string()).filter(|n| n.ends_with(".json")).find(|n| n[..n.len() - 5].to_lowercase().starts_with(&lower)).map(|n| n[..n.len() - 5].to_string())?
+                entries
+                    .flatten()
+                    .map(|e| e.file_name().to_string_lossy().to_string())
+                    .filter(|n| n.ends_with(".json"))
+                    .find(|n| n[..n.len() - 5].to_lowercase().starts_with(&lower))
+                    .map(|n| n[..n.len() - 5].to_string())?
             }
         };
         let spawned = self.spawned.lock().unwrap();
@@ -756,11 +801,8 @@ impl Subagents {
                     .or_else(|| self.metadata.lock().unwrap().get(&target_id).map(|m| m.0.clone()))
                     .or_else(|| raw.get("title").and_then(Value::as_str).map(str::to_string))
                     .unwrap_or_else(|| take_chars(&target_id, 8).to_string());
-                let report = if !answer.is_empty() {
-                    answer
-                } else {
-                    agent.and_then(|a| a.last_output.clone().filter(|o| !o.is_empty()).or(a.last_error.clone())).unwrap_or_else(|| "(no output yet)".into())
-                };
+                let report =
+                    if !answer.is_empty() { answer } else { agent.and_then(|a| a.last_output.clone().filter(|o| !o.is_empty()).or(a.last_error.clone())).unwrap_or_else(|| "(no output yet)".into()) };
                 Some(format!("Subagent {nickname} ({target_id}):\n{report}"))
             }
             None => agent.map(|a| {
@@ -886,7 +928,6 @@ async fn wait_done(mut rx: tokio::sync::watch::Receiver<bool>) {
 fn string_list(input: &Value, key: &str) -> Vec<String> {
     input.get(key).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect()).unwrap_or_default()
 }
-
 
 #[cfg(test)]
 mod tests {

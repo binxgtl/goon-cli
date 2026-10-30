@@ -133,11 +133,7 @@ pub fn build_body(model_id: &str, request: &ModelRequest) -> Value {
     }
     body.insert("messages".into(), Value::Array(convert_messages(request.system.as_deref(), &request.messages)));
     if !request.tools.is_empty() {
-        let tools: Vec<Value> = request
-            .tools
-            .iter()
-            .map(|t| json!({ "type": "function", "function": { "name": t.name, "description": t.description, "parameters": t.parameters } }))
-            .collect();
+        let tools: Vec<Value> = request.tools.iter().map(|t| json!({ "type": "function", "function": { "name": t.name, "description": t.description, "parameters": t.parameters } })).collect();
         body.insert("tools".into(), Value::Array(tools));
         body.insert("tool_choice".into(), json!("auto"));
     }
@@ -289,7 +285,11 @@ fn content_items(content: Option<&Value>) -> Vec<(bool, String)> {
             .filter_map(|p| match p.get("type").and_then(Value::as_str) {
                 Some("text") => p.get("text").and_then(Value::as_str).filter(|t| !t.is_empty()).map(|t| (false, t.to_string())),
                 Some("thinking") => {
-                    let text: String = p.get("thinking").and_then(Value::as_array).map(|items| items.iter().filter(|c| c.get("type").and_then(Value::as_str) == Some("text")).filter_map(|c| c.get("text").and_then(Value::as_str)).collect()).unwrap_or_default();
+                    let text: String = p
+                        .get("thinking")
+                        .and_then(Value::as_array)
+                        .map(|items| items.iter().filter(|c| c.get("type").and_then(Value::as_str) == Some("text")).filter_map(|c| c.get("text").and_then(Value::as_str)).collect())
+                        .unwrap_or_default();
                     (!text.is_empty()).then_some((true, text))
                 }
                 _ => None,
@@ -431,7 +431,10 @@ mod tests {
             json!({"role": "assistant", "content": [{"type": "text", "text": "x"}], "providerOptions": {"openaiCompatible": {"reasoning_content": ""}}}),
         ];
         let wire = convert_messages(Some("sys"), &messages);
-        assert_eq!(crate::jsutil::stringify(&wire[2]), r#"{"role":"assistant","content":"Let me read.","reasoning_content":"think","tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a.txt\",\"offset\":1,\"lines\":200}"}}]}"#);
+        assert_eq!(
+            crate::jsutil::stringify(&wire[2]),
+            r#"{"role":"assistant","content":"Let me read.","reasoning_content":"think","tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a.txt\",\"offset\":1,\"lines\":200}"}}]}"#
+        );
         assert_eq!(wire[3], json!({"role": "tool", "tool_call_id": "call_1", "content": "ok"}));
         assert_eq!(wire[4], json!({"role": "assistant", "content": "x", "reasoning_content": ""}));
     }

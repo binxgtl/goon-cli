@@ -230,7 +230,13 @@ fn to_usage(turn: &StubTurn) -> Usage {
     let input = usage.input_tokens.unwrap_or(0);
     // A total-only fixture must still move token/cost budgets; derive the missing side.
     let output = usage.output_tokens.unwrap_or_else(|| usage.total_tokens.map(|t| t.saturating_sub(input)).unwrap_or(0));
-    Usage { input_tokens: Some(input), output_tokens: Some(output), cache_read_tokens: Some(usage.cache_read_tokens.unwrap_or(0)), cache_write_tokens: Some(usage.cache_write_tokens.unwrap_or(0)), reasoning_tokens: Some(0) }
+    Usage {
+        input_tokens: Some(input),
+        output_tokens: Some(output),
+        cache_read_tokens: Some(usage.cache_read_tokens.unwrap_or(0)),
+        cache_write_tokens: Some(usage.cache_write_tokens.unwrap_or(0)),
+        reasoning_tokens: Some(0),
+    }
 }
 
 impl LanguageModel for StubModel {

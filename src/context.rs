@@ -4,7 +4,7 @@
 use crate::config::{atomic_json, config_dir, mkdir_private, RuntimeConfig};
 use crate::cost::{to_usage_split, UsageSplit};
 use crate::files::{limit_text, WorkspaceFiles};
-use crate::jsutil::{now_iso, quote, take_chars, tail_chars, utf16_len};
+use crate::jsutil::{now_iso, quote, tail_chars, take_chars, utf16_len};
 use crate::model::{FinishReason, LanguageModel, ModelRequest};
 use crate::provider::{auxiliary_effort, resolve_model_capabilities};
 use crate::reasoning::visible_answer;
@@ -685,10 +685,8 @@ pub fn without_binary_parts(messages: &[Value]) -> Vec<Value> {
             if !parts.iter().any(is_binary_part) {
                 return message.clone();
             }
-            let content: Vec<Value> = parts
-                .iter()
-                .map(|p| if is_binary_part(p) { json!({ "type": "text", "text": format!("[{} attachment omitted]", p["type"].as_str().unwrap()) }) } else { p.clone() })
-                .collect();
+            let content: Vec<Value> =
+                parts.iter().map(|p| if is_binary_part(p) { json!({ "type": "text", "text": format!("[{} attachment omitted]", p["type"].as_str().unwrap()) }) } else { p.clone() }).collect();
             let mut out = message.clone();
             out["content"] = Value::Array(content);
             out
@@ -838,7 +836,8 @@ pub async fn recap_session(store: &SessionStore, config: &RuntimeConfig, model: 
     if messages.is_empty() {
         return Ok(RecapOutcome { text: "No conversation history in this session yet.".into(), tokens: 0, usage: UsageSplit::default() });
     }
-    let system = "Provide a concise, structured recap of this coding session so far: (1) Objective, (2) Completed Work & Modified Files, (3) Open Questions / Remaining Tasks. Keep it factual and brief.";
+    let system =
+        "Provide a concise, structured recap of this coding session so far: (1) Objective, (2) Completed Work & Modified Files, (3) Open Questions / Remaining Tasks. Keep it factual and brief.";
     let prompt = crate::jsutil::stringify(&Value::Array(prune_for_summary(&messages)));
     let request = summary_request(config, system, prompt, 8_192u64.min(config.max_output_tokens), cancel);
     let summary = crate::generate::generate_text(model, request, 2).await.map_err(anyhow::Error::new)?;

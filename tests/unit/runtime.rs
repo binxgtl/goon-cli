@@ -10,7 +10,10 @@ fn tool_names(body: &Value) -> Vec<String> {
 
 #[tokio::test]
 async fn discover_models_queries_the_models_endpoint_with_the_bearer_key() {
-    let p = provider(|_, _| json_response(200, json!({ "data": [{ "id": "live-model-alpha", "context_window": 200000, "max_output_tokens": 16384 }, { "id": "live-model-beta", "context_length": 65536 }] }))).await;
+    let p = provider(|_, _| {
+        json_response(200, json!({ "data": [{ "id": "live-model-alpha", "context_window": 200000, "max_output_tokens": 16384 }, { "id": "live-model-beta", "context_length": 65536 }] }))
+    })
+    .await;
     let discovered = discover_models(&p.url, Some("disc-key"), "openai-compatible", None).await;
     assert_eq!(p.path(0), "/v1/models");
     assert_eq!(p.header(0, "authorization").as_deref(), Some("Bearer disc-key"));
@@ -93,19 +96,25 @@ async fn gateway_compatibility_session_headers_aliases_vision_filtering_and_comp
     assert_eq!(config::normalize_gateway_url("https://api.yuristore.xyz/"), "https://api.yuristore.xyz/v1");
     assert_eq!(config::normalize_gateway_url("http://127.0.0.1:8000"), "http://127.0.0.1:8000/v1");
     let gateway = provider(|_, _| {
-        json_response(200, json!({ "data": [
+        json_response(
+            200,
+            json!({ "data": [
             { "id": "glm-5.3-flash", "context_window": 200000, "max_output_tokens": 32000, "supports_vision": true, "reasoning_effort": "max" },
             { "id": "deepseek-v4.1-flash", "context_window": 200000, "max_output_tokens": 32000, "supports_vision": true, "reasoning_effort": "max" },
             { "id": "space-bunny", "context_window": 1048576, "max_output_tokens": 65536, "supports_vision": true, "supports_1m_context": true, "reasoning_effort": "max" },
             { "id": "beam", "context_window": 1048576, "max_output_tokens": 65536, "supports_vision": false, "supports_1m_context": true, "reasoning_effort": "max" },
-        ] }))
+        ] }),
+        )
     })
     .await;
     let models = discover_models(&gateway.url, Some("gw-key"), "openai-compatible", None).await;
     assert_eq!(models.len(), 4);
     assert_eq!(format!("{}{}", models[2].id, format_model_badge(&models[2])), "space-bunny (ctx: 1024k · out: 64k · vision · effort: max)");
     assert_eq!(format!("{}{}", models[3].id, format_model_badge(&models[3])), "beam (ctx: 1024k · out: 64k · text-only · effort: max)");
-    assert_eq!(resolve_model_capabilities("beam", None), DiscoveredModel { id: "beam".into(), context_window: Some(1048576), max_output_tokens: Some(65536), supports_vision: Some(false), default_effort: Some("max".into()) });
+    assert_eq!(
+        resolve_model_capabilities("beam", None),
+        DiscoveredModel { id: "beam".into(), context_window: Some(1048576), max_output_tokens: Some(65536), supports_vision: Some(false), default_effort: Some("max".into()) }
+    );
 
     std::fs::write(f.cwd.join("shot.png"), base64::engine::general_purpose::STANDARD.decode(PNG).unwrap()).unwrap();
     let ws = files::WorkspaceFiles::new(&f.cwd);
@@ -131,7 +140,13 @@ async fn gateway_compatibility_session_headers_aliases_vision_filtering_and_comp
         }
     })
     .await;
-    let rt = runtime_keyed(&f.cwd, &f.data, &p.url, json!({ "model": "space-bunny", "effort": "max", "contextWindow": 1048576, "maxOutputTokens": 65536, "runTokenBudget": 1000000, "timeoutMs": 30000 }), "test-secret-never-echo");
+    let rt = runtime_keyed(
+        &f.cwd,
+        &f.data,
+        &p.url,
+        json!({ "model": "space-bunny", "effort": "max", "contextWindow": 1048576, "maxOutputTokens": 65536, "runTokenBudget": 1000000, "timeoutMs": 30000 }),
+        "test-secret-never-echo",
+    );
     let st = store(&rt);
     let tools = registry(&f.cwd, tools::approve_all(), false);
     let h = harness::Harness::new(rt.clone(), st.clone(), tools, harness::noop_emit(), None, Default::default()).unwrap();
@@ -152,7 +167,9 @@ async fn gateway_compatibility_session_headers_aliases_vision_filtering_and_comp
 #[tokio::test]
 async fn transient_500s_are_retried_three_times_and_empty_sessions_are_ignored_on_resume() {
     let f = fixture();
-    let p = provider(|_, n| if n <= 3 { json_response(500, json!({ "error": { "message": format!("Transient upstream 500 on attempt #{n}") } })) } else { text("Recovered on retry #3 (attempt #4).") }).await;
+    let p =
+        provider(|_, n| if n <= 3 { json_response(500, json!({ "error": { "message": format!("Transient upstream 500 on attempt #{n}") } })) } else { text("Recovered on retry #3 (attempt #4).") })
+            .await;
     let rt = runtime_keyed(&f.cwd, &f.data, &p.url, json!({ "contextWindow": 32000, "maxOutputTokens": 1024, "runTokenBudget": 100000, "timeoutMs": 10000 }), "test-secret-never-echo");
     let root = rt.data_dir.join("sessions");
     let s1 = store(&rt);

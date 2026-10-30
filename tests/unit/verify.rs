@@ -212,7 +212,12 @@ async fn run_verification_executes_commands_and_reports_failures() {
 #[tokio::test]
 async fn run_verification_passes_offline_go_environment_to_the_runner() {
     let f = fixture();
-    let mut plan = VerifyPlan { stages: strings(&["test"]), commands: vec![VerifyCommand { stage: "test".into(), command: "go".into(), args: strings(&["test", "./..."]), display: "go test ./...".into() }], projects: vec![], approved: true };
+    let mut plan = VerifyPlan {
+        stages: strings(&["test"]),
+        commands: vec![VerifyCommand { stage: "test".into(), command: "go".into(), args: strings(&["test", "./..."]), display: "go test ./...".into() }],
+        projects: vec![],
+        approved: true,
+    };
     let runner = Scripted::new(result(0, ""));
     let verdict = run_verification(&f.cwd, &[], &cfg(&[], 1000), &*runner, &token(), &mut plan, None).await.unwrap();
     assert!(verdict.pass);
@@ -240,7 +245,14 @@ fn redact_verdict_and_redact_text_remove_secrets_and_credential_patterns() {
     let verdict = VerifyVerdict {
         pass: false,
         severity: Severity::Fail,
-        stages: vec![StageResult { stage: "test".into(), severity: Severity::Fail, duration_ms: 1, issues: vec![issue("token=secret-token bearer abc.def")], output: Some("Authorization: Bearer abc.def".into()), reason: None }],
+        stages: vec![StageResult {
+            stage: "test".into(),
+            severity: Severity::Fail,
+            duration_ms: 1,
+            issues: vec![issue("token=secret-token bearer abc.def")],
+            output: Some("Authorization: Bearer abc.def".into()),
+            reason: None,
+        }],
         errors: vec![issue("token=secret-token")],
         warnings: vec![],
         reason: "secret-token failed".into(),

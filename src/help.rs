@@ -2,7 +2,8 @@
 use crate::version::VERSION;
 
 pub fn help() -> String {
-    format!(r#"goon cli {VERSION} — independent coding harness
+    format!(
+        r#"goon cli {VERSION} — independent coding harness
 
 Usage: goon [options] [prompt]
        goon resume [ID|latest|number]
@@ -63,5 +64,6 @@ Interactive commands:
 Shortcuts: Shift+Tab mode, Ctrl+T transcript, Ctrl+O copy, Alt+. / Alt+, effort, Tab autocomplete, Esc Esc rewind, Ctrl+C cancel.
 API keys are read from environment variables or ~/.config/goon/credentials.json.
 Shell commands run as your OS user; approvals are not an OS sandbox.
-"#)
+"#
+    )
 }

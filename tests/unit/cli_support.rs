@@ -65,7 +65,12 @@ async fn setup_wizard_discovers_models_dynamically_and_keeps_the_key_out_of_conf
 async fn cancelling_the_wizard_midway_persists_neither_the_key_nor_the_config() {
     let f = fixture();
     let _env = fixture_env(&f);
-    let io = setup::SetupIo { write: Some(Arc::new(|_| {})), ask: Some(scripted(vec!["4", "https://openrouter.ai/api/v1", "sk-cancelled-secret-key"], true)), ask_secret: None, discover: Some(Arc::new(|_, _, _| Box::pin(async { vec![] }))) };
+    let io = setup::SetupIo {
+        write: Some(Arc::new(|_| {})),
+        ask: Some(scripted(vec!["4", "https://openrouter.ai/api/v1", "sk-cancelled-secret-key"], true)),
+        ask_secret: None,
+        discover: Some(Arc::new(|_, _, _| Box::pin(async { vec![] }))),
+    };
     let error = setup::run_setup_wizard(None, io).await.unwrap_err();
     assert!(error.downcast_ref::<goon::term::InputCancelled>().is_some(), "{error}");
     for file in walk(&f.config) {

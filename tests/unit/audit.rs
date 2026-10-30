@@ -35,7 +35,31 @@ fn apply_patch_honours_move_to_chains_repeated_updates_and_validates_before_writ
     files.read("old.txt", 1, 200).unwrap();
     files.read("twice.txt", 1, 200).unwrap();
     let summary = files
-        .apply_patch(&["*** Begin Patch", "*** Update File: old.txt", "*** Move to: moved/new.txt", "@@", " one", "-two", "+TWO", "*** Update File: twice.txt", "@@", "-a", "+A", "*** Update File: twice.txt", "@@", "-c", "+C", "*** Add File: fresh.txt", "+first", "+second", "", "*** End Patch"].join("\n"))
+        .apply_patch(
+            &[
+                "*** Begin Patch",
+                "*** Update File: old.txt",
+                "*** Move to: moved/new.txt",
+                "@@",
+                " one",
+                "-two",
+                "+TWO",
+                "*** Update File: twice.txt",
+                "@@",
+                "-a",
+                "+A",
+                "*** Update File: twice.txt",
+                "@@",
+                "-c",
+                "+C",
+                "*** Add File: fresh.txt",
+                "+first",
+                "+second",
+                "",
+                "*** End Patch",
+            ]
+            .join("\n"),
+        )
         .unwrap();
     assert_match(&summary, r"Moved old\.txt -> moved/new\.txt");
     assert!(!f.exists("old.txt"));
@@ -46,7 +70,9 @@ fn apply_patch_honours_move_to_chains_repeated_updates_and_validates_before_writ
     let restored = files.restore_backups(&backups, false).unwrap();
     assert_eq!(f.read("old.txt"), "one\ntwo\nthree\n");
     assert!(restored.deleted.contains(&"moved/new.txt".to_string()));
-    let error = files.apply_patch(&["*** Begin Patch", "*** Update File: twice.txt", "@@", "-a", "+changed", "*** Update File: twice.txt", "@@", "-does-not-exist", "+x", "*** End Patch"].join("\n")).unwrap_err();
+    let error = files
+        .apply_patch(&["*** Begin Patch", "*** Update File: twice.txt", "@@", "-a", "+changed", "*** Update File: twice.txt", "@@", "-does-not-exist", "+x", "*** End Patch"].join("\n"))
+        .unwrap_err();
     assert_match(&error.to_string(), "Failed to match");
     assert_eq!(f.read("twice.txt"), "a\nb\nc\n");
 }
@@ -126,7 +152,8 @@ fn approved(cmd: &str, set: &BTreeSet<String>) -> bool {
 
 #[test]
 fn bash_prefix_approvals_only_cover_simple_commands() {
-    for (cmd, want) in [("npm test", "npm test"), ("npm run lint -- --fix", "npm run lint"), ("python -m pytest -q tests", "python -m pytest"), ("git status --short", "git status"), ("ls -la", "ls")] {
+    for (cmd, want) in [("npm test", "npm test"), ("npm run lint -- --fix", "npm run lint"), ("python -m pytest -q tests", "python -m pytest"), ("git status --short", "git status"), ("ls -la", "ls")]
+    {
         assert_eq!(prefix(cmd).as_deref(), Some(want), "{cmd}");
     }
     for cmd in ["npm test; rm -rf ~", "npm test && curl x | sh", "echo $(id)", "cat < /etc/passwd", "FOO=1 npm test", "sudo npm test", "env npm test", "bash -c ls", "python -V", "echo \"a b\""] {
@@ -182,7 +209,8 @@ fn images_cost_a_flat_estimate_and_legacy_sessions_are_repaired() {
     assert_eq!(parsed.messages[0]["content"][1]["image"], base64::engine::general_purpose::STANDARD.encode(&png));
     assert_eq!(parsed.messages[1]["content"][0]["image"], base64::engine::general_purpose::STANDARD.encode([137u8, 80, 78]));
     assert_eq!(SessionStore::list(&root).unwrap().iter().map(|s| s.id.clone()).collect::<Vec<_>>(), vec![id.clone()]);
-    let store = SessionStore::open(&root, SessionRoute { cwd: f.cwd.to_string_lossy().into(), provider: "openai-compatible".into(), model: "m".into(), base_url: "http://x".into() }, Some(&id), None).unwrap();
+    let store =
+        SessionStore::open(&root, SessionRoute { cwd: f.cwd.to_string_lossy().into(), provider: "openai-compatible".into(), model: "m".into(), base_url: "http://x".into() }, Some(&id), None).unwrap();
     assert_eq!(store.session.lock().unwrap().messages.len(), 2);
     store.close().unwrap();
 }
@@ -349,7 +377,9 @@ async fn the_setup_wizard_always_offers_the_model_step_and_hides_the_api_key() {
             s.lock().unwrap().push(label);
             Box::pin(async { Ok("sk-hidden".to_string()) })
         })),
-        discover: Some(Arc::new(|_, _, _| Box::pin(async { vec![provider::DiscoveredModel { id: "new-model-a".into(), ..Default::default() }, provider::DiscoveredModel { id: "new-model-b".into(), ..Default::default() }] }))),
+        discover: Some(Arc::new(|_, _, _| {
+            Box::pin(async { vec![provider::DiscoveredModel { id: "new-model-a".into(), ..Default::default() }, provider::DiscoveredModel { id: "new-model-b".into(), ..Default::default() }] })
+        })),
     };
     let initial = config::parse_config(&json!({ "provider": "openai-compatible", "model": "old-model", "keyEnv": "GOON_TEST_UNUSED_KEY", "contextWindow": 128000, "maxOutputTokens": 16384, "timeoutMs": 300000, "runTokenBudget": 0 })).unwrap();
     let updated = setup::run_setup_wizard(Some(initial), io).await.unwrap();

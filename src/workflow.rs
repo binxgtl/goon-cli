@@ -34,8 +34,43 @@ impl std::error::Error for WorkflowApprovalError {}
 // ---------------------------------------------------------------------------------------------
 
 const IMPERATIVE_VERBS: [&str; 37] = [
-    "add", "implement", "fix", "refactor", "create", "write", "update", "delete", "remove", "migrate", "port", "build", "review", "audit", "deploy", "design", "research", "install", "configure", "rename", "move", "split", "merge", "optimize", "document", "clean", "extract", "thêm",
-    "sửa", "xóa", "tạo", "viết", "chạy", "cập nhật", "kiểm tra", "xây dựng", "triển khai",
+    "add",
+    "implement",
+    "fix",
+    "refactor",
+    "create",
+    "write",
+    "update",
+    "delete",
+    "remove",
+    "migrate",
+    "port",
+    "build",
+    "review",
+    "audit",
+    "deploy",
+    "design",
+    "research",
+    "install",
+    "configure",
+    "rename",
+    "move",
+    "split",
+    "merge",
+    "optimize",
+    "document",
+    "clean",
+    "extract",
+    "thêm",
+    "sửa",
+    "xóa",
+    "tạo",
+    "viết",
+    "chạy",
+    "cập nhật",
+    "kiểm tra",
+    "xây dựng",
+    "triển khai",
 ];
 
 fn verb_re() -> &'static Regex {
@@ -187,7 +222,14 @@ impl WorkflowDefinition {
 }
 
 pub fn builtin_workflows() -> Vec<WorkflowDefinition> {
-    let def = |name: &str, description: &str, steps: Vec<Value>| WorkflowDefinition { name: name.into(), description: description.into(), scope: "builtin", path: None, inputs: None, steps: steps.into_iter().map(step).collect() };
+    let def = |name: &str, description: &str, steps: Vec<Value>| WorkflowDefinition {
+        name: name.into(),
+        description: description.into(),
+        scope: "builtin",
+        path: None,
+        inputs: None,
+        steps: steps.into_iter().map(step).collect(),
+    };
     vec![
         def(
             "feature-dev",
@@ -399,8 +441,6 @@ pub fn parse_markdown_workflow(filename: &str, content: &str, scope: &'static st
     static FM: OnceLock<Regex> = OnceLock::new();
     static LINE: OnceLock<Regex> = OnceLock::new();
     static STEP: OnceLock<Regex> = OnceLock::new();
-    static CODE: OnceLock<Regex> = OnceLock::new();
-    static BULLET: OnceLock<Regex> = OnceLock::new();
     let mut name = EXT.get_or_init(|| Regex::new(r"(?i)\.(?:md|json)$").unwrap()).replace(filename, "").to_string();
     let mut description = String::new();
     let mut inputs = IndexMap::new();
@@ -461,7 +501,7 @@ pub fn parse_markdown_workflow(filename: &str, content: &str, scope: &'static st
             s.insert("type".into(), json!(kind));
             match kind.as_str() {
                 "shell" => {
-                    let code = CODE.get_or_init(|| Regex::new(r"(?i)```(?:bash|sh|shell)?\r?\n((?s).*?)```").unwrap());
+                    let code = crate::re!(r"(?i)```(?:bash|sh|shell)?\r?\n((?s).*?)```");
                     let command = code.captures(&section).map(|c| c[1].to_string()).unwrap_or_else(|| section.clone());
                     s.insert("command".into(), json!(command.trim()));
                 }
@@ -475,7 +515,7 @@ pub fn parse_markdown_workflow(filename: &str, content: &str, scope: &'static st
                     }
                 }
                 "subagent" => {
-                    let bullet = BULLET.get_or_init(|| Regex::new(r"^\s*[-*]\s+").unwrap());
+                    let bullet = crate::re!(r"^\s*[-*]\s+");
                     let bullets: Vec<String> = section.split('\n').map(|l| bullet.replace(l.strip_suffix('\r').unwrap_or(l), "").trim().to_string()).filter(|l| !l.is_empty()).collect();
                     s.insert("tasks".into(), json!(if bullets.is_empty() { vec![section.clone()] } else { bullets }));
                     s.insert("readOnly".into(), json!(true));
@@ -668,10 +708,19 @@ pub fn create_workflow_scaffold(cwd: &Path, name: &str, description: Option<&str
     let mut inputs = IndexMap::new();
     inputs.insert("focus".to_string(), "quality and tests".to_string());
     let steps = vec![
-        step(json!({ "id": "brainstorm", "title": "Brainstorm Ideas with Agent Network", "type": "network", "topic": "Brainstorm approach for: $input (Focus: $focus)", "roles": ["architect", "critic", "pragmatist"], "rounds": 1 })),
+        step(
+            json!({ "id": "brainstorm", "title": "Brainstorm Ideas with Agent Network", "type": "network", "topic": "Brainstorm approach for: $input (Focus: $focus)", "roles": ["architect", "critic", "pragmatist"], "rounds": 1 }),
+        ),
         step(json!({ "id": "execute", "title": "Implement Solution", "type": "prompt", "prompt": "Execute task \"$input\" following this plan:\n\n$prev" })),
     ];
-    let def = WorkflowDefinition { name: clean.clone(), description: description.clone(), scope: if global { "user" } else { "workspace" }, path: Some(file.clone()), inputs: Some(inputs.clone()), steps: steps.clone() };
+    let def = WorkflowDefinition {
+        name: clean.clone(),
+        description: description.clone(),
+        scope: if global { "user" } else { "workspace" },
+        path: Some(file.clone()),
+        inputs: Some(inputs.clone()),
+        steps: steps.clone(),
+    };
     atomic_json(&file, &json!({ "name": clean, "description": description, "inputs": inputs, "steps": steps.iter().map(|s| Value::Object(s.0.clone())).collect::<Vec<_>>() }), false)?;
     Ok((file, def))
 }
@@ -819,10 +868,26 @@ pub async fn execute_workflow(workflow: &WorkflowDefinition, raw_args: &str, hoo
                         env.insert(format!("GOON_WF_VAR_{key}"), v.clone());
                     }
                     let limits = hooks.policy.as_ref().map(|p| p.limits.clone());
-                    let timeout = limits.as_ref().map(|l| l.default_tool_timeout_ms).unwrap_or(DEFAULT_COMMAND_TIMEOUT_MS).min(limits.as_ref().map(|l| l.max_tool_timeout_ms).unwrap_or(DEFAULT_COMMAND_TIMEOUT_MS)).max(1000);
-                    let res = run_command("bash", &["-c".into(), cmd], RunOptions { cwd: &hooks.cwd, cancel: &hooks.cancel, timeout_ms: timeout, env: Some(env), output_limit_bytes: limits.as_ref().map(|l| l.max_output_bytes), hard_output_bytes: limits.as_ref().map(|l| l.hard_output_bytes) })
-                        .await
-                        .map_err(|e| anyhow!(e.to_string()))?;
+                    let timeout = limits
+                        .as_ref()
+                        .map(|l| l.default_tool_timeout_ms)
+                        .unwrap_or(DEFAULT_COMMAND_TIMEOUT_MS)
+                        .min(limits.as_ref().map(|l| l.max_tool_timeout_ms).unwrap_or(DEFAULT_COMMAND_TIMEOUT_MS))
+                        .max(1000);
+                    let res = run_command(
+                        "bash",
+                        &["-c".into(), cmd],
+                        RunOptions {
+                            cwd: &hooks.cwd,
+                            cancel: &hooks.cancel,
+                            timeout_ms: timeout,
+                            env: Some(env),
+                            output_limit_bytes: limits.as_ref().map(|l| l.max_output_bytes),
+                            hard_output_bytes: limits.as_ref().map(|l| l.hard_output_bytes),
+                        },
+                    )
+                    .await
+                    .map_err(|e| anyhow!(e.to_string()))?;
                     let out = limit_text(format!("Exit code: {}\n{}", res.code, res.output).trim(), 12_000);
                     if res.code != 0 && step.bool("continueOnError") != Some(true) {
                         bail!("Command exited with code {}:\n{}", res.code, take_chars(&res.output, 1000));
@@ -871,7 +936,14 @@ pub async fn execute_workflow(workflow: &WorkflowDefinition, raw_args: &str, hoo
         let duration = now_millis() - started;
         match outcome {
             Ok(None) => {
-                results.push(WorkflowStepResult { id: step.id().into(), title, kind: step.kind().into(), status: "skipped", output: "Aborted at approval gate by user.".into(), duration_ms: duration });
+                results.push(WorkflowStepResult {
+                    id: step.id().into(),
+                    title,
+                    kind: step.kind().into(),
+                    status: "skipped",
+                    output: "Aborted at approval gate by user.".into(),
+                    duration_ms: duration,
+                });
                 progress(&format!("╰─── Workflow \"{}\" stopped at approval gate ───╯\n", workflow.name));
                 return Ok(WorkflowRunResult { workflow: workflow.name.clone(), status: "aborted", steps: results, final_output: prev });
             }
@@ -898,10 +970,7 @@ pub async fn execute_workflow(workflow: &WorkflowDefinition, raw_args: &str, hoo
 
 pub fn format_workflow_details(wf: &WorkflowDefinition) -> String {
     let collapse = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
-    let mut lines = vec![
-        format!("Workflow: {} [{}]{}", wf.name, wf.scope, wf.path.as_ref().map(|p| format!(" ({})", p.display())).unwrap_or_default()),
-        format!("Description: {}", wf.description),
-    ];
+    let mut lines = vec![format!("Workflow: {} [{}]{}", wf.name, wf.scope, wf.path.as_ref().map(|p| format!(" ({})", p.display())).unwrap_or_default()), format!("Description: {}", wf.description)];
     if let Some(i) = wf.inputs.as_ref().filter(|i| !i.is_empty()) {
         lines.push(format!("Default inputs: {}", i.iter().map(|(k, v)| format!("{k}=\"{v}\"")).collect::<Vec<_>>().join(", ")));
     }
@@ -939,12 +1008,33 @@ mod tests {
 
     #[test]
     fn classifier_parity_cases() {
-        for p in ["fix the login bug", "add a test for parseUser", "refactor src/utils.ts", "write docs for the CLI", "update package.json", "run the tests", "review the code and fix issues if needed", "plan the feature", "chạy kiểm tra hồi quy", "", "Fix the bug and update the tests", "update src/a.ts, src/b.ts, src/c.ts"] {
+        for p in [
+            "fix the login bug",
+            "add a test for parseUser",
+            "refactor src/utils.ts",
+            "write docs for the CLI",
+            "update package.json",
+            "run the tests",
+            "review the code and fix issues if needed",
+            "plan the feature",
+            "chạy kiểm tra hồi quy",
+            "",
+            "Fix the bug and update the tests",
+            "update src/a.ts, src/b.ts, src/c.ts",
+        ] {
             let r = classify_workflow_complexity(p, 0);
             assert_eq!(r.mode, "single", "{p}: {}", r.reason);
         }
         assert!(classify_workflow_complexity("Implement auth, fix the login bug and update the docs", 0).reason.contains("3 distinct imperative verbs"));
-        for p in ["Fix the bug then update the tests", "Write the parser, after that update the docs", "thêm handler rồi... sau đó sửa test", "run the suite, then run lint, then run build", "multi-step task: implement the parser and write tests", "plan the workflow then implement it", "fix and update src/a.ts, src/b.ts, src/c.ts"] {
+        for p in [
+            "Fix the bug then update the tests",
+            "Write the parser, after that update the docs",
+            "thêm handler rồi... sau đó sửa test",
+            "run the suite, then run lint, then run build",
+            "multi-step task: implement the parser and write tests",
+            "plan the workflow then implement it",
+            "fix and update src/a.ts, src/b.ts, src/c.ts",
+        ] {
             let r = classify_workflow_complexity(p, 0);
             assert_eq!(r.mode, "multi", "{p}: {}", r.reason);
         }

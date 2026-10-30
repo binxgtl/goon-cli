@@ -100,11 +100,7 @@ impl SseParser {
 }
 
 fn header_map(response: &reqwest::Response) -> BTreeMap<String, String> {
-    response
-        .headers()
-        .iter()
-        .filter_map(|(k, v)| Some((k.as_str().to_lowercase(), v.to_str().ok()?.to_string())))
-        .collect()
+    response.headers().iter().filter_map(|(k, v)| Some((k.as_str().to_lowercase(), v.to_str().ok()?.to_string()))).collect()
 }
 
 fn status_text(status: reqwest::StatusCode) -> String {
@@ -130,13 +126,7 @@ fn error_from_body(status: reqwest::StatusCode, headers: BTreeMap<String, String
 
 /// POSTs a JSON body and streams parsed SSE events. Cancellation and the request deadline both end
 /// the stream with an aborted error.
-pub async fn post_sse(
-    url: &str,
-    headers: &[(String, String)],
-    body: &Value,
-    cancel: CancellationToken,
-    timeout: Duration,
-) -> Result<mpsc::Receiver<Result<SseEvent, ApiError>>, ApiError> {
+pub async fn post_sse(url: &str, headers: &[(String, String)], body: &Value, cancel: CancellationToken, timeout: Duration) -> Result<mpsc::Receiver<Result<SseEvent, ApiError>>, ApiError> {
     let deadline = tokio::time::Instant::now() + timeout;
     let mut request = http_client().post(url).header("content-type", "application/json").header("accept", "text/event-stream");
     for (k, v) in headers {

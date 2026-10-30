@@ -74,10 +74,10 @@ pub fn resolve_model_capabilities(model_id: &str, discovered: Option<&Discovered
 }
 
 fn format_token_count(n: u64) -> String {
-    if n % 1024 == 0 {
+    if n.is_multiple_of(1024) {
         return format!("{}k", n / 1024);
     }
-    if n % 1000 == 0 {
+    if n.is_multiple_of(1000) {
         return format!("{}k", n / 1000);
     }
     format!("{}k", crate::jsutil::js_round(n as f64 / 1024.0) as i64)

@@ -158,7 +158,16 @@ impl AgentNetworkBus {
     }
 
     pub fn post_blackboard(&self, author: &str, role: &str, topic: &str, content: &str, kind: Option<&str>, round: Option<u32>) -> BlackboardEntry {
-        let entry = BlackboardEntry { id: short_id(), author: author.into(), role: role.into(), topic: topic.trim().into(), kind: kind.unwrap_or("idea").into(), content: content.trim().into(), round, created_at: now_iso() };
+        let entry = BlackboardEntry {
+            id: short_id(),
+            author: author.into(),
+            role: role.into(),
+            topic: topic.trim().into(),
+            kind: kind.unwrap_or("idea").into(),
+            content: content.trim().into(),
+            round,
+            created_at: now_iso(),
+        };
         let mut s = self.state.lock().unwrap();
         s.blackboard.push(entry.clone());
         if s.blackboard.len() > 200 {
@@ -192,10 +201,8 @@ impl AgentNetworkBus {
         if unread.is_empty() {
             return String::new();
         }
-        let lines: Vec<String> = unread
-            .iter()
-            .map(|m| format!("  • [{}] from {}{}: {}", m.kind.to_uppercase(), m.from, m.topic.as_ref().map(|t| format!(" ({t})")).unwrap_or_default(), m.content))
-            .collect();
+        let lines: Vec<String> =
+            unread.iter().map(|m| format!("  • [{}] from {}{}: {}", m.kind.to_uppercase(), m.from, m.topic.as_ref().map(|t| format!(" ({t})")).unwrap_or_default(), m.content)).collect();
         format!("\n<peer_messages_inbox>\nPeer agents sent you the following messages:\n{}\n</peer_messages_inbox>\n", lines.join("\n"))
     }
 
@@ -405,7 +412,12 @@ pub fn resolve_personas(roles: Option<&[String]>) -> Vec<NetworkPersona> {
                     Some(c) => format!("{}{}", c.to_uppercase(), chars.as_str()),
                     None => String::new(),
                 };
-                out.push(NetworkPersona { id: key, name: display.clone(), role: format!("{display} Specialist"), focus: format!("Provide specialized {display} insights, constructive critique, and concrete recommendations.") });
+                out.push(NetworkPersona {
+                    id: key,
+                    name: display.clone(),
+                    role: format!("{display} Specialist"),
+                    focus: format!("Provide specialized {display} insights, constructive critique, and concrete recommendations."),
+                });
             }
         }
     }
@@ -468,7 +480,13 @@ impl AgentNetwork {
             }))
         };
         for p in &personas {
-            self.bus.register_node(NetworkNodeInfo { id: format!("net-{}", p.id), nickname: p.name.clone(), role: p.role.clone(), status: "ready".into(), task: Some(take_chars(&options.topic, 120).to_string()) });
+            self.bus.register_node(NetworkNodeInfo {
+                id: format!("net-{}", p.id),
+                nickname: p.name.clone(),
+                role: p.role.clone(),
+                status: "ready".into(),
+                task: Some(take_chars(&options.topic, 120).to_string()),
+            });
         }
         progress(&format!(
             "\n╭─── Agent Network Brainstorm · {} ({} round{}) ───╮\n  Topic: {}\n",
@@ -503,10 +521,24 @@ impl AgentNetwork {
                         self.bus.update_node_status(&persona.name, &format!("round-{round}"), None);
                         progress(&format!("  ▸ [{} · {}] thinking...\n", persona.name, persona.role));
                         let prior = contributions.lock().unwrap().clone();
-                        let response = self.run_persona_turn(PersonaTurn { persona, all: &personas, topic: &options.topic, round, total_rounds: rounds, prior, explore }, &options.cancel, &budget, options.policy.clone()).await?;
+                        let response = self
+                            .run_persona_turn(
+                                PersonaTurn { persona, all: &personas, topic: &options.topic, round, total_rounds: rounds, prior, explore },
+                                &options.cancel,
+                                &budget,
+                                options.policy.clone(),
+                            )
+                            .await?;
                         self.sync_parent_budget(parent_budget.as_ref(), &budget);
                         contributions.lock().unwrap().push(Contribution { round, persona: persona.clone(), response: response.clone() });
-                        self.bus.post_blackboard(&persona.name, &persona.role, &format!("Round {round}: {}", take_chars(&options.topic, 60)), &response, Some(if round == 1 { "idea" } else { "critique" }), Some(round));
+                        self.bus.post_blackboard(
+                            &persona.name,
+                            &persona.role,
+                            &format!("Round {round}: {}", take_chars(&options.topic, 60)),
+                            &response,
+                            Some(if round == 1 { "idea" } else { "critique" }),
+                            Some(round),
+                        );
                         self.bus.update_node_status(&persona.name, "idle", None);
                         let preview = take_chars(collapse(&response).trim(), 180).to_string();
                         progress(&format!("  ● [{}] {preview}{}\n", persona.name, if crate::jsutil::utf16_len(&response) > 180 { "…" } else { "" }));
@@ -637,7 +669,16 @@ impl AgentNetwork {
         result
     }
 
-    async fn run_synthesis(&self, topic: &str, personas: &[NetworkPersona], rounds: u32, contributions: &[Contribution], cancel: &CancellationToken, budget: &SharedBudget, policy: Option<Arc<ExecutionPolicy>>) -> Result<String> {
+    async fn run_synthesis(
+        &self,
+        topic: &str,
+        personas: &[NetworkPersona],
+        rounds: u32,
+        contributions: &[Contribution],
+        cancel: &CancellationToken,
+        budget: &SharedBudget,
+        policy: Option<Arc<ExecutionPolicy>>,
+    ) -> Result<String> {
         let tools = self.child_tools(policy, budget);
         tools.update_flags(|f| f.only_peer_tools = true);
         let transcript = contributions.iter().map(|c| format!("### [Round {}] {} ({})\n{}", c.round, c.persona.name, c.persona.role, c.response)).collect::<Vec<_>>().join("\n\n");

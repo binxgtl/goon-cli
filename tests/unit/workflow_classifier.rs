@@ -71,7 +71,14 @@ fn caller_provided_file_count_counts_toward_the_path_signal() {
 }
 
 fn def(steps: Vec<Value>) -> WorkflowDefinition {
-    WorkflowDefinition { name: "w".into(), description: "d".into(), scope: "builtin", path: None, inputs: None, steps: steps.into_iter().map(|s| WorkflowStep(s.as_object().unwrap().clone())).collect() }
+    WorkflowDefinition {
+        name: "w".into(),
+        description: "d".into(),
+        scope: "builtin",
+        path: None,
+        inputs: None,
+        steps: steps.into_iter().map(|s| WorkflowStep(s.as_object().unwrap().clone())).collect(),
+    }
 }
 
 #[derive(Default)]

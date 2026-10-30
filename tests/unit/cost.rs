@@ -143,7 +143,8 @@ fn harness_account_usage_updates_session_canonical_and_budget_mirror() {
 #[test]
 fn child_harness_never_clobbers_a_shared_budget_with_its_own_session_cost() {
     let f = fixture();
-    let parent = Arc::new(CostLedger::new(table(&[("test-model", Price { input_per_1m: 1.0, output_per_1m: 0.0, cached_input_per_1m: None, cache_write_per_1m: None })], None), Some("test-model".into())));
+    let parent =
+        Arc::new(CostLedger::new(table(&[("test-model", Price { input_per_1m: 1.0, output_per_1m: 0.0, cached_input_per_1m: None, cache_write_per_1m: None })], None), Some("test-model".into())));
     *parent.total.lock().unwrap() = 5.0;
     let shared: SharedBudget = Arc::new(Mutex::new(RunBudget { spent: 0, limit: 0, cost_spent: 5.0, cost_limit: 0.0, started_at: None, time_limit_ms: 0, ledger: Some(parent.clone()) }));
     let (child, _) = harness_fixture(&f);

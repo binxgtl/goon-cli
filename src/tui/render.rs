@@ -1,8 +1,11 @@
 //! Transcript parsing/styling and frame layout. Every row is wrapped to the terminal width
 //! before styling (prefixes included), so no emitted row can exceed it.
 
-use super::text::{format_compact_duration, format_inline_markdown, format_inline_markdown_default, format_token_count, re, slice_ansi_line, slice_visible, style_box_line, visible_length, wrap_chunks, wrap_terminal, BOLD, BRAND, BRAND_BOLD, DEFAULT_FG, DIM, ERR, INFO, OK, RESET, WARN};
-use super::{glyph, slash_description, BodyCache, Block, PickerState, Row, RowKind, State, Tui, SPINNER, USER_MARK};
+use super::text::{
+    format_compact_duration, format_inline_markdown, format_inline_markdown_default, format_token_count, slice_ansi_line, slice_visible, style_box_line, visible_length, wrap_chunks, wrap_terminal,
+    BOLD, BRAND, BRAND_BOLD, DEFAULT_FG, DIM, ERR, INFO, OK, RESET, WARN,
+};
+use super::{glyph, slash_description, Block, BodyCache, PickerState, Row, RowKind, State, Tui, SPINNER, USER_MARK};
 use crate::session::format_goal_status_indicator;
 
 type Seg = (String, &'static str);
@@ -57,7 +60,11 @@ impl Tui {
         let cols = columns.max(4);
         let show_reasoning = st.view_mode != "normal" || st.in_transcript_overlay;
         let transcript = st.transcript.clone();
-        let reuse = st.body_cache.as_ref().map(|c| c.cols == cols && c.rich == rich && c.show_reasoning == show_reasoning && transcript.len() >= c.source.len() && transcript.starts_with(&c.source)).unwrap_or(false);
+        let reuse = st
+            .body_cache
+            .as_ref()
+            .map(|c| c.cols == cols && c.rich == rich && c.show_reasoning == show_reasoning && transcript.len() >= c.source.len() && transcript.starts_with(&c.source))
+            .unwrap_or(false);
         let cache = if reuse { st.body_cache.take() } else { None };
         let mut state = cache.as_ref().map(|c| c.state).unwrap_or_default();
         let mut rows: Vec<Row> = cache.as_ref().map(|c| c.rows.clone()).unwrap_or_default();
@@ -153,7 +160,11 @@ impl Tui {
                     let grid = format!("├{}┤", widths.iter().map(|w| "─".repeat(w + 2)).collect::<Vec<_>>().join("┼"));
                     rows.push(Row { kind: RowKind::Table, pre: first_pre(base), text: slice_visible(&grid, avail), glyph: None, sign: None, level: 0 });
                 } else {
-                    let cells: Vec<String> = split_table_cells(trimmed).iter().enumerate().map(|(i, c)| format!("{c}{}", " ".repeat(widths.get(i).copied().unwrap_or(0).saturating_sub(visible_length(&displayed_cell(c)))))).collect();
+                    let cells: Vec<String> = split_table_cells(trimmed)
+                        .iter()
+                        .enumerate()
+                        .map(|(i, c)| format!("{c}{}", " ".repeat(widths.get(i).copied().unwrap_or(0).saturating_sub(visible_length(&displayed_cell(c))))))
+                        .collect();
                     rows.push(Row { kind: RowKind::Table, pre: first_pre(base), text: slice_visible(&format!("│ {} │", cells.join(" │ ")), avail), glyph: None, sign: None, level: 0 });
                 }
                 return;
@@ -216,7 +227,7 @@ impl Tui {
             if state.block == Block::Reasoning && !show_reasoning {
                 continue;
             }
-            if trimmed.starts_with("```") {
+            if let Some(fence_label) = trimmed.strip_prefix("```") {
                 if state.in_code {
                     state.in_code = false;
                     blank(&mut rows);
@@ -224,7 +235,7 @@ impl Tui {
                     state.in_code = true;
                     state.in_diff = false;
                     state.answer_first = false;
-                    let label = trimmed[3..].trim();
+                    let label = fence_label.trim();
                     rows.push(Row { kind: RowKind::CodeHead, pre: String::new(), text: if label.is_empty() { "code".into() } else { label.to_string() }, glyph: None, sign: None, level: 0 });
                 }
                 continue;
@@ -404,14 +415,7 @@ impl Tui {
             }
             RowKind::Banner => {
                 if re!(r"^/help\b").is_match(&row.text) {
-                    let painted = re!(r"(/help|shift\+tab|(?:^|\s)[@$!]) ").replace_all(&row.text, |c: &regex::Captures| {
-                        let tok = &c[1];
-                        if tok == "/help" || tok == "shift+tab" {
-                            format!("{RESET}{tok}{DIM} ")
-                        } else {
-                            format!("{RESET}{tok}{DIM} ")
-                        }
-                    });
+                    let painted = re!(r"(/help|shift\+tab|(?:^|\s)[@$!]) ").replace_all(&row.text, |c: &regex::Captures| format!("{RESET}{}{DIM} ", &c[1]));
                     let painted = re!(r"(shift\+tab)$").replace_all(&painted, format!("{RESET}${{1}}{DIM}").as_str());
                     return format!("{}{DIM}{painted}{RESET}", row.pre);
                 }
@@ -446,7 +450,13 @@ impl Tui {
             return format!("{glyph_out}{BRAND_BOLD}{}{RESET}", row.text);
         }
         let verb_tone = if glyph == glyph::FAILED { format!("{ERR}\x1b[1m") } else { BOLD.to_string() };
-        let rest_base = if glyph == glyph::RAN { INFO } else if glyph == glyph::EDIT { DEFAULT_FG } else { DIM };
+        let rest_base = if glyph == glyph::RAN {
+            INFO
+        } else if glyph == glyph::EDIT {
+            DEFAULT_FG
+        } else {
+            DIM
+        };
         format!("{glyph_out}{verb_tone}{verb}{RESET}{rest_base}{}{RESET}", with_durations(&rest, rest_base))
     }
 
@@ -550,7 +560,13 @@ impl Tui {
     fn context_group(st: &State) -> Vec<Seg> {
         let (Some(used), true) = (st.context_used, st.context_window > 0) else { return vec![] };
         let pct = ((used as f64 / st.context_window as f64) * 100.0).round().clamp(0.0, 100.0) as u64;
-        let tone = if pct >= 90 { ERR } else if pct >= 70 { WARN } else { DIM };
+        let tone = if pct >= 90 {
+            ERR
+        } else if pct >= 70 {
+            WARN
+        } else {
+            DIM
+        };
         vec![seg(format!("ctx {pct}%"), tone)]
     }
 
@@ -572,7 +588,11 @@ impl Tui {
         let matches = Tui::picker_matches(state, state.tab);
         let list_rows = max_rows.saturating_sub(3).max(1);
         if matches.is_empty() {
-            let empty = if !state.filter.is_empty() { format!("No match for \"{}\"", state.filter) } else { state.tabs.get(state.tab).and_then(|t| t.empty.clone()).unwrap_or_else(|| "Nothing here yet".into()) };
+            let empty = if !state.filter.is_empty() {
+                format!("No match for \"{}\"", state.filter)
+            } else {
+                state.tabs.get(state.tab).and_then(|t| t.empty.clone()).unwrap_or_else(|| "Nothing here yet".into())
+            };
             lines.push(format!("{DIM}  {}{RESET}", slice_visible(&empty, cols.saturating_sub(2).max(1))));
         } else {
             state.index = state.index.min(matches.len() - 1);
@@ -686,7 +706,12 @@ impl Tui {
 
         // Full-screen transcript (Ctrl+T or /transcript).
         if st.in_transcript_overlay {
-            let header = Self::band(&[seg(format!("{} ", glyph::BRAND), BRAND_BOLD), seg("transcript", BOLD), seg(format!("   {session_label}"), DIM)], vec![goal_group.clone(), todo_group.clone()], safe_cols, rich);
+            let header = Self::band(
+                &[seg(format!("{} ", glyph::BRAND), BRAND_BOLD), seg("transcript", BOLD), seg(format!("   {session_label}"), DIM)],
+                vec![goal_group.clone(), todo_group.clone()],
+                safe_cols,
+                rich,
+            );
             let height = rows.saturating_sub(2).max(2);
             st.max_scroll = all.len().saturating_sub(height);
             st.scroll = st.scroll.min(st.max_scroll);
@@ -765,7 +790,10 @@ impl Tui {
             return;
         }
 
-        let queue_lines: Vec<String> = st.queued_prompts[st.queued_prompts.len().saturating_sub(3)..].iter().map(|q| format!("{DIM}{}{RESET}", clip(&format!("  queued  {}   alt+↑ edit", q.split_whitespace().collect::<Vec<_>>().join(" "))))).collect();
+        let queue_lines: Vec<String> = st.queued_prompts[st.queued_prompts.len().saturating_sub(3)..]
+            .iter()
+            .map(|q| format!("{DIM}{}{RESET}", clip(&format!("  queued  {}   alt+↑ edit", q.split_whitespace().collect::<Vec<_>>().join(" ")))))
+            .collect();
         let fixed_rows = 1 + queue_lines.len() + 3;
         let mut popup_lines: Vec<String> = vec![];
         let (matches, selected) = Self::slash_popup(st);
@@ -808,17 +836,30 @@ impl Tui {
         let placeholder_text = if busy { "Type to queue a follow-up; /commands run now" } else { "Ask anything   / commands   @ files   $ skills   ! shell" };
         let placeholder = if empty { wrap_terminal(placeholder_text, input_cols).into_iter().next().unwrap_or_default() } else { String::new() };
         let label_styled = if asking { format!("{WARN}{BOLD}{prompt_label}{RESET}") } else { format!("{BRAND_BOLD}{prompt_label}{RESET}") };
-        let content = if !placeholder.is_empty() { format!("{DIM}{placeholder}{RESET}") } else if st.masked { shown.clone() } else { format_inline_markdown_default(&shown) };
+        let content = if !placeholder.is_empty() {
+            format!("{DIM}{placeholder}{RESET}")
+        } else if st.masked {
+            shown.clone()
+        } else {
+            format_inline_markdown_default(&shown)
+        };
         let prompt_line = format!("{label_styled}{content}");
         let display_mode = if st.mode_label == "auto" { "auto-approve".to_string() } else { st.mode_label.clone() };
         // Auto-approve is the one risky state, so it is the one mode shown in a warning colour.
-        let mode_tone = if display_mode == "auto-approve" { WARN } else if display_mode == "plan" { BRAND } else { DIM };
+        let mode_tone = if display_mode == "auto-approve" {
+            WARN
+        } else if display_mode == "plan" {
+            BRAND
+        } else {
+            DIM
+        };
         let mut left: Vec<Seg> = vec![seg(display_mode, mode_tone), seg(format!("   {model_name}"), DIM), seg(format!("   effort {}", st.effort_label), DIM)];
         if st.view_mode == "transcript" {
             left.push(seg("   transcript view", DIM));
         }
         let hint: Vec<Seg> = if awaiting { vec![seg(format!("enter submit   esc {}", st.esc_hint), DIM)] } else { vec![] };
-        let place: Vec<Seg> = if st.workspace_name.is_empty() { vec![] } else { vec![seg(if st.branch.is_empty() { st.workspace_name.clone() } else { format!("{} ({})", st.workspace_name, st.branch) }, DIM)] };
+        let place: Vec<Seg> =
+            if st.workspace_name.is_empty() { vec![] } else { vec![seg(if st.branch.is_empty() { st.workspace_name.clone() } else { format!("{} ({})", st.workspace_name, st.branch) }, DIM)] };
         let footer = Self::band(&left, vec![hint, place, goal_group, todo_group, Self::context_group(st), token_group], safe_cols, rich);
         let mut lines = body;
         lines.push(status_line);

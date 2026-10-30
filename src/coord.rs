@@ -79,7 +79,8 @@ fn planner_schema() -> Value {
 }
 
 pub fn plan_from_planner(raw: &Value, id: &str) -> Result<Plan> {
-    let parsed = crate::schema::zod_parse(&planner_schema(), raw, &["goal", "todos.*.id", "todos.*.title", "todos.*.dependsOn.*", "todos.*.assignee", "todos.*.artifacts.*"]).map_err(|e| anyhow!(e))?;
+    let parsed =
+        crate::schema::zod_parse(&planner_schema(), raw, &["goal", "todos.*.id", "todos.*.title", "todos.*.dependsOn.*", "todos.*.assignee", "todos.*.artifacts.*"]).map_err(|e| anyhow!(e))?;
     let strs = |v: &Value| v.as_array().map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect::<Vec<_>>()).unwrap_or_default();
     let todos = parsed["todos"]
         .as_array()
@@ -523,7 +524,15 @@ pub async fn run_dag(goal: &str, hooks: DagHooks, opts: DagOptions) -> Result<Da
             Some(b) => b.clone(),
             None => {
                 let limit = if opts.config.run_token_budget > 0 { opts.config.run_token_budget } else { DEFAULT_DAG_TOKEN_BUDGET };
-                Arc::new(Mutex::new(RunBudget { spent: 0, limit, cost_spent: 0.0, cost_limit: opts.config.max_cost_usd, started_at: Some(now_millis()), time_limit_ms: opts.config.max_time_ms, ledger: None }))
+                Arc::new(Mutex::new(RunBudget {
+                    spent: 0,
+                    limit,
+                    cost_spent: 0.0,
+                    cost_limit: opts.config.max_cost_usd,
+                    started_at: Some(now_millis()),
+                    time_limit_ms: opts.config.max_time_ms,
+                    ledger: None,
+                }))
             }
         };
         {
@@ -550,7 +559,14 @@ pub async fn run_dag(goal: &str, hooks: DagHooks, opts: DagOptions) -> Result<Da
             return Err(error.into());
         }
         emit(json!({ "type": "dag_plan_ready", "planId": plan.id, "todos": plan.todos.len() }));
-        *state.lock().unwrap() = Some(DagState { scheduler: Scheduler::new(plan, write_concurrency, max_concurrency), reports: HashMap::new(), diffs: HashMap::new(), failures: HashMap::new(), todo_backups: vec![], rolled_back: false });
+        *state.lock().unwrap() = Some(DagState {
+            scheduler: Scheduler::new(plan, write_concurrency, max_concurrency),
+            reports: HashMap::new(),
+            diffs: HashMap::new(),
+            failures: HashMap::new(),
+            todo_backups: vec![],
+            rolled_back: false,
+        });
         let with = |f: &mut dyn FnMut(&mut DagState)| {
             let mut g = state.lock().unwrap();
             f(g.as_mut().unwrap());
@@ -596,7 +612,14 @@ pub async fn run_dag(goal: &str, hooks: DagHooks, opts: DagOptions) -> Result<Da
                 }
                 let mut backups: Vec<FileBackup> = vec![];
                 let attempt: Result<()> = async {
-                    let report = (hooks.spawn)(DagSpawnRequest { todo: todo.clone(), read_only: !write, allowed_tools: role_toolset(&todo.role, &allowed_mcp), budget: budget.clone(), cancel: internal.clone() }).await?;
+                    let report = (hooks.spawn)(DagSpawnRequest {
+                        todo: todo.clone(),
+                        read_only: !write,
+                        allowed_tools: role_toolset(&todo.role, &allowed_mcp),
+                        budget: budget.clone(),
+                        cancel: internal.clone(),
+                    })
+                    .await?;
                     backups = if write { files.take_turn_backups() } else { vec![] };
                     let diff = diff_from_backups(&files, &backups);
                     with(&mut |s| {
@@ -712,7 +735,8 @@ pub async fn run_dag(goal: &str, hooks: DagHooks, opts: DagOptions) -> Result<Da
         }
         let verify_hook = hooks.verify.clone();
         let cancel = internal.clone();
-        let verify: VerifyMergeFn = verify_hook.map(|v| Box::new(move |combined: String, artifacts: Vec<String>| v(artifacts, combined, cancel)) as Box<dyn FnOnce(String, Vec<String>) -> BoxFuture<'static, Result<bool>> + Send>);
+        let verify: VerifyMergeFn = verify_hook
+            .map(|v| Box::new(move |combined: String, artifacts: Vec<String>| v(artifacts, combined, cancel)) as Box<dyn FnOnce(String, Vec<String>) -> BoxFuture<'static, Result<bool>> + Send>);
         let merged = merge(&plan, &diffs, opts.allow_empty, verify).await?;
         let mut ev = Map::new();
         ev.insert("type".into(), json!("dag_merge"));
@@ -854,7 +878,15 @@ pub async fn run_scope_loop(goal: &str, attempt: impl Fn(ScopeLoopAttempt, Cance
         for round in 1..=max_rounds {
             if let Some(cap) = budget_stop_reason(opts.budget.as_ref()) {
                 emit(round, "stop", &cap);
-                return Ok(ScopeLoopResult { ok: false, rounds: round - 1, reason: cap, verdict: last_verdict.clone(), reports: reports.clone(), changed_files: changed.clone(), rollback: Some(rollback(&accumulated)?) });
+                return Ok(ScopeLoopResult {
+                    ok: false,
+                    rounds: round - 1,
+                    reason: cap,
+                    verdict: last_verdict.clone(),
+                    reports: reports.clone(),
+                    changed_files: changed.clone(),
+                    rollback: Some(rollback(&accumulated)?),
+                });
             }
             opts.files.begin_turn();
             let verify_output = last_verdict.as_ref().map(|v| redact_text(&format_verify_errors(v), &secrets)).unwrap_or_default();
@@ -866,7 +898,15 @@ pub async fn run_scope_loop(goal: &str, attempt: impl Fn(ScopeLoopAttempt, Cance
             if changed.is_empty() {
                 let reason = "no tracked file changes to verify";
                 emit(round, "stop", reason);
-                return Ok(ScopeLoopResult { ok: false, rounds: round, reason: reason.into(), verdict: None, reports: reports.clone(), changed_files: changed.clone(), rollback: Some(rollback(&accumulated)?) });
+                return Ok(ScopeLoopResult {
+                    ok: false,
+                    rounds: round,
+                    reason: reason.into(),
+                    verdict: None,
+                    reports: reports.clone(),
+                    changed_files: changed.clone(),
+                    rollback: Some(rollback(&accumulated)?),
+                });
             }
             let mut plan = plan_verification(&opts.cwd, &changed, &cfg, &policy);
             last_commands = plan.commands.iter().map(|c| c.display.clone()).collect();
@@ -877,7 +917,15 @@ pub async fn run_scope_loop(goal: &str, attempt: impl Fn(ScopeLoopAttempt, Cance
             last_verdict = Some(verdict.clone());
             if verdict.severity != Severity::Fail {
                 emit(round, "contract", &format!("verification {} in {}ms: {}", verdict.severity.as_str(), now_millis() - started, verdict.reason));
-                return Ok(ScopeLoopResult { ok: true, rounds: round, reason: verdict.reason.clone(), verdict: Some(verdict), reports: reports.clone(), changed_files: changed.clone(), rollback: None });
+                return Ok(ScopeLoopResult {
+                    ok: true,
+                    rounds: round,
+                    reason: verdict.reason.clone(),
+                    verdict: Some(verdict),
+                    reports: reports.clone(),
+                    changed_files: changed.clone(),
+                    rollback: None,
+                });
             }
             if round == max_rounds {
                 break;
@@ -931,11 +979,7 @@ pub fn reflect(index: usize, task: &str, report: &str, cost_usd: f64, backups: V
 pub fn rerank(candidates: &[Candidate]) -> Vec<Candidate> {
     let mut out = candidates.to_vec();
     out.sort_by(|a, b| {
-        (b.passed as u8)
-            .cmp(&(a.passed as u8))
-            .then(a.warnings.cmp(&b.warnings))
-            .then(a.cost_usd.partial_cmp(&b.cost_usd).unwrap_or(std::cmp::Ordering::Equal))
-            .then(a.index.cmp(&b.index))
+        (b.passed as u8).cmp(&(a.passed as u8)).then(a.warnings.cmp(&b.warnings)).then(a.cost_usd.partial_cmp(&b.cost_usd).unwrap_or(std::cmp::Ordering::Equal)).then(a.index.cmp(&b.index))
     });
     out
 }
@@ -1021,7 +1065,16 @@ pub async fn run_candidates(
                 if !backups.is_empty() {
                     let _ = files.restore_backups(&backups, false);
                 }
-                generated.push(Candidate { index, task: task.into(), report, cost_usd: (spent() - before).max(0.0), passed: false, warnings: 0, reason: safe_error(&error.to_string(), None), backups });
+                generated.push(Candidate {
+                    index,
+                    task: task.into(),
+                    report,
+                    cost_usd: (spent() - before).max(0.0),
+                    passed: false,
+                    warnings: 0,
+                    reason: safe_error(&error.to_string(), None),
+                    backups,
+                });
             }
         }
     }
@@ -1046,13 +1099,22 @@ pub fn default_runner() -> Arc<dyn VerifyRunner> {
     Arc::new(CommandRunner)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn todo(id: &str, deps: &[&str], role: &str) -> Todo {
-        Todo { id: id.into(), title: id.into(), acceptance: String::new(), depends_on: deps.iter().map(|d| d.to_string()).collect(), status: "pending".into(), role: role.into(), assignee: None, artifacts: vec![], rework_cycles: 0 }
+        Todo {
+            id: id.into(),
+            title: id.into(),
+            acceptance: String::new(),
+            depends_on: deps.iter().map(|d| d.to_string()).collect(),
+            status: "pending".into(),
+            role: role.into(),
+            assignee: None,
+            artifacts: vec![],
+            rework_cycles: 0,
+        }
     }
 
     #[test]

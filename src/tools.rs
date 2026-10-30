@@ -158,8 +158,23 @@ pub fn tool_allowed_by_set(allowed: &HashSet<String>, name: &str) -> bool {
 
 pub const PEER_TOOLS: [&str; 4] = ["peer_list", "peer_send", "peer_broadcast", "peer_read"];
 const COLLAB_TOOLS: [&str; 17] = [
-    "spawn_agent", "wait_agent", "send_input", "close_agent", "resume_agent", "list_agents", "agent_network", "run_workflow", "update_plan", "get_goal", "create_goal", "update_goal", "request_user_input", "view_image",
-    "list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource",
+    "spawn_agent",
+    "wait_agent",
+    "send_input",
+    "close_agent",
+    "resume_agent",
+    "list_agents",
+    "agent_network",
+    "run_workflow",
+    "update_plan",
+    "get_goal",
+    "create_goal",
+    "update_goal",
+    "request_user_input",
+    "view_image",
+    "list_mcp_resources",
+    "list_mcp_resource_templates",
+    "read_mcp_resource",
 ];
 
 pub fn format_todos(todos: &[TodoItem]) -> String {
@@ -353,10 +368,16 @@ pub fn normalize_tool_input(tool: &str, input: &Value) -> Value {
                 obj.insert("targets".into(), json!([s]));
             }
             Some(Value::Array(a)) => {
-                let list: Vec<Value> = a.iter().map(|v| Value::String(match v {
-                    Value::String(s) => s.clone(),
-                    other => crate::jsutil::js_string(other),
-                })).filter(|v| !v.as_str().unwrap().is_empty()).collect();
+                let list: Vec<Value> = a
+                    .iter()
+                    .map(|v| {
+                        Value::String(match v {
+                            Value::String(s) => s.clone(),
+                            other => crate::jsutil::js_string(other),
+                        })
+                    })
+                    .filter(|v| !v.as_str().unwrap().is_empty())
+                    .collect();
                 obj.insert("targets".into(), Value::Array(list));
             }
             _ => {}
@@ -527,7 +548,22 @@ pub fn catalog_definition(name: &str, exec: Option<ToolExec>) -> ToolDefinition 
 }
 
 const BUILTINS: [&str; 16] = [
-    "read_file", "list_files", "search", "todo_write", "todo_read", "update_plan", "get_goal", "create_goal", "update_goal", "request_user_input", "view_image", "exit_plan_mode", "write_file", "edit_file", "apply_patch", "bash",
+    "read_file",
+    "list_files",
+    "search",
+    "todo_write",
+    "todo_read",
+    "update_plan",
+    "get_goal",
+    "create_goal",
+    "update_goal",
+    "request_user_input",
+    "view_image",
+    "exit_plan_mode",
+    "write_file",
+    "edit_file",
+    "apply_patch",
+    "bash",
 ];
 
 pub struct ToolRegistry {
@@ -714,10 +750,7 @@ impl ToolRegistry {
     /// Tool specs offered to the model in the current mode.
     pub fn schemas(&self) -> Vec<ToolSpec> {
         let defs = self.definitions.read().unwrap().clone();
-        defs.iter()
-            .filter(|(n, d)| self.is_exposed(n, d))
-            .map(|(n, d)| ToolSpec { name: n.clone(), description: d.description.clone(), parameters: d.schema.clone() })
-            .collect()
+        defs.iter().filter(|(n, d)| self.is_exposed(n, d)).map(|(n, d)| ToolSpec { name: n.clone(), description: d.description.clone(), parameters: d.schema.clone() }).collect()
     }
 
     /// Validators for the exposed tools (the AI SDK parses tool-call input before the harness sees it).
@@ -728,7 +761,8 @@ impl ToolRegistry {
 
     pub fn is_read_only_tool(&self, name: &str) -> bool {
         let canonical = self.resolve_tool_name(name);
-        if ["exit_plan_mode", "todo_write", "update_plan", "create_goal", "update_goal", "request_user_input", "wait_agent", "send_input", "close_agent", "resume_agent"].contains(&canonical.as_str()) {
+        if ["exit_plan_mode", "todo_write", "update_plan", "create_goal", "update_goal", "request_user_input", "wait_agent", "send_input", "close_agent", "resume_agent"].contains(&canonical.as_str())
+        {
             return false;
         }
         self.definitions.read().unwrap().get(&canonical).map(|d| d.read_only).unwrap_or(false)
@@ -764,7 +798,13 @@ impl ToolRegistry {
         let canonical = self.resolve_tool_name(&call.tool_name);
         let Some(definition) = self.definition(&canonical) else { bail!("Unknown tool: {}", call.tool_name) };
         if canonical != "exit_plan_mode" && !self.is_exposed(&canonical, &definition) {
-            let mode = if self.plan_mode() { "plan" } else if self.effective_read_only() { "read-only" } else { "the current" };
+            let mode = if self.plan_mode() {
+                "plan"
+            } else if self.effective_read_only() {
+                "read-only"
+            } else {
+                "the current"
+            };
             bail!("Tool is not available in {mode} mode: {}", call.tool_name);
         }
         let normalized = normalize_tool_input(&canonical, &call.input);
@@ -790,7 +830,8 @@ impl ToolRegistry {
         let trusted_auto = definition.trusted == Some(true) && (risk == RiskClass::Medium || risk == RiskClass::Low);
         let needs_approval = !definition.read_only || risk != RiskClass::Low;
         if needs_approval && !trusted_auto {
-            let approved = (self.approve)(ApprovalRequest { tool: canonical.clone(), input: input.clone(), cancel: cancel.clone(), risk: Some(risk), trusted: Some(definition.trusted == Some(true)) }).await;
+            let approved =
+                (self.approve)(ApprovalRequest { tool: canonical.clone(), input: input.clone(), cancel: cancel.clone(), risk: Some(risk), trusted: Some(definition.trusted == Some(true)) }).await;
             if !approved {
                 return Ok(self.deny(&call_key, "Permission denied by the user. Stop this run.".into()).await);
             }
@@ -835,11 +876,12 @@ impl ToolRegistry {
                 let path = self.files.path(&s("path"))?;
                 let rel = crate::files::relative_path(&self.files.root, &path);
                 let target = if rel.is_empty() { ".".to_string() } else { rel };
-                let args: Vec<String> = ["--fixed-strings", "--line-number", "--hidden", "--glob", "!.git", "--glob", "!node_modules", "--max-count", "50", "--max-columns", "1000", "--max-columns-preview", "--"]
-                    .iter()
-                    .map(|a| a.to_string())
-                    .chain([s("query"), target])
-                    .collect();
+                let args: Vec<String> =
+                    ["--fixed-strings", "--line-number", "--hidden", "--glob", "!.git", "--glob", "!node_modules", "--max-count", "50", "--max-columns", "1000", "--max-columns-preview", "--"]
+                        .iter()
+                        .map(|a| a.to_string())
+                        .chain([s("query"), target])
+                        .collect();
                 let result = run_command("rg", &args, RunOptions { cwd: &self.files.root, cancel, timeout_ms: 30_000, env: None, output_limit_bytes: None, hard_output_bytes: None }).await;
                 match result {
                     Ok(r) => {
@@ -874,7 +916,12 @@ impl ToolRegistry {
                 let todos: Vec<TodoItem> = plan
                     .iter()
                     .enumerate()
-                    .map(|(i, item)| TodoItem { id: Some((i + 1).to_string()), content: item["step"].as_str().unwrap_or("").into(), status: item["status"].as_str().unwrap_or("pending").into(), priority: "medium".into() })
+                    .map(|(i, item)| TodoItem {
+                        id: Some((i + 1).to_string()),
+                        content: item["step"].as_str().unwrap_or("").into(),
+                        status: item["status"].as_str().unwrap_or("pending").into(),
+                        priority: "medium".into(),
+                    })
                     .collect();
                 self.set_todos(todos.clone());
                 if let Some(cb) = self.callbacks().on_todo_update {
@@ -959,7 +1006,14 @@ impl ToolRegistry {
                 let path = s("path");
                 let (resolved, inside) = self.files.locate_image(&path)?;
                 if !inside {
-                    let ok = (self.approve)(ApprovalRequest { tool: "view_image".into(), input: json!({ "path": resolved.to_string_lossy(), "outsideWorkspace": true }), cancel: cancel.clone(), risk: None, trusted: None }).await;
+                    let ok = (self.approve)(ApprovalRequest {
+                        tool: "view_image".into(),
+                        input: json!({ "path": resolved.to_string_lossy(), "outsideWorkspace": true }),
+                        cancel: cancel.clone(),
+                        risk: None,
+                        trusted: None,
+                    })
+                    .await;
                     if !ok {
                         return Err(PermissionDenied("Permission denied: reading an image outside the workspace. Stop this run.".into()).into());
                     }
@@ -984,7 +1038,9 @@ impl ToolRegistry {
                 if let Some(cb) = self.callbacks().on_plan_exit {
                     cb(plan.clone());
                 }
-                Ok(format!("Plan approved — exited plan mode. You can now use write_file, edit_file, apply_patch, todo_write, and bash to implement the plan step by step.\n\n## Approved Plan:\n{plan}"))
+                Ok(format!(
+                    "Plan approved — exited plan mode. You can now use write_file, edit_file, apply_patch, todo_write, and bash to implement the plan step by step.\n\n## Approved Plan:\n{plan}"
+                ))
             }
             "write_file" => self.files.write(&s("path"), &s("content")),
             "edit_file" => self.files.edit(&s("path"), &s("oldText"), &s("newText"), input.get("replaceAll").and_then(Value::as_bool).unwrap_or(false)),
@@ -999,7 +1055,14 @@ impl ToolRegistry {
                 let result = run_command(
                     "bash",
                     &["-c".to_string(), command],
-                    RunOptions { cwd: &self.cwd, cancel, timeout_ms: timeout, env: None, output_limit_bytes: limits.as_ref().map(|l| l.max_output_bytes), hard_output_bytes: limits.as_ref().map(|l| l.hard_output_bytes) },
+                    RunOptions {
+                        cwd: &self.cwd,
+                        cancel,
+                        timeout_ms: timeout,
+                        env: None,
+                        output_limit_bytes: limits.as_ref().map(|l| l.max_output_bytes),
+                        hard_output_bytes: limits.as_ref().map(|l| l.hard_output_bytes),
+                    },
                 )
                 .await;
                 if crate::jsutil::is_windows() {
@@ -1025,7 +1088,10 @@ mod tests {
         assert_eq!(normalize_tool_input("edit_file", &json!({"path": "a", "old_string": "x", "new_string": "y"})), json!({"path": "a", "oldText": "x", "newText": "y"}));
         assert_eq!(normalize_tool_input("wait_agent", &json!({"id": "abc", "timeoutMs": 500})), json!({"targets": ["abc"], "timeout_ms": 500}));
         assert_eq!(normalize_tool_input("delegate_task", &json!("x")), json!({"tasks": ["x"]}));
-        assert_eq!(normalize_tool_input("update_plan", &json!({"steps": ["a", {"title": "b", "status": "completed"}]})), json!({"plan": [{"step": "a", "status": "pending"}, {"step": "b", "status": "completed"}]}));
+        assert_eq!(
+            normalize_tool_input("update_plan", &json!({"steps": ["a", {"title": "b", "status": "completed"}]})),
+            json!({"plan": [{"step": "a", "status": "pending"}, {"step": "b", "status": "completed"}]})
+        );
     }
 
     #[tokio::test]

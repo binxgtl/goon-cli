@@ -464,10 +464,8 @@ pub fn repair_interrupted(messages: &mut Vec<Value>) -> bool {
     if pending.is_empty() {
         return false;
     }
-    let content: Vec<Value> = pending
-        .into_iter()
-        .map(|(id, name)| json!({ "type": "tool-result", "toolCallId": id, "toolName": name, "output": { "type": "error-text", "value": INTERRUPTED_RESULT } }))
-        .collect();
+    let content: Vec<Value> =
+        pending.into_iter().map(|(id, name)| json!({ "type": "tool-result", "toolCallId": id, "toolName": name, "output": { "type": "error-text", "value": INTERRUPTED_RESULT } })).collect();
     messages.push(json!({ "role": "tool", "content": content }));
     true
 }
@@ -569,7 +567,9 @@ impl SessionStore {
         } else if let Some(raw) = id.clone().filter(|i| !is_uuid(i) && prefix_re.is_match(i)) {
             let prefix = raw.to_lowercase();
             let list = SessionStore::list(root)?;
-            if let Some(s) = list.iter().find(|s| same_workspace(&s.cwd, &input.cwd) && s.id.to_lowercase().starts_with(&prefix)).or_else(|| list.iter().find(|s| s.id.to_lowercase().starts_with(&prefix))) {
+            if let Some(s) =
+                list.iter().find(|s| same_workspace(&s.cwd, &input.cwd) && s.id.to_lowercase().starts_with(&prefix)).or_else(|| list.iter().find(|s| s.id.to_lowercase().starts_with(&prefix)))
+            {
                 id = Some(s.id.clone());
             }
         }
@@ -731,13 +731,7 @@ impl SessionStore {
         }
         if matches.len() > 1 {
             let ids: Vec<&str> = matches.iter().take(4).map(|m| &m.id[..8]).collect();
-            bail!(
-                "Session prefix \"{}\" is ambiguous ({} matches: {}{}). Use more characters.",
-                id_or_prefix.trim(),
-                matches.len(),
-                ids.join(", "),
-                if matches.len() > 4 { ", ..." } else { "" }
-            );
+            bail!("Session prefix \"{}\" is ambiguous ({} matches: {}{}). Use more characters.", id_or_prefix.trim(), matches.len(), ids.join(", "), if matches.len() > 4 { ", ..." } else { "" });
         }
         let id = matches[0].id.clone();
         let lock = root.join(format!("{id}.lock"));
@@ -846,15 +840,7 @@ fn summarize_session_file(file: &Path) -> Option<SessionSummary> {
         Some(Value::String(t)) => Some(t.clone()).filter(|t| !t.is_empty()),
         Some(_) => return None,
     };
-    Some(SessionSummary {
-        id: id.into(),
-        cwd: cwd.into(),
-        updated_at: updated_at.into(),
-        model: model.into(),
-        messages_count: Some(messages.len()),
-        title,
-        preview: first_user_preview(messages),
-    })
+    Some(SessionSummary { id: id.into(), cwd: cwd.into(), updated_at: updated_at.into(), model: model.into(), messages_count: Some(messages.len()), title, preview: first_user_preview(messages) })
 }
 
 /// Total bytes of file content kept for /undo across all checkpoints of one session.

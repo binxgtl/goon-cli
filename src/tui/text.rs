@@ -5,14 +5,6 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::OnceLock;
 use unicode_normalization::UnicodeNormalization;
 
-macro_rules! re {
-    ($pattern:expr) => {{
-        static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-        RE.get_or_init(|| regex::Regex::new($pattern).unwrap())
-    }};
-}
-pub(crate) use re;
-
 pub const RESET: &str = "\x1b[0m";
 pub const DIM: &str = "\x1b[2m";
 pub const BOLD: &str = "\x1b[1m";

@@ -201,7 +201,22 @@ fn redaction_and_sensitive_path_patterns() {
     assert_eq!(redact_secrets("GOON_API_KEY=short", &none), "GOON_API_KEY=[REDACTED]");
     let obj = redact_object(&json!({ "apiKey": "k", "nested": { "password": "p", "keep": "v" } }), &none);
     assert_eq!(obj, json!({ "apiKey": "[REDACTED]", "nested": { "password": "[REDACTED]", "keep": "v" } }));
-    for p in [".env", ".env.local", ".env.example", "server.pem", "id_rsa", "id_ed25519.pub", "client.key", ".npmrc", ".netrc", ".git-credentials", ".ssh/id_rsa", "secrets/a.txt", ".aws/credentials", "config/gcloud/creds.json"] {
+    for p in [
+        ".env",
+        ".env.local",
+        ".env.example",
+        "server.pem",
+        "id_rsa",
+        "id_ed25519.pub",
+        "client.key",
+        ".npmrc",
+        ".netrc",
+        ".git-credentials",
+        ".ssh/id_rsa",
+        "secrets/a.txt",
+        ".aws/credentials",
+        "config/gcloud/creds.json",
+    ] {
         assert!(is_sensitive_path(p), "{p}");
     }
     for p in ["src/index.ts", "README.md", "docs/PLAN.md", "package.json"] {

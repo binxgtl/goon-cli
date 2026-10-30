@@ -217,12 +217,12 @@ fn network_commands_stay_high_risk_so_auto_or_exact_approval_cannot_bypass_the_g
 async fn process_output_limits_are_configurable_and_bounded() {
     let cwd = std::env::current_dir().unwrap();
     let cancel = token();
-    let (cmd, args): (&str, Vec<String>) = if cfg!(windows) {
-        ("cmd", vec!["/c".into(), "for /l %i in (1,1,500) do @echo xxxxxxxxx".into()])
-    } else {
-        ("sh", vec!["-c".into(), "head -c 5000 /dev/zero | tr '\\0' x".into()])
-    };
-    let result = process::run_command(cmd, &args, process::RunOptions { cwd: &cwd, cancel: &cancel, timeout_ms: 10_000, env: None, output_limit_bytes: Some(2048), hard_output_bytes: Some(64 * 1024) }).await.unwrap();
+    let (cmd, args): (&str, Vec<String>) =
+        if cfg!(windows) { ("cmd", vec!["/c".into(), "for /l %i in (1,1,500) do @echo xxxxxxxxx".into()]) } else { ("sh", vec!["-c".into(), "head -c 5000 /dev/zero | tr '\\0' x".into()]) };
+    let result =
+        process::run_command(cmd, &args, process::RunOptions { cwd: &cwd, cancel: &cancel, timeout_ms: 10_000, env: None, output_limit_bytes: Some(2048), hard_output_bytes: Some(64 * 1024) })
+            .await
+            .unwrap();
     assert!(result.truncated);
     assert_match(&result.output, r"\[output truncated\]");
     assert!(result.output.len() < 4096);

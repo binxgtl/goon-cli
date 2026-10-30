@@ -352,9 +352,9 @@ fn call(module: &str, func: &str, a: &[Value]) -> Outcome {
             )))
         }
         "context.estimatedTokens" => Ok_(json!(context::estimated_tokens(&objects(&a[0]), &s(a, 1)))),
-        "context.extractCandidatePaths" => Ok_(Value::Array(
-            context::extract_candidate_paths(&s(a, 0)).iter().map(|c| json!({ "rawToken": c.raw_token, "path": c.path, "isExplicitMention": c.is_explicit_mention })).collect(),
-        )),
+        "context.extractCandidatePaths" => {
+            Ok_(Value::Array(context::extract_candidate_paths(&s(a, 0)).iter().map(|c| json!({ "rawToken": c.raw_token, "path": c.path, "isExplicitMention": c.is_explicit_mention })).collect()))
+        }
         "context.withoutBinaryParts" => Ok_(Value::Array(context::without_binary_parts(&objects(&a[0])))),
         // ---------------------------------------------------------------- coord
         "coord.candidateCap" => {
@@ -564,13 +564,8 @@ fn call(module: &str, func: &str, a: &[Value]) -> Outcome {
             let positional = strs_of(&c["positional"]);
             let named = index_map(c.get("named"));
             let steps = index_map(c.get("stepOutputs"));
-            let ctx = workflow::InterpContext {
-                input: c["input"].as_str().unwrap_or(""),
-                positional: &positional,
-                named: &named,
-                prev_output: c["prevOutput"].as_str().unwrap_or(""),
-                step_outputs: &steps,
-            };
+            let ctx =
+                workflow::InterpContext { input: c["input"].as_str().unwrap_or(""), positional: &positional, named: &named, prev_output: c["prevOutput"].as_str().unwrap_or(""), step_outputs: &steps };
             let shell = arg(a, 2).and_then(|o| o.get("mode")).and_then(Value::as_str) == Some("shell");
             Ok_(json!(workflow::interpolate_workflow_template(&s(a, 0), &ctx, shell)))
         }

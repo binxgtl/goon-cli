@@ -73,9 +73,7 @@ pub struct SetupIo {
 }
 
 fn default_ask() -> AskFn {
-    Arc::new(|label: String| {
-        Box::pin(async move { Ok(crate::term::read_line(&label, None).await?.unwrap_or_default().trim().to_string()) })
-    })
+    Arc::new(|label: String| Box::pin(async move { Ok(crate::term::read_line(&label, None).await?.unwrap_or_default().trim().to_string()) }))
 }
 
 fn default_secret() -> AskFn {
@@ -93,10 +91,7 @@ pub async fn run_setup_wizard(initial: Option<Config>, io: SetupIo) -> Result<Co
     let ask_secret = io.ask_secret.clone().or_else(|| io.ask.clone()).unwrap_or_else(default_secret);
     let discover: DiscoverFn = io.discover.clone().unwrap_or_else(|| Arc::new(|url, key, prov| Box::pin(async move { discover_models(&url, key.as_deref(), &prov, None).await })));
 
-    write(&format!(
-        "\n◆ goon v{} setup\n  Provider, endpoint, API key, model and reasoning effort. Esc cancels; nothing is saved until the end.\n\nStep 1/5 · Provider\n",
-        crate::version::VERSION
-    ));
+    write(&format!("\n◆ goon v{} setup\n  Provider, endpoint, API key, model and reasoning effort. Esc cancels; nothing is saved until the end.\n\nStep 1/5 · Provider\n", crate::version::VERSION));
     let default_index = PROVIDER_PRESETS.iter().position(|p| p.provider == current.provider && current.base_url.as_deref().map(|u| u == p.base_url).unwrap_or(true)).unwrap_or(0);
     for (idx, preset) in PROVIDER_PRESETS.iter().enumerate() {
         let marker = if idx == default_index { "●" } else { " " };
@@ -148,7 +143,13 @@ pub async fn run_setup_wizard(initial: Option<Config>, io: SetupIo) -> Result<Co
         let idx = input.parse::<i64>().ok().map(|n| n - 1);
         model = match idx {
             Some(i) if !input.is_empty() && i >= 0 && (i as usize) < limit => discovered[i as usize].id.clone(),
-            _ => if input.is_empty() { fallback_model.clone() } else { input },
+            _ => {
+                if input.is_empty() {
+                    fallback_model.clone()
+                } else {
+                    input
+                }
+            }
         };
         if model.is_empty() {
             write("  ! Model ID is required (no models are hardcoded).\n");

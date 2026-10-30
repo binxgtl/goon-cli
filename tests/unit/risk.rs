@@ -7,7 +7,21 @@ fn r(cmd: &str) -> &'static str {
 
 #[test]
 fn safe_read_build_test_commands_are_low() {
-    for cmd in ["cat README.md", "ls -la", "grep -R foo src", "npm test", "npm run build", "npm run lint", "npm run typecheck", "node --test tests/x.test.mjs", "pytest", "go test ./...", "cargo test", "git status", "git diff HEAD"] {
+    for cmd in [
+        "cat README.md",
+        "ls -la",
+        "grep -R foo src",
+        "npm test",
+        "npm run build",
+        "npm run lint",
+        "npm run typecheck",
+        "node --test tests/x.test.mjs",
+        "pytest",
+        "go test ./...",
+        "cargo test",
+        "git status",
+        "git diff HEAD",
+    ] {
         assert_eq!(r(cmd), "low", "{cmd}");
     }
 }

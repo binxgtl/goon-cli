@@ -7,7 +7,10 @@ use crate::coord::{run_dag, DagConfig, DagHooks, DagOptions, DagSpawnRequest, DE
 use crate::cost::{format_duration_ms, format_usd, CostLedger, RunBudget, SharedBudget};
 use crate::jsutil::{self, now_iso, now_millis, stringify_pretty, take_chars};
 use crate::model::ModelRequest;
-use crate::session::{format_goal_status_indicator, format_goal_summary_lines, format_goal_usage_summary, goal_status_label, parse_goal_draft_args, same_workspace, GoalDraft, SessionGoal, SessionRoute, SessionStore, GOAL_USAGE};
+use crate::session::{
+    format_goal_status_indicator, format_goal_summary_lines, format_goal_usage_summary, goal_status_label, parse_goal_draft_args, same_workspace, GoalDraft, SessionGoal, SessionRoute, SessionStore,
+    GOAL_USAGE,
+};
 use crate::subagents::RunTasksOptions;
 use crate::term::terminal_text;
 use crate::tools::{catalog_definition, ApprovalRequest, ToolCall, ToolExec, ToolRegistry};
@@ -130,10 +133,11 @@ impl App {
         let runtime = self.runtime();
         let me = self.me.clone();
         let approve_reg = reg.clone();
-        let approve_shell: Arc<dyn Fn(String, CancellationToken, crate::risk::RiskClass) -> BoxFuture<'static, bool> + Send + Sync> = Arc::new(move |command: String, step: CancellationToken, risk| {
-            let approve = approve_reg.approve.clone();
-            Box::pin(async move { approve(ApprovalRequest { tool: "bash".into(), input: json!({ "command": command }), cancel: step, risk: Some(risk), trusted: Some(false) }).await })
-        });
+        let approve_shell: Arc<dyn Fn(String, CancellationToken, crate::risk::RiskClass) -> BoxFuture<'static, bool> + Send + Sync> =
+            Arc::new(move |command: String, step: CancellationToken, risk| {
+                let approve = approve_reg.approve.clone();
+                Box::pin(async move { approve(ApprovalRequest { tool: "bash".into(), input: json!({ "command": command }), cancel: step, risk: Some(risk), trusted: Some(false) }).await })
+            });
         let shared_budget = budget.clone();
         let run_prompt: Arc<dyn Fn(String, crate::workflow::WorkflowStep, CancellationToken) -> crate::workflow::StepFuture + Send + Sync> = {
             let me = me.clone();
@@ -164,7 +168,11 @@ impl App {
                         return app.harness().run(&tasks.join("\n\n"), &sig, Some(budget)).await;
                     }
                     let tools = app.tools();
-                    let (call, previous) = with_budget(&tools, budget, || ToolCall { tool_call_id: format!("wf_{}", now_millis()), tool_name: if read_only { "delegate_task" } else { "delegate_edit" }.into(), input: json!({ "tasks": tasks }) });
+                    let (call, previous) = with_budget(&tools, budget, || ToolCall {
+                        tool_call_id: format!("wf_{}", now_millis()),
+                        tool_name: if read_only { "delegate_task" } else { "delegate_edit" }.into(),
+                        input: json!({ "tasks": tasks }),
+                    });
                     let res = tools.execute(&call, &sig).await;
                     tools.set_budget(previous);
                     Ok(res?.text)
@@ -197,7 +205,16 @@ impl App {
                     });
                     let res = subagents
                         .network
-                        .brainstorm(crate::network::BrainstormOptions { topic, roles, rounds, explore_codebase: None, cancel: sig, budget: if tool_mode { reg.budget() } else { budget.or_else(|| Some(app.fresh_budget())) }, policy: Some(app.policy.clone()), on_progress: progress })
+                        .brainstorm(crate::network::BrainstormOptions {
+                            topic,
+                            roles,
+                            rounds,
+                            explore_codebase: None,
+                            cancel: sig,
+                            budget: if tool_mode { reg.budget() } else { budget.or_else(|| Some(app.fresh_budget())) },
+                            policy: Some(app.policy.clone()),
+                            on_progress: progress,
+                        })
                         .await?;
                     let report = crate::network::format_brainstorm_report(&res);
                     if !tool_mode {
@@ -358,22 +375,39 @@ impl App {
             let subagents = spawn_sub.clone();
             let goal = goal_text.clone();
             Box::pin(async move {
-                let task = [format!("Goal: {goal}"), format!("Todo {}: {}", req.todo.id, req.todo.title), if req.todo.acceptance.is_empty() { String::new() } else { format!("Acceptance criteria: {}", req.todo.acceptance) }, "Other todos may have already changed the workspace; do not revert their work. End with a short report.".to_string()]
-                    .into_iter()
-                    .filter(|l| !l.is_empty())
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                subagents.run_tasks(vec![task], RunTasksOptions { read_only: req.read_only, cancel: req.cancel, budget: Some(req.budget), allowed_tools: Some(req.allowed_tools.into_iter().collect::<HashSet<_>>()), role: Some(req.todo.role.clone()) }).await
+                let task = [
+                    format!("Goal: {goal}"),
+                    format!("Todo {}: {}", req.todo.id, req.todo.title),
+                    if req.todo.acceptance.is_empty() { String::new() } else { format!("Acceptance criteria: {}", req.todo.acceptance) },
+                    "Other todos may have already changed the workspace; do not revert their work. End with a short report.".to_string(),
+                ]
+                .into_iter()
+                .filter(|l| !l.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+                subagents
+                    .run_tasks(
+                        vec![task],
+                        RunTasksOptions {
+                            read_only: req.read_only,
+                            cancel: req.cancel,
+                            budget: Some(req.budget),
+                            allowed_tools: Some(req.allowed_tools.into_iter().collect::<HashSet<_>>()),
+                            role: Some(req.todo.role.clone()),
+                        },
+                    )
+                    .await
             })
         });
         let verify_me = me.clone();
-        let test: Arc<dyn Fn(crate::coord::Todo, Vec<String>, CancellationToken) -> BoxFuture<'static, Result<bool>> + Send + Sync> = Arc::new(move |_todo, files: Vec<String>, sig: CancellationToken| {
-            let me = verify_me.clone();
-            Box::pin(async move {
-                let app = me.upgrade().ok_or_else(|| anyhow!("Session closed."))?;
-                app.run_dag_verification(files, sig).await
-            })
-        });
+        let test: Arc<dyn Fn(crate::coord::Todo, Vec<String>, CancellationToken) -> BoxFuture<'static, Result<bool>> + Send + Sync> =
+            Arc::new(move |_todo, files: Vec<String>, sig: CancellationToken| {
+                let me = verify_me.clone();
+                Box::pin(async move {
+                    let app = me.upgrade().ok_or_else(|| anyhow!("Session closed."))?;
+                    app.run_dag_verification(files, sig).await
+                })
+            });
         let verify_me = me.clone();
         let verify: Arc<dyn Fn(Vec<String>, String, CancellationToken) -> BoxFuture<'static, Result<bool>> + Send + Sync> = Arc::new(move |files: Vec<String>, _diff, sig: CancellationToken| {
             let me = verify_me.clone();
@@ -384,7 +418,13 @@ impl App {
         });
         let emit_me = me.clone();
         let options = DagOptions {
-            config: DagConfig { run_token_budget: runtime.run_token_budget, max_cost_usd: runtime.max_cost_usd, max_time_ms: runtime.max_time_ms, rework_cap: Some(runtime.multi_agent_rework_cap as u32), max_concurrency: Some(runtime.multi_agent_max_concurrency as usize) },
+            config: DagConfig {
+                run_token_budget: runtime.run_token_budget,
+                max_cost_usd: runtime.max_cost_usd,
+                max_time_ms: runtime.max_time_ms,
+                rework_cap: Some(runtime.multi_agent_rework_cap as u32),
+                max_concurrency: Some(runtime.multi_agent_max_concurrency as usize),
+            },
             cancel: sig.clone(),
             files: self.tools().files.clone(),
             budget: Some(budget),
@@ -422,7 +462,13 @@ impl App {
                 return Box::pin(async { false });
             }
             let approve = tools.approve.clone();
-            let request = ApprovalRequest { tool: "verify".into(), input: json!({ "files": approve_files, "commands": plan.commands.iter().map(|c| c.display.clone()).collect::<Vec<_>>() }), cancel: approve_sig.clone(), risk: Some(assessment.risk), trusted: Some(false) };
+            let request = ApprovalRequest {
+                tool: "verify".into(),
+                input: json!({ "files": approve_files, "commands": plan.commands.iter().map(|c| c.display.clone()).collect::<Vec<_>>() }),
+                cancel: approve_sig.clone(),
+                risk: Some(assessment.risk),
+                trusted: Some(false),
+            };
             Box::pin(async move { approve(request).await })
         };
         let verdict = run_verification(&runtime.cwd, &files, &runtime.verify, &CommandRunner, &sig.clone(), &mut plan, Some(&approve)).await?;
@@ -688,7 +734,9 @@ impl App {
                 return Ok(true);
             }
             if prompts.is_empty() {
-                self.display("No prompt files found. Create e.g. .goon/prompts/review.md or ~/.config/goon/prompts/review.md,\nthen run /prompts:review [args] ($ARGUMENTS and $1..$9 are substituted).\n");
+                self.display(
+                    "No prompt files found. Create e.g. .goon/prompts/review.md or ~/.config/goon/prompts/review.md,\nthen run /prompts:review [args] ($ARGUMENTS and $1..$9 are substituted).\n",
+                );
             } else {
                 let lines: Vec<String> = prompts.iter().map(|p| format!("  /prompts:{} [{}] {}", pad_end(&p.name, 20), p.scope, p.description)).collect();
                 self.display(&format!("Custom prompts ({}) — run with /prompts:<name> [args]:\n{}\n", prompts.len(), lines.join("\n")));
@@ -765,7 +813,8 @@ impl App {
                 if presets.is_empty() {
                     self.display(&format!("No saved prompt presets ({}).\nUse \"/presets save <name> <prompt>\" and \"/presets run <name>\".\n", crate::context::presets_path().display()));
                 } else {
-                    let lines: Vec<String> = presets.values().map(|p| format!("  {} — {}", pad_end(&p.name, 18), jsutil::slice_chars(&p.prompt.split_whitespace().collect::<Vec<_>>().join(" "), 0, 80))).collect();
+                    let lines: Vec<String> =
+                        presets.values().map(|p| format!("  {} — {}", pad_end(&p.name, 18), jsutil::slice_chars(&p.prompt.split_whitespace().collect::<Vec<_>>().join(" "), 0, 80))).collect();
                     self.display(&format!("Saved Presets ({}):\n{}\n", presets.len(), lines.join("\n")));
                 }
                 return Ok(true);
@@ -864,7 +913,13 @@ impl App {
             let arg = if input == "/yolo" { "on".to_string() } else { input[5..].trim().to_lowercase() };
             let mode = self.mode();
             let next = match arg.as_str() {
-                "" | "toggle" => if mode == "auto" { "ask" } else { "auto" },
+                "" | "toggle" => {
+                    if mode == "auto" {
+                        "ask"
+                    } else {
+                        "auto"
+                    }
+                }
                 "on" | "true" | "1" | "yes" => "auto",
                 "off" | "false" | "0" | "ask" => "ask",
                 _ => {
@@ -1104,7 +1159,12 @@ impl App {
             let gateway = if discovered.is_empty() {
                 "Unreachable or no /models response".to_string()
             } else {
-                format!("OK ({} models: {} · active model {})", discovered.len(), discovered.iter().map(|m| m.id.clone()).collect::<Vec<_>>().join(", "), if in_list { "verified" } else { "NOT listed" })
+                format!(
+                    "OK ({} models: {} · active model {})",
+                    discovered.len(),
+                    discovered.iter().map(|m| m.id.clone()).collect::<Vec<_>>().join(", "),
+                    if in_list { "verified" } else { "NOT listed" }
+                )
             };
             self.display(&format!(
                 "Provider: {} | Model: {} | Effort: {} | BaseURL: {}\nBash: {} | Ripgrep: {} | API Key: Configured\nGateway (/models): {gateway}\n",
@@ -1185,7 +1245,12 @@ impl App {
             let out_name = if out_name.is_empty() { format!("goon-session-{}.md", take_chars(&s.id, 8)) } else { out_name };
             let target = self.tools().files.path(&out_name)?;
             let runtime = self.runtime();
-            let mut lines = vec![format!("# Goon Session {}", s.title.clone().unwrap_or_else(|| s.id.clone())), format!("- **Model**: {} ({})", runtime.model, runtime.provider), format!("- **Updated**: {}", s.updated_at), String::new()];
+            let mut lines = vec![
+                format!("# Goon Session {}", s.title.clone().unwrap_or_else(|| s.id.clone())),
+                format!("- **Model**: {} ({})", runtime.model, runtime.provider),
+                format!("- **Updated**: {}", s.updated_at),
+                String::new(),
+            ];
             for m in &s.messages {
                 lines.push(format!("## {}", m.get("role").and_then(Value::as_str).unwrap_or("").to_uppercase()));
                 lines.push(match m.get("content") {
@@ -1203,7 +1268,11 @@ impl App {
             let title = input[5..].trim();
             let forked = store.fork_to_new_file((!title.is_empty()).then_some(title))?;
             let count = store.session.lock().unwrap().messages.len();
-            self.display(&format!("Forked current session ({count} messages) -> new session ID: {forked}\nSwitch to it now with: /resume {} (or goon --resume {})\n", take_chars(&forked, 8), take_chars(&forked, 8)));
+            self.display(&format!(
+                "Forked current session ({count} messages) -> new session ID: {forked}\nSwitch to it now with: /resume {} (or goon --resume {})\n",
+                take_chars(&forked, 8),
+                take_chars(&forked, 8)
+            ));
             return Ok(true);
         }
         if starts_cmd(input, "/pair") {
@@ -1266,7 +1335,19 @@ impl App {
             } else {
                 let lines: Vec<String> = list
                     .iter()
-                    .map(|s| format!("  {} ({})  [{}]  {}  ({} msgs)  {}\n    Task: {}{}", s.nickname, s.id, s.role, s.status, s.messages_count, s.updated_at, s.task, s.summary.as_ref().map(|x| format!("\n    Summary: {x}")).unwrap_or_default()))
+                    .map(|s| {
+                        format!(
+                            "  {} ({})  [{}]  {}  ({} msgs)  {}\n    Task: {}{}",
+                            s.nickname,
+                            s.id,
+                            s.role,
+                            s.status,
+                            s.messages_count,
+                            s.updated_at,
+                            s.task,
+                            s.summary.as_ref().map(|x| format!("\n    Summary: {x}")).unwrap_or_default()
+                        )
+                    })
                     .collect();
                 self.display(&format!("Subagents ({}):\n{}\n", list.len(), lines.join("\n")));
             }
@@ -1506,8 +1587,12 @@ impl App {
         let cwd = self.runtime().cwd.clone();
         if rest.is_empty() || sub == "list" {
             let all = discover_workflows(&cwd);
-            let lines: Vec<String> = all.iter().map(|w| format!("  {} [{}] ({} steps) — {}", pad_end(&w.name, 20), pad_end(&w.scope, 9), w.steps.len(), w.description)).collect();
-            self.display(&format!("\nAvailable Workflows ({}) — run with \"/workflow run <name> [input]\":\n{}\n  Tip: Create a custom workflow with \"/workflow create <name> [description]\"\n", all.len(), lines.join("\n")));
+            let lines: Vec<String> = all.iter().map(|w| format!("  {} [{}] ({} steps) — {}", pad_end(&w.name, 20), pad_end(w.scope, 9), w.steps.len(), w.description)).collect();
+            self.display(&format!(
+                "\nAvailable Workflows ({}) — run with \"/workflow run <name> [input]\":\n{}\n  Tip: Create a custom workflow with \"/workflow create <name> [description]\"\n",
+                all.len(),
+                lines.join("\n")
+            ));
             return Ok(true);
         }
         if ["show", "get", "info"].contains(&sub.as_str()) {
@@ -1528,7 +1613,12 @@ impl App {
             };
             let desc = tokens[2..].join(" ").trim().to_string();
             match create_workflow_scaffold(&cwd, name, (!desc.is_empty()).then_some(desc.as_str()), false, false) {
-                Ok((path, wf)) => self.display(&format!("Created custom workflow \"{}\" at {}\nEdit the JSON file to customize steps, or run it now with: /workflow run {} <your task>\n", wf.name, path.display(), wf.name)),
+                Ok((path, wf)) => self.display(&format!(
+                    "Created custom workflow \"{}\" at {}\nEdit the JSON file to customize steps, or run it now with: /workflow run {} <your task>\n",
+                    wf.name,
+                    path.display(),
+                    wf.name
+                )),
                 Err(error) => self.display(&format!("Failed to create workflow: {}\n", safe_error(&error))),
             }
             return Ok(true);
@@ -1576,7 +1666,15 @@ impl App {
         // account against the same caps.
         let previous = tools.budget();
         let cost_spent = self.store().session.lock().unwrap().cost();
-        let budget: SharedBudget = Arc::new(Mutex::new(RunBudget { spent: 0, limit: if runtime.run_token_budget > 0 { runtime.run_token_budget } else { DEFAULT_DAG_TOKEN_BUDGET }, cost_spent, cost_limit: 0.0, started_at: None, time_limit_ms: 0, ledger: tools.cost_ledger() }));
+        let budget: SharedBudget = Arc::new(Mutex::new(RunBudget {
+            spent: 0,
+            limit: if runtime.run_token_budget > 0 { runtime.run_token_budget } else { DEFAULT_DAG_TOKEN_BUDGET },
+            cost_spent,
+            cost_limit: 0.0,
+            started_at: None,
+            time_limit_ms: 0,
+            ledger: tools.cost_ledger(),
+        }));
         tools.set_budget(Some(budget.clone()));
         if let Some(t) = self.tui() {
             t.set_status("Running");
@@ -1662,7 +1760,12 @@ impl App {
                     continue;
                 };
                 let block = format!("\n◇ Edit Goal Objective\n  Current: {}\n", goal.objective);
-                let next = self.ask_block(&block, "New objective (Enter to cancel): ", None, QuestionOpts { esc_hint: Some("cancel".into()), ..Default::default() }).await.unwrap_or_default().trim().to_string();
+                let next = self
+                    .ask_block(&block, "New objective (Enter to cancel): ", None, QuestionOpts { esc_hint: Some("cancel".into()), ..Default::default() })
+                    .await
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
                 if next.is_empty() {
                     if self.tui().is_some() {
                         self.notice("Cancelled /goal edit.");
@@ -1677,7 +1780,10 @@ impl App {
             if input == "/key" {
                 let runtime = self.runtime();
                 let entered = match self.tui() {
-                    Some(t) => t.question(&format!("New API key for {} (hidden, Esc to cancel): ", runtime.key_env), None, false, QuestionOpts { esc_cancels: true, mask: true, ..Default::default() }).await.unwrap_or_default(),
+                    Some(t) => t
+                        .question(&format!("New API key for {} (hidden, Esc to cancel): ", runtime.key_env), None, false, QuestionOpts { esc_cancels: true, mask: true, ..Default::default() })
+                        .await
+                        .unwrap_or_default(),
                     None => self.question_hidden(&format!("New API key for {} (hidden): ", runtime.key_env)).await.unwrap_or_default(),
                 };
                 let entered = entered.trim().to_string();
@@ -1698,8 +1804,7 @@ impl App {
                 continue;
             }
             if input.starts_with("/prompts:") {
-                let re = Regex::new(r"(?s)^/prompts:([A-Za-z0-9][A-Za-z0-9_.-]*)\s*(.*)$").unwrap();
-                let caps = re.captures(&input);
+                let caps = crate::re!(r"(?s)^/prompts:([A-Za-z0-9][A-Za-z0-9_.-]*)\s*(.*)$").captures(&input);
                 let prompts = crate::prompts::discover_prompts(&self.runtime().cwd);
                 let found = caps.as_ref().and_then(|c| prompts.iter().find(|p| p.name.to_lowercase() == c[1].to_lowercase()));
                 let Some(found) = found else {
@@ -1728,7 +1833,13 @@ impl App {
                     self.display(&format!("\nReasoning Effort (current: {}):\n", runtime.effort.clone().unwrap_or_else(|| "default".into())));
                     self.display(&format!("  {} [1] default  — Use provider/model default\n", if runtime.effort.is_none() { '●' } else { ' ' }));
                     for (idx, level) in EFFORT_LEVELS.iter().enumerate() {
-                        self.display(&format!("  {} [{}] {} — {}\n", if runtime.effort.as_deref() == Some(*level) { '●' } else { ' ' }, idx + 2, pad_end(level, 8), crate::setup::effort_description(level)));
+                        self.display(&format!(
+                            "  {} [{}] {} — {}\n",
+                            if runtime.effort.as_deref() == Some(*level) { '●' } else { ' ' },
+                            idx + 2,
+                            pad_end(level, 8),
+                            crate::setup::effort_description(level)
+                        ));
                     }
                     arg = self.question(&format!("Select [1-{}] or effort name: ", EFFORT_LEVELS.len() + 1), None, false).await.unwrap_or_default().trim().to_string();
                     if arg.is_empty() {
@@ -1783,13 +1894,22 @@ impl App {
                     .take(15)
                     .enumerate()
                     .map(|(idx, cp)| {
-                        let files = if cp.files.is_empty() { "no file changes".to_string() } else { format!("{} file(s): {}", cp.files.len(), cp.files.iter().map(|f| f.path.clone()).collect::<Vec<_>>().join(", ")) };
+                        let files = if cp.files.is_empty() {
+                            "no file changes".to_string()
+                        } else {
+                            format!("{} file(s): {}", cp.files.len(), cp.files.iter().map(|f| f.path.clone()).collect::<Vec<_>>().join(", "))
+                        };
                         let preview = jsutil::slice_chars(&cp.prompt.split_whitespace().collect::<Vec<_>>().join(" "), 0, 54).to_string();
                         format!("  {}. #{} [{}] \"{preview}\" ({files})", pad_start(&(idx + 1).to_string(), 2), cp.id, jsutil::slice_chars(&cp.created_at, 11, 19))
                     })
                     .collect();
                 let block = format!("\n◇ Rewind to turn checkpoint · {} available\n{}\n", checkpoints.len(), rows.join("\n"));
-                let choice = t.ask_transient(&block, &format!("Rewind [1-{}, or Enter to cancel]: ", reversed.len().min(15)), None, QuestionOpts { esc_hint: Some("cancel".into()), ..Default::default() }).await.unwrap_or_default().trim().to_string();
+                let choice = t
+                    .ask_transient(&block, &format!("Rewind [1-{}, or Enter to cancel]: ", reversed.len().min(15)), None, QuestionOpts { esc_hint: Some("cancel".into()), ..Default::default() })
+                    .await
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
                 match choice.parse::<usize>().ok().filter(|n| *n >= 1 && *n <= reversed.len() && choice.chars().all(|c| c.is_ascii_digit())) {
                     Some(n) => input = format!("/revert {n}"),
                     None => continue,
@@ -1849,8 +1969,8 @@ impl App {
                 continue;
             }
             if input.starts_with("/presets ") || input.starts_with("/preset ") {
-                let rest = Regex::new(r"^/presets?\s+").unwrap().replace(&input, "").trim().to_string();
-                let name = Regex::new(r"(?i)^run\s+").unwrap().replace(&rest, "").trim().to_string();
+                let rest = crate::re!(r"^/presets?\s+").replace(&input, "").trim().to_string();
+                let name = crate::re!(r"(?i)^run\s+").replace(&rest, "").trim().to_string();
                 let presets = crate::context::load_presets();
                 let Some(preset) = presets.get(&name) else {
                     self.display(&format!("Preset \"{name}\" not found. Use \"/presets list\" or \"/presets save <name> <prompt>\".\n"));
@@ -1870,8 +1990,8 @@ impl App {
             }
             if starts_cmd(&input, "/review") {
                 let extra = input[7..].trim();
-                let branch = Regex::new(r"(?is)^branch\s+(\S+)(?:\s+(.+))?$").unwrap().captures(extra);
-                let commit = Regex::new(r"(?is)^commit\s+(\S+)(?:\s+(.+))?$").unwrap().captures(extra);
+                let branch = crate::re!(r"(?is)^branch\s+(\S+)(?:\s+(.+))?$").captures(extra);
+                let commit = crate::re!(r"(?is)^commit\s+(\S+)(?:\s+(.+))?$").captures(extra);
                 let focus = "Focus on correctness, bugs, regressions, security issues, edge cases, and missing tests. Report findings ordered by severity with exact file and line references.";
                 let notes = |c: &regex::Captures| c.get(2).map(|m| m.as_str().trim().to_string()).filter(|s| !s.is_empty()).map(|n| format!("\nAdditional review focus: {n}")).unwrap_or_default();
                 let prompt = if let Some(c) = branch {
@@ -1890,12 +2010,12 @@ impl App {
                 self.run("Inspect this workspace (package manifests, build/test scripts, directory structure, existing docs) and create or update AGENTS.md with concise, accurate commands for building, linting, typechecking, testing, and key architectural invariants.").await?;
                 continue;
             }
-            if input.starts_with("/mcp ") {
-                self.mcp_slash_command(input[5..].trim()).await?;
+            if let Some(rest) = input.strip_prefix("/mcp ") {
+                self.mcp_slash_command(rest.trim()).await?;
                 continue;
             }
             if ["/subagents", "/agents", "/agent"].contains(&input.as_str()) || input.starts_with("/subagents ") || input.starts_with("/agents ") || input.starts_with("/agent ") {
-                let rest = Regex::new(r"^/(?:subagents|agents|agent)\s*").unwrap().replace(&input, "").trim().to_string();
+                let rest = crate::re!(r"^/(?:subagents|agents|agent)\s*").replace(&input, "").trim().to_string();
                 if self.subagent_listing(&rest) {
                     continue;
                 }
@@ -2030,7 +2150,13 @@ impl App {
         let auto_ctx = next_model.as_ref().and(caps.context_window).unwrap_or(config.context_window);
         let raw_out = next_model.as_ref().and(caps.max_output_tokens).unwrap_or(config.max_output_tokens);
         let auto_out = raw_out.min(auto_ctx / 2);
-        let final_effort = if effort_changed { next_effort } else if next_model.is_some() && caps.default_effort.is_some() { caps.default_effort.clone() } else { config.effort.clone() };
+        let final_effort = if effort_changed {
+            next_effort
+        } else if next_model.is_some() && caps.default_effort.is_some() {
+            caps.default_effort.clone()
+        } else {
+            config.effort.clone()
+        };
         let mut changes = Map::new();
         if let Some(m) = &next_model {
             changes.insert("model".into(), json!(m));
@@ -2146,7 +2272,11 @@ impl App {
                 return;
             }
         };
-        let kept = if res.conflict_files.is_empty() { String::new() } else { format!("\n⚠ Kept {} file(s) changed after that turn: {} (use /revert {steps} {scope} --force to overwrite)\n", res.conflict_files.len(), res.conflict_files.join(", ")) };
+        let kept = if res.conflict_files.is_empty() {
+            String::new()
+        } else {
+            format!("\n⚠ Kept {} file(s) changed after that turn: {} (use /revert {steps} {scope} --force to overwrite)\n", res.conflict_files.len(), res.conflict_files.join(", "))
+        };
         let lost = if res.unrecoverable_files.is_empty() { String::new() } else { format!("\n⚠ Backup pruned (session size limit), not restored: {}\n", res.unrecoverable_files.join(", ")) };
         if !kept.is_empty() || !lost.is_empty() {
             self.display(&format!("{kept}{lost}"));
@@ -2177,7 +2307,11 @@ impl App {
                 let note = if changed.is_empty() { String::new() } else { format!(" · restored {} file(s)", changed.len()) };
                 t.set_notice(Some(&format!("↺ Rewound {} turn{plural}{note} — edit prompt below, Enter to resend, or Esc Esc to rewind further", res.turns_reverted)));
             } else {
-                self.display(&format!("\n↺ Reverted file changes from {} turn{plural}{}", res.turns_reverted, if changed.is_empty() { " (no files modified)\n".to_string() } else { format!(" ({})\n", changed.join(", ")) }));
+                self.display(&format!(
+                    "\n↺ Reverted file changes from {} turn{plural}{}",
+                    res.turns_reverted,
+                    if changed.is_empty() { " (no files modified)\n".to_string() } else { format!(" ({})\n", changed.join(", ")) }
+                ));
             }
         } else {
             let mut text = format!("\n↺ Reverted {} turn(s) [scope: {scope}] ({} messages removed)\n", res.turns_reverted, res.messages_removed);
@@ -2261,13 +2395,28 @@ impl App {
             let target = if let Some(t) = self.tui() {
                 let to_item = |s: &crate::session::SessionSummary, show_folder: bool| PickerItem {
                     id: s.id.clone(),
-                    label: format!("{}{}{}", if s.id == current { "(current) " } else { "" }, s.title.as_ref().map(|t| format!("{t}: ")).unwrap_or_default(), s.preview.clone().unwrap_or_else(|| "(no prompt yet)".into())),
-                    meta: Some([if show_folder { super::folder_label(&s.cwd) } else { String::new() }, super::format_relative_time(&s.updated_at), format!("{} msgs", s.messages_count.unwrap_or(0))].into_iter().filter(|x| !x.is_empty()).collect::<Vec<_>>().join("   ")),
+                    label: format!(
+                        "{}{}{}",
+                        if s.id == current { "(current) " } else { "" },
+                        s.title.as_ref().map(|t| format!("{t}: ")).unwrap_or_default(),
+                        s.preview.clone().unwrap_or_else(|| "(no prompt yet)".into())
+                    ),
+                    meta: Some(
+                        [if show_folder { super::folder_label(&s.cwd) } else { String::new() }, super::format_relative_time(&s.updated_at), format!("{} msgs", s.messages_count.unwrap_or(0))]
+                            .into_iter()
+                            .filter(|x| !x.is_empty())
+                            .collect::<Vec<_>>()
+                            .join("   "),
+                    ),
                     detail: Some(format!("{}   {}   {}", s.cwd, take_chars(&s.id, 8), s.model)),
                     search: Some(format!("{} {} {}", s.cwd, s.model, s.title.clone().unwrap_or_default())),
                 };
                 let tabs = vec![
-                    PickerTab { label: "This folder".into(), items: folder.iter().map(|s| to_item(s, false)).collect(), empty: Some("No sessions in this folder yet. Press → for all projects.".into()) },
+                    PickerTab {
+                        label: "This folder".into(),
+                        items: folder.iter().map(|s| to_item(s, false)).collect(),
+                        empty: Some("No sessions in this folder yet. Press → for all projects.".into()),
+                    },
                     PickerTab { label: "All projects".into(), items: project.iter().map(|s| to_item(s, true)).collect(), empty: None },
                 ];
                 match t.pick("Resume", tabs, if folder.is_empty() { 1 } else { 0 }, "resume").await {
@@ -2289,11 +2438,26 @@ impl App {
                         .map(|(i, s)| {
                             let label = s.title.clone().or_else(|| s.preview.clone()).unwrap_or_else(|| "(no prompt yet)".into());
                             let label = jsutil::slice_chars(&label.split_whitespace().collect::<Vec<_>>().join(" "), 0, 60).to_string();
-                            format!("  {}  {label}   {}{}", pad_start(&(i + 1).to_string(), 2), if show_all { format!("{}   ", super::folder_label(&s.cwd)) } else { String::new() }, super::format_relative_time(&s.updated_at))
+                            format!(
+                                "  {}  {label}   {}{}",
+                                pad_start(&(i + 1).to_string(), 2),
+                                if show_all { format!("{}   ", super::folder_label(&s.cwd)) } else { String::new() },
+                                super::format_relative_time(&s.updated_at)
+                            )
                         })
                         .collect();
-                    self.display(&format!("\n{} ({})\n{}\n", if show_all { "All projects" } else { "This folder" }, pool.len(), if rows.is_empty() { "  (none)".to_string() } else { rows.join("\n") }));
-                    let choice = self.question(&format!("Resume [number, ID prefix, a = {}, Enter = cancel]: ", if show_all { "this folder" } else { "all projects" }), None, false).await.unwrap_or_default().trim().to_string();
+                    self.display(&format!(
+                        "\n{} ({})\n{}\n",
+                        if show_all { "All projects" } else { "This folder" },
+                        pool.len(),
+                        if rows.is_empty() { "  (none)".to_string() } else { rows.join("\n") }
+                    ));
+                    let choice = self
+                        .question(&format!("Resume [number, ID prefix, a = {}, Enter = cancel]: ", if show_all { "this folder" } else { "all projects" }), None, false)
+                        .await
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string();
                     if choice.to_lowercase() == "a" {
                         show_all = !show_all;
                         continue;
@@ -2523,7 +2687,19 @@ impl App {
             }
         });
         let budget = self.tools().budget().unwrap_or_else(|| self.fresh_budget());
-        let outcome = subagents.network.brainstorm(crate::network::BrainstormOptions { topic: topic.clone(), roles, rounds: Some(rounds), explore_codebase: None, cancel: token.clone(), budget: Some(budget), policy: Some(self.policy.clone()), on_progress: Some(progress) }).await;
+        let outcome = subagents
+            .network
+            .brainstorm(crate::network::BrainstormOptions {
+                topic: topic.clone(),
+                roles,
+                rounds: Some(rounds),
+                explore_codebase: None,
+                cancel: token.clone(),
+                budget: Some(budget),
+                policy: Some(self.policy.clone()),
+                on_progress: Some(progress),
+            })
+            .await;
         match outcome {
             Ok(res) => {
                 let report = crate::network::format_brainstorm_report(&res);

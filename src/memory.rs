@@ -6,7 +6,10 @@ use crate::config::{atomic_json, config_dir, mkdir_private};
 use crate::context_budget::{MemoryPromptContext, RagChunk};
 use crate::harness::{MemoryHooks, RepoIndexOutcome};
 use crate::jsutil::{now_iso, now_millis, take_chars, utf16_len};
-use crate::rag::{chunk_file, index_repo, load_rag_snapshot, looks_binary, rag_snapshot_path, save_rag_snapshot, tokenize, walk_repo, AddDocument, Chunk, Embedder, LexicalIndex, RagFileRecord, RagSnapshot, RetrievedChunk};
+use crate::rag::{
+    chunk_file, index_repo, load_rag_snapshot, looks_binary, rag_snapshot_path, save_rag_snapshot, tokenize, walk_repo, AddDocument, Chunk, Embedder, LexicalIndex, RagFileRecord, RagSnapshot,
+    RetrievedChunk,
+};
 use crate::redact::{collect_secrets, redact_secrets};
 use anyhow::{bail, Result};
 use futures_util::future::BoxFuture;
@@ -208,10 +211,15 @@ impl KnowledgeMemory {
             truncated = walk.truncated;
             let current: IndexMap<String, crate::rag::WalkedFile> = walk.files.iter().map(|f| (f.path.clone(), f.clone())).collect();
             let snapshot = s.snapshot.clone().unwrap();
-            let changed: Vec<String> = walk.files.iter().filter(|f| match snapshot.files.get(&f.path) {
-                None => true,
-                Some(prev) => (prev.mtime_ms - f.mtime_ms).abs() > 0.5 || prev.size != f.size,
-            }).map(|f| f.path.clone()).collect();
+            let changed: Vec<String> = walk
+                .files
+                .iter()
+                .filter(|f| match snapshot.files.get(&f.path) {
+                    None => true,
+                    Some(prev) => (prev.mtime_ms - f.mtime_ms).abs() > 0.5 || prev.size != f.size,
+                })
+                .map(|f| f.path.clone())
+                .collect();
             let removed: Vec<String> = snapshot.files.keys().filter(|p| !current.contains_key(*p)).cloned().collect();
             if !changed.is_empty() || !removed.is_empty() {
                 reindexed = "partial";
@@ -262,7 +270,10 @@ impl KnowledgeMemory {
         s.insights.push(clean.clone());
         let n = s.insights.len() - 1;
         self.ensure_loaded(&mut s).await?;
-        let docs: Vec<AddDocument> = chunk_file("memory://insight", &clean, None).into_iter().map(|c| AddDocument { id: Some(format!("insight:{n}:{}", c.start_line)), chunk: Chunk { path: "memory://insight".into(), ..c } }).collect();
+        let docs: Vec<AddDocument> = chunk_file("memory://insight", &clean, None)
+            .into_iter()
+            .map(|c| AddDocument { id: Some(format!("insight:{n}:{}", c.start_line)), chunk: Chunk { path: "memory://insight".into(), ..c } })
+            .collect();
         s.index.as_mut().unwrap().add(docs).await?;
         s.dirty = true;
         Ok(())
@@ -389,11 +400,21 @@ impl MemoryStore {
             .as_ref()
             .and_then(|d| d.get("exec"))
             .and_then(Value::as_array)
-            .map(|a| a.iter().filter(|e| e.get("text").map(Value::is_string).unwrap_or(false)).map(|e| ExecLesson { text: e["text"].as_str().unwrap().into(), at: e.get("at").map(crate::jsutil::js_string).unwrap_or_else(now_iso) }).collect::<Vec<_>>())
+            .map(|a| {
+                a.iter()
+                    .filter(|e| e.get("text").map(Value::is_string).unwrap_or(false))
+                    .map(|e| ExecLesson { text: e["text"].as_str().unwrap().into(), at: e.get("at").map(crate::jsutil::js_string).unwrap_or_else(now_iso) })
+                    .collect::<Vec<_>>()
+            })
             .map(|v| v[v.len().saturating_sub(EXEC_LIMIT)..].to_vec())
             .unwrap_or_default();
-        let insights: Vec<String> = data.as_ref().and_then(|d| d.get("insights")).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect()).unwrap_or_default();
-        let repo = data.as_ref().and_then(|d| d.get("repo")).map(|r| (r.get("tree").and_then(Value::as_str).map(str::to_string), r.get("refreshedAt").and_then(Value::as_str).map(str::to_string))).unwrap_or((None, None));
+        let insights: Vec<String> =
+            data.as_ref().and_then(|d| d.get("insights")).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect()).unwrap_or_default();
+        let repo = data
+            .as_ref()
+            .and_then(|d| d.get("repo"))
+            .map(|r| (r.get("tree").and_then(Value::as_str).map(str::to_string), r.get("refreshedAt").and_then(Value::as_str).map(str::to_string)))
+            .unwrap_or((None, None));
         let pref_file = config_dir().join("preferences.json");
         let mut prefs = IndexMap::new();
         if let Some(Value::Object(m)) = std::fs::read_to_string(&pref_file).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()) {
@@ -623,7 +644,10 @@ mod tests {
         std::fs::create_dir_all(&ws).unwrap();
         std::fs::write(ws.join("auth.ts"), "export function login(user: string) {\n  return checkPassword(user);\n}\n").unwrap();
         std::env::set_var("XDG_CONFIG_HOME", dir.path().join("cfg"));
-        let store = MemoryStore::open(&dir.path().join("data"), "p1", Some(&ws), &[], RagSettings { top_k: None, capacity: None, threshold: None, max_files: None, max_file_bytes: None, embedder: None }).await.unwrap();
+        let store =
+            MemoryStore::open(&dir.path().join("data"), "p1", Some(&ws), &[], RagSettings { top_k: None, capacity: None, threshold: None, max_files: None, max_file_bytes: None, embedder: None })
+                .await
+                .unwrap();
         let r = store.ensure_repo_indexed(None).await.unwrap();
         assert_eq!((r.files, r.reindexed), (1, "full"));
         assert_eq!(store.ensure_repo_indexed(None).await.unwrap().reindexed, "none");

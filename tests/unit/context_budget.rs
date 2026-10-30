@@ -147,7 +147,11 @@ fn duplicate_tool_results_collapse_to_a_marker_keeping_the_part() {
 
 fn call_still_present(messages: &[Value], idx: usize) -> bool {
     let ids: HashSet<&str> = messages[idx]["content"].as_array().unwrap().iter().filter_map(|p| p["toolCallId"].as_str()).collect();
-    messages[..idx].iter().rev().filter(|m| m["role"] == "assistant").any(|m| m["content"].as_array().into_iter().flatten().any(|p| p["type"] == "tool-call" && ids.contains(p["toolCallId"].as_str().unwrap_or(""))))
+    messages[..idx]
+        .iter()
+        .rev()
+        .filter(|m| m["role"] == "assistant")
+        .any(|m| m["content"].as_array().into_iter().flatten().any(|p| p["type"] == "tool-call" && ids.contains(p["toolCallId"].as_str().unwrap_or(""))))
 }
 
 #[test]

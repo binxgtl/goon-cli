@@ -298,7 +298,12 @@ impl LanguageModel for OpenAIResponsesModel {
                             }
                         }
                         "error" => {
-                            let message = data.get("message").and_then(Value::as_str).or_else(|| data.get("error").and_then(|e| e.get("message")).and_then(Value::as_str)).unwrap_or("Responses stream error").to_string();
+                            let message = data
+                                .get("message")
+                                .and_then(Value::as_str)
+                                .or_else(|| data.get("error").and_then(|e| e.get("message")).and_then(Value::as_str))
+                                .unwrap_or("Responses stream error")
+                                .to_string();
                             finish = Some(FinishReason::Error);
                             parts.push(StreamPart::Error(ApiError::new(message)));
                         }

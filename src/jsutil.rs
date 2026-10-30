@@ -511,17 +511,13 @@ pub fn now_iso() -> String {
 }
 
 pub fn iso_from_millis(ms: i64) -> String {
-    let dt = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms)
-        .unwrap_or_else(|| chrono::DateTime::<chrono::Utc>::from_timestamp_millis(0).unwrap());
+    let dt = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms).unwrap_or_else(|| chrono::DateTime::<chrono::Utc>::from_timestamp_millis(0).unwrap());
     dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
 }
 
 /// `Date.now()`.
 pub fn now_millis() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
 /// `Date.parse(iso)` for the ISO strings this program writes; `None` when unparsable.
@@ -532,9 +528,7 @@ pub fn parse_iso_millis(text: &str) -> Option<i64> {
 /// True for strings accepted by zod's `z.string().datetime()` (UTC `Z` suffix, optional fraction).
 pub fn is_iso_datetime(text: &str) -> bool {
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| regex::Regex::new(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?Z$").unwrap())
-        .is_match(text)
-        && parse_iso_millis(text).is_some()
+    RE.get_or_init(|| regex::Regex::new(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?Z$").unwrap()).is_match(text) && parse_iso_millis(text).is_some()
 }
 
 /// Number of UTF-16 code units (`string.length` in JS).
@@ -599,10 +593,7 @@ pub fn stable_stringify(value: &Value) -> String {
         Value::Object(map) => {
             let mut keys: Vec<&String> = map.keys().collect();
             keys.sort_by(|a, b| locale_cmp(a, b));
-            let parts: Vec<String> = keys
-                .into_iter()
-                .map(|k| format!("{}:{}", quote(k), stable_stringify(&map[k])))
-                .collect();
+            let parts: Vec<String> = keys.into_iter().map(|k| format!("{}:{}", quote(k), stable_stringify(&map[k]))).collect();
             format!("{{{}}}", parts.join(","))
         }
         other => stringify(other),
@@ -660,7 +651,7 @@ pub fn is_true(value: Option<&Value>) -> bool {
     matches!(value, Some(Value::Bool(true)))
 }
 
-pub fn as_str<'a>(value: Option<&'a Value>) -> Option<&'a str> {
+pub fn as_str(value: Option<&Value>) -> Option<&str> {
     value.and_then(Value::as_str)
 }
 
@@ -734,6 +725,18 @@ pub fn js_round(value: f64) -> f64 {
     }
 }
 
+/// `String(value)` for a JSON value.
+pub fn js_string(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        Value::Null => "null".into(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(_) => stringify(value),
+        Value::Array(items) => items.iter().map(|v| if v.is_null() { String::new() } else { js_string(v) }).collect::<Vec<_>>().join(","),
+        Value::Object(_) => "[object Object]".into(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -760,7 +763,16 @@ mod tests {
 
     #[test]
     fn numbers_print_like_number_to_string() {
-        for (value, text) in [(0.000001, "0.000001"), (1e-7, "1e-7"), (1e21, "1e+21"), (1.5e20, "150000000000000000000"), (0.1 + 0.2, "0.30000000000000004"), (-2.5e-8, "-2.5e-8"), (123.0, "123"), (1.0e16, "10000000000000000")] {
+        for (value, text) in [
+            (0.000001, "0.000001"),
+            (1e-7, "1e-7"),
+            (1e21, "1e+21"),
+            (1.5e20, "150000000000000000000"),
+            (0.1 + 0.2, "0.30000000000000004"),
+            (-2.5e-8, "-2.5e-8"),
+            (123.0, "123"),
+            (1.0e16, "10000000000000000"),
+        ] {
             assert_eq!(number_to_string(value), text);
         }
         assert_eq!(stringify(&json!({"a": 0.000001, "b": [1.5e20]})), r#"{"a":0.000001,"b":[150000000000000000000]}"#);
@@ -769,7 +781,21 @@ mod tests {
 
     #[test]
     fn to_fixed_matches_javascript() {
-        for (value, digits, text) in [(1.25, 1, "1.3"), (1.005, 2, "1.00"), (2.5, 0, "3"), (-1.25, 1, "-1.3"), (0.0, 2, "0.00"), (-0.0001, 2, "-0.00"), (1234.5678, 4, "1234.5678"), (0.000123, 4, "0.0001"), (1e21, 2, "1e+21"), (f64::NAN, 2, "NaN"), (12.345, 2, "12.35"), (8.345, 2, "8.35"), (1.45, 1, "1.4")] {
+        for (value, digits, text) in [
+            (1.25, 1, "1.3"),
+            (1.005, 2, "1.00"),
+            (2.5, 0, "3"),
+            (-1.25, 1, "-1.3"),
+            (0.0, 2, "0.00"),
+            (-0.0001, 2, "-0.00"),
+            (1234.5678, 4, "1234.5678"),
+            (0.000123, 4, "0.0001"),
+            (1e21, 2, "1e+21"),
+            (f64::NAN, 2, "NaN"),
+            (12.345, 2, "12.35"),
+            (8.345, 2, "8.35"),
+            (1.45, 1, "1.4"),
+        ] {
             assert_eq!(to_fixed(value, digits), text, "{value}.toFixed({digits})");
         }
         assert_eq!(js_round(2.5), 3.0);
@@ -819,17 +845,5 @@ mod tests {
         assert_eq!(take_chars("héllo", 2), "hé");
         assert_eq!(tail_chars("héllo", 3), "llo");
         assert_eq!(slice_chars("abcdef", 1, 3), "bc");
-    }
-}
-
-/// `String(value)` for a JSON value.
-pub fn js_string(value: &Value) -> String {
-    match value {
-        Value::String(s) => s.clone(),
-        Value::Null => "null".into(),
-        Value::Bool(b) => b.to_string(),
-        Value::Number(_) => stringify(value),
-        Value::Array(items) => items.iter().map(|v| if v.is_null() { String::new() } else { js_string(v) }).collect::<Vec<_>>().join(","),
-        Value::Object(_) => "[object Object]".into(),
     }
 }

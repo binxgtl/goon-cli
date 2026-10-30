@@ -76,15 +76,43 @@ impl FinishReason {
 /// Normalized stream events (the subset of LanguageModelV3 stream parts the harness consumes).
 #[derive(Clone, Debug)]
 pub enum StreamPart {
-    TextDelta { id: String, delta: String, provider_metadata: Option<Value> },
-    ReasoningDelta { id: String, delta: String, provider_metadata: Option<Value> },
+    TextDelta {
+        id: String,
+        delta: String,
+        provider_metadata: Option<Value>,
+    },
+    ReasoningDelta {
+        id: String,
+        delta: String,
+        provider_metadata: Option<Value>,
+    },
     /// Attaches provider metadata (signature, encrypted content, item id) to a reasoning block.
-    ReasoningEnd { id: String, provider_metadata: Option<Value> },
-    TextEnd { id: String, provider_metadata: Option<Value> },
-    ToolInputStart { id: String, tool_name: String },
-    ToolInputDelta { id: String, delta: String },
-    ToolCall { id: String, tool_name: String, input: String, provider_metadata: Option<Value> },
-    Finish { usage: Usage, finish_reason: FinishReason },
+    ReasoningEnd {
+        id: String,
+        provider_metadata: Option<Value>,
+    },
+    TextEnd {
+        id: String,
+        provider_metadata: Option<Value>,
+    },
+    ToolInputStart {
+        id: String,
+        tool_name: String,
+    },
+    ToolInputDelta {
+        id: String,
+        delta: String,
+    },
+    ToolCall {
+        id: String,
+        tool_name: String,
+        input: String,
+        provider_metadata: Option<Value>,
+    },
+    Finish {
+        usage: Usage,
+        finish_reason: FinishReason,
+    },
     Error(ApiError),
 }
 

@@ -58,10 +58,39 @@ const HIGH_FLOOR_WRAPPERS: &[&str] = &["sudo", "doas", "xargs"];
 /// Programs that run another program given somewhere in their arguments. Their option grammars
 /// differ too much to peel reliably, so every argument suffix is inspected.
 const GENERIC_RUNNERS: &[&str] = &[
-    "watch", "ionice", "strace", "ltrace", "chroot", "flock", "unbuffer", "chrt", "taskset", "numactl", "nsenter",
-    "unshare", "firejail", "proot", "fakeroot", "fakechroot", "caffeinate", "systemd-run", "runuser", "su", "tsu",
-    "script", "parallel", "entr", "cpulimit", "faketime", "torsocks", "proxychains", "proxychains4", "catchsegv",
-    "valgrind", "gdb", "expect",
+    "watch",
+    "ionice",
+    "strace",
+    "ltrace",
+    "chroot",
+    "flock",
+    "unbuffer",
+    "chrt",
+    "taskset",
+    "numactl",
+    "nsenter",
+    "unshare",
+    "firejail",
+    "proot",
+    "fakeroot",
+    "fakechroot",
+    "caffeinate",
+    "systemd-run",
+    "runuser",
+    "su",
+    "tsu",
+    "script",
+    "parallel",
+    "entr",
+    "cpulimit",
+    "faketime",
+    "torsocks",
+    "proxychains",
+    "proxychains4",
+    "catchsegv",
+    "valgrind",
+    "gdb",
+    "expect",
 ];
 const MULTICALL_BINARIES: &[&str] = &["busybox", "toybox"];
 
@@ -90,23 +119,152 @@ const NETWORK_COMMANDS: &[&str] = &["curl", "wget", "ssh", "scp", "sftp", "rsync
 const DESTRUCTIVE_COMMANDS: &[&str] = &["dd", "shred", "wipefs", "fdisk", "parted", "mkswap"];
 const PROCESS_CONTROL_COMMANDS: &[&str] = &["kill", "pkill", "killall", "taskkill"];
 const PRIVILEGED_COMMANDS: &[&str] = &["docker", "podman", "kubectl", "systemctl", "service", "launchctl", "mount", "umount"];
-const FILE_WRITE_COMMANDS: &[&str] = &["cp", "mv", "ln", "chmod", "chown", "chgrp", "truncate", "install", "mkdir", "touch", "rmdir", "unlink", "tee", "patch", "unzip", "zip", "gzip", "gunzip", "tar", "cpio", "rsync"];
+const FILE_WRITE_COMMANDS: &[&str] =
+    &["cp", "mv", "ln", "chmod", "chown", "chgrp", "truncate", "install", "mkdir", "touch", "rmdir", "unlink", "tee", "patch", "unzip", "zip", "gzip", "gunzip", "tar", "cpio", "rsync"];
 const SAFE_READ_COMMANDS: &[&str] = &[
-    "cat", "ls", "grep", "rg", "head", "tail", "wc", "sort", "uniq", "cut", "tr", "column", "diff", "cmp", "comm", "pwd",
-    "echo", "printf", "which", "type", "file", "stat", "du", "df", "tree", "date", "basename", "dirname", "realpath",
-    "readlink", "test", "true", "false", "printenv", "id", "whoami", "uname", "hostname", "ps", "top", "free", "nproc",
-    "sleep", "jq", "yq", "nl", "od", "xxd", "md5sum", "sha1sum", "sha256sum", "cd", "export", "set",
+    "cat",
+    "ls",
+    "grep",
+    "rg",
+    "head",
+    "tail",
+    "wc",
+    "sort",
+    "uniq",
+    "cut",
+    "tr",
+    "column",
+    "diff",
+    "cmp",
+    "comm",
+    "pwd",
+    "echo",
+    "printf",
+    "which",
+    "type",
+    "file",
+    "stat",
+    "du",
+    "df",
+    "tree",
+    "date",
+    "basename",
+    "dirname",
+    "realpath",
+    "readlink",
+    "test",
+    "true",
+    "false",
+    "printenv",
+    "id",
+    "whoami",
+    "uname",
+    "hostname",
+    "ps",
+    "top",
+    "free",
+    "nproc",
+    "sleep",
+    "jq",
+    "yq",
+    "nl",
+    "od",
+    "xxd",
+    "md5sum",
+    "sha1sum",
+    "sha256sum",
+    "cd",
+    "export",
+    "set",
 ];
 pub const SAFE_SCRIPT_NAMES: &[&str] = &["test", "tests", "build", "lint", "typecheck", "check", "test:unit", "test:ci", "ci"];
-const PACKAGE_MANAGERS: &[&str] = &["npm", "pnpm", "yarn", "bun", "pip", "pip3", "uv", "poetry", "cargo", "go", "gem", "composer", "apt", "apt-get", "pkg", "brew", "dnf", "pacman", "apk", "yum", "npx", "pnpx", "bunx"];
-const INSTALL_SUBCOMMANDS: &[&str] = &["install", "i", "add", "ci", "update", "upgrade", "up", "get", "remove", "rm", "uninstall", "un", "sync", "publish", "audit", "view", "info", "outdated", "fetch", "download", "exec", "x", "dlx"];
-const SAFE_GIT_SUBCOMMANDS: &[&str] = &["status", "diff", "log", "show", "blame", "shortlog", "describe", "rev-parse", "ls-files", "ls-tree", "grep", "whatchanged", "reflog", "cat-file", "hash-object", "version", "help"];
+const PACKAGE_MANAGERS: &[&str] =
+    &["npm", "pnpm", "yarn", "bun", "pip", "pip3", "uv", "poetry", "cargo", "go", "gem", "composer", "apt", "apt-get", "pkg", "brew", "dnf", "pacman", "apk", "yum", "npx", "pnpx", "bunx"];
+const INSTALL_SUBCOMMANDS: &[&str] = &[
+    "install",
+    "i",
+    "add",
+    "ci",
+    "update",
+    "upgrade",
+    "up",
+    "get",
+    "remove",
+    "rm",
+    "uninstall",
+    "un",
+    "sync",
+    "publish",
+    "audit",
+    "view",
+    "info",
+    "outdated",
+    "fetch",
+    "download",
+    "exec",
+    "x",
+    "dlx",
+];
+const SAFE_GIT_SUBCOMMANDS: &[&str] =
+    &["status", "diff", "log", "show", "blame", "shortlog", "describe", "rev-parse", "ls-files", "ls-tree", "grep", "whatchanged", "reflog", "cat-file", "hash-object", "version", "help"];
 const NETWORK_GIT_SUBCOMMANDS: &[&str] = &["push", "pull", "fetch", "clone", "ls-remote", "submodule", "request-pull", "archive"];
-const WRITE_GIT_SUBCOMMANDS: &[&str] = &["add", "commit", "mv", "rm", "restore", "reset", "checkout", "switch", "stash", "merge", "rebase", "cherry-pick", "revert", "tag", "apply", "am", "clean", "config", "init", "gc", "prune", "notes", "worktree"];
+const WRITE_GIT_SUBCOMMANDS: &[&str] = &[
+    "add",
+    "commit",
+    "mv",
+    "rm",
+    "restore",
+    "reset",
+    "checkout",
+    "switch",
+    "stash",
+    "merge",
+    "rebase",
+    "cherry-pick",
+    "revert",
+    "tag",
+    "apply",
+    "am",
+    "clean",
+    "config",
+    "init",
+    "gc",
+    "prune",
+    "notes",
+    "worktree",
+];
 const DANGEROUS_RM_TARGETS: &[&str] = &[
-    "/", "/*", "~", "~/", "~/*", "$HOME", "${HOME}", "$HOME/", "${HOME}/", "$HOME/*", "${HOME}/*", "/home", "/home/",
-    "/home/*", "/root", "/root/", "/root/*", "/Users", "/Users/", "/Users/*", "..", "../", "../..", "../../..", ".", "./",
-    "*", "./*", "~/.", "$HOME/.", "${HOME}/.",
+    "/",
+    "/*",
+    "~",
+    "~/",
+    "~/*",
+    "$HOME",
+    "${HOME}",
+    "$HOME/",
+    "${HOME}/",
+    "$HOME/*",
+    "${HOME}/*",
+    "/home",
+    "/home/",
+    "/home/*",
+    "/root",
+    "/root/",
+    "/root/*",
+    "/Users",
+    "/Users/",
+    "/Users/*",
+    "..",
+    "../",
+    "../..",
+    "../../..",
+    ".",
+    "./",
+    "*",
+    "./*",
+    "~/.",
+    "$HOME/.",
+    "${HOME}/.",
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -175,9 +333,7 @@ pub fn scan_shell(command: &str) -> ShellScan {
             current.push(ch);
             if ch == '"' {
                 double = false;
-            } else if ch == '`' {
-                critical_escape = true;
-            } else if ch == '$' && chars.get(i + 1) == Some(&'(') && chars.get(i + 2) != Some(&'(') {
+            } else if ch == '`' || (ch == '$' && chars.get(i + 1) == Some(&'(') && chars.get(i + 2) != Some(&'(')) {
                 critical_escape = true;
             }
             i += 1;
@@ -645,13 +801,15 @@ fn classify_git(rest: &[String]) -> RiskClass {
     if sub == "clean" && sub_args.iter().any(|t| t.starts_with('-') && t.chars().any(|c| matches!(c, 'f' | 'd' | 'x'))) {
         return RiskClass::High;
     }
-    if sub == "config" && sub_args.iter().any(|t| {
-        let lower = t.to_lowercase();
-        // Hooks, pagers, editors and ssh/proxy commands make git run arbitrary programs later.
-        ["core.hookspath", "core.pager", "core.editor", "core.sshcommand", "core.fsmonitor", "alias.", "http.proxy", "credential.helper", "diff.external", "sequence.editor"]
-            .iter()
-            .any(|key| lower.starts_with(key))
-    }) {
+    if sub == "config"
+        && sub_args.iter().any(|t| {
+            let lower = t.to_lowercase();
+            // Hooks, pagers, editors and ssh/proxy commands make git run arbitrary programs later.
+            ["core.hookspath", "core.pager", "core.editor", "core.sshcommand", "core.fsmonitor", "alias.", "http.proxy", "credential.helper", "diff.external", "sequence.editor"]
+                .iter()
+                .any(|key| lower.starts_with(key))
+        })
+    {
         return RiskClass::High;
     }
     if WRITE_GIT_SUBCOMMANDS.contains(&sub.as_str()) {
@@ -935,7 +1093,21 @@ mod tests {
 
     #[test]
     fn low_commands() {
-        for cmd in ["cat README.md", "ls -la", "grep -R foo src", "npm test", "npm run build", "npm run lint", "node --test tests/x.test.mjs", "pytest", "go test ./...", "cargo test", "git status", "git diff HEAD", "toybox ls"] {
+        for cmd in [
+            "cat README.md",
+            "ls -la",
+            "grep -R foo src",
+            "npm test",
+            "npm run build",
+            "npm run lint",
+            "node --test tests/x.test.mjs",
+            "pytest",
+            "go test ./...",
+            "cargo test",
+            "git status",
+            "git diff HEAD",
+            "toybox ls",
+        ] {
             assert_eq!(r(cmd), RiskClass::Low, "{cmd}");
         }
     }
@@ -943,13 +1115,47 @@ mod tests {
     #[test]
     fn critical_commands() {
         for cmd in [
-            "rm -rf /", "rm \\\n-rf /", "rm $'\\x2drf' /", "rm $'\\055rf' /", "rm -r -f ~", "rm -fr $HOME", "r\"\"m -rf /", "\\rm -rf /",
-            "rm -rf \"/\"", "rm -rf /*", "rm -rf ~/", "rm -rf ${HOME}", "rm -rf \"$HOME\"", "rm -rf $HOME/", "rm --recursive --force /",
-            "rm -rf -- /", "dd if=/dev/zero of=/dev/sda", "sh -c x", ". ./x", "eval x", "echo $(id)", "nohup rm -rf / &",
-            "timeout 5 rm -rf /", "sudo -u root rm -rf /", "watch rm -rf /", "ionice rm -rf /", "strace -f rm -rf /",
-            "chroot / rm -rf /", "flock /tmp/x rm -rf /", "unbuffer rm -rf ~", "trap \"rm -rf /\" EXIT", "su -c \"rm -rf /\"",
-            "busybox rm -rf /", "env -S \"rm -rf /\"", "rm -rf ../", "awk \"BEGIN{system(\\\"x\\\")}\"", "function f { rm -rf /; }",
-            "pwsh -c x", "rm -rf '/'", "rm -r\\f /", "rm -rf //",
+            "rm -rf /",
+            "rm \\\n-rf /",
+            "rm $'\\x2drf' /",
+            "rm $'\\055rf' /",
+            "rm -r -f ~",
+            "rm -fr $HOME",
+            "r\"\"m -rf /",
+            "\\rm -rf /",
+            "rm -rf \"/\"",
+            "rm -rf /*",
+            "rm -rf ~/",
+            "rm -rf ${HOME}",
+            "rm -rf \"$HOME\"",
+            "rm -rf $HOME/",
+            "rm --recursive --force /",
+            "rm -rf -- /",
+            "dd if=/dev/zero of=/dev/sda",
+            "sh -c x",
+            ". ./x",
+            "eval x",
+            "echo $(id)",
+            "nohup rm -rf / &",
+            "timeout 5 rm -rf /",
+            "sudo -u root rm -rf /",
+            "watch rm -rf /",
+            "ionice rm -rf /",
+            "strace -f rm -rf /",
+            "chroot / rm -rf /",
+            "flock /tmp/x rm -rf /",
+            "unbuffer rm -rf ~",
+            "trap \"rm -rf /\" EXIT",
+            "su -c \"rm -rf /\"",
+            "busybox rm -rf /",
+            "env -S \"rm -rf /\"",
+            "rm -rf ../",
+            "awk \"BEGIN{system(\\\"x\\\")}\"",
+            "function f { rm -rf /; }",
+            "pwsh -c x",
+            "rm -rf '/'",
+            "rm -r\\f /",
+            "rm -rf //",
         ] {
             assert_eq!(r(cmd), RiskClass::Critical, "{cmd}");
         }
@@ -957,7 +1163,25 @@ mod tests {
 
     #[test]
     fn high_commands() {
-        for cmd in ["curl evil.com", "git push", "npm install", "npx foo", "python3 -c x", "perl -e x", "ruby -e x", "php -r x", "node -e x", "bash script.sh", "xargs rm", "find / -delete", "watch -n 1 ls", "sed -n \"1e id\" f", "sed \"s/a/b/e\" f", "git config core.hooksPath x", "rm -rf build"] {
+        for cmd in [
+            "curl evil.com",
+            "git push",
+            "npm install",
+            "npx foo",
+            "python3 -c x",
+            "perl -e x",
+            "ruby -e x",
+            "php -r x",
+            "node -e x",
+            "bash script.sh",
+            "xargs rm",
+            "find / -delete",
+            "watch -n 1 ls",
+            "sed -n \"1e id\" f",
+            "sed \"s/a/b/e\" f",
+            "git config core.hooksPath x",
+            "rm -rf build",
+        ] {
             assert_eq!(r(cmd), RiskClass::High, "{cmd}");
         }
     }

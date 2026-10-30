@@ -39,13 +39,8 @@ struct HttpFixture {
 impl HttpFixture {
     fn start(mode: &str, token: &str) -> HttpFixture {
         use std::io::BufRead;
-        let mut child = std::process::Command::new("node")
-            .args([FIXTURE, mode])
-            .env("MCP_FIXTURE_TOKEN", token)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .expect("node");
+        let mut child =
+            std::process::Command::new("node").args([FIXTURE, mode]).env("MCP_FIXTURE_TOKEN", token).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).spawn().expect("node");
         let mut line = String::new();
         std::io::BufReader::new(child.stdout.take().unwrap()).read_line(&mut line).unwrap();
         HttpFixture { port: line.trim().parse().expect("port"), child }
@@ -123,7 +118,8 @@ async fn request_failures_leave_no_registered_tools_and_redact_configured_creden
     let reg = registry(&f.cwd, tools::approve_all(), false);
     let config = parse_mcp_config(&json!({ "servers": { "broken": { "transport": "http", "url": server.url(), "bearerEnv": "GOON_MCP_ERROR_TOKEN", "timeoutMs": 200 } } })).unwrap();
     let manager = McpManager::new(config, &f.cwd, None);
-    let error = manager.connect(Some(&reg), None).await.err().expect("rejected").to_string();
+    let Err(error) = manager.connect(Some(&reg), None).await else { panic!("the connection must be rejected") };
+    let error = error.to_string();
     assert!(!error.contains("mcp-error-secret"), "{error}");
     assert!(manager.tools().is_empty());
 
@@ -176,7 +172,10 @@ async fn codex_config_import_and_enabled_disabled_tool_filtering() {
 
     let f = fixture();
     let reg = registry(&f.cwd, tools::approve_all(), false);
-    let config = parse_mcp_config(&json!({ "mcpServers": { "rea": { "command": "node", "args": [FIXTURE, "--rea-scale"], "enabledTools": ["rea_tool_1", "rea_tool_2", "rea_tool_3"], "disabledTools": ["rea_tool_2"] } } })).unwrap();
+    let config = parse_mcp_config(
+        &json!({ "mcpServers": { "rea": { "command": "node", "args": [FIXTURE, "--rea-scale"], "enabledTools": ["rea_tool_1", "rea_tool_2", "rea_tool_3"], "disabledTools": ["rea_tool_2"] } } }),
+    )
+    .unwrap();
     let manager = McpManager::new(config, &f.cwd, None);
     manager.connect(Some(&reg), None).await.unwrap();
     let mut got: Vec<String> = manager.tools().into_iter().map(|t| t.name).collect();

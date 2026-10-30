@@ -105,13 +105,7 @@ pub fn to_usage_split(usage: Option<&crate::model::Usage>, fallback_input: u64, 
     let total = usage.and_then(|u| u.total_tokens()).unwrap_or(input + output);
     let cached = usage.and_then(|u| u.cache_read_tokens).unwrap_or(0);
     let cache_write = usage.and_then(|u| u.cache_write_tokens).unwrap_or(0);
-    UsageSplit {
-        input_tokens: input,
-        output_tokens: output,
-        total_tokens: total,
-        cached_input_tokens: (cached > 0).then_some(cached),
-        cache_write_tokens: (cache_write > 0).then_some(cache_write),
-    }
+    UsageSplit { input_tokens: input, output_tokens: output, total_tokens: total, cached_input_tokens: (cached > 0).then_some(cached), cache_write_tokens: (cache_write > 0).then_some(cache_write) }
 }
 
 pub fn format_usd(value: f64) -> String {
@@ -279,10 +273,7 @@ impl CostLedger {
             if let Some(started) = budget.started_at {
                 let elapsed = (crate::jsutil::now_millis() - started) as f64;
                 if elapsed >= budget.time_limit_ms as f64 {
-                    return CapCheck {
-                        exceeded: true,
-                        reason: format!("Run time budget reached ({} of {}).", format_duration_ms(elapsed), format_duration_ms(budget.time_limit_ms as f64)),
-                    };
+                    return CapCheck { exceeded: true, reason: format!("Run time budget reached ({} of {}).", format_duration_ms(elapsed), format_duration_ms(budget.time_limit_ms as f64)) };
                 }
             }
         }

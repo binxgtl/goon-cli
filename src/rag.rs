@@ -119,7 +119,9 @@ fn declaration_re(path: &str) -> Option<&'static Regex> {
         return Some(TS.get_or_init(|| Regex::new(&format!(r"^(?:export\s+)?(?:default\s+)?(?:declare\s+)?(?:abstract\s+)?(?:async\s+)?(?:function\s*\*?\s*{w}+|(?:class|interface|enum|namespace)\s+{w}+|type\s+{w}+\s*=|(?:const|let|var)\s+{w}+\s*=\s*(?:async\s*)?(?:function(?-u:\b)|\())")).unwrap()));
     }
     if [".js", ".jsx", ".mjs", ".cjs"].iter().any(|e| base.ends_with(e)) {
-        return Some(JS.get_or_init(|| Regex::new(&format!(r"^(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function\s*\*?\s*{w}+|class\s+{w}+|(?:const|let|var)\s+{w}+\s*=\s*(?:async\s*)?(?:function(?-u:\b)|\())")).unwrap()));
+        return Some(JS.get_or_init(|| {
+            Regex::new(&format!(r"^(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function\s*\*?\s*{w}+|class\s+{w}+|(?:const|let|var)\s+{w}+\s*=\s*(?:async\s*)?(?:function(?-u:\b)|\())")).unwrap()
+        }));
     }
     if base.ends_with(".go") {
         return Some(GO.get_or_init(|| Regex::new(&format!(r"^(?:func\s+(?:\([^)]*\)\s*)?{w}+|type\s+{w}+\s+(?:struct|interface)(?-u:\b))")).unwrap()));
@@ -329,7 +331,8 @@ pub fn is_ignored(rel: &str, rules: &[GoonignoreRule]) -> bool {
     ignored
 }
 
-pub const DEFAULT_SKIP_DIRS: [&str; 18] = [".git", "node_modules", "vendor", "dist", "build", "out", ".next", ".cache", ".turbo", "coverage", ".venv", "venv", "__pycache__", ".idea", ".vscode", "target", "bin", "obj"];
+pub const DEFAULT_SKIP_DIRS: [&str; 18] =
+    [".git", "node_modules", "vendor", "dist", "build", "out", ".next", ".cache", ".turbo", "coverage", ".venv", "venv", "__pycache__", ".idea", ".vscode", "target", "bin", "obj"];
 
 #[derive(Clone, Debug)]
 pub struct WalkedFile {
@@ -487,10 +490,14 @@ pub fn index_repo(root: &Path, max_files: usize, max_file_bytes: u64, secrets: &
             continue;
         }
         let content = String::from_utf8_lossy(&buffer);
-        let chunks: Vec<Chunk> = chunk_file(&f.path, &content, None).into_iter().map(|mut c| {
-            c.content = redact_secrets(&c.content, secrets);
-            c
-        }).filter(|c| !c.content.trim().is_empty()).collect();
+        let chunks: Vec<Chunk> = chunk_file(&f.path, &content, None)
+            .into_iter()
+            .map(|mut c| {
+                c.content = redact_secrets(&c.content, secrets);
+                c
+            })
+            .filter(|c| !c.content.trim().is_empty())
+            .collect();
         if chunks.is_empty() {
             continue;
         }
@@ -498,7 +505,13 @@ pub fn index_repo(root: &Path, max_files: usize, max_file_bytes: u64, secrets: &
         files.insert(f.path.clone(), RagFileRecord { mtime_ms: f.mtime_ms, size: f.size, chunks });
     }
     let n = files.len();
-    RepoIndexResult { snapshot: RagSnapshot { cwd: root.to_string_lossy().to_string(), indexed_at: now_iso(), files }, files: n, chunks: count, duration_ms: now_millis() - started, truncated: walk.truncated }
+    RepoIndexResult {
+        snapshot: RagSnapshot { cwd: root.to_string_lossy().to_string(), indexed_at: now_iso(), files },
+        files: n,
+        chunks: count,
+        duration_ms: now_millis() - started,
+        truncated: walk.truncated,
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -524,7 +537,13 @@ pub struct LexicalIndex {
 
 impl LexicalIndex {
     pub fn new(embedder: Option<Arc<dyn Embedder>>, capacity: Option<usize>, threshold: Option<f64>) -> Self {
-        LexicalIndex { entries: IndexMap::new(), embedder: embedder.unwrap_or_else(|| Arc::new(HashEmbedder)), capacity: capacity.unwrap_or(5000).max(1), threshold: threshold.unwrap_or(0.0), clock: 0 }
+        LexicalIndex {
+            entries: IndexMap::new(),
+            embedder: embedder.unwrap_or_else(|| Arc::new(HashEmbedder)),
+            capacity: capacity.unwrap_or(5000).max(1),
+            threshold: threshold.unwrap_or(0.0),
+            clock: 0,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -583,7 +602,9 @@ impl LexicalIndex {
             }
             scored.push(RetrievedChunk { chunk: e.chunk.clone(), score });
         }
-        scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal).then_with(|| locale_cmp(&a.chunk.path, &b.chunk.path)).then(a.chunk.start_line.cmp(&b.chunk.start_line)));
+        scored.sort_by(|a, b| {
+            b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal).then_with(|| locale_cmp(&a.chunk.path, &b.chunk.path)).then(a.chunk.start_line.cmp(&b.chunk.start_line))
+        });
         scored.truncate(k);
         Ok(scored)
     }

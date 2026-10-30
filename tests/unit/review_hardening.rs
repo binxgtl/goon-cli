@@ -11,8 +11,17 @@ fn deny_net() -> ExecutionPolicy {
 #[test]
 fn command_runners_cannot_hide_critical_commands_from_the_classifier() {
     for cmd in [
-        "watch rm -rf /", "ionice rm -rf /", "strace -f rm -rf /", "chroot / rm -rf /", "flock /tmp/lock rm -rf /", "unbuffer rm -rf ~", "trap \"rm -rf /\" EXIT", "su -c \"rm -rf /\"", "busybox rm -rf /",
-        "watch \"rm -rf $HOME\"", "proot rm -rf /",
+        "watch rm -rf /",
+        "ionice rm -rf /",
+        "strace -f rm -rf /",
+        "chroot / rm -rf /",
+        "flock /tmp/lock rm -rf /",
+        "unbuffer rm -rf ~",
+        "trap \"rm -rf /\" EXIT",
+        "su -c \"rm -rf /\"",
+        "busybox rm -rf /",
+        "watch \"rm -rf $HOME\"",
+        "proot rm -rf /",
     ] {
         assert_eq!(classify_bash_risk(cmd), RiskClass::Critical, "{cmd}");
     }

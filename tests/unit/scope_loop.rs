@@ -60,7 +60,11 @@ fn opts(f: &Fixture, files: &Arc<files::WorkspaceFiles>, runner: Arc<FakeRunner>
     }
 }
 
-fn writer(files: &Arc<files::WorkspaceFiles>, name: impl Fn(u64) -> String + Send + Sync + 'static, content: impl Fn(u64) -> String + Send + Sync + 'static) -> impl Fn(ScopeLoopAttempt, CancellationToken) -> BoxFuture<'static, Result<String>> {
+fn writer(
+    files: &Arc<files::WorkspaceFiles>,
+    name: impl Fn(u64) -> String + Send + Sync + 'static,
+    content: impl Fn(u64) -> String + Send + Sync + 'static,
+) -> impl Fn(ScopeLoopAttempt, CancellationToken) -> BoxFuture<'static, Result<String>> {
     let files = files.clone();
     move |ctx, _| {
         let r = files.write(&name(ctx.round), &content(ctx.round));
@@ -155,7 +159,12 @@ async fn secrets_are_redacted_in_the_expanded_verify_output() {
 async fn the_returned_verdict_is_redacted() {
     let f = fixture();
     let files = Arc::new(files::WorkspaceFiles::new(&f.cwd));
-    let runner = Arc::new(FakeRunner { codes: vec![1], index: Mutex::new(0), calls: Mutex::new(vec![]), output: Some("token: supersecret\nAuthorization: Bearer sk-live-abcdef123456\nnote: LITERALSECRETVALUE".into()) });
+    let runner = Arc::new(FakeRunner {
+        codes: vec![1],
+        index: Mutex::new(0),
+        calls: Mutex::new(vec![]),
+        output: Some("token: supersecret\nAuthorization: Bearer sk-live-abcdef123456\nnote: LITERALSECRETVALUE".into()),
+    });
     let mut o = opts(&f, &files, runner, approve_with(true, None));
     o.secrets = vec!["LITERALSECRETVALUE".into()];
     let result = run_scope_loop("fix it", writer(&files, |r| format!("r-{r}.ts"), |_| "x\n".into()), o).await.unwrap();
@@ -334,7 +343,13 @@ fn budget_stop_reason_checks_the_token_limit_first_then_ledger_caps() {
     assert_eq!(budget_stop_reason(None), None);
     assert_match(&budget_stop_reason(Some(&token_budget(5, 5))).unwrap(), "token budget reached");
     assert_eq!(budget_stop_reason(Some(&token_budget(4, 5))), None);
-    let ledger = Arc::new(cost::CostLedger::new(cost::CostPricingTable { default: None, models: [("m".to_string(), cost::Price { input_per_1m: 1.0, output_per_1m: 1.0, cached_input_per_1m: None, cache_write_per_1m: None })].into_iter().collect() }, Some("m".into())));
+    let ledger = Arc::new(cost::CostLedger::new(
+        cost::CostPricingTable {
+            default: None,
+            models: [("m".to_string(), cost::Price { input_per_1m: 1.0, output_per_1m: 1.0, cached_input_per_1m: None, cache_write_per_1m: None })].into_iter().collect(),
+        },
+        Some("m".into()),
+    ));
     let now = jsutil::now_millis();
     let b = |cost_limit: f64, cost_spent: f64, time_limit_ms: u64, started_at: Option<i64>| -> cost::SharedBudget {
         Arc::new(Mutex::new(cost::RunBudget { spent: 0, limit: 0, cost_spent, cost_limit, started_at, time_limit_ms, ledger: Some(ledger.clone()) }))

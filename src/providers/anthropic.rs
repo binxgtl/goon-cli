@@ -152,11 +152,7 @@ pub fn build_body(model_id: &str, request: &ModelRequest) -> Value {
     }
     body.insert("messages".into(), Value::Array(convert_messages(&request.messages)));
     if !request.tools.is_empty() {
-        let tools: Vec<Value> = request
-            .tools
-            .iter()
-            .map(|t| json!({ "name": t.name, "description": t.description, "input_schema": t.parameters, "eager_input_streaming": true }))
-            .collect();
+        let tools: Vec<Value> = request.tools.iter().map(|t| json!({ "name": t.name, "description": t.description, "input_schema": t.parameters, "eager_input_streaming": true })).collect();
         body.insert("tools".into(), Value::Array(tools));
         body.insert("tool_choice".into(), json!({ "type": "auto" }));
     }
@@ -193,11 +189,8 @@ impl LanguageModel for AnthropicModel {
     fn generate(&self, request: ModelRequest) -> BoxFuture<'static, Result<GenerateResponse, ApiError>> {
         let url = join_url(&self.base_url, "messages");
         let body = without_stream(build_body(&self.model_id, &request));
-        let mut headers = vec![
-            ("anthropic-version".to_string(), "2023-06-01".to_string()),
-            ("x-api-key".to_string(), self.api_key.clone()),
-            ("authorization".to_string(), format!("Bearer {}", self.api_key)),
-        ];
+        let mut headers =
+            vec![("anthropic-version".to_string(), "2023-06-01".to_string()), ("x-api-key".to_string(), self.api_key.clone()), ("authorization".to_string(), format!("Bearer {}", self.api_key))];
         headers.extend(session_headers(self.session_id.as_deref()));
         Box::pin(async move {
             let response = post_json(&url, &headers, &body, request.cancel.clone(), request.timeout).await?;
@@ -232,11 +225,8 @@ impl LanguageModel for AnthropicModel {
     fn stream(&self, request: ModelRequest) -> BoxFuture<'static, Result<PartStream, ApiError>> {
         let url = join_url(&self.base_url, "messages");
         let body = build_body(&self.model_id, &request);
-        let mut headers = vec![
-            ("anthropic-version".to_string(), "2023-06-01".to_string()),
-            ("x-api-key".to_string(), self.api_key.clone()),
-            ("authorization".to_string(), format!("Bearer {}", self.api_key)),
-        ];
+        let mut headers =
+            vec![("anthropic-version".to_string(), "2023-06-01".to_string()), ("x-api-key".to_string(), self.api_key.clone()), ("authorization".to_string(), format!("Bearer {}", self.api_key))];
         headers.extend(session_headers(self.session_id.as_deref()));
         Box::pin(async move {
             let mut rx = post_sse(&url, &headers, &body, request.cancel.clone(), request.timeout).await?;
@@ -412,7 +402,10 @@ mod tests {
         ];
         let wire = convert_messages(&messages);
         assert_eq!(wire[0], json!({"role": "user", "content": [{"type": "text", "text": "read a.txt please"}]}));
-        assert_eq!(wire[1], json!({"role": "assistant", "content": [{"type": "thinking", "thinking": "think", "signature": "sig"}, {"type": "tool_use", "id": "toolu_1", "name": "read_file", "input": {"path": "a.txt"}}]}));
+        assert_eq!(
+            wire[1],
+            json!({"role": "assistant", "content": [{"type": "thinking", "thinking": "think", "signature": "sig"}, {"type": "tool_use", "id": "toolu_1", "name": "read_file", "input": {"path": "a.txt"}}]})
+        );
         assert_eq!(wire[2], json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "boom", "is_error": true}]}));
     }
 }
