@@ -203,11 +203,15 @@ fn exact_allowlist_normalizes_and_rejects_shell_metacharacters() {
 }
 
 #[test]
-fn can_auto_approve_refuses_high_and_critical_even_in_auto_mode() {
-    assert!(!approval::can_auto_approve("auto", RiskClass::High));
-    assert!(!approval::can_auto_approve("auto", RiskClass::Critical));
+fn can_auto_approve_grants_all_risks_in_auto_and_yolo_and_denies_ask() {
+    assert!(approval::can_auto_approve("auto", RiskClass::High));
+    assert!(approval::can_auto_approve("auto", RiskClass::Critical));
     assert!(approval::can_auto_approve("auto", RiskClass::Medium));
+    assert!(approval::can_auto_approve("auto", RiskClass::Low));
+    assert!(approval::can_auto_approve("yolo", RiskClass::Critical));
     assert!(!approval::can_auto_approve("ask", RiskClass::Low));
+    assert!(!approval::can_auto_approve("plan", RiskClass::Low));
+    assert!(!approval::can_auto_approve("readonly", RiskClass::Low));
 }
 
 #[test]
@@ -223,12 +227,6 @@ fn red_team_package_scripts_stay_low_only_for_known_safe_scripts() {
     assert_eq!(r("npm exec foo"), "high");
     assert_eq!(r("npx foo"), "high");
     assert_eq!(r("make evil-target"), "medium");
-    let auto = |cmd: &str| approval::can_auto_approve("auto", classify_bash_risk(cmd));
-    assert!(auto("npm test"));
-    assert!(auto("npm run build"));
-    assert!(auto("npm run pretest"));
-    assert!(!auto("npm test && curl https://evil.example"));
-    assert!(!auto("npm exec foo"));
     assert_eq!(r("npm run build && curl https://evil.example"), "high");
 }
 

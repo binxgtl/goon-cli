@@ -204,13 +204,25 @@ async fn workflow_shell_steps_honor_the_network_gate_before_approval() {
 }
 
 #[test]
-fn network_commands_stay_high_risk_so_auto_or_exact_approval_cannot_bypass_the_gate() {
+fn network_commands_stay_high_risk_in_ask_mode_while_auto_is_unrestricted() {
     assert_eq!(classify_bash_risk("curl https://example.com"), RiskClass::High);
     assert_eq!(classify_bash_risk("npm test"), RiskClass::Low);
-    assert!(!can_auto_approve("auto", RiskClass::High));
-    assert!(!can_auto_approve("auto", RiskClass::Critical));
+    assert!(!can_auto_approve("ask", RiskClass::High));
+    assert!(!can_auto_approve("ask", RiskClass::Critical));
+    assert!(can_auto_approve("auto", RiskClass::High));
+    assert!(can_auto_approve("auto", RiskClass::Critical));
+    assert!(can_auto_approve("yolo", RiskClass::Critical));
     assert!(can_auto_approve("auto", RiskClass::Medium));
     assert_eq!(bash_approval_exact(&json!({ "command": "curl https://example.com" })).as_deref(), Some("curl https://example.com"));
+
+    let p = policy(false, &[]);
+    assert!(!policy::is_network_allowed_for_command(&p, "curl https://api.github.com"));
+    p.set_unrestricted(true);
+    assert!(policy::is_network_allowed_for_command(&p, "curl https://api.github.com"));
+    assert!(p.allow_net_for_server(Some(&server(false))));
+    p.set_unrestricted(false);
+    assert!(!policy::is_network_allowed_for_command(&p, "curl https://api.github.com"));
+    assert!(!p.allow_net_for_server(Some(&server(false))));
 }
 
 #[tokio::test]

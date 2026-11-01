@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 
@@ -500,6 +501,7 @@ pub struct WorkspaceFiles {
     /// Canonical (symlink-free) workspace root.
     pub root: PathBuf,
     state: Mutex<FilesState>,
+    unrestricted: Mutex<Arc<AtomicBool>>,
 }
 
 #[derive(Clone)]
@@ -517,7 +519,19 @@ impl WorkspaceFiles {
     pub fn new(root: &Path) -> Self {
         let absolute = resolve_lexical(&std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")), &root.to_string_lossy());
         let canonical = std::fs::canonicalize(&absolute).map(crate::config::strip_verbatim).unwrap_or(absolute);
-        WorkspaceFiles { root: canonical, state: Mutex::new(FilesState::default()) }
+        WorkspaceFiles { root: canonical, state: Mutex::new(FilesState::default()), unrestricted: Mutex::new(Arc::new(AtomicBool::new(false))) }
+    }
+
+    pub fn set_unrestricted(&self, value: bool) {
+        self.unrestricted.lock().unwrap().store(value, Ordering::Relaxed);
+    }
+
+    pub fn share_unrestricted(&self, flag: Arc<AtomicBool>) {
+        *self.unrestricted.lock().unwrap() = flag;
+    }
+
+    pub fn is_unrestricted(&self) -> bool {
+        self.unrestricted.lock().unwrap().load(Ordering::Relaxed)
     }
 
     pub fn begin_turn(&self) {
@@ -601,7 +615,15 @@ impl WorkspaceFiles {
 
     /// Resolves a requested path inside the workspace, following symlinks of existing ancestors.
     pub fn path(&self, requested: &str) -> Result<PathBuf> {
-        let lexical = resolve_lexical(&self.root, requested);
+        let expanded: String;
+        let effective = if self.is_unrestricted() && (requested == "~" || requested.starts_with("~/") || requested.starts_with("~\\")) {
+            let home = jsutil::home_dir();
+            expanded = if requested.len() == 1 { home.to_string_lossy().to_string() } else { home.join(&requested[2..]).to_string_lossy().to_string() };
+            expanded.as_str()
+        } else {
+            requested
+        };
+        let lexical = resolve_lexical(&self.root, effective);
         self.assert_within(&lexical)?;
         let mut parent = lexical.clone();
         let mut suffix: Vec<std::ffi::OsString> = vec![];
@@ -637,6 +659,9 @@ impl WorkspaceFiles {
     }
 
     fn assert_within(&self, file: &Path) -> Result<()> {
+        if self.is_unrestricted() {
+            return Ok(());
+        }
         if !is_within_root(&self.root, file) {
             bail!("File path escapes the workspace.");
         }
@@ -644,17 +669,32 @@ impl WorkspaceFiles {
     }
 
     fn assert_not_windows_reserved(&self, file: &Path) -> Result<()> {
-        let rel = relative_path(&self.root, file);
-        for seg in rel.split(['/', '\\']) {
-            if windows_reserved_device_re().is_match(seg) {
-                bail!("Refusing to create Windows reserved device name \"{seg}\" (use /dev/null instead of nul).");
+        if is_within_root(&self.root, file) {
+            let rel = relative_path(&self.root, file);
+            for seg in rel.split(['/', '\\']) {
+                if windows_reserved_device_re().is_match(seg) {
+                    bail!("Refusing to create Windows reserved device name \"{seg}\" (use /dev/null instead of nul).");
+                }
+            }
+        } else {
+            for comp in file.components() {
+                if let Component::Normal(seg) = comp {
+                    let seg = seg.to_string_lossy();
+                    if windows_reserved_device_re().is_match(&seg) {
+                        bail!("Refusing to create Windows reserved device name \"{seg}\" (use /dev/null instead of nul).");
+                    }
+                }
             }
         }
         Ok(())
     }
 
     pub fn rel(&self, file: &Path) -> String {
-        relative_path(&self.root, file)
+        if is_within_root(&self.root, file) {
+            relative_path(&self.root, file)
+        } else {
+            to_posix(&file.to_string_lossy())
+        }
     }
 
     /// Reads a regular UTF-8 text file (≤ 2 MiB, no NUL bytes).

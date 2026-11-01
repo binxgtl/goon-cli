@@ -11,7 +11,7 @@ use crate::mcp::{
     mcp_tool_name, parse_env_placeholder, resolve_mcp_command, sanitize_and_compact_tool_schema, McpConfig, McpServerConfig, McpTransport, COMPACT_BULK_SCHEMA_MAX_BYTES, DEFAULT_MAX_MCP_TOOLS,
     DEFAULT_SCHEMA_MAX_BYTES,
 };
-use crate::policy::ExecutionPolicy;
+use crate::policy::{ExecutionPolicy, NetworkMode};
 use crate::risk::{classify_mcp_risk, RiskClass};
 use crate::tools::{catalog_definition, ToolExec, ToolRegistry};
 use anyhow::{anyhow, bail, Result};
@@ -940,8 +940,9 @@ impl McpManager {
         };
         let policy = registry.policy();
         for spec in &specs {
-            // Server-level allowNet / global --allow-net exempts a networked tool from the gate.
-            let net_gated = spec.net && !policy.as_ref().map(|p| p.allow_net_for_server(Some(&spec.server_config))).unwrap_or(false);
+            // Server-level allowNet / static --allow-net exempts a networked tool from the gate;
+            // dynamic unrestricted (auto/yolo) mode is evaluated per call against `policy.effective_mode()`.
+            let net_gated = spec.net && !(spec.server_config.allow_net || policy.as_ref().map(|p| p.mode == NetworkMode::Allow).unwrap_or(false));
             if registry.register_json(&spec.name, &spec.description, &spec.schema, spec.read_only, Some(spec.risk), Some(net_gated), Some(spec.trusted), spec.exec.clone()).is_ok() {
                 spec.connection.removals.lock().unwrap().push((Arc::downgrade(registry), spec.name.clone()));
             }

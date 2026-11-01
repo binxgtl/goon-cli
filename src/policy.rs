@@ -9,6 +9,8 @@ use crate::mcp::McpServerConfig;
 use crate::process::{DEFAULT_COMMAND_TIMEOUT_MS, DEFAULT_HARD_OUTPUT_LIMIT_BYTES, DEFAULT_OUTPUT_LIMIT_BYTES, MAX_COMMAND_TIMEOUT_MS};
 use crate::risk::{base_name, is_generic_runner, peel_wrappers, scan_shell, tokenize};
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 pub const DEFAULT_MCP_MAX_OUTPUT_BYTES: usize = 32 * 1024;
 
@@ -38,21 +40,48 @@ impl NetworkMode {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct ExecutionPolicy {
     pub mode: NetworkMode,
     pub hosts: BTreeSet<String>,
     pub limits: ExecutionLimits,
     allow_all: bool,
+    unrestricted: Arc<AtomicBool>,
+}
+
+impl PartialEq for ExecutionPolicy {
+    fn eq(&self, other: &Self) -> bool {
+        self.mode == other.mode && self.hosts == other.hosts && self.limits == other.limits && self.allow_all == other.allow_all && self.is_unrestricted() == other.is_unrestricted()
+    }
 }
 
 impl ExecutionPolicy {
     pub fn allow_net_for_server(&self, server: Option<&McpServerConfig>) -> bool {
-        self.allow_all || server.map(|s| s.allow_net).unwrap_or(false)
+        self.allow_all || self.is_unrestricted() || server.map(|s| s.allow_net).unwrap_or(false)
+    }
+
+    pub fn set_unrestricted(&self, value: bool) {
+        self.unrestricted.store(value, Ordering::Relaxed);
+    }
+
+    pub fn is_unrestricted(&self) -> bool {
+        self.unrestricted.load(Ordering::Relaxed)
+    }
+
+    pub fn unrestricted_handle(&self) -> Arc<AtomicBool> {
+        self.unrestricted.clone()
+    }
+
+    pub fn effective_mode(&self) -> NetworkMode {
+        if self.is_unrestricted() {
+            NetworkMode::Allow
+        } else {
+            self.mode
+        }
     }
 
     pub fn with_mode(mode: NetworkMode, hosts: &[&str]) -> Self {
-        ExecutionPolicy { mode, hosts: hosts.iter().map(|h| h.to_string()).collect(), limits: default_limits(), allow_all: mode == NetworkMode::Allow }
+        ExecutionPolicy { mode, hosts: hosts.iter().map(|h| h.to_string()).collect(), limits: default_limits(), allow_all: mode == NetworkMode::Allow, unrestricted: Arc::new(AtomicBool::new(false)) }
     }
 }
 
@@ -349,7 +378,7 @@ pub fn resolve_execution_policy(config: &Config, flag_allow_net: bool, flag_host
     } else {
         NetworkMode::Deny
     };
-    ExecutionPolicy { mode, hosts, limits: default_limits(), allow_all }
+    ExecutionPolicy { mode, hosts, limits: default_limits(), allow_all, unrestricted: Arc::new(AtomicBool::new(false)) }
 }
 
 fn positionals(tokens: &[String], value_flags: &[&str]) -> Vec<String> {
@@ -629,6 +658,9 @@ pub fn extract_network_host(input: &str) -> Option<String> {
 
 /// True when the execution policy permits this input line. Non-network operations always pass.
 pub fn is_network_allowed_for_command(policy: &ExecutionPolicy, input: &str) -> bool {
+    if policy.is_unrestricted() {
+        return true;
+    }
     let assessment = assess_command_network(input);
     if !assessment.network {
         return true;

@@ -426,7 +426,7 @@ pub fn parse_config(value: &Value) -> Result<Config> {
     };
     let inline_reasoning = get_enum(map, "inlineReasoning", &["leading-think", "off"], Some("leading-think"), &mut issues).unwrap();
     let show_reasoning = get_bool(map, "showReasoning", false, &mut issues);
-    let approval_mode = get_enum(map, "approvalMode", &["ask", "auto", "plan", "readonly"], None, &mut issues);
+    let approval_mode = get_enum(map, "approvalMode", &["ask", "auto", "yolo", "plan", "readonly"], None, &mut issues).map(|m| if m == "yolo" { "auto".to_string() } else { m });
     let allow_net = get_bool(map, "allowNet", false, &mut issues);
     let allow_net_hosts = get_string_array(map, "allowNetHosts", &mut issues);
     let view_mode = get_enum(map, "viewMode", &["normal", "verbose", "transcript"], None, &mut issues);

@@ -492,17 +492,20 @@ pub struct VerifyPlanAssessment {
 /// Verification commands are shell commands too: they get the same critical-risk and network
 /// policy gates as the bash tool, and their risk is passed to the approval callback.
 pub fn assess_verify_plan(plan: &VerifyPlan, policy: Option<&ExecutionPolicy>) -> VerifyPlanAssessment {
+    let unrestricted = policy.map(|p| p.is_unrestricted()).unwrap_or(false);
     let mut risk = RiskClass::Low;
     for command in &plan.commands {
         let line = verify_command_line(command);
         let command_risk = classify_bash_risk(&line);
         risk = risk.max(command_risk);
-        if command_risk == RiskClass::Critical {
+        if command_risk == RiskClass::Critical && !unrestricted {
             return VerifyPlanAssessment { risk: RiskClass::Critical, denied: Some(format!("verification command is critical risk and cannot run: {}", command.display)) };
         }
-        if let Some(policy) = policy {
-            if !is_network_allowed_for_command(policy, &line) {
-                return VerifyPlanAssessment { risk, denied: Some(format!("verification command needs network access blocked by the execution policy: {}", command.display)) };
+        if !unrestricted {
+            if let Some(policy) = policy {
+                if !is_network_allowed_for_command(policy, &line) {
+                    return VerifyPlanAssessment { risk, denied: Some(format!("verification command needs network access blocked by the execution policy: {}", command.display)) };
+                }
             }
         }
     }

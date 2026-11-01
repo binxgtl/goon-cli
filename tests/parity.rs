@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 /// Intentional behaviour changes: `(module.fn, substring of the JSON-encoded args, reason)`.
 const DIVERGENCES: &[(&str, &str, &str)] = &[
+    ("approval.canAutoApprove", "\"auto\"", "auto/yolo mode grants full unrestricted permissions across all risk classes"),
     ("risk.classifyBashRisk", "core.hooksPath", "git config of keys that execute programs later (core.hooksPath, core.pager, …) is high risk; TS rated it medium"),
     ("risk.classifyBashRisk", "${HOME}", "rm -rf ${HOME} deletes the home directory; TS only recognised the bare $HOME spelling"),
     ("risk.classifyBashRisk", "$HOME/", "rm -rf \"$HOME/\" deletes the home directory; TS missed the trailing-slash spelling"),

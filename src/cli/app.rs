@@ -424,11 +424,11 @@ impl App {
         // auto-approving after the user switches back to ask/plan.
         let command = request.input.get("command").map(jsutil::js_string).unwrap_or_default();
         let risk = request.risk.unwrap_or_else(|| if request.tool == "bash" { classify_bash_risk(if request.input.is_object() { &command } else { "" }) } else { RiskClass::Medium });
-        if risk == RiskClass::Critical {
-            return false;
-        }
         if can_auto_approve(&self.mode(), risk) {
             return true;
+        }
+        if risk == RiskClass::Critical {
+            return false;
         }
         // High-risk calls are never remembered, so they always prompt even after an "always".
         let remembered = risk != RiskClass::High;
@@ -610,6 +610,7 @@ impl App {
         reg.set_plan_mode(current_mode == "plan");
         *reg.rejection_guard.lock().unwrap() = Some(Arc::new(SessionRejectionGuard { app: self.me.clone() }));
         reg.set_policy(Some(self.policy.clone()));
+        reg.set_unrestricted(current_mode == "auto");
         if !matches!(self.ui, Ui::None) {
             reg.callbacks.lock().unwrap().ask_user = Some(self.ask_user_fn());
         }
@@ -709,6 +710,8 @@ impl App {
         let tools = self.tools();
         tools.set_read_only(next == "readonly");
         tools.set_plan_mode(next == "plan");
+        self.policy.set_unrestricted(next == "auto");
+        tools.set_unrestricted(next == "auto");
         if let Some(t) = self.tui() {
             t.set_mode(next);
         }
@@ -717,7 +720,7 @@ impl App {
             config.approval_mode = Some(next.to_string());
             let _ = config::save_config(&config);
         }
-        let label = if next == "auto" { "auto-approve (low/medium risk auto-approved; high risk still asks, critical always denied)".to_string() } else { next.to_string() };
+        let label = if next == "auto" { "auto-approve (full access — all tools, commands & network unrestricted)".to_string() } else { next.to_string() };
         self.notice(&format!("Mode: {label}"));
         self.display(&format!("\n[Mode switched to: {label}]\n"));
     }
@@ -726,6 +729,8 @@ impl App {
         let tools = self.tools();
         tools.set_plan_mode(mode == "plan");
         tools.set_read_only(mode == "readonly");
+        self.policy.set_unrestricted(mode == "auto");
+        tools.set_unrestricted(mode == "auto");
         if let Some(t) = self.tui() {
             t.set_mode(mode);
         }
@@ -1223,16 +1228,18 @@ pub async fn run_session(values: Parsed, mut config: Config, policy: ExecutionPo
         )
     });
     let memory_store = if runtime.memory_enabled { open_memory_store(&runtime).await } else { None };
+    let yes_flag = values.flag("yes") || values.flag("yolo");
     let mode = if values.flag("read-only") {
         "readonly".to_string()
     } else if values.flag("plan") {
         "plan".into()
-    } else if values.flag("yes") {
+    } else if yes_flag {
         "auto".into()
     } else {
         config.approval_mode.clone().unwrap_or_else(|| "ask".into())
     };
-    let pre_plan_mode = if values.flag("yes") || config.approval_mode.as_deref() == Some("auto") { "auto" } else { "ask" }.to_string();
+    policy.set_unrestricted(mode == "auto");
+    let pre_plan_mode = if yes_flag || config.approval_mode.as_deref() == Some("auto") { "auto" } else { "ask" }.to_string();
     let notify_enabled = !matches!(std::env::var("GOON_NOTIFY").as_deref(), Ok("0") | Ok("off"));
     let use_tui = interactive && stdin_tty && crate::term::stdout_is_tty() && !json_out && !values.flag("no-tui") && std::env::var("TERM").as_deref() != Ok("dumb");
     let app_slot: Arc<OnceLock<Weak<App>>> = Arc::new(OnceLock::new());

@@ -134,9 +134,9 @@ pub fn bash_approval_prefix(input: &Value) -> Option<String> {
     Some(tokens[..take].join(" "))
 }
 
-/// Auto mode never approves high or critical risk.
-pub fn can_auto_approve(mode: &str, risk: RiskClass) -> bool {
-    mode == "auto" && risk != RiskClass::High && risk != RiskClass::Critical
+/// Auto / yolo mode grants unrestricted auto-approval across every risk class.
+pub fn can_auto_approve(mode: &str, _risk: RiskClass) -> bool {
+    mode == "auto" || mode == "yolo"
 }
 
 /// An exact, session-scoped allowlist entry for one simple command (no quoting/metacharacters).
@@ -217,7 +217,9 @@ mod tests {
         assert_eq!(bash_approval_exact(&cmd("  ls   -la ")), Some("ls -la".into()));
         assert_eq!(bash_approval_exact(&cmd("echo 'x'")), None);
         assert!(can_auto_approve("auto", RiskClass::Medium));
-        assert!(!can_auto_approve("auto", RiskClass::High));
+        assert!(can_auto_approve("auto", RiskClass::High));
+        assert!(can_auto_approve("auto", RiskClass::Critical));
+        assert!(can_auto_approve("yolo", RiskClass::Critical));
         assert!(!can_auto_approve("ask", RiskClass::Low));
     }
 }

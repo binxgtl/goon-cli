@@ -27,7 +27,7 @@ use tokio_util::sync::CancellationToken;
 
 const HELP_TEXT: &str = concat!(
     "\nCommands (can also run while agent is working):\n",
-    "  /auto [on|off], /yolo             Toggle Auto-Approve mode (or press Shift+Tab)\n",
+    "  /auto [on|off], /yolo [on|off]    Toggle full unrestricted Auto-Approve / YOLO mode (or Shift+Tab)\n",
     "  /transcript [on|off]              Toggle Codex full-screen Transcript mode (or press Ctrl+T)\n",
     "  /view [normal|verbose|transcript] Switch view: normal (hide thinking) | verbose | transcript\n",
     "  /copy [last|code|<N>]             Copy last response, code block, or Nth response (or press Ctrl+O)\n",
@@ -306,6 +306,7 @@ impl App {
             let step_read_only = reg.read_only() || step.bool("readOnly") == Some(true) || step.str("mode") == Some("readonly");
             let approve = reg.approve.clone();
             let child_tools = ToolRegistry::new(&runtime.cwd, Arc::new(move |req| approve(req)), step_read_only, None);
+            child_tools.update_flags(|f| f.unrestricted = reg.unrestricted());
             child_tools.set_policy(reg.policy());
             child_tools.set_plan_mode(reg.plan_mode() || step.str("mode") == Some("plan"));
             child_tools.set_cost_ledger(reg.cost_ledger());
@@ -909,8 +910,10 @@ impl App {
             }
             return Ok(true);
         }
-        if starts_cmd(input, "/auto") || input == "/yolo" {
-            let arg = if input == "/yolo" { "on".to_string() } else { input[5..].trim().to_lowercase() };
+        if starts_cmd(input, "/auto") || starts_cmd(input, "/yolo") {
+            let is_yolo = starts_cmd(input, "/yolo");
+            let raw_arg = input[5..].trim().to_lowercase();
+            let arg = if is_yolo && raw_arg.is_empty() { "on".to_string() } else { raw_arg };
             let mode = self.mode();
             let next = match arg.as_str() {
                 "" | "toggle" => {
@@ -923,7 +926,7 @@ impl App {
                 "on" | "true" | "1" | "yes" => "auto",
                 "off" | "false" | "0" | "ask" => "ask",
                 _ => {
-                    self.display("Usage: /auto [on | off] (or /yolo)\n");
+                    self.display("Usage: /auto [on | off] (or /yolo [on | off])\n");
                     return Ok(true);
                 }
             };

@@ -136,6 +136,7 @@ pub struct PendingImage {
 pub struct RegistryFlags {
     pub read_only: bool,
     pub plan_mode: bool,
+    pub unrestricted: bool,
     pub allow_peer_tools_in_read_only: bool,
     pub only_peer_tools: bool,
 }
@@ -638,11 +639,27 @@ impl ToolRegistry {
         f.read_only || f.plan_mode
     }
 
+    pub fn unrestricted(&self) -> bool {
+        self.flags().unrestricted
+    }
+
+    pub fn set_unrestricted(&self, value: bool) {
+        self.update_flags(|f| f.unrestricted = value);
+        self.files.set_unrestricted(value);
+    }
+
+    pub fn is_unrestricted(&self) -> bool {
+        !self.effective_read_only() && (self.unrestricted() || self.policy().map(|p| p.is_unrestricted()).unwrap_or(false))
+    }
+
     pub fn policy(&self) -> Option<Arc<ExecutionPolicy>> {
         self.policy.lock().unwrap().clone()
     }
 
     pub fn set_policy(&self, policy: Option<Arc<ExecutionPolicy>>) {
+        if let Some(p) = &policy {
+            self.files.share_unrestricted(p.unrestricted_handle());
+        }
         *self.policy.lock().unwrap() = policy;
     }
 
@@ -811,25 +828,31 @@ impl ToolRegistry {
         let input = definition.parse(&canonical, &normalized)?;
         let risk = self.risk_of(&canonical, Some(&input));
         let call_key = tool_approval_signature(&canonical, &normalized);
-        if risk == RiskClass::Critical {
+        let unrestricted = self.is_unrestricted();
+        if risk == RiskClass::Critical && !unrestricted {
             return Ok(self.deny(&call_key, format!("Permission denied: {canonical} is critical risk and cannot run. Stop this run.")).await);
         }
-        if let Some(policy) = self.policy() {
-            if canonical == "bash" {
-                if let Some(command) = input.get("command").and_then(Value::as_str) {
-                    if !is_network_allowed_for_command(&policy, command) {
-                        return Ok(self.deny(&call_key, network_denied_message(command)).await);
+        if !unrestricted {
+            if let Some(policy) = self.policy() {
+                if canonical == "bash" {
+                    if let Some(command) = input.get("command").and_then(Value::as_str) {
+                        if !is_network_allowed_for_command(&policy, command) {
+                            return Ok(self.deny(&call_key, network_denied_message(command)).await);
+                        }
                     }
+                } else if definition.net == Some(true) && policy.effective_mode() != NetworkMode::Allow {
+                    return Ok(self
+                        .deny(
+                            &call_key,
+                            "Permission denied: this MCP tool is marked as network/open-world and network access is not permitted. Use --allow-net or set allowNet on the MCP server.".into(),
+                        )
+                        .await);
                 }
-            } else if definition.net == Some(true) && policy.mode != NetworkMode::Allow {
-                return Ok(self
-                    .deny(&call_key, "Permission denied: this MCP tool is marked as network/open-world and network access is not permitted. Use --allow-net or set allowNet on the MCP server.".into())
-                    .await);
             }
         }
         let trusted_auto = definition.trusted == Some(true) && (risk == RiskClass::Medium || risk == RiskClass::Low);
         let needs_approval = !definition.read_only || risk != RiskClass::Low;
-        if needs_approval && !trusted_auto {
+        if !unrestricted && needs_approval && !trusted_auto {
             let approved =
                 (self.approve)(ApprovalRequest { tool: canonical.clone(), input: input.clone(), cancel: cancel.clone(), risk: Some(risk), trusted: Some(definition.trusted == Some(true)) }).await;
             if !approved {
@@ -874,7 +897,7 @@ impl ToolRegistry {
             "list_files" => self.files.list(&s("path")),
             "search" => {
                 let path = self.files.path(&s("path"))?;
-                let rel = crate::files::relative_path(&self.files.root, &path);
+                let rel = self.files.rel(&path);
                 let target = if rel.is_empty() { ".".to_string() } else { rel };
                 let args: Vec<String> =
                     ["--fixed-strings", "--line-number", "--hidden", "--glob", "!.git", "--glob", "!node_modules", "--max-count", "50", "--max-columns", "1000", "--max-columns-preview", "--"]
@@ -1005,7 +1028,7 @@ impl ToolRegistry {
             "view_image" => {
                 let path = s("path");
                 let (resolved, inside) = self.files.locate_image(&path)?;
-                if !inside {
+                if !inside && !self.is_unrestricted() {
                     let ok = (self.approve)(ApprovalRequest {
                         tool: "view_image".into(),
                         input: json!({ "path": resolved.to_string_lossy(), "outsideWorkspace": true }),

@@ -842,12 +842,15 @@ pub async fn execute_workflow(workflow: &WorkflowDefinition, raw_args: &str, hoo
                     }
                     let cmd = sanitize_bash_command(&raw);
                     let risk = classify_bash_risk(&cmd);
-                    if risk == RiskClass::Critical {
+                    let unrestricted = hooks.policy.as_ref().map(|p| p.is_unrestricted()).unwrap_or(false);
+                    if risk == RiskClass::Critical && !unrestricted {
                         return Err(WorkflowApprovalError(format!("Permission denied: workflow shell step \"{}\" is critical risk and cannot run.", step.id())).into());
                     }
-                    if let Some(p) = &hooks.policy {
-                        if !is_network_allowed_for_command(p, &cmd) {
-                            return Err(WorkflowApprovalError(network_denied_message(&cmd)).into());
+                    if !unrestricted {
+                        if let Some(p) = &hooks.policy {
+                            if !is_network_allowed_for_command(p, &cmd) {
+                                return Err(WorkflowApprovalError(network_denied_message(&cmd)).into());
+                            }
                         }
                     }
                     let Some(approve) = &hooks.approve_shell else {

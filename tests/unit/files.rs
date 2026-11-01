@@ -371,3 +371,28 @@ fn merge_backups_propagates_after_deleted_and_fills_missing_pre_turn_fields() {
     assert_eq!(filled.content.as_deref(), Some("content"));
     assert_eq!(filled.mode, Some(0o755));
 }
+
+#[test]
+fn unrestricted_workspace_files_allows_outside_paths_and_restores_containment_when_toggled_off() {
+    let f = fixture();
+    let files = ws(&f);
+    let outside = f.root.join("outside-config.txt");
+    let outside_str = outside.to_string_lossy().to_string();
+
+    assert_match(&err(files.write(&outside_str, "blocked")), "escapes");
+
+    files.set_unrestricted(true);
+    files.begin_turn();
+    files.write(&outside_str, "v1\n").unwrap();
+    assert_match(&files.read(&outside_str, 1, 200).unwrap(), "1: v1");
+    files.edit(&outside_str, "v1", "v2", false).unwrap();
+    assert_eq!(std::fs::read_to_string(&outside).unwrap(), "v2\n");
+
+    let backups = files.take_turn_backups();
+    assert_eq!(backups.len(), 1);
+    files.restore_backups(&backups, true).unwrap();
+    assert!(!outside.exists());
+
+    files.set_unrestricted(false);
+    assert_match(&err(files.write(&outside_str, "blocked-again")), "escapes");
+}

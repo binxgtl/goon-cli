@@ -519,7 +519,10 @@ impl Subagents {
             store = Some(st.clone());
             (self.emit)(json!({ "type": "subagent", "id": id, "task": task, "state": "start" }));
             let tools = ToolRegistry::new(&config.cwd, self.child_approve(denied.clone()), read_only || self.registry.read_only(), None);
-            tools.update_flags(|f| f.allow_peer_tools_in_read_only = true);
+            tools.update_flags(|f| {
+                f.allow_peer_tools_in_read_only = true;
+                f.unrestricted = self.registry.unrestricted();
+            });
             tools.set_policy(self.registry.policy());
             tools.set_cost_ledger(self.registry.cost_ledger());
             self.bus.register_peer_tools(&tools, &nickname, &agent_type)?;
@@ -879,6 +882,7 @@ impl Subagents {
             self.metadata.lock().unwrap().insert(id.clone(), (nickname, role.clone(), task.to_string()));
             (self.emit)(json!({ "type": "subagent", "id": id, "task": task, "state": "start" }));
             let tools = ToolRegistry::new(&self.config.cwd, self.child_approve(denied.clone()), read_only || self.registry.read_only(), allowed);
+            tools.update_flags(|f| f.unrestricted = self.registry.unrestricted());
             tools.set_policy(self.registry.policy());
             tools.set_cost_ledger(self.registry.cost_ledger());
             let harness = Harness::new(self.config.clone(), st.clone(), tools, self.child_emit(id.clone()), None, HarnessDeps { verify_enabled: Some(false), ..Default::default() })?;

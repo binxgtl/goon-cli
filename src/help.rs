@@ -27,7 +27,7 @@ Options:
       --key-env NAME         Credential variable (default GOON_API_KEY)
       --resume ID|latest     Resume a saved session in this workspace
       --pair                 Start Cloudflared tunnel + QR device pairing on launch
-      --yes                 Approve file changes and shell commands automatically
+  -y, --yes, --yolo         Full auto-approve (unrestricted tools, shell & network)
       --read-only           Read tools and research agents; no writes or shell
       --allow-net           Allow outbound network (bash/MCP) for this run (default: deny)
       --allow-net-hosts H   Allow only these exact hosts (repeatable or comma-separated)
