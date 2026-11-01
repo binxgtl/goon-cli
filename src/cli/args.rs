@@ -7,6 +7,7 @@ use indexmap::IndexMap;
 pub enum Kind {
     Bool,
     Str,
+    OptStr,
 }
 
 pub struct OptSpec {
@@ -24,6 +25,10 @@ const fn s(name: &'static str, short: Option<char>) -> OptSpec {
     OptSpec { name, kind: Kind::Str, short, multiple: false }
 }
 
+const fn os(name: &'static str, short: Option<char>) -> OptSpec {
+    OptSpec { name, kind: Kind::OptStr, short, multiple: false }
+}
+
 const fn m(name: &'static str) -> OptSpec {
     OptSpec { name, kind: Kind::Str, short: None, multiple: true }
 }
@@ -38,7 +43,7 @@ pub const MAIN_OPTIONS: &[OptSpec] = &[
     s("model", None),
     s("effort", None),
     s("key-env", None),
-    s("resume", None),
+    os("resume", Some('r')),
     b("pair", None),
     b("yes", Some('y')),
     b("yolo", None),
@@ -196,6 +201,21 @@ pub fn parse_args(args: &[String], specs: &[OptSpec], strict: bool) -> Result<Pa
                     store(&mut parsed, spec, OptValue::Str(next.clone()));
                     i += 2;
                 }
+                Kind::OptStr => {
+                    if let Some(v) = inline {
+                        let val = if v.is_empty() { OptValue::Bool(true) } else { OptValue::Str(v) };
+                        store(&mut parsed, spec, val);
+                        i += 1;
+                        continue;
+                    }
+                    if let Some(next) = args.get(i + 1).filter(|n| !option_like(n)) {
+                        store(&mut parsed, spec, OptValue::Str(next.clone()));
+                        i += 2;
+                    } else {
+                        store(&mut parsed, spec, OptValue::Bool(true));
+                        i += 1;
+                    }
+                }
             }
             continue;
         }
@@ -237,6 +257,18 @@ pub fn parse_args(args: &[String], specs: &[OptSpec], strict: bool) -> Result<Pa
                         }
                         break;
                     }
+                    Kind::OptStr => {
+                        let rest: String = chars[j + 1..].iter().collect();
+                        if !rest.is_empty() {
+                            store(&mut parsed, spec, OptValue::Str(rest));
+                        } else if let Some(next) = args.get(i + 1).filter(|n| !option_like(n)) {
+                            store(&mut parsed, spec, OptValue::Str(next.clone()));
+                            consumed_next = true;
+                        } else {
+                            store(&mut parsed, spec, OptValue::Bool(true));
+                        }
+                        break;
+                    }
                 }
             }
             i += if consumed_next { 2 } else { 1 };
@@ -270,5 +302,26 @@ mod tests {
         assert_eq!(p(&["a", "--", "--yes"]).unwrap().positionals, vec!["a", "--yes"]);
         assert_eq!(p(&["--allow-net-hosts", "a", "--allow-net-hosts=b"]).unwrap().list("allow-net-hosts"), vec!["a", "b"]);
         assert_eq!(p(&["-"]).unwrap().positionals, vec!["-"]);
+    }
+
+    #[test]
+    fn resume_accepts_optional_value_and_short_flag() {
+        let bare = p(&["--resume"]).unwrap();
+        assert!(bare.has("resume") && bare.flag("resume") && bare.str("resume").is_none());
+
+        let bare_with_flag = p(&["--resume", "-y"]).unwrap();
+        assert!(bare_with_flag.flag("resume") && bare_with_flag.flag("yes") && bare_with_flag.str("resume").is_none());
+
+        assert_eq!(p(&["--resume", "3aee7fdc"]).unwrap().str("resume").as_deref(), Some("3aee7fdc"));
+        assert_eq!(p(&["--resume=3aee7fdc"]).unwrap().str("resume").as_deref(), Some("3aee7fdc"));
+
+        let short_bare = p(&["-r"]).unwrap();
+        assert!(short_bare.has("resume") && short_bare.flag("resume") && short_bare.str("resume").is_none());
+
+        let short_with_flag = p(&["-r", "-y"]).unwrap();
+        assert!(short_with_flag.flag("resume") && short_with_flag.flag("yes") && short_with_flag.str("resume").is_none());
+
+        assert_eq!(p(&["-r", "3aee7fdc"]).unwrap().str("resume").as_deref(), Some("3aee7fdc"));
+        assert_eq!(p(&["-r3aee7fdc"]).unwrap().str("resume").as_deref(), Some("3aee7fdc"));
     }
 }

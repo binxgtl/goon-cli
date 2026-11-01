@@ -105,4 +105,41 @@ test('e2e: --resume continues the same session: id, file artifacts and history c
 
   const list = JSON.parse((await runGoon(t, f, ['sessions', '--json'])).stdout);
   assert.ok(list.some(entry => entry.id === sessionId), 'sessions listing must contain the resumed session');
+
+  // Bare `--resume` and short `-r` continue the latest session in non-interactive runs too.
+  const thirdFixture = await writeFixture(f, 'part-three.json', {
+    v: 1,
+    turns: [{ match: 'part three', text: ['part three done'], usage: { inputTokens: 8, outputTokens: 2, totalTokens: 10 } }],
+  });
+  const third = await runGoon(t, f, [
+    ...BASE_FLAGS, '--resume', '-p', 'part three', '--stub-fixture', thirdFixture, '--json', '--yes', '--no-verify',
+  ]);
+  assert.equal(third.code, 0, third.stderr);
+  assert.equal(jsonLines(third.stdout)[0].id, sessionId, 'bare --resume must continue the latest session');
+
+  const fourthFixture = await writeFixture(f, 'part-four.json', {
+    v: 1,
+    turns: [{ match: 'part four', text: ['part four done'], usage: { inputTokens: 8, outputTokens: 2, totalTokens: 10 } }],
+  });
+  const fourth = await runGoon(t, f, [
+    ...BASE_FLAGS, '-r', sessionId.slice(0, 8), '-p', 'part four', '--stub-fixture', fourthFixture, '--json', '--yes', '--no-verify',
+  ]);
+  assert.equal(fourth.code, 0, fourth.stderr);
+  assert.equal(jsonLines(fourth.stdout)[0].id, sessionId, '-r <prefix> must continue the target session');
+});
+
+test('e2e: --resume on a session whose workspace folder was deleted reports the missing folder clearly', async t => {
+  const { mkdir, rm } = await import('node:fs/promises');
+  const f = await e2eFixture(t);
+  const ephemeral = join(f.root, 'deleted-workspace');
+  await mkdir(ephemeral, { recursive: true });
+  const fixture = await writeFixture(f, 'hello.json', HELLO_FIXTURE);
+  const created = await runGoon(t, f, [...BASE_FLAGS, '--cwd', ephemeral, '-p', 'hello', '--stub-fixture', fixture, '--json', '--no-verify']);
+  assert.equal(created.code, 0, created.stderr);
+  const id = jsonLines(created.stdout)[0].id;
+  await rm(ephemeral, { recursive: true, force: true });
+
+  const failed = await runGoon(t, f, [...BASE_FLAGS, '--resume', id.slice(0, 8), '-p', 'hello', '--stub-fixture', fixture, '--no-verify']);
+  assert.notEqual(failed.code, 0);
+  assert.match(failed.stderr, /folder no longer exists/i);
 });

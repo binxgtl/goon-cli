@@ -1106,7 +1106,7 @@ pub async fn run_session(values: Parsed, mut config: Config, policy: ExecutionPo
     let positionals = values.positionals.clone();
     let first = positionals.first().map(String::as_str);
     let mut resume_target = values.str("resume");
-    let mut launch_resume_picker = false;
+    let mut launch_resume_picker = values.has("resume") && resume_target.is_none();
     let launch_pair = values.flag("pair") || first == Some("pair");
     let mut initial_command: Option<String> = None;
     let mut prompt_positionals = positionals.clone();
@@ -1182,10 +1182,13 @@ pub async fn run_session(values: Parsed, mut config: Config, policy: ExecutionPo
     let sessions_root = runtime.data_dir.join("sessions");
     if launch_resume_picker && resume_target.is_none() {
         let resumable: Vec<_> = SessionStore::list(&sessions_root)?.into_iter().filter(|s| s.messages_count.unwrap_or(0) > 0 || s.title.is_some()).collect();
-        if resumable.len() == 1 {
-            resume_target = Some(resumable[0].id.clone());
+        if !interactive {
+            let cwd_text = runtime.cwd.to_string_lossy().to_string();
+            let pick = resumable.iter().find(|s| same_workspace(&s.cwd, &cwd_text)).or_else(|| values.str("cwd").is_none().then(|| resumable.first()).flatten());
+            resume_target = Some(pick.map(|s| s.id.clone()).unwrap_or_else(|| "latest".into()));
             launch_resume_picker = false;
-        } else if resumable.is_empty() {
+        } else if resumable.len() == 1 {
+            resume_target = Some(resumable[0].id.clone());
             launch_resume_picker = false;
         }
     }
@@ -1203,10 +1206,11 @@ pub async fn run_session(values: Parsed, mut config: Config, policy: ExecutionPo
             }
         });
         if let Some(m) = found.filter(|m| !same_workspace(&m.cwd, &cwd_text)) {
-            if let Ok(folder) = std::fs::canonicalize(&m.cwd) {
-                runtime = config::resolve_runtime(&config, &config::strip_verbatim(folder))?;
-                resume_target = Some(m.id.clone());
-            }
+            let Ok(folder) = std::fs::canonicalize(&m.cwd) else {
+                bail!("Cannot resume: the session's folder no longer exists ({}).", m.cwd);
+            };
+            runtime = config::resolve_runtime(&config, &config::strip_verbatim(folder))?;
+            resume_target = Some(m.id.clone());
         }
     }
     if let Err(error) = CostLedger::from_config(&runtime, Some(&runtime.model)) {

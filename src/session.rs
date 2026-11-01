@@ -595,7 +595,7 @@ impl SessionStore {
             }
             let outcome = (|| -> Result<()> {
                 let pid = lock_pid(&lock)?.ok_or_else(|| anyhow!("Invalid session lock: {}", lock.display()))?;
-                if crate::process::process_alive(pid) {
+                if crate::process::lock_owner_alive(pid, &lock) {
                     bail!("Session is already open in another process.");
                 }
                 std::fs::remove_file(&lock)?;
@@ -738,7 +738,7 @@ impl SessionStore {
         let id = matches[0].id.clone();
         let lock = root.join(format!("{id}.lock"));
         match lock_pid(&lock) {
-            Ok(Some(pid)) if crate::process::process_alive(pid) => bail!("Session {} is open in another goon process (pid {pid}).", &id[..8]),
+            Ok(Some(pid)) if crate::process::lock_owner_alive(pid, &lock) => bail!("Session {} is open in another goon process (pid {pid}).", &id[..8]),
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),

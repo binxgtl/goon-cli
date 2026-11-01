@@ -1373,7 +1373,8 @@ impl App {
         let tokens = store.session.lock().unwrap().tokens;
         let busy = self.controller().is_some();
         if arg.is_empty() {
-            match store.session.lock().unwrap().goal.clone() {
+            let goal = store.session.lock().unwrap().goal.clone();
+            match goal {
                 None => self.display(&format!("No active session goal.\n{GOAL_USAGE}\n")),
                 Some(g) => self.display(&format!("\n{}\n", format_goal_summary_lines(&g, tokens))),
             }
@@ -2354,14 +2355,15 @@ impl App {
             Some(title) => format!("{} · {title}", runtime.model),
             None => format!("{} · {}", runtime.model, take_chars(&store.id(), 8)),
         });
-        let (tokens, cost, todos) = {
+        let (tokens, cost, todos, has_messages) = {
             let s = store.session.lock().unwrap();
-            (s.tokens, s.cost(), s.todos.clone().unwrap_or_default())
+            (s.tokens, s.cost(), s.todos.clone().unwrap_or_default(), !s.messages.is_empty())
         };
         t.set_tokens(tokens);
         t.set_cost_usd(cost);
         self.sync_tui_header(true);
-        t.event(&json!({ "type": "todo", "todos": serde_json::to_value(todos).unwrap() }));
+        let initial_todos = if has_messages { Vec::new() } else { todos };
+        t.event(&json!({ "type": "todo", "todos": serde_json::to_value(initial_todos).unwrap() }));
     }
 
     async fn new_session_command(&self, title: &str) -> Result<()> {
@@ -2526,7 +2528,8 @@ impl App {
                     self.refresh_workspace_files();
                 }
             }
-            self.reset_tui_after_switch(new_store.session.lock().unwrap().title.clone());
+            let title = new_store.session.lock().unwrap().title.clone();
+            self.reset_tui_after_switch(title);
             self.render_resumed_history(true);
             if switching {
                 self.display(&format!("Workspace switched to {}\n", runtime.cwd.display()));

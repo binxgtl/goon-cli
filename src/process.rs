@@ -347,6 +347,70 @@ pub fn process_alive(pid: u32) -> bool {
     }
 }
 
+fn process_start_time(pid: u32) -> Option<(std::time::SystemTime, Duration)> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+        use windows_sys::Win32::System::Threading::{GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                return None;
+            }
+            let zero = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+            let (mut creation, mut exit, mut kernel, mut user) = (zero, zero, zero, zero);
+            let ok = GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user);
+            CloseHandle(handle);
+            if ok == 0 {
+                return None;
+            }
+            let ticks = ((creation.dwHighDateTime as u64) << 32) | (creation.dwLowDateTime as u64);
+            let unix_100ns = ticks.checked_sub(116_444_736_000_000_000)?;
+            let started = std::time::UNIX_EPOCH + Duration::new(unix_100ns / 10_000_000, ((unix_100ns % 10_000_000) * 100) as u32);
+            Some((started, Duration::from_secs(2)))
+        }
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let clk_tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        if clk_tck <= 0 {
+            return None;
+        }
+        let clk = clk_tck as u64;
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let after_comm = stat.get(stat.rfind(')')? + 2..)?;
+        let start_ticks: u64 = after_comm.split_whitespace().nth(19)?.parse().ok()?;
+        let proc_stat = std::fs::read_to_string("/proc/stat").ok()?;
+        let btime: u64 = proc_stat.lines().find_map(|line| line.strip_prefix("btime ")?.trim().parse().ok())?;
+        let secs = btime.checked_add(start_ticks / clk)?;
+        let nanos = (((start_ticks % clk) as u128 * 1_000_000_000) / clk as u128) as u32;
+        Some((std::time::UNIX_EPOCH + Duration::new(secs, nanos), Duration::from_secs(5)))
+    }
+    #[cfg(not(any(windows, target_os = "linux", target_os = "android")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// True when the process that created `lock` is still running (guards against OS PID recycling).
+pub fn lock_owner_alive(pid: u32, lock: &std::path::Path) -> bool {
+    if !process_alive(pid) {
+        return false;
+    }
+    if pid == std::process::id() {
+        return true;
+    }
+    if let (Ok(lock_mtime), Some((proc_start, slack))) = (std::fs::metadata(lock).and_then(|m| m.modified()), process_start_time(pid)) {
+        if let Some(threshold) = lock_mtime.checked_add(slack) {
+            if proc_start > threshold {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Finds an executable on PATH (`which`).
 pub fn which(name: &str) -> Option<std::path::PathBuf> {
     let path = std::env::var_os("PATH")?;

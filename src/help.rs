@@ -25,7 +25,7 @@ Options:
       --model NAME           Exact model ID from your provider
       --effort LEVEL         Reasoning effort: low | medium | high | xhigh | max
       --key-env NAME         Credential variable (default GOON_API_KEY)
-      --resume ID|latest     Resume a saved session in this workspace
+  -r, --resume [ID|latest]   Resume a saved session (opens picker when omitted)
       --pair                 Start Cloudflared tunnel + QR device pairing on launch
   -y, --yes, --yolo         Full auto-approve (unrestricted tools, shell & network)
       --read-only           Read tools and research agents; no writes or shell
@@ -59,7 +59,7 @@ Piping: with -p, text piped on stdin is attached as context, e.g.
 Interactive commands:
   /help, /setup, /key, /model, /effort, /mode, /auto, /view, /transcript, /copy, /btw,
   /goal, /recap, /skills, /prompts, /memories, /memory, /presets, /mention, /pair, /workflow, /network, /dag,
-  /cd, /pwd, /mcp, /subagents, /plan, /revert, /undo, /checkpoints, /todo, /compact, /diff, /review, /fork, /rename,
+  /cd, /pwd, /mcp, /subagents, /plan, /revert, /undo, /checkpoints, /todo, /resume, /new, /compact, /diff, /review, /fork, /rename,
   /delete, /export, /init, /status, /cost, /tools, /sessions, /debug-config, /warnings, /doctor, /clear, /exit, or !<cmd>.
 Shortcuts: Shift+Tab mode, Ctrl+T transcript, Ctrl+O copy, Alt+. / Alt+, effort, Tab autocomplete, Esc Esc rewind, Ctrl+C cancel.
 API keys are read from environment variables or ~/.config/goon/credentials.json.
