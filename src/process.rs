@@ -386,7 +386,20 @@ fn process_start_time(pid: u32) -> Option<(std::time::SystemTime, Duration)> {
         let nanos = (((start_ticks % clk) as u128 * 1_000_000_000) / clk as u128) as u32;
         Some((std::time::UNIX_EPOCH + Duration::new(secs, nanos), Duration::from_secs(5)))
     }
-    #[cfg(not(any(windows, target_os = "linux", target_os = "android")))]
+    #[cfg(target_os = "macos")]
+    {
+        unsafe {
+            let mut info: libc::proc_bsdinfo = std::mem::zeroed();
+            let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+            let got = libc::proc_pidinfo(pid as libc::c_int, libc::PROC_PIDTBSDINFO, 0, std::ptr::addr_of_mut!(info).cast::<libc::c_void>(), size);
+            if got != size {
+                return None;
+            }
+            let nanos = (info.pbi_start_tvusec.min(999_999) as u32) * 1_000;
+            Some((std::time::UNIX_EPOCH + Duration::new(info.pbi_start_tvsec, nanos), Duration::from_secs(2)))
+        }
+    }
+    #[cfg(not(any(windows, target_os = "linux", target_os = "android", target_os = "macos")))]
     {
         let _ = pid;
         None
