@@ -177,6 +177,21 @@ impl App {
         }
     }
 
+    pub fn record_worked(&self, started_ms: i64) {
+        if self.json {
+            return;
+        }
+        let elapsed_ms = (jsutil::now_millis() - started_ms).max(0);
+        let dur = crate::tui::text::format_turn_duration(elapsed_ms);
+        if let Some(p) = self.pair() {
+            p.notify_system(&format!("✓ Worked for {dur}\n"));
+        }
+        match self.tui() {
+            Some(t) => t.record_turn_duration(elapsed_ms),
+            None => stderr_write(&format!("[Worked for {dur}]\n")),
+        }
+    }
+
     pub fn notify_attention(&self) {
         if self.notify_enabled && crate::term::stdout_is_tty() && !self.json {
             stdout_write("\x07");
@@ -831,8 +846,19 @@ impl App {
                     self.publish_event(&json!({ "type": "done", "text": text, "denied": denied, "sessionId": store.id() }), false);
                     if !self.json {
                         match self.tui() {
-                            Some(t) => t.write("\n"),
-                            None => stdout_write("\n"),
+                            Some(t) => {
+                                if denied {
+                                    t.write("\n");
+                                } else {
+                                    self.record_worked(started);
+                                }
+                            }
+                            None => {
+                                stdout_write("\n");
+                                if !denied {
+                                    self.record_worked(started);
+                                }
+                            }
                         }
                     }
                     if denied && !self.interactive {

@@ -43,6 +43,7 @@ pub mod glyph {
     pub const RESUMED: &str = "↻";
     pub const REVERTED: &str = "↺";
     pub const PROMPT: &str = "◇";
+    pub const WORKED: &str = "✓";
 }
 
 pub const SLASH_COMMANDS: &[&str] = &[
@@ -930,6 +931,13 @@ impl Tui {
         st.output_channel = None;
         let block = format!("{}{text}", Self::block_reset(st));
         self.append_transcript(st, &block, false);
+    }
+
+    pub fn record_turn_duration(&self, elapsed_ms: i64) {
+        let mut st = self.state.lock().unwrap();
+        self.flush_explore_group(&mut st);
+        let dur = text::format_turn_duration(elapsed_ms);
+        self.append_cell(&mut st, &format!("\n{} Worked for {dur}\n", glyph::WORKED));
     }
 
     pub fn write(&self, text: &str) {

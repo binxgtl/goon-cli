@@ -43,6 +43,7 @@ try:
     wait_for('Allow write_file?')
     os.write(master, b'y\r')
     wait_for('Created by TUI.')
+    wait_for('Worked for ')
     time.sleep(0.1)
     os.write(master, b'/exit\r')
     # Keep draining the pty while the child exits: a full pty buffer (small on macOS) would

@@ -216,7 +216,25 @@ pub fn format_compact_duration(ms: i64) -> String {
     if total < 60 {
         return format!("{total}s");
     }
-    format!("{}m {:02}s", total / 60, total % 60)
+    if total < 3600 {
+        return format!("{}m {:02}s", total / 60, total % 60);
+    }
+    format!("{}h {:02}m {:02}s", total / 3600, (total % 3600) / 60, total % 60)
+}
+
+pub fn format_turn_duration(ms: i64) -> String {
+    let clamped = ms.max(0);
+    if clamped < 10_000 {
+        let tenths = ((clamped as f64) / 100.0).round().max(1.0) as i64;
+        if tenths >= 100 {
+            return "10s".into();
+        }
+        if tenths % 10 == 0 {
+            return format!("{}s", tenths / 10);
+        }
+        return format!("{}.{}s", tenths / 10, tenths % 10);
+    }
+    format_compact_duration(clamped)
 }
 
 pub fn extract_reasoning_summary(buffer: &str) -> (Option<String>, Option<String>) {
@@ -344,5 +362,15 @@ mod tests {
         assert_eq!(format_token_count(2_000_000.0), "2M");
         assert_eq!(wrap_chunks("hello world foo", 8, 8, true), vec!["hello", "world", "foo"]);
         assert_eq!(slice_ansi_line("\x1b[1mabcdef\x1b[0m", 3), "\x1b[1mabc\x1b[0m");
+        assert_eq!(width('✓'), 1);
+        assert_eq!(format_turn_duration(0), "0.1s");
+        assert_eq!(format_turn_duration(420), "0.4s");
+        assert_eq!(format_turn_duration(1000), "1s");
+        assert_eq!(format_turn_duration(3480), "3.5s");
+        assert_eq!(format_turn_duration(9960), "10s");
+        assert_eq!(format_turn_duration(18_400), "18s");
+        assert_eq!(format_turn_duration(134_200), "2m 14s");
+        assert_eq!(format_turn_duration(3_734_000), "1h 02m 14s");
+        assert_eq!(format_compact_duration(3_734_000), "1h 02m 14s");
     }
 }

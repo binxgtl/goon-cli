@@ -1680,6 +1680,7 @@ impl App {
             ledger: tools.cost_ledger(),
         }));
         tools.set_budget(Some(budget.clone()));
+        let started = jsutil::now_millis();
         if let Some(t) = self.tui() {
             t.set_status("Running");
             t.mark_turn_start();
@@ -1688,7 +1689,10 @@ impl App {
             self.display(&format!("\n[dag] {goal}\n"));
         }
         match self.run_dag_core(goal, budget, &token).await {
-            Ok(summary) => self.display(&format!("\n{summary}\n")),
+            Ok(summary) => {
+                self.display(&format!("\n{summary}\n"));
+                self.record_worked(started);
+            }
             Err(error) => self.display(&format!("\n[dag failed] {}\n", safe_error(&error))),
         }
         tools.set_budget(previous);
@@ -2628,6 +2632,7 @@ impl App {
             self.display(&format!("Workflow \"{name}\" not found. Run \"/workflow list\" to see available workflows.\n"));
             return;
         };
+        let started = jsutil::now_millis();
         let token = CancellationToken::new();
         self.set_controller(Some(token.clone()));
         if let Some(t) = self.tui() {
@@ -2641,6 +2646,8 @@ impl App {
             Ok(res) => {
                 if self.json {
                     write_json_line(&json!({ "type": "workflow_done", "result": res.to_value(), "sessionId": self.session_id() }));
+                } else {
+                    self.record_worked(started);
                 }
             }
             Err(error) => self.display(&format!("\nWorkflow error: {}\n", safe_error(&error))),
@@ -2679,6 +2686,7 @@ impl App {
             self.display("Usage: /network [--rounds=2] [--roles=architect,critic,researcher,pragmatist] <topic>\n");
             return Ok(());
         }
+        let started = jsutil::now_millis();
         let token = CancellationToken::new();
         self.set_controller(Some(token.clone()));
         if let Some(t) = self.tui() {
@@ -2719,6 +2727,8 @@ impl App {
                 store.save()?;
                 if self.json {
                     write_json_line(&json!({ "type": "network_done", "synthesis": res.synthesis, "rounds": res.rounds }));
+                } else {
+                    self.record_worked(started);
                 }
             }
             Err(error) => self.display(&format!("\nAgent Network failed: {}\n", safe_error(&error))),

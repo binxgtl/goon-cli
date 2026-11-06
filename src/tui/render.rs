@@ -45,7 +45,7 @@ fn plain_row(row: &Row, cols: usize) -> String {
 fn cell_tone(glyph: &str) -> &'static str {
     match glyph {
         "○" | "≡" | "↻" | "↺" => DIM,
-        "●" => OK,
+        "●" | "✓" => OK,
         "✗" => ERR,
         "±" => DEFAULT_FG,
         "◈" | "◇" => BRAND,
@@ -279,7 +279,7 @@ impl Tui {
                 }
                 state.in_banner = false;
             }
-            if let Some(cell) = re!(r"^([○●✗±◈≡▲◌↻↺◇]) (\S.*)$").captures(raw_line) {
+            if let Some(cell) = re!(r"^([○●✗±◈≡▲◌↻↺◇✓]) (\S.*)$").captures(raw_line) {
                 blank(&mut rows);
                 state.in_diff = &cell[1] == glyph::EDIT || re!(r"^(?:Edited|Added|Deleted|Wrote|Created|Updated)\b").is_match(&cell[2]);
                 wrap_into(&mut rows, RowKind::Cell, cell[2].trim_end(), &format!("{} ", &cell[1]), "  ", Some(cell[1].to_string()), None, 0, true);
@@ -429,11 +429,14 @@ impl Tui {
         let glyph = row.glyph.clone().unwrap_or_else(|| "•".into());
         let tone = cell_tone(&glyph);
         let with_durations = |text: &str, base: &str| {
-            let t = re!(r"\((?:\d+m )?\d+s\)").replace_all(text, |c: &regex::Captures| format!("{DIM}{}{RESET}{base}", &c[0]));
+            let t = re!(r"\((?:\d+h )?(?:\d+m )?\d+(?:\.\d+)?s\)").replace_all(text, |c: &regex::Captures| format!("{DIM}{}{RESET}{base}", &c[0]));
             re!(r"\(\+(\d+) -(\d+)\)").replace_all(&t, |c: &regex::Captures| format!("{DIM}({RESET}{OK}+{}{RESET} {ERR}-{}{RESET}{DIM}){RESET}{base}", &c[1], &c[2])).to_string()
         };
         if row.pre.trim().is_empty() {
             return format!("{}{DIM}{}{RESET}", row.pre, with_durations(&row.text, DIM));
+        }
+        if glyph == glyph::WORKED {
+            return format!("{OK}{glyph}{RESET} {DIM}{}{RESET}", row.text);
         }
         let (verb, rest) = match re!(r"^(\S+)(.*)$").captures(&row.text) {
             Some(c) => (c[1].to_string(), c[2].to_string()),

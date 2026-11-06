@@ -794,6 +794,7 @@ async fn no_row_exceeds_the_width_at_any_size_across_every_cell_kind() {
         tty.ui.event(&serde_json::json!({ "type": "todo", "todos": [{ "content": "todo item ".repeat(20), "status": "in_progress" }] }));
         tty.ui.event(&serde_json::json!({ "type": "subagent", "id": "abcdef123456", "state": "start", "task": "task words ".repeat(30) }));
         tty.ui.event(&serde_json::json!({ "type": "text", "text": format!("# {}\n- {}\n> {}\n```js\n{}\n```\n| {}| d |\n|---|---|\n| e | f |\n", "Heading ".repeat(20), "bullet ".repeat(40), "quote ".repeat(40), "const z = 1; ".repeat(30), "c ".repeat(80)) }));
+        tty.ui.record_turn_duration(3_734_000);
         tty.ui.set_status("Running");
         let ui = tty.ui.clone();
         let _q = tokio::spawn(async move { ui.question("goon> ", None, true, QuestionOpts::default()).await });
@@ -909,4 +910,26 @@ async fn verify_events_render_rows_and_skips_are_silent() {
     assert!(transcript.contains("Verify fail: 1 failing test"));
     assert!(transcript.contains("Verify rollback"));
     assert!(!transcript.contains("approval denied"));
+}
+
+#[tokio::test]
+async fn turn_completion_duration_flushes_explore_styles_cleanly_and_rewinds_with_turn() {
+    let tty = Tty::new(90, 24);
+    tty.ui.mark_turn_start();
+    tty.ui.write("\n> build the game\n");
+    tty.ui.event(&serde_json::json!({ "type": "tool", "id": "r1", "name": "read_file", "state": "done", "meta": { "kind": "read", "summary": "src/game.js" } }));
+    tty.ui.event(&serde_json::json!({ "type": "text", "text": "Game finished and verified.\n" }));
+    tty.ui.record_turn_duration(134_200);
+    tty.ui.render_now();
+    let raw = tty.ui.rendered_frame();
+    let plain = crate::term::strip_vt(&raw).to_string();
+    let explored_pos = plain.find("○ Explored").expect("Explored cell shown");
+    let answer_pos = plain.find("◆ Game finished and verified.").expect("Answer shown");
+    let worked_pos = plain.find("✓ Worked for 2m 14s").expect("Worked duration shown");
+    assert!(explored_pos < answer_pos && answer_pos < worked_pos, "{plain}");
+    let worked_row = rows(&raw).into_iter().find(|l| crate::term::strip_vt(l).starts_with("✓ Worked for 2m 14s")).unwrap();
+    assert!(worked_row.contains(&format!("{}✓{}", Theme::OK, Theme::RESET)), "{worked_row:?}");
+    assert!(worked_row.contains(&format!("{}Worked for 2m 14s{}", Theme::FAINT, Theme::RESET)), "{worked_row:?}");
+    assert!(tty.ui.rewind_turns(1));
+    assert!(!tty.frame().contains("Worked for 2m 14s"));
 }

@@ -42,6 +42,7 @@ test('--show-reasoning uses separate JSON events and leaves done.text answer-onl
   const plain = await cli(f, p.url, ['--show-reasoning', '-p', 'inspect']).done;
   assert.equal(plain.stdout, 'Answer\n');
   assert.match(plain.stderr, /\[reasoning · provider\]/); assert.match(plain.stderr, /\[reasoning · inline\]/); assert.match(plain.stderr, /inline detail/);
+  assert.match(plain.stderr, /\[Worked for \d+(?:\.\d+)?s\]/);
 });
 
 test('--inline-reasoning off preserves a literal leading element', async t => {
