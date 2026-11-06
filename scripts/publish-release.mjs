@@ -89,9 +89,9 @@ await command('gh', ['release', 'upload', tag, ...packed.files, '--repo', reposi
 await command('gh', ['release', 'edit', tag, '--repo', repository, '--draft=false', '--latest'], root);
 console.log(`Published https://github.com/${repository}/releases/tag/${tag}`);
 
-// The same archive goes to the npm registry so `npm install -g goon-cli` works. Only after the
-// GitHub release is complete (the wrapper downloads its binary from it). Supports both NPM_TOKEN
-// and tokenless npm Trusted Publishing (GitHub Actions OIDC with `id-token: write`).
+// The same archive goes to the npm registry so `npm install -g @binxgodteli/goon-cli` works. Only
+// after the GitHub release is complete (the wrapper downloads its binary from it). Supports both
+// NPM_TOKEN and tokenless npm Trusted Publishing (GitHub Actions OIDC with `id-token: write`).
 const npmToken = (process.env.NPM_TOKEN || process.env.NODE_AUTH_TOKEN || '').trim();
 const hasGithubOidc = Boolean(process.env.ACTIONS_ID_TOKEN_REQUEST_URL && process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN);
 const oidcAvailable = hasGithubOidc &&

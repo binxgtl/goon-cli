@@ -623,11 +623,12 @@ giữ CRLF.
 ## Repository & Tự động Release
 
 - Source: [binxgtl/goon-cli](https://github.com/binxgtl/goon-cli)
+- Gói npm: [@binxgodteli/goon-cli](https://www.npmjs.com/package/@binxgodteli/goon-cli)
 - Bản cài và checksum: [GitHub Releases](https://github.com/binxgtl/goon-cli/releases)
 - Đóng góp & phát triển: [CONTRIBUTING.md](CONTRIBUTING.md)
 
 Mỗi lần push lên `main` (trừ khi commit có `[skip ci]`), workflow `Check and release`
 chạy rustfmt, clippy, `cargo test` và test Node (Ubuntu/Windows/macOS, restrictive umask), build
-binary cho 8 target, tự động tăng phiên bản patch, đóng gói `goon-cli.tgz` cùng các
-`goon-<target>.gz` và `SHA256SUMS.txt`, rồi phát hành GitHub Release mới. Chi tiết cách chọn số phiên bản và cách tăng minor/major: xem
+binary cho 8 target, tự động tăng phiên bản patch, đóng gói `binxgodteli-goon-cli-X.Y.Z.tgz` + `goon-cli.tgz` cùng các
+`goon-<target>.gz` và `SHA256SUMS.txt`, rồi phát hành GitHub Release mới và tự động đẩy gói lên npm kèm SLSA Provenance qua GitHub Actions OIDC. Chi tiết cách chọn số phiên bản và cách tăng minor/major: xem
 [CONTRIBUTING.md](CONTRIBUTING.md#12-phát-hành).
