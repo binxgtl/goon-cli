@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { readFile, mkdir, mkdtemp, writeFile, copyFile, rm, realpath } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { createServer } from 'node:http';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { gzipSync } from 'node:zlib';
@@ -121,11 +122,18 @@ test('verifyPublishReady and prepublishOnly block unpacked bare npm publish whil
 
   // 1. Missing vendor/manifest.json must fail verifyPublishReady and block bare `npm publish --dry-run`.
   await assert.rejects(() => verifyPublishReady(root), /Refusing bare "npm publish"/);
+  const registry = createServer((_req, res) => {
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end('{"error":"Not found"}');
+  });
+  await new Promise(resolve => registry.listen(0, '127.0.0.1', resolve));
+  t.after(() => registry.close());
+  const registryUrl = `http://127.0.0.1:${registry.address().port}`;
   const emptyNpmrc = join(root, 'empty.npmrc');
   await writeFile(emptyNpmrc, '');
-  const npmEnv = { ...process.env, NPM_CONFIG_USERCONFIG: emptyNpmrc, NPM_TOKEN: '', NODE_AUTH_TOKEN: '' };
+  const npmEnv = { ...process.env, NPM_CONFIG_USERCONFIG: emptyNpmrc, npm_config_registry: registryUrl, NPM_TOKEN: '', NODE_AUTH_TOKEN: '' };
   await assert.rejects(
-    () => exec('npm', ['publish', '--dry-run'], { cwd: root, env: npmEnv, shell: process.platform === 'win32' }),
+    () => exec('npm', ['publish', '--registry', registryUrl, '--dry-run'], { cwd: root, env: npmEnv, shell: process.platform === 'win32' }),
     error => /Refusing bare "npm publish"/.test(`${error.stdout ?? ''}${error.stderr ?? ''}${error.message}`),
   );
 
@@ -152,7 +160,7 @@ test('verifyPublishReady and prepublishOnly block unpacked bare npm publish whil
   await rm(join(root, 'THIRD-PARTY-NOTICES.txt'), { force: true });
   assert.equal(tarballFilename('@binxgodteli/goon-cli', '0.1.0'), 'binxgodteli-goon-cli-0.1.0.tgz');
   assert.equal(tarballFilename('goon-cli', '0.1.0'), 'goon-cli-0.1.0.tgz');
-  await exec('npm', ['publish', join(outDir, 'binxgodteli-goon-cli-0.1.0.tgz'), '--access', 'public', '--dry-run'], { cwd: root, env: npmEnv, shell: process.platform === 'win32' });
+  await exec('npm', ['publish', join(outDir, 'binxgodteli-goon-cli-0.1.0.tgz'), '--registry', registryUrl, '--access', 'public', '--dry-run'], { cwd: root, env: npmEnv, shell: process.platform === 'win32' });
 
   // 4. packRelease packs and smoke-tests scoped @binxgodteli/goon-cli into node_modules/@binxgodteli/goon-cli/bin/goon.mjs.
   await writeFile(join(root, 'THIRD-PARTY-NOTICES.txt'), 'Third-party notices\n');
