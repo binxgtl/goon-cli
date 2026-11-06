@@ -12,8 +12,14 @@ Cài bản GitHub Release mới nhất:
 pkg install nodejs-lts git bash ripgrep
 
 node --version
-npm install -g https://github.com/binxgtl/goon-cli/releases/latest/download/goon-cli.tgz --omit=dev
+npm install -g goon-cli
 goon --version
+```
+
+Cách cũ (cài thẳng từ GitHub Release, vẫn dùng được và cho cùng một gói):
+
+```bash
+npm install -g https://github.com/binxgtl/goon-cli/releases/latest/download/goon-cli.tgz --omit=dev
 ```
 
 goon là một binary native viết bằng Rust. Gói npm chỉ là lớp vỏ nhỏ: khi cài, nó tải binary

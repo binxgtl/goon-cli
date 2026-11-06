@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### npm registry
+- Every release is also published to npm, so `npm install -g goon-cli` works. The GitHub Release
+  install command keeps working and installs the same package. CI publishes only when the
+  `NPM_TOKEN` repository secret is set, and only after the GitHub release is complete.
+
 ### Native Rust rewrite
 - goon is now a single native binary written in Rust; the TypeScript implementation, its build and
   its runtime dependencies are gone. The install command is unchanged

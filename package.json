@@ -4,7 +4,23 @@
   "description": "A small independent coding harness for Termux and external model APIs",
   "type": "module",
   "license": "MIT",
-  "private": true,
+  "homepage": "https://github.com/binxgtl/goon-cli#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/binxgtl/goon-cli.git"
+  },
+  "bugs": {
+    "url": "https://github.com/binxgtl/goon-cli/issues"
+  },
+  "keywords": [
+    "coding-agent",
+    "cli",
+    "termux",
+    "llm"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "bin": {
     "goon": "bin/goon.mjs"
   },

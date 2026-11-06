@@ -81,3 +81,18 @@ if (!release) await command('gh', ['release', 'create', tag, '--repo', repositor
 await command('gh', ['release', 'upload', tag, ...packed.files, '--repo', repository, '--clobber'], root);
 await command('gh', ['release', 'edit', tag, '--repo', repository, '--draft=false', '--latest'], root);
 console.log(`Published https://github.com/${repository}/releases/tag/${tag}`);
+
+// The same archive goes to the npm registry so `npm install -g goon-cli` works. Only after the
+// GitHub release is complete (the wrapper downloads its binary from it), and only when a token is
+// configured, so forks and repositories without the secret keep releasing to GitHub alone.
+if (process.env.NODE_AUTH_TOKEN) {
+  const published = await command('npm', ['view', `${manifest.name}@${version}`, 'version'], root).catch(error => {
+    if (/E404/.test(`${error.stderr}${error.message}`)) return '';
+    throw error;
+  });
+  if (published === version) console.log(`npm already has ${manifest.name}@${version}; skipped.`);
+  else {
+    await command('npm', ['publish', packed.files[0], '--access', 'public'], root);
+    console.log(`Published ${manifest.name}@${version} to npm`);
+  }
+} else console.log('NPM_TOKEN is not set; npm publish skipped.');
