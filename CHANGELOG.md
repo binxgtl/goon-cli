@@ -2,10 +2,17 @@
 
 ## Unreleased
 
+### Turn completion duration
+- After a turn (or `/dag`, `/workflow`, `/network` run) completes, the TUI displays the elapsed
+  duration (`✓ Worked for …`) beneath the response and plain non-JSON CLI runs log `[Worked for …]`
+  on `stderr` without altering `stdout`, `--json` streams or copied answers.
+
 ### npm registry
-- Every release is also published to npm, so `npm install -g goon-cli` works. The GitHub Release
-  install command keeps working and installs the same package. CI publishes only when the
-  `NPM_TOKEN` repository secret is set, and only after the GitHub release is complete.
+- Every release is also published to npm (`npm install -g goon-cli`) with SLSA provenance
+  (`--provenance`), supporting both tokenless npm Trusted Publishing (GitHub Actions OIDC via
+  `id-token: write`) and the `NPM_TOKEN` repository secret. Publishing runs only after the GitHub
+  Release is live, skips already-published versions idempotently on reruns, and `prepublishOnly`
+  blocks accidental bare `npm publish` from an unpacked source checkout.
 
 ### Native Rust rewrite
 - goon is now a single native binary written in Rust; the TypeScript implementation, its build and

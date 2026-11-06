@@ -90,6 +90,34 @@ export async function packRelease(root = resolve(dirname(fileURLToPath(import.me
   return { version, files, output, manifest };
 }
 
+export async function verifyPublishReady(root = resolve(dirname(fileURLToPath(import.meta.url)), '..')) {
+  const { version } = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
+  parseVersion(version);
+  let manifest;
+  try {
+    manifest = JSON.parse(await readFile(join(root, 'vendor', 'manifest.json'), 'utf8'));
+  } catch {
+    throw new Error(
+      `Refusing bare "npm publish" from an unpacked checkout: vendor/manifest.json is missing.\n` +
+      `Publish the verified release archive instead: npm publish release-out/goon-cli-${version}.tgz --access public`
+    );
+  }
+  if (manifest.version !== version) {
+    throw new Error(`vendor/manifest.json version (${manifest.version}) does not match package.json (${version}).`);
+  }
+  for (const triple of TARGETS) {
+    const asset = manifest.assets?.[triple];
+    if (!asset || asset.file !== assetName(triple) || !/^[a-f0-9]{64}$/.test(asset.sha256 ?? '')) {
+      throw new Error(`vendor/manifest.json is missing a valid SHA-256 entry for ${triple}.`);
+    }
+  }
+  if (!(await readFile(join(root, 'THIRD-PARTY-NOTICES.txt'), 'utf8').catch(() => '')).trim()) {
+    throw new Error('Refusing bare "npm publish": THIRD-PARTY-NOTICES.txt is missing; run node scripts/third-party-notices.mjs first.');
+  }
+  return manifest;
+}
+
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  console.log(JSON.stringify(await packRelease()));
+  if (process.argv.includes('--verify-ready')) await verifyPublishReady();
+  else console.log(JSON.stringify(await packRelease()));
 }

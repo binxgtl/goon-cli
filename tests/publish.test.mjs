@@ -37,7 +37,11 @@ test('publishing creates the first tag, bumps every version file on update and r
   await writeFile(join(work, 'bin/goon.mjs'), "#!/usr/bin/env node\nimport {readFileSync} from 'node:fs'; const p=JSON.parse(readFileSync(new URL('../package.json',import.meta.url),'utf8')); console.log('goon cli '+p.version);\n");
   for (const file of ['pack-release.mjs', 'publish-release.mjs', 'release-version.mjs', 'install.mjs']) await copyFile(join('scripts', file), join(work, 'scripts', file));
   const state = join(root, 'releases.json'), log = join(root, 'gh.log');
+  const npmState = join(root, 'npm-state.json'), npmLog = join(root, 'npm.log');
+  const realNpm = (await exec('which', ['npm'])).stdout.trim();
   await writeFile(state, '{}');
+  await writeFile(npmState, JSON.stringify({ versions: [] }));
+  await writeFile(npmLog, '');
   await writeFile(join(bin, 'gh'), `#!/usr/bin/env node
 const fs=require('node:fs');
 const args=process.argv.slice(2), [resource,command,tag]=args;
@@ -48,6 +52,33 @@ if(command==='create'){if(state[tag])throw Error('Duplicate release');state[tag]
 if(command==='upload'){for(const f of args.slice(3)){if(f.startsWith('--'))break;if(!fs.existsSync(f))throw Error('Missing asset '+f);}}
 if(command==='edit')state[tag].draft=false;
 fs.writeFileSync(process.env.GH_TEST_STATE,JSON.stringify(state));
+`, { mode: 0o755 });
+  await writeFile(join(bin, 'npm'), `#!/usr/bin/env node
+const fs=require('node:fs');
+const {execFileSync}=require('node:child_process');
+const args=process.argv.slice(2);
+if(args[0]==='view'){
+  const state=JSON.parse(fs.readFileSync(process.env.NPM_TEST_STATE,'utf8'));
+  const versions=state.versions||[];
+  fs.appendFileSync(process.env.NPM_TEST_LOG,JSON.stringify({cmd:'view',args,userconfig:process.env.NPM_CONFIG_USERCONFIG||''})+'\\n');
+  if(!versions.length){process.stderr.write('npm error code E404\\n');process.exit(1);}
+  process.stdout.write(JSON.stringify(versions)+'\\n');
+  process.exit(0);
+}
+if(args[0]==='publish'){
+  const userconfig=process.env.NPM_CONFIG_USERCONFIG||'';
+  const rc=userconfig&&fs.existsSync(userconfig)?fs.readFileSync(userconfig,'utf8'):'';
+  const ghState=JSON.parse(fs.readFileSync(process.env.GH_TEST_STATE,'utf8'));
+  fs.appendFileSync(process.env.NPM_TEST_LOG,JSON.stringify({cmd:'publish',args,userconfig,hasAuth:rc.includes('_authToken='),ghState})+'\\n');
+  if(process.env.NPM_TEST_FAIL){process.stderr.write('npm error code '+process.env.NPM_TEST_FAIL+'\\n');process.exit(1);}
+  const m=args[1]&&args[1].match(/goon-cli-(\\d+\\.\\d+\\.\\d+)\\.tgz$/);
+  if(!m||!fs.existsSync(args[1])) throw Error('Expected packed tarball, got '+args[1]);
+  const state=JSON.parse(fs.readFileSync(process.env.NPM_TEST_STATE,'utf8'));
+  state.versions=[...(state.versions||[]),m[1]];
+  fs.writeFileSync(process.env.NPM_TEST_STATE,JSON.stringify(state));
+  process.exit(0);
+}
+execFileSync(process.env.REAL_NPM,args,{stdio:'inherit'});
 `, { mode: 0o755 });
   const preload = join(root, 'mock-fetch.mjs');
   await writeFile(preload, `import {readFileSync} from 'node:fs';
@@ -60,20 +91,27 @@ globalThis.fetch=async url=>{
   await git('commit', '-m', 'initial source');
   await git('push', 'origin', 'main');
   const first = await git('rev-parse', 'HEAD');
-  const publish = async source => exec(process.execPath, ['scripts/publish-release.mjs'], {
+  const publish = async (source, extraEnv = {}) => exec(process.execPath, ['scripts/publish-release.mjs'], {
     cwd: work, timeout: 20000, env: { ...process.env, PATH: bin + delimiter + process.env.PATH,
+      REAL_NPM: realNpm, NPM_TEST_STATE: npmState, NPM_TEST_LOG: npmLog,
+      NPM_TOKEN: '', NODE_AUTH_TOKEN: '', ACTIONS_ID_TOKEN_REQUEST_URL: '', ACTIONS_ID_TOKEN_REQUEST_TOKEN: '', NPM_TRUSTED_PUBLISHER: '',
       GH_TOKEN: 'fake-local-test-token', GITHUB_REPOSITORY: 'test/goon-cli', SOURCE_SHA: source,
-      GH_TEST_STATE: state, GH_TEST_LOG: log, NODE_OPTIONS: '--import=' + pathToFileURL(preload).href },
+      GH_TEST_STATE: state, GH_TEST_LOG: log, NODE_OPTIONS: '--import=' + pathToFileURL(preload).href, ...extraEnv },
   });
   await publish(first);
   assert.equal(await git('rev-parse', 'v0.1.0^{commit}'), first);
   assert.equal(JSON.parse(await readFile(state, 'utf8'))['v0.1.0'].draft, false);
+  assert.equal((await readFile(npmLog, 'utf8')).trim(), '', 'npm is untouched when neither NPM_TOKEN nor OIDC is configured');
   await writeFile(join(work, 'change.txt'), 'new source');
   await git('add', 'change.txt');
   await git('commit', '-m', 'source update');
   await git('push', 'origin', 'main');
   const update = await git('rev-parse', 'HEAD');
-  await publish(update);
+  await publish(update, {
+    NPM_TOKEN: 'test-npm-token',
+    ACTIONS_ID_TOKEN_REQUEST_URL: 'https://oidc.example/token',
+    ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'oidc-req-token',
+  });
   const released = await git('rev-parse', 'HEAD');
   assert.notEqual(released, update);
   assert.equal(await git('rev-parse', 'v0.1.1^{commit}'), released);
@@ -89,7 +127,7 @@ globalThis.fetch=async url=>{
   assert.equal(vendored.version, '0.1.1');
   assert.deepEqual(Object.keys(vendored.assets).sort(), [...TARGETS].sort());
   await git('checkout', '--detach', update);
-  await publish(update);
+  await publish(update, { NPM_TOKEN: 'test-npm-token' });
   assert.equal(await git('rev-parse', 'HEAD'), released);
   assert.deepEqual((await git('tag', '--list')).split('\n'), ['v0.1.0', 'v0.1.1']);
   const calls = (await readFile(log, 'utf8')).trim().split('\n').map(JSON.parse);
@@ -98,4 +136,27 @@ globalThis.fetch=async url=>{
   assert.equal(uploads.length, 3);
   const uploaded = uploads[0].slice(3, uploads[0].indexOf('--repo')).map(f => f.split(/[\\/]/).at(-1));
   assert.deepEqual(uploaded.sort(), ['SHA256SUMS.txt', 'THIRD-PARTY-NOTICES.txt', 'goon-cli-0.1.0.tgz', 'goon-cli.tgz', ...TARGETS.map(assetName)].sort());
+
+  const npmCalls = (await readFile(npmLog, 'utf8')).trim().split('\n').map(JSON.parse);
+  const npmPublishes = npmCalls.filter(c => c.cmd === 'publish');
+  assert.equal(npmPublishes.length, 1, 'rerun must skip already-published npm version');
+  assert.equal(npmPublishes[0].hasAuth, true);
+  assert.equal(npmPublishes[0].ghState['v0.1.1']?.draft, false, 'npm publish runs only after GitHub Release is undrafted');
+  assert.deepEqual(npmPublishes[0].args.slice(2), ['--access', 'public', '--provenance']);
+  await assert.rejects(() => readFile(npmPublishes[0].userconfig, 'utf8'), 'temporary .npmrc must be deleted on exit');
+
+  // Configured OIDC Trusted Publisher failures must propagate instead of silently succeeding.
+  await git('checkout', 'main');
+  await git('reset', '--hard', 'origin/main');
+  await writeFile(join(work, 'change2.txt'), 'third change');
+  await git('add', 'change2.txt');
+  await git('commit', '-m', 'third update');
+  await git('push', 'origin', 'main');
+  const third = await git('rev-parse', 'HEAD');
+  await assert.rejects(() => publish(third, {
+    NPM_TRUSTED_PUBLISHER: 'true',
+    ACTIONS_ID_TOKEN_REQUEST_URL: 'https://oidc.example/token',
+    ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'oidc-req-token',
+    NPM_TEST_FAIL: 'E403',
+  }));
 });

@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { selectVersion, setManifestVersion, parseVersion, setCargoVersion, cargoVersions } from '../scripts/release-version.mjs';
+import { verifyPublishReady } from '../scripts/pack-release.mjs';
 import { TARGETS, targetTriple, assetName } from '../scripts/install.mjs';
 
 test('first release, automatic patches and numeric ordering use distinct immutable tags', () => {
@@ -92,4 +93,58 @@ test('the CI plan entry point runs on its own and picks the next version from th
   // with pack-release.mjs once deadlocked here and exited 13).
   const { stdout } = await exec(process.execPath, ['scripts/release-version.mjs', 'plan'], { cwd: work });
   assert.deepEqual(JSON.parse(stdout), { skip: false, version: '0.1.1', reason: '' });
+});
+
+test('verifyPublishReady and prepublishOnly block unpacked bare npm publish while packed tarballs pass', { timeout: 30000 }, async t => {
+  const exec = promisify(execFile);
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'goon-verify-publish-')));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await mkdir(join(root, 'scripts'), { recursive: true });
+  await mkdir(join(root, 'bin'), { recursive: true });
+  for (const file of ['release-version.mjs', 'pack-release.mjs', 'install.mjs']) {
+    await copyFile(join('scripts', file), join(root, 'scripts', file));
+  }
+  await copyFile(join('bin', 'goon.mjs'), join(root, 'bin', 'goon.mjs'));
+  const pkg = {
+    name: 'goon-cli',
+    version: '0.1.0',
+    type: 'module',
+    bin: { goon: 'bin/goon.mjs' },
+    files: ['bin', 'scripts/install.mjs', 'vendor/manifest.json', 'THIRD-PARTY-NOTICES.txt'],
+    scripts: { prepublishOnly: 'node scripts/pack-release.mjs --verify-ready' },
+  };
+  await writeFile(join(root, 'package.json'), `${JSON.stringify(pkg, null, 2)}\n`);
+
+  // 1. Missing vendor/manifest.json must fail verifyPublishReady and block bare `npm publish --dry-run`.
+  await assert.rejects(() => verifyPublishReady(root), /Refusing bare "npm publish"/);
+  const emptyNpmrc = join(root, 'empty.npmrc');
+  await writeFile(emptyNpmrc, '');
+  const npmEnv = { ...process.env, NPM_CONFIG_USERCONFIG: emptyNpmrc, NPM_TOKEN: '', NODE_AUTH_TOKEN: '' };
+  await assert.rejects(
+    () => exec('npm', ['publish', '--dry-run'], { cwd: root, env: npmEnv, shell: process.platform === 'win32' }),
+    error => /Refusing bare "npm publish"/.test(`${error.stdout ?? ''}${error.stderr ?? ''}${error.message}`),
+  );
+
+  // 2. Version mismatch, invalid SHA-256, and missing THIRD-PARTY-NOTICES.txt must all be rejected.
+  await mkdir(join(root, 'vendor'), { recursive: true });
+  const validAssets = Object.fromEntries(TARGETS.map(triple => [triple, { file: assetName(triple), sha256: 'a'.repeat(64), size: 4096 }]));
+  await writeFile(join(root, 'vendor', 'manifest.json'), JSON.stringify({ version: '0.9.9', assets: validAssets }));
+  await assert.rejects(() => verifyPublishReady(root), /does not match package\.json/);
+
+  await writeFile(join(root, 'vendor', 'manifest.json'), JSON.stringify({ version: '0.1.0', assets: { ...validAssets, [TARGETS[0]]: { file: assetName(TARGETS[0]), sha256: 'short' } } }));
+  await assert.rejects(() => verifyPublishReady(root), /missing a valid SHA-256 entry/);
+
+  await writeFile(join(root, 'vendor', 'manifest.json'), JSON.stringify({ version: '0.1.0', assets: validAssets }));
+  await assert.rejects(() => verifyPublishReady(root), /THIRD-PARTY-NOTICES\.txt is missing/);
+
+  // 3. Complete valid tree passes verifyPublishReady, and publishing a packed .tgz tarball works directly.
+  await writeFile(join(root, 'THIRD-PARTY-NOTICES.txt'), 'Third-party notices\n');
+  const verified = await verifyPublishReady(root);
+  assert.equal(verified.version, '0.1.0');
+  const outDir = join(root, 'packed');
+  await mkdir(outDir, { recursive: true });
+  await exec('npm', ['pack', '--ignore-scripts', '--pack-destination', outDir], { cwd: root, env: npmEnv, shell: process.platform === 'win32' });
+  await rm(join(root, 'vendor'), { recursive: true, force: true });
+  await rm(join(root, 'THIRD-PARTY-NOTICES.txt'), { force: true });
+  await exec('npm', ['publish', join(outDir, 'goon-cli-0.1.0.tgz'), '--dry-run'], { cwd: root, env: npmEnv, shell: process.platform === 'win32' });
 });

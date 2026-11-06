@@ -218,7 +218,9 @@ Không có bước phát hành thủ công. Mỗi lần push lên `main` (kể c
    `vendor/manifest.json` (SHA-256 của từng binary), `npm pack`, cài thử `.tgz` vào prefix tạm để lớp vỏ tự
    tải + kiểm checksum + chạy `--version`/`--help`, rồi đẩy commit `chore: release vX.Y.Z [skip ci]` + tag và
    tạo GitHub Release với `goon-cli-X.Y.Z.tgz`, bản alias `goon-cli.tgz` (địa chỉ cài trong README), các
-   `goon-<target>.gz`, `THIRD-PARTY-NOTICES.txt` và `SHA256SUMS.txt`.
+   `goon-<target>.gz`, `THIRD-PARTY-NOTICES.txt` và `SHA256SUMS.txt`. Sau khi GitHub Release hoàn tất, cùng
+   file `goon-cli-X.Y.Z.tgz` được đẩy tự động lên npm kèm chứng thực SLSA (`--provenance`) thông qua **npm
+   Trusted Publisher** (GitHub Actions OIDC `id-token: write`, không cần token) hoặc secret `NPM_TOKEN`.
 
 Việc thủ công duy nhất là **tăng minor/major**: trong một PR, sửa `version` ở cả `package.json`,
 `npm-shrinkwrap.json` (`npm version minor --no-git-tag-version` lo hai file này), `Cargo.toml` và mục
@@ -227,7 +229,7 @@ Việc thủ công duy nhất là **tăng minor/major**: trong một PR, sửa `
 
 Thử đóng gói trên máy (không đẩy gì lên GitHub): đặt các `goon-<target>.gz` vào `release-bin/` (đủ 8 target),
 chạy `node scripts/third-party-notices.mjs` rồi `npm run release:pack`; kết quả nằm trong `release-out/` (đã ignore). Đừng chạy
-`scripts/publish-release.mjs` cục bộ: nó tạo tag, push và phát hành thật.
+`scripts/publish-release.mjs` cục bộ (nó tạo tag, push và phát hành thật) và không chạy `npm publish` trần trên thư mục nguồn chưa đóng gói (`prepublishOnly` sẽ chặn để tránh đẩy gói thiếu `vendor/manifest.json` — luôn publish từ file `release-out/goon-cli-X.Y.Z.tgz`).
 
 ## 13. Ghi chú cho Termux
 

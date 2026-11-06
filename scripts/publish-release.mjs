@@ -1,6 +1,7 @@
 // Tags and publishes a GitHub release from CI. The plan job already chose the version (see
 // release-version.mjs) and the build jobs stamped it into the binaries in release-bin/.
-import { readFile, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { planRelease, setManifestVersion, setCargoVersion, VERSION_FILES } from './release-version.mjs';
@@ -66,6 +67,12 @@ Independent coding harness for Termux and external APIs — a native Rust binary
 Install or update (Node >=22.16.0; the matching binary is downloaded and SHA-256 verified on install):
 
 \`\`\`bash
+npm install -g goon-cli
+\`\`\`
+
+Or install directly from this GitHub Release:
+
+\`\`\`bash
 npm install -g https://github.com/${repository}/releases/latest/download/goon-cli.tgz --omit=dev
 \`\`\`
 
@@ -83,16 +90,53 @@ await command('gh', ['release', 'edit', tag, '--repo', repository, '--draft=fals
 console.log(`Published https://github.com/${repository}/releases/tag/${tag}`);
 
 // The same archive goes to the npm registry so `npm install -g goon-cli` works. Only after the
-// GitHub release is complete (the wrapper downloads its binary from it), and only when a token is
-// configured, so forks and repositories without the secret keep releasing to GitHub alone.
-if (process.env.NODE_AUTH_TOKEN) {
-  const published = await command('npm', ['view', `${manifest.name}@${version}`, 'version'], root).catch(error => {
-    if (/E404/.test(`${error.stderr}${error.message}`)) return '';
-    throw error;
-  });
-  if (published === version) console.log(`npm already has ${manifest.name}@${version}; skipped.`);
-  else {
-    await command('npm', ['publish', packed.files[0], '--access', 'public'], root);
-    console.log(`Published ${manifest.name}@${version} to npm`);
+// GitHub release is complete (the wrapper downloads its binary from it). Supports both NPM_TOKEN
+// and tokenless npm Trusted Publishing (GitHub Actions OIDC with `id-token: write`).
+const npmToken = (process.env.NPM_TOKEN || process.env.NODE_AUTH_TOKEN || '').trim();
+const hasGithubOidc = Boolean(process.env.ACTIONS_ID_TOKEN_REQUEST_URL && process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN);
+const oidcAvailable = hasGithubOidc &&
+  (repository === 'binxgtl/goon-cli' || process.env.NPM_TRUSTED_PUBLISHER === 'true');
+if (npmToken || oidcAvailable) {
+  const tempDir = await mkdtemp(join(tmpdir(), 'goon-npmrc-'));
+  try {
+    const emptyConfig = join(tempDir, 'empty.npmrc');
+    await writeFile(emptyConfig, '', { mode: 0o600 });
+    const cleanEnv = { NPM_CONFIG_USERCONFIG: emptyConfig, NPM_TOKEN: '', NODE_AUTH_TOKEN: '' };
+    const existingVersions = await command('npm', ['view', manifest.name, 'versions', '--json'], root, cleanEnv)
+      .then(out => {
+        const parsed = JSON.parse(out || '[]');
+        return Array.isArray(parsed) ? parsed : parsed ? [String(parsed)] : [];
+      })
+      .catch(error => {
+        if (/E404/.test(`${error.stderr ?? ''}${error.message}`)) return [];
+        throw error;
+      });
+    if (existingVersions.includes(version)) {
+      console.log(`npm already has ${manifest.name}@${version}; skipped.`);
+    } else {
+      const publishArgs = ['publish', packed.files[0], '--access', 'public'];
+      if (hasGithubOidc) publishArgs.push('--provenance');
+      let publishEnv = cleanEnv;
+      if (npmToken) {
+        const authConfig = join(tempDir, 'auth.npmrc');
+        await writeFile(authConfig, `//registry.npmjs.org/:_authToken=${npmToken}\n`, { mode: 0o600 });
+        publishEnv = { NPM_CONFIG_USERCONFIG: authConfig, NPM_TOKEN: '', NODE_AUTH_TOKEN: '' };
+      }
+      try {
+        await command('npm', publishArgs, root, publishEnv);
+        console.log(`Published ${manifest.name}@${version} to npm`);
+      } catch (error) {
+        const detail = `${error.stderr ?? ''}${error.message}`;
+        const unconfiguredOidc = !npmToken && process.env.NPM_TRUSTED_PUBLISHER !== 'true' &&
+          existingVersions.length === 0 && /(ENEEDAUTH|E401|E403|E404)/.test(detail);
+        if (unconfiguredOidc) {
+          console.log('npm auth is not configured yet (set NPM_TOKEN secret or publish once and add GitHub Actions Trusted Publisher on npmjs.com); npm publish skipped.');
+        } else {
+          throw error;
+        }
+      }
+    }
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
   }
-} else console.log('NPM_TOKEN is not set; npm publish skipped.');
+} else console.log('NPM_TOKEN / OIDC is not set; npm publish skipped.');

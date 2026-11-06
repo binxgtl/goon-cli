@@ -39,6 +39,7 @@
   ],
   "scripts": {
     "postinstall": "node scripts/install.mjs",
+    "prepublishOnly": "node scripts/pack-release.mjs --verify-ready",
     "build": "cargo build",
     "build:release": "cargo build --release",
     "lint": "cargo fmt --check && cargo clippy --all-targets --locked -- -D warnings && oxlint tests bin scripts",

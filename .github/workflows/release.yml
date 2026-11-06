@@ -212,6 +212,7 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: write
+      id-token: write
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -219,7 +220,14 @@ jobs:
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: '24'
-          registry-url: https://registry.npmjs.org
+      - name: Ensure npm >= 11.5.1 for OIDC trusted publishing
+        run: |
+          ver=$(npm --version)
+          echo "npm $ver"
+          if ! node -e 'const [a,b,c]=process.argv[1].split(".").map(Number); process.exit(a>11||(a===11&&(b>5||(b===5&&c>=1)))?0:1)' "$ver"; then
+            npm install --prefix "$HOME/.npm-cli" npm@latest --no-audit --no-fund
+            echo "$HOME/.npm-cli/bin" >> "$GITHUB_PATH"
+          fi
       - name: Install the Rust toolchain
         run: rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" --profile minimal
       - name: Collect third-party license notices
@@ -235,4 +243,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           SOURCE_SHA: ${{ github.sha }}
           RELEASE_VERSION: ${{ needs.plan.outputs.version }}
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_TRUSTED_PUBLISHER: ${{ vars.NPM_TRUSTED_PUBLISHER }}
