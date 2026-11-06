@@ -1,11 +1,11 @@
 {
-  "name": "goon-cli",
+  "name": "@binxgodteli/goon-cli",
   "version": "0.3.8",
   "lockfileVersion": 3,
   "requires": true,
   "packages": {
     "": {
-      "name": "goon-cli",
+      "name": "@binxgodteli/goon-cli",
       "version": "0.3.8",
       "hasInstallScript": true,
       "license": "MIT",

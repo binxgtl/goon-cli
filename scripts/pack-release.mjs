@@ -19,6 +19,7 @@ export async function command(program, args, cwd, env) {
 }
 
 const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
+export const tarballFilename = (name, version) => `${name.replace(/^@/, '').replace('/', '-')}-${version}.tgz`;
 
 /** Reads `goon-<triple>.gz` for every release target from `binaries` and records its digest. */
 export async function binaryManifest(binaries, version, repository) {
@@ -37,7 +38,7 @@ export async function binaryManifest(binaries, version, repository) {
 }
 
 export async function packRelease(root = resolve(dirname(fileURLToPath(import.meta.url)), '..'), options = {}) {
-  const { version } = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
+  const { name, version } = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
   parseVersion(version);
   const binaries = resolve(root, options.binaries ?? process.env.GOON_RELEASE_BINARIES ?? 'release-bin');
   const repository = options.repository ?? process.env.GITHUB_REPOSITORY ?? 'binxgtl/goon-cli';
@@ -51,7 +52,7 @@ export async function packRelease(root = resolve(dirname(fileURLToPath(import.me
   await rm(output, { recursive: true, force: true });
   await mkdir(output, { recursive: true });
   const packed = JSON.parse(await command('npm', ['pack', '--ignore-scripts', '--json', '--pack-destination', output], root));
-  const filename = `goon-cli-${version}.tgz`;
+  const filename = tarballFilename(name, version);
   if (packed.length !== 1 || packed[0].filename !== filename) throw new Error('Unexpected npm pack output.');
   const packedFiles = packed[0].files.map(f => f.path);
   for (const required of ['vendor/manifest.json', 'THIRD-PARTY-NOTICES.txt']) {
@@ -65,7 +66,7 @@ export async function packRelease(root = resolve(dirname(fileURLToPath(import.me
   const prefix = await mkdtemp(join(tmpdir(), 'goon-release-'));
   try {
     await command('npm', ['install', '--prefix', prefix, archive, '--omit=dev', '--no-audit', '--no-fund'], root, { GOON_DOWNLOAD_BASE: binaries });
-    const bin = join(prefix, 'node_modules', 'goon-cli', 'bin', 'goon.mjs');
+    const bin = join(prefix, 'node_modules', ...name.split('/'), 'bin', 'goon.mjs');
     const env = { GOON_DOWNLOAD_BASE: binaries, GOON_BINARY: '' };
     const reported = await command(process.execPath, [bin, '--version'], root, env);
     if (reported !== `goon cli ${version}`) throw new Error(`Installed archive reports the wrong version: ${reported}`);
@@ -91,7 +92,7 @@ export async function packRelease(root = resolve(dirname(fileURLToPath(import.me
 }
 
 export async function verifyPublishReady(root = resolve(dirname(fileURLToPath(import.meta.url)), '..')) {
-  const { version } = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
+  const { name, version } = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
   parseVersion(version);
   let manifest;
   try {
@@ -99,7 +100,7 @@ export async function verifyPublishReady(root = resolve(dirname(fileURLToPath(im
   } catch {
     throw new Error(
       `Refusing bare "npm publish" from an unpacked checkout: vendor/manifest.json is missing.\n` +
-      `Publish the verified release archive instead: npm publish release-out/goon-cli-${version}.tgz --access public`
+      `Publish the verified release archive instead: npm publish ./release-out/${tarballFilename(name, version)} --access public`
     );
   }
   if (manifest.version !== version) {

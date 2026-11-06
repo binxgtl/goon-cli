@@ -67,7 +67,7 @@ Independent coding harness for Termux and external APIs — a native Rust binary
 Install or update (Node >=22.16.0; the matching binary is downloaded and SHA-256 verified on install):
 
 \`\`\`bash
-npm install -g goon-cli
+npm install -g ${manifest.name}
 \`\`\`
 
 Or install directly from this GitHub Release:

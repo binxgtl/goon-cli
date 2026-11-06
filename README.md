@@ -12,7 +12,7 @@ Cài bản GitHub Release mới nhất:
 pkg install nodejs-lts git bash ripgrep
 
 node --version
-npm install -g goon-cli
+npm install -g @binxgodteli/goon-cli
 goon --version
 ```
 

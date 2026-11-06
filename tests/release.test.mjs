@@ -5,8 +5,10 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { gzipSync } from 'node:zlib';
+import { randomBytes } from 'node:crypto';
 import { selectVersion, setManifestVersion, parseVersion, setCargoVersion, cargoVersions } from '../scripts/release-version.mjs';
-import { verifyPublishReady } from '../scripts/pack-release.mjs';
+import { packRelease, verifyPublishReady, tarballFilename } from '../scripts/pack-release.mjs';
 import { TARGETS, targetTriple, assetName } from '../scripts/install.mjs';
 
 test('first release, automatic patches and numeric ordering use distinct immutable tags', () => {
@@ -61,6 +63,8 @@ test('every supported platform maps to a shipped target', () => {
 test('CLI version comes from the installed package manifest', async () => {
   const manifest = JSON.parse(await readFile('package.json', 'utf8'));
   const lock = JSON.parse(await readFile('npm-shrinkwrap.json', 'utf8'));
+  assert.equal(lock.name, manifest.name, 'npm-shrinkwrap.json name must match package.json');
+  assert.equal(lock.packages?.['']?.name, manifest.name, 'npm-shrinkwrap.json root package name must match package.json');
   assert.equal(lock.version, manifest.version, 'npm-shrinkwrap.json version must match package.json');
   assert.equal(lock.packages?.['']?.version, manifest.version, 'npm-shrinkwrap.json root package version must match package.json');
   assert.deepEqual(cargoVersions(await readFile('Cargo.toml', 'utf8'), await readFile('Cargo.lock', 'utf8')), { manifest: manifest.version, lock: manifest.version }, 'Cargo.toml and Cargo.lock must match package.json');
@@ -106,7 +110,7 @@ test('verifyPublishReady and prepublishOnly block unpacked bare npm publish whil
   }
   await copyFile(join('bin', 'goon.mjs'), join(root, 'bin', 'goon.mjs'));
   const pkg = {
-    name: 'goon-cli',
+    name: '@binxgodteli/goon-cli',
     version: '0.1.0',
     type: 'module',
     bin: { goon: 'bin/goon.mjs' },
@@ -146,5 +150,18 @@ test('verifyPublishReady and prepublishOnly block unpacked bare npm publish whil
   await exec('npm', ['pack', '--ignore-scripts', '--pack-destination', outDir], { cwd: root, env: npmEnv, shell: process.platform === 'win32' });
   await rm(join(root, 'vendor'), { recursive: true, force: true });
   await rm(join(root, 'THIRD-PARTY-NOTICES.txt'), { force: true });
-  await exec('npm', ['publish', join(outDir, 'goon-cli-0.1.0.tgz'), '--dry-run'], { cwd: root, env: npmEnv, shell: process.platform === 'win32' });
+  assert.equal(tarballFilename('@binxgodteli/goon-cli', '0.1.0'), 'binxgodteli-goon-cli-0.1.0.tgz');
+  assert.equal(tarballFilename('goon-cli', '0.1.0'), 'goon-cli-0.1.0.tgz');
+  await exec('npm', ['publish', join(outDir, 'binxgodteli-goon-cli-0.1.0.tgz'), '--access', 'public', '--dry-run'], { cwd: root, env: npmEnv, shell: process.platform === 'win32' });
+
+  // 4. packRelease packs and smoke-tests scoped @binxgodteli/goon-cli into node_modules/@binxgodteli/goon-cli/bin/goon.mjs.
+  await writeFile(join(root, 'THIRD-PARTY-NOTICES.txt'), 'Third-party notices\n');
+  await writeFile(join(root, 'bin', 'goon.mjs'), "#!/usr/bin/env node\nimport { readFileSync } from 'node:fs';\nconst p = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));\nconsole.log('goon cli ' + p.version);\n");
+  const binDir = join(root, 'release-bin');
+  await mkdir(binDir, { recursive: true });
+  for (const triple of TARGETS) await writeFile(join(binDir, assetName(triple)), gzipSync(randomBytes(4096)));
+  const packed = await packRelease(root, { binaries: binDir });
+  assert.equal(packed.version, '0.1.0');
+  assert.ok(packed.files[0].endsWith('binxgodteli-goon-cli-0.1.0.tgz'));
+  assert.ok(packed.files[1].endsWith('goon-cli.tgz'));
 });

@@ -25,9 +25,9 @@ test('publishing creates the first tag, bumps every version file on update and r
   await git('config', 'user.name', 'Release Test');
   await git('config', 'user.email', 'test@example.invalid');
   await git('remote', 'add', 'origin', remote);
-  const manifest = { name: 'goon-cli', version: '0.1.0', private: true, type: 'module', bin: { goon: 'bin/goon.mjs' }, files: ['bin', 'vendor/manifest.json', 'THIRD-PARTY-NOTICES.txt'] };
+  const manifest = { name: '@binxgodteli/goon-cli', version: '0.1.0', private: true, type: 'module', bin: { goon: 'bin/goon.mjs' }, files: ['bin', 'vendor/manifest.json', 'THIRD-PARTY-NOTICES.txt'] };
   await writeFile(join(work, 'package.json'), JSON.stringify(manifest));
-  await writeFile(join(work, 'npm-shrinkwrap.json'), JSON.stringify({ name: 'goon-cli', version: '0.1.0', lockfileVersion: 3, requires: true, packages: { '': { name: 'goon-cli', version: '0.1.0' } } }));
+  await writeFile(join(work, 'npm-shrinkwrap.json'), JSON.stringify({ name: '@binxgodteli/goon-cli', version: '0.1.0', lockfileVersion: 3, requires: true, packages: { '': { name: '@binxgodteli/goon-cli', version: '0.1.0' } } }));
   await writeFile(join(work, 'Cargo.toml'), '[package]\nname = "goon-cli"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\nserde = { version = "1" }\n');
   await writeFile(join(work, 'Cargo.lock'), '# generated\nversion = 4\n\n[[package]]\nname = "goon-cli"\nversion = "0.1.0"\n\n[[package]]\nname = "serde"\nversion = "1.0.0"\n');
   await writeFile(join(work, '.gitignore'), 'node_modules/\nrelease-out/\nrelease-bin/\nvendor/\nTHIRD-PARTY-NOTICES.txt\n');
@@ -71,7 +71,7 @@ if(args[0]==='publish'){
   const ghState=JSON.parse(fs.readFileSync(process.env.GH_TEST_STATE,'utf8'));
   fs.appendFileSync(process.env.NPM_TEST_LOG,JSON.stringify({cmd:'publish',args,userconfig,hasAuth:rc.includes('_authToken='),ghState})+'\\n');
   if(process.env.NPM_TEST_FAIL){process.stderr.write('npm error code '+process.env.NPM_TEST_FAIL+'\\n');process.exit(1);}
-  const m=args[1]&&args[1].match(/goon-cli-(\\d+\\.\\d+\\.\\d+)\\.tgz$/);
+  const m=args[1]&&args[1].match(/binxgodteli-goon-cli-(\\d+\\.\\d+\\.\\d+)\\.tgz$/);
   if(!m||!fs.existsSync(args[1])) throw Error('Expected packed tarball, got '+args[1]);
   const state=JSON.parse(fs.readFileSync(process.env.NPM_TEST_STATE,'utf8'));
   state.versions=[...(state.versions||[]),m[1]];
@@ -135,7 +135,7 @@ globalThis.fetch=async url=>{
   const uploads = calls.filter(args => args[1] === 'upload');
   assert.equal(uploads.length, 3);
   const uploaded = uploads[0].slice(3, uploads[0].indexOf('--repo')).map(f => f.split(/[\\/]/).at(-1));
-  assert.deepEqual(uploaded.sort(), ['SHA256SUMS.txt', 'THIRD-PARTY-NOTICES.txt', 'goon-cli-0.1.0.tgz', 'goon-cli.tgz', ...TARGETS.map(assetName)].sort());
+  assert.deepEqual(uploaded.sort(), ['SHA256SUMS.txt', 'THIRD-PARTY-NOTICES.txt', 'binxgodteli-goon-cli-0.1.0.tgz', 'goon-cli.tgz', ...TARGETS.map(assetName)].sort());
 
   const npmCalls = (await readFile(npmLog, 'utf8')).trim().split('\n').map(JSON.parse);
   const npmPublishes = npmCalls.filter(c => c.cmd === 'publish');

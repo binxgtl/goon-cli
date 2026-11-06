@@ -8,7 +8,7 @@
   on `stderr` without altering `stdout`, `--json` streams or copied answers.
 
 ### npm registry
-- Every release is also published to npm (`npm install -g goon-cli`) with SLSA provenance
+- Every release is also published to npm (`npm install -g @binxgodteli/goon-cli`) with SLSA provenance
   (`--provenance`), supporting both tokenless npm Trusted Publishing (GitHub Actions OIDC via
   `id-token: write`) and the `NPM_TOKEN` repository secret. Publishing runs only after the GitHub
   Release is live, skips already-published versions idempotently on reruns, and `prepublishOnly`
