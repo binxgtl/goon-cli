@@ -379,3 +379,117 @@ async fn agent_network_shares_the_parent_ledger_and_mirrors_cost_back_to_the_bud
     assert_eq!(b.started_at, Some(started_at));
     assert_eq!(b.time_limit_ms, 600_000);
 }
+
+#[tokio::test]
+async fn long_subagent_and_queued_send_input_exceed_model_timeout_ms_without_aborting_turn() {
+    let f = fixture();
+    f.write("notes.txt", "saboteur warm-runner ok\n");
+    let child_requests = Arc::new(AtomicUsize::new(0));
+    let cr = child_requests.clone();
+    let p = provider(move |body, _| {
+        if is_child(body) || body["messages"].to_string().contains("You are a delegated agent.") {
+            let n = cr.fetch_add(1, Ordering::SeqCst) + 1;
+            let tool_count = body["messages"].as_array().map(|m| m.iter().filter(|m| m["role"] == "tool").count()).unwrap_or(0);
+            // Each request responds in 45ms (< 150ms idle timeout), while a multi-step child turn
+            // spans > 180ms and queued + synchronous turns exceed 400ms (> 2.5x timeout_ms).
+            let mut resp = if tool_count < 3 {
+                calls(vec![tc(&format!("child-read-{n}-{tool_count}"), "read_file", json!({ "path": "notes.txt" }))])
+            } else {
+                let user_count = body["messages"].as_array().map(|m| m.iter().filter(|m| m["role"] == "user").count()).unwrap_or(0);
+                text(&format!("warm-runner completed user-turn-{user_count}"))
+            };
+            resp.delay_ms = 45;
+            return resp;
+        }
+        let tool_msgs: Vec<&Value> = body["messages"].as_array().unwrap().iter().filter(|m| m["role"] == "tool").collect();
+        match tool_msgs.len() {
+            0 => calls(vec![tc("spawn-warm", "spawn_agent", json!({ "nickname": "warm-runner", "agent_type": "worker", "message": "Run initial suite" }))]),
+            1 => {
+                // Queue a follow-up while warm-runner is still in the middle of its first turn.
+                calls(vec![tc("steer-warm", "send_input", json!({ "target": "warm-runner", "message": "Check mutant survivors" }))])
+            }
+            2 => {
+                let queued: Value = serde_json::from_str(tool_msgs[1]["content"].as_str().unwrap()).unwrap();
+                assert_eq!(queued["status"], "running");
+                // Also verify Codex 1-hour (3_600_000ms) wait_agent ceiling passes schema validation.
+                calls(vec![tc("wait-warm", "wait_agent", json!({ "targets": ["warm-runner"], "timeout_ms": 3_600_000 }))])
+            }
+            3 => {
+                let waited: Value = serde_json::from_str(tool_msgs[2]["content"].as_str().unwrap()).unwrap();
+                assert_eq!(waited["timed_out"], false);
+                let completed = waited["status"].as_object().unwrap().values().next().unwrap()["completed"].as_str().unwrap();
+                assert_eq!(completed, "warm-runner completed user-turn-2");
+                // Now run a synchronous send_input(wait: true) whose turn exceeds timeout_ms (150ms).
+                calls(vec![tc("sync-warm", "send_input", json!({ "target": "warm-runner", "message": "Final synchronous check", "wait": true }))])
+            }
+            _ => {
+                let sync_out: Value = serde_json::from_str(tool_msgs[3]["content"].as_str().unwrap()).unwrap();
+                assert_eq!(sync_out["status"]["completed"], "warm-runner completed user-turn-3");
+                text("All warm-runner work verified.")
+            }
+        }
+    })
+    .await;
+
+    let mut raw = (*runtime(&f.cwd, &f.data, &p.url, json!({ "runTokenBudget": 100_000 }))).clone();
+    raw.config.timeout_ms = 150;
+    raw.config.max_time_ms = 0;
+    let rt = Arc::new(raw);
+    let st = store(&rt);
+    let tools = registry(&f.cwd, tools::approve_all(), false);
+    let subagents = Subagents::new(rt.clone(), st.clone(), tools.clone(), harness::noop_emit());
+    subagents.register().unwrap();
+    let h = harness::Harness::new(rt, st, tools, harness::noop_emit(), None, Default::default()).unwrap();
+
+    let answer = h.run("coordinate warm-runner", &token(), None).await.expect("tool batches and subagents must not fail with artificial timeout_ms deadline");
+    assert_eq!(answer, "All warm-runner work verified.");
+    subagents.close_all().await;
+}
+
+#[tokio::test]
+async fn explicit_max_time_ms_enforces_budget_and_cancel_interrupts_subagent_wait_immediately() {
+    let f = fixture();
+    let p = provider(|body, _| {
+        if is_child(body) || body["messages"].to_string().contains("You are a delegated agent.") {
+            let mut r = text("slow child");
+            r.delay_ms = 600;
+            return r;
+        }
+        calls(vec![tc("spawn-wait", "spawn_agent", json!({ "nickname": "slow-worker", "message": "Long task", "wait": true }))])
+    })
+    .await;
+
+    // 1. Explicit max_time_ms > 0 still enforces the hard wall-clock run cap.
+    let mut capped = (*runtime(&f.cwd, &f.data, &p.url, json!({ "timeoutMs": 5000, "maxTimeMs": 90 }))).clone();
+    capped.config.max_time_ms = 90;
+    let capped = Arc::new(capped);
+    let st1 = store(&capped);
+    let tools1 = registry(&f.cwd, tools::approve_all(), false);
+    let sub1 = Subagents::new(capped.clone(), st1.clone(), tools1.clone(), harness::noop_emit());
+    sub1.register().unwrap();
+    let h1 = harness::Harness::new(capped, st1, tools1, harness::noop_emit(), None, Default::default()).unwrap();
+    let started = std::time::Instant::now();
+    let err = h1.run("run with cap", &token(), None).await.expect_err("explicit max_time_ms must abort long run");
+    assert!(started.elapsed() < std::time::Duration::from_millis(500), "took {:?}", started.elapsed());
+    assert_match(&err.to_string(), "Run time budget reached");
+    sub1.close_all().await;
+
+    // 2. User Ctrl+C / Esc (CancellationToken) interrupts wait_done_cancellable immediately.
+    let rt2 = runtime(&f.cwd, &f.data, &p.url, json!({ "timeoutMs": 5000, "maxTimeMs": 0 }));
+    let st2 = store(&rt2);
+    let tools2 = registry(&f.cwd, tools::approve_all(), false);
+    let sub2 = Subagents::new(rt2.clone(), st2.clone(), tools2.clone(), harness::noop_emit());
+    sub2.register().unwrap();
+    let h2 = harness::Harness::new(rt2, st2, tools2, harness::noop_emit(), None, Default::default()).unwrap();
+    let cancel = token();
+    let c2 = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(45)).await;
+        c2.cancel();
+    });
+    let started = std::time::Instant::now();
+    let err2 = h2.run("run then cancel", &cancel, None).await.expect_err("user cancel must abort immediately");
+    assert!(started.elapsed() < std::time::Duration::from_millis(450), "cancel took {:?}", started.elapsed());
+    assert!(harness::is_aborted(&err2), "expected Aborted, got: {err2}");
+    sub2.close_all().await;
+}

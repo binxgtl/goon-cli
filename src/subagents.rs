@@ -16,7 +16,7 @@ use anyhow::{anyhow, bail, Result};
 use futures_util::future::BoxFuture;
 use indexmap::IndexMap;
 use serde_json::{json, Map, Value};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::Notify;
@@ -95,6 +95,16 @@ impl AgentStatus {
     }
 }
 
+/// Matches OpenAI Codex `DEFAULT_MULTI_AGENT_V2_MAX_WAIT_TIMEOUT_MS` (1 hour).
+pub const MAX_WAIT_AGENT_TIMEOUT_MS: u64 = 3_600_000;
+
+pub struct QueuedTurn {
+    pub config: Arc<RuntimeConfig>,
+    pub prompt: String,
+    pub budget: SharedBudget,
+    pub cancel: CancellationToken,
+}
+
 pub struct ManagedSubagent {
     pub id: String,
     pub nickname: String,
@@ -108,8 +118,9 @@ pub struct ManagedSubagent {
     pub last_error: Option<String>,
     pub updated_at: String,
     pub controller: CancellationToken,
-    /// Completion of the current turn (`true` once it finished).
+    /// Completion of the current worker loop (`true` once active + queued turns finish).
     pub done: Option<tokio::sync::watch::Receiver<bool>>,
+    pub queued_inputs: VecDeque<QueuedTurn>,
     pub notify: Arc<Notify>,
 }
 
@@ -466,6 +477,7 @@ impl Subagents {
                 updated_at: now_iso(),
                 controller: controller.clone(),
                 done: None,
+                queued_inputs: VecDeque::new(),
                 notify,
             },
         );
@@ -475,7 +487,7 @@ impl Subagents {
         let prompt = build_role_prompt(role, &message);
         let done = self.start_managed_turn(&id, child_config, prompt, budget);
         if input.get("wait") == Some(&Value::Bool(true)) {
-            wait_done(done).await;
+            wait_done_cancellable(done, &parent_cancel).await?;
             let spawned = self.spawned.lock().unwrap();
             return Ok(stringify(&json!({ "agent_id": id, "nickname": nickname, "agent_type": role, "status": status_payload(spawned.get(&id)) })));
         }
@@ -490,13 +502,28 @@ impl Subagents {
         let me = self.arc();
         let id = id.to_string();
         tokio::spawn(async move {
-            me.execute_managed_turn(&id, config, prompt, budget).await;
+            let mut cur_config = config;
+            let mut cur_prompt = prompt;
+            let mut cur_budget = budget;
+            let notify = loop {
+                match me.execute_managed_turn(&id, cur_config, cur_prompt, cur_budget).await {
+                    ManagedTurnStep::Continue(next) => {
+                        cur_config = next.config;
+                        cur_prompt = next.prompt;
+                        cur_budget = next.budget;
+                    }
+                    ManagedTurnStep::Finished(notify) => break notify,
+                }
+            };
             let _ = tx.send(true);
+            if let Some(n) = notify {
+                n.notify_waiters();
+            }
         });
         rx
     }
 
-    async fn execute_managed_turn(&self, id: &str, config: Arc<RuntimeConfig>, prompt: String, budget: SharedBudget) {
+    async fn execute_managed_turn(&self, id: &str, config: Arc<RuntimeConfig>, prompt: String, budget: SharedBudget) -> ManagedTurnStep {
         let (cancel, read_only, nickname, agent_type, task) = {
             let s = self.spawned.lock().unwrap();
             let a = &s[id];
@@ -541,27 +568,14 @@ impl Subagents {
             Ok(last_assistant_answer(&messages, &config.inline_reasoning))
         }
         .await;
-        match outcome {
-            Ok(answer) => {
-                let mut s = self.spawned.lock().unwrap();
-                let a = s.get_mut(id).unwrap();
-                a.last_output = Some(limit_text(&answer, 12_000));
-                a.last_error = None;
-                if a.status != AgentStatus::Shutdown {
-                    a.status = AgentStatus::Completed;
-                }
-            }
+        let was_denied = *denied.lock().unwrap();
+        let answer_ok = match outcome {
+            Ok(answer) => Some(limit_text(&answer, 12_000)),
             Err(error) => {
-                let message = safe_error(&error.to_string(), Some(&config.api_key));
-                failure = Some(message.clone());
-                let mut s = self.spawned.lock().unwrap();
-                let a = s.get_mut(id).unwrap();
-                a.last_error = Some(message);
-                if a.status != AgentStatus::Shutdown {
-                    a.status = AgentStatus::Errored;
-                }
+                failure = Some(safe_error(&error.to_string(), Some(&config.api_key)));
+                None
             }
-        }
+        };
         if let Some(st) = &store {
             let last = st.session.lock().unwrap().checkpoints.as_ref().and_then(|c| c.last().cloned());
             if let Some(cp) = last {
@@ -569,29 +583,60 @@ impl Subagents {
             }
             if let Err(error) = st.close() {
                 let message = safe_error(&error.to_string(), Some(&config.api_key));
-                failure.get_or_insert(message.clone());
-                let mut s = self.spawned.lock().unwrap();
-                let a = s.get_mut(id).unwrap();
-                a.last_error = Some(message);
-                if a.status != AgentStatus::Shutdown {
-                    a.status = AgentStatus::Errored;
-                }
+                failure.get_or_insert(message);
             }
         }
         if acquired {
             self.release();
         }
-        let (status, task, notify) = {
+        let (step, status, current_task, emit_terminal) = {
             let mut s = self.spawned.lock().unwrap();
-            let a = s.get_mut(id).unwrap();
+            let Some(a) = s.get_mut(id) else {
+                return ManagedTurnStep::Finished(None);
+            };
+            if let Some(err) = &failure {
+                a.last_error = Some(err.clone());
+            } else if let Some(ans) = answer_ok {
+                a.last_output = Some(ans);
+                a.last_error = None;
+            }
             a.updated_at = now_iso();
-            (a.status.as_str().to_string(), a.task.clone(), a.notify.clone())
+            if was_denied || a.status == AgentStatus::Shutdown {
+                a.queued_inputs.clear();
+            }
+            let mut next_turn = None;
+            if a.status != AgentStatus::Shutdown {
+                while let Some(candidate) = a.queued_inputs.pop_front() {
+                    if !candidate.cancel.is_cancelled() {
+                        next_turn = Some(candidate);
+                        break;
+                    }
+                }
+            }
+            match next_turn {
+                Some(q) => {
+                    a.controller = q.cancel.clone();
+                    a.status = AgentStatus::Running;
+                    a.task = q.prompt.clone();
+                    a.model = q.config.model.clone();
+                    a.effort = q.config.effort.clone();
+                    let t = a.task.clone();
+                    (ManagedTurnStep::Continue(q), "running".to_string(), t, false)
+                }
+                None => {
+                    if a.status != AgentStatus::Shutdown {
+                        a.status = if failure.is_some() { AgentStatus::Errored } else { AgentStatus::Completed };
+                    }
+                    a.done = None;
+                    (ManagedTurnStep::Finished(Some(a.notify.clone())), a.status.as_str().to_string(), a.task.clone(), store.is_some())
+                }
+            }
         };
-        self.bus.update_node_status(&nickname, &status, Some(take_chars(&task, 120)));
-        if store.is_some() {
+        self.bus.update_node_status(&nickname, &status, Some(take_chars(&current_task, 120)));
+        if emit_terminal {
             (self.emit)(json!({ "type": "subagent", "id": id, "state": if failure.is_some() { "error" } else { "done" } }));
         }
-        notify.notify_waiters();
+        step
     }
 
     async fn wait_agent_tool(&self, input: Value, cancel: CancellationToken) -> Result<String> {
@@ -608,7 +653,7 @@ impl Subagents {
             resolved.iter().all(|(_, id)| id.as_ref().and_then(|i| s.get(i)).map(|a| a.status != AgentStatus::Running).unwrap_or(true))
         };
         if !all_done(self) {
-            let timeout = input.get("timeout_ms").and_then(Value::as_u64).unwrap_or(120_000).clamp(100, 600_000);
+            let timeout = input.get("timeout_ms").and_then(Value::as_u64).unwrap_or(120_000).clamp(100, MAX_WAIT_AGENT_TIMEOUT_MS);
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout);
             loop {
                 let notifies: Vec<Arc<Notify>> = {
@@ -647,26 +692,61 @@ impl Subagents {
     async fn send_input_tool(&self, input: Value, parent_cancel: CancellationToken) -> Result<String> {
         let target = input["target"].as_str().unwrap_or("").to_string();
         let message = input["message"].as_str().unwrap_or("").to_string();
+        let interrupt = input.get("interrupt") == Some(&Value::Bool(true));
+        let wait = input.get("wait") == Some(&Value::Bool(true));
         let Some(id) = self.resolve_agent_id(&target) else { bail!("Agent with target \"{target}\" not found.") };
-        let (status, nickname, controller, done) = {
-            let s = self.spawned.lock().unwrap();
-            let a = &s[&id];
-            (a.status.clone(), a.nickname.clone(), a.controller.clone(), a.done.clone())
+        let budget = self.run_budget();
+        let submission = uuid::Uuid::new_v4().to_string();
+
+        let (nickname, running_interrupt_wait, queued_wait) = {
+            let mut s = self.spawned.lock().unwrap();
+            let a = s.get_mut(&id).unwrap();
+            if a.status == AgentStatus::Shutdown {
+                bail!("Agent \"{}\" ({id}) is closed. Call resume_agent first.", a.nickname);
+            }
+            let nickname = a.nickname.clone();
+            if a.status == AgentStatus::Running {
+                if interrupt {
+                    a.queued_inputs.clear();
+                    (nickname, Some((a.controller.clone(), a.done.clone())), None)
+                } else {
+                    let mut child_config = (*self.config).clone();
+                    child_config.model = a.model.clone();
+                    if a.effort.is_some() {
+                        child_config.config.effort = a.effort.clone();
+                    }
+                    a.queued_inputs.push_back(QueuedTurn { config: Arc::new(child_config), prompt: message.clone(), budget: budget.clone(), cancel: parent_cancel.child_token() });
+                    (nickname, None, Some(a.done.clone()))
+                }
+            } else {
+                (nickname, None, None)
+            }
         };
-        if status == AgentStatus::Shutdown {
-            bail!("Agent \"{nickname}\" ({id}) is closed. Call resume_agent first.");
-        }
-        if status == AgentStatus::Running {
-            if input.get("interrupt") == Some(&Value::Bool(true)) {
-                controller.cancel();
+
+        if let Some(done_opt) = queued_wait {
+            if wait {
+                if let Some(d) = done_opt {
+                    wait_done_cancellable(d, &parent_cancel).await?;
+                }
+                let s = self.spawned.lock().unwrap();
+                return Ok(stringify(&json!({ "submission_id": submission, "agent_id": id, "nickname": nickname, "status": status_payload(s.get(&id)) })));
             }
-            if let Some(d) = done {
-                wait_done(d).await;
+            return Ok(stringify(&json!({ "submission_id": submission, "agent_id": id, "nickname": nickname, "status": "running" })));
+        }
+
+        if let Some((controller, done_opt)) = running_interrupt_wait {
+            controller.cancel();
+            if let Some(d) = done_opt {
+                wait_done_cancellable(d, &parent_cancel).await?;
             }
         }
+
         let (model, effort) = {
             let mut s = self.spawned.lock().unwrap();
             let a = s.get_mut(&id).unwrap();
+            if a.status == AgentStatus::Shutdown {
+                bail!("Agent \"{nickname}\" ({id}) is closed. Call resume_agent first.");
+            }
             a.controller = parent_cancel.child_token();
             a.status = AgentStatus::Running;
             a.task = message.clone();
@@ -677,11 +757,9 @@ impl Subagents {
         if effort.is_some() {
             child_config.config.effort = effort;
         }
-        let budget = self.run_budget();
         let done = self.start_managed_turn(&id, Arc::new(child_config), message, budget);
-        let submission = uuid::Uuid::new_v4().to_string();
-        if input.get("wait") == Some(&Value::Bool(true)) {
-            wait_done(done).await;
+        if wait {
+            wait_done_cancellable(done, &parent_cancel).await?;
             let s = self.spawned.lock().unwrap();
             return Ok(stringify(&json!({ "submission_id": submission, "agent_id": id, "nickname": nickname, "status": status_payload(s.get(&id)) })));
         }
@@ -694,6 +772,7 @@ impl Subagents {
             let mut s = self.spawned.lock().unwrap();
             let a = s.get_mut(&id).unwrap();
             let previous = status_payload(Some(a));
+            a.queued_inputs.clear();
             a.status = AgentStatus::Shutdown;
             (previous, a.controller.clone(), a.done.clone(), a.notify.clone())
         };
@@ -720,6 +799,7 @@ impl Subagents {
         {
             let mut s = self.spawned.lock().unwrap();
             for a in s.values_mut() {
+                a.queued_inputs.clear();
                 if a.status == AgentStatus::Running {
                     a.status = AgentStatus::Shutdown;
                     a.controller.cancel();
@@ -921,12 +1001,32 @@ impl Subagents {
     }
 }
 
+enum ManagedTurnStep {
+    Continue(QueuedTurn),
+    Finished(Option<Arc<Notify>>),
+}
+
 async fn wait_done(mut rx: tokio::sync::watch::Receiver<bool>) {
     while !*rx.borrow() {
         if rx.changed().await.is_err() {
             break;
         }
     }
+}
+
+async fn wait_done_cancellable(mut rx: tokio::sync::watch::Receiver<bool>, cancel: &CancellationToken) -> Result<()> {
+    while !*rx.borrow() {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(Aborted("Wait cancelled".into()).into()),
+            res = rx.changed() => {
+                if res.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn string_list(input: &Value, key: &str) -> Vec<String> {

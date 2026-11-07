@@ -6,7 +6,7 @@ use crate::config::RuntimeConfig;
 use crate::config::VerifyPolicy;
 use crate::context::{build_goal_budget_limit_prompt, compact_if_needed, compact_now, estimated_tokens, expand_file_mentions, recap_session, system_prompt, MentionOptions, SystemPromptCache};
 use crate::context_budget::{allocate_context_budget, prepare_context_budget, render_memory_context, ContextBudgetConfig, MemoryPromptContext};
-use crate::cost::{create_run_budget, to_usage_split, CostLedger, SharedBudget, UsageSplit};
+use crate::cost::{create_run_budget, format_duration_ms, to_usage_split, CostLedger, SharedBudget, UsageSplit};
 use crate::errors::safe_error;
 use crate::files::FileBackup;
 use crate::jsutil::{canonicalize, now_iso, now_millis, stringify};
@@ -826,13 +826,28 @@ impl Harness {
         }
     }
 
-    fn run_timeout(&self, budget: &SharedBudget) -> Duration {
+    /// Remaining wall-clock run budget when `--max-time-ms` (`time_limit_ms > 0`) is configured.
+    /// Returns `None` when no explicit run time cap is set so tool batches, verification, and
+    /// subagents are never killed by the per-request SSE idle timeout (`config.timeout_ms`).
+    fn remaining_budget_time(&self, budget: &SharedBudget) -> Option<Duration> {
         let b = budget.lock().unwrap();
-        let remaining = match b.started_at {
-            Some(started) if b.time_limit_ms > 0 => (started + b.time_limit_ms as i64 - now_millis()).max(1) as u64,
-            _ => self.config.timeout_ms,
-        };
-        Duration::from_millis(self.config.timeout_ms.min(remaining))
+        match b.started_at {
+            Some(started) if b.time_limit_ms > 0 => {
+                let rem_ms = (started + b.time_limit_ms as i64 - now_millis()).max(0) as u64;
+                Some(Duration::from_millis(rem_ms))
+            }
+            _ => None,
+        }
+    }
+
+    fn budget_time_exceeded_reason(budget: &SharedBudget) -> String {
+        let b = budget.lock().unwrap();
+        let cap = CostLedger::hard_cap_exceeded(&b);
+        if cap.exceeded {
+            return cap.reason;
+        }
+        let limit = format_duration_ms(b.time_limit_ms as f64);
+        format!("Run time budget reached ({limit} of {limit}).")
     }
 
     /// Parses tool calls like the AI SDK (`parseToolCall`) against the tools offered this step.
@@ -1208,27 +1223,37 @@ impl Harness {
             let tool_specs = self.tools.schemas();
             let mut attempt: u32 = 0;
             let step = loop {
-                let deadline = Deadline::new(cancel, self.run_timeout(budget));
+                let budget_rem = self.remaining_budget_time(budget);
+                let step_deadline = budget_rem.map(|rem| Deadline::new(cancel, rem));
+                let step_cancel = match &step_deadline {
+                    Some(d) => &d.token,
+                    None => cancel,
+                };
+                let idle_timeout = Duration::from_millis(self.config.timeout_ms);
+                let request_timeout = match budget_rem {
+                    Some(rem) => idle_timeout.min(rem.max(Duration::from_millis(1))),
+                    None => idle_timeout,
+                };
                 let request = ModelRequest {
                     system: Some(prepared.system.clone()),
                     messages: with_reasoning_replay(&prepared.messages, self.model.provider(), self.config.effort.as_deref()),
                     tools: tool_specs.clone(),
                     max_output_tokens: self.config.max_output_tokens,
                     effort: if self.config.stub { None } else { self.config.effort.clone() },
-                    cancel: deadline.token.clone(),
-                    timeout: Duration::from_secs(365 * 24 * 3600),
+                    cancel: step_cancel.clone(),
+                    timeout: request_timeout,
                 };
-                let outcome = self.stream_step(request, &defs, &deadline.token).await.and_then(|step| {
+                let outcome = self.stream_step(request, &defs, step_cancel).await.and_then(|step| {
                     if step.calls.len() > 32 || step.calls.iter().map(|c| &c.tool_call_id).collect::<HashSet<_>>().len() != step.calls.len() {
                         bail!("Invalid or excessive tool call batch. No tools executed.");
                     }
                     Ok(step)
                 });
-                drop(deadline);
-                let outcome = match outcome {
-                    Err(e) if is_aborted(&e) && !cancel.is_cancelled() => Err(anyhow::Error::new(ApiError::aborted())),
-                    other => other,
-                };
+                let step_budget_timed_out = step_deadline.as_ref().map(|d| d.token.is_cancelled()).unwrap_or(false) && !cancel.is_cancelled();
+                drop(step_deadline);
+                if step_budget_timed_out && outcome.is_err() {
+                    bail!("{}", Self::budget_time_exceeded_reason(budget));
+                }
                 match outcome {
                     Ok(step) => {
                         let input = step.usage.input_tokens.unwrap_or_else(|| estimated_tokens(&prepared.messages, &prepared.system));
@@ -1272,16 +1297,20 @@ impl Harness {
                 self.remember_assistant_message(text);
                 return Ok(text.clone());
             }
-            let batch_deadline = Deadline::new(cancel, self.run_timeout(budget));
-            let outcome = self.execute_batch(step.calls, &batch_deadline.token).await;
-            let timed_out = batch_deadline.token.is_cancelled() && !cancel.is_cancelled();
+            let batch_deadline = self.remaining_budget_time(budget).map(|rem| Deadline::new(cancel, rem));
+            let batch_cancel = match &batch_deadline {
+                Some(d) => &d.token,
+                None => cancel,
+            };
+            let outcome = self.execute_batch(step.calls, batch_cancel).await;
+            let batch_budget_timed_out = batch_deadline.as_ref().map(|d| d.token.is_cancelled()).unwrap_or(false) && !cancel.is_cancelled();
             drop(batch_deadline);
             let (denied, loop_detected) = outcome?;
             if cancel.is_cancelled() {
                 return Err(Aborted::default().into());
             }
-            if timed_out {
-                bail!("The operation was aborted due to timeout");
+            if batch_budget_timed_out {
+                bail!("{}", Self::budget_time_exceeded_reason(budget));
             }
             if denied {
                 let reason = if loop_detected { "Repeated denials for identical arguments; stopping this run." } else { "Permission denied." };
@@ -1291,10 +1320,21 @@ impl Harness {
                 return Ok(text.clone());
             }
             self.flush_goal(false);
-            let verify_deadline = Deadline::new(cancel, self.run_timeout(budget));
-            let verified = self.run_verification_hook(&verify_deadline.token).await;
+            let verify_deadline = self.remaining_budget_time(budget).map(|rem| Deadline::new(cancel, rem));
+            let verify_cancel = match &verify_deadline {
+                Some(d) => &d.token,
+                None => cancel,
+            };
+            let verified = self.run_verification_hook(verify_cancel).await;
+            let verify_budget_timed_out = verify_deadline.as_ref().map(|d| d.token.is_cancelled()).unwrap_or(false) && !cancel.is_cancelled();
             drop(verify_deadline);
             self.state.lock().unwrap().turn_had_edit = false;
+            if cancel.is_cancelled() {
+                return Err(Aborted::default().into());
+            }
+            if verify_budget_timed_out {
+                bail!("{}", Self::budget_time_exceeded_reason(budget));
+            }
             verified?;
             let limit_goal = {
                 let s = self.store.session.lock().unwrap();

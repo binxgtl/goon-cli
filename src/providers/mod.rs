@@ -124,10 +124,11 @@ fn error_from_body(status: reqwest::StatusCode, headers: BTreeMap<String, String
     ApiError::http(status.as_u16(), message, headers)
 }
 
-/// POSTs a JSON body and streams parsed SSE events. Cancellation and the request deadline both end
-/// the stream with an aborted error.
+/// POSTs a JSON body and streams parsed SSE events. `timeout` acts as a per-phase / per-chunk
+/// idle timeout (matching OpenAI Codex's `stream_idle_timeout`): active streams that keep receiving
+/// chunks never time out, while stalled streams emit a retryable timeout error and explicit
+/// cancellation emits a non-retryable aborted error.
 pub async fn post_sse(url: &str, headers: &[(String, String)], body: &Value, cancel: CancellationToken, timeout: Duration) -> Result<mpsc::Receiver<Result<SseEvent, ApiError>>, ApiError> {
-    let deadline = tokio::time::Instant::now() + timeout;
     let mut request = http_client().post(url).header("content-type", "application/json").header("accept", "text/event-stream");
     for (k, v) in headers {
         request = request.header(k.as_str(), v.as_str());
@@ -135,17 +136,19 @@ pub async fn post_sse(url: &str, headers: &[(String, String)], body: &Value, can
     let payload = crate::jsutil::stringify(body);
     let send = request.body(payload).send();
     let response = tokio::select! {
-        r = send => r.map_err(|e| ApiError::network(network_message(&e)))?,
+        biased;
         _ = cancel.cancelled() => return Err(ApiError::aborted()),
-        _ = tokio::time::sleep_until(deadline) => return Err(ApiError::aborted()),
+        r = send => r.map_err(|e| ApiError::network(network_message(&e)))?,
+        _ = tokio::time::sleep(timeout) => return Err(ApiError::request_timeout(timeout)),
     };
     let status = response.status();
     let response_headers = header_map(&response);
     if !status.is_success() {
         let text = tokio::select! {
-            t = response.text() => t.unwrap_or_default(),
+            biased;
             _ = cancel.cancelled() => return Err(ApiError::aborted()),
-            _ = tokio::time::sleep_until(deadline) => return Err(ApiError::aborted()),
+            t = response.text() => t.unwrap_or_default(),
+            _ = tokio::time::sleep(timeout) => String::new(),
         };
         return Err(error_from_body(status, response_headers, &text));
     }
@@ -156,9 +159,16 @@ pub async fn post_sse(url: &str, headers: &[(String, String)], body: &Value, can
         let mut pending: Vec<u8> = vec![];
         loop {
             let next = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    let _ = tx.send(Err(ApiError::aborted())).await;
+                    return;
+                }
                 n = stream.next() => n,
-                _ = cancel.cancelled() => { let _ = tx.send(Err(ApiError::aborted())).await; return; }
-                _ = tokio::time::sleep_until(deadline) => { let _ = tx.send(Err(ApiError::aborted())).await; return; }
+                _ = tokio::time::sleep(timeout) => {
+                    let _ = tx.send(Err(ApiError::stream_idle_timeout(timeout))).await;
+                    return;
+                }
             };
             match next {
                 Some(Ok(bytes)) => {
@@ -207,16 +217,23 @@ pub async fn post_json(url: &str, headers: &[(String, String)], body: &Value, ca
     }
     let send = request.body(crate::jsutil::stringify(body)).send();
     let response = tokio::select! {
-        r = send => r.map_err(|e| ApiError::network(network_message(&e)))?,
+        biased;
         _ = cancel.cancelled() => return Err(ApiError::aborted()),
-        _ = tokio::time::sleep_until(deadline) => return Err(ApiError::aborted()),
+        r = send => r.map_err(|e| ApiError::network(network_message(&e)))?,
+        _ = tokio::time::sleep_until(deadline) => return Err(ApiError::request_timeout(timeout)),
     };
     let status = response.status();
     let response_headers = header_map(&response);
     let text = tokio::select! {
-        t = response.text() => t.map_err(|e| ApiError::network(network_message(&e)))?,
+        biased;
         _ = cancel.cancelled() => return Err(ApiError::aborted()),
-        _ = tokio::time::sleep_until(deadline) => return Err(ApiError::aborted()),
+        t = response.text() => t.map_err(|e| ApiError::network(network_message(&e)))?,
+        _ = tokio::time::sleep_until(deadline) => {
+            if !status.is_success() {
+                return Err(error_from_body(status, response_headers, ""));
+            }
+            return Err(ApiError::request_timeout(timeout));
+        }
     };
     if !status.is_success() {
         return Err(error_from_body(status, response_headers, &text));
@@ -271,6 +288,9 @@ pub fn generate_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     #[test]
     fn sse_parser_handles_split_chunks() {
@@ -280,5 +300,90 @@ mod tests {
         assert_eq!(events, vec![SseEvent { event: None, data: "{\"a\":1}".into() }, SseEvent { event: Some("x".into()), data: "y".into() }]);
         assert_eq!(parser.push("data: tail"), vec![]);
         assert_eq!(parser.finish(), vec![SseEvent { event: None, data: "tail".into() }]);
+    }
+
+    async fn read_http_headers(socket: &mut tokio::net::TcpStream) {
+        let mut buf = vec![0u8; 4096];
+        let mut seen = Vec::new();
+        loop {
+            let n = match socket.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            seen.extend_from_slice(&buf[..n]);
+            if seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn post_sse_resets_idle_timeout_on_active_chunks_and_times_out_when_stalled() {
+        // 1. Active stream whose total wall-clock duration (5 * 45ms = 225ms) exceeds the 110ms
+        //    idle timeout must succeed without aborting because chunks keep arriving.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_http_headers(&mut socket).await;
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+            for i in 1..=5 {
+                tokio::time::sleep(Duration::from_millis(45)).await;
+                let frame = format!("data: chunk-{i}\n\n");
+                let chunk = format!("{:X}\r\n{}\r\n", frame.len(), frame);
+                socket.write_all(chunk.as_bytes()).await.unwrap();
+                socket.flush().await.unwrap();
+            }
+            socket.write_all(b"0\r\n\r\n").await.unwrap();
+        });
+        let mut rx = post_sse(&format!("http://{addr}/v1/chat/completions"), &[], &json!({}), CancellationToken::new(), Duration::from_millis(110)).await.unwrap();
+        let mut received = Vec::new();
+        while let Some(item) = rx.recv().await {
+            received.push(item.expect("active SSE stream must not time out").data);
+        }
+        server.await.unwrap();
+        assert_eq!(received, vec!["chunk-1", "chunk-2", "chunk-3", "chunk-4", "chunk-5"]);
+
+        // 2. Stalled stream with zero bytes for longer than idle timeout emits a retryable timeout.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stall_server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_http_headers(&mut socket).await;
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+            let first = "data: first\n\n";
+            socket.write_all(format!("{:X}\r\n{}\r\n", first.len(), first).as_bytes()).await.unwrap();
+            socket.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        });
+        let mut rx = post_sse(&format!("http://{addr}/v1/chat/completions"), &[], &json!({}), CancellationToken::new(), Duration::from_millis(70)).await.unwrap();
+        assert_eq!(rx.recv().await.unwrap().unwrap().data, "first");
+        let err = rx.recv().await.unwrap().expect_err("stalled stream must hit idle timeout");
+        assert!(!err.aborted, "idle timeout must be distinct from user abort");
+        assert!(err.retryable, "idle timeout must be retryable");
+        assert!(err.message.contains("idle timed out"), "unexpected message: {}", err.message);
+        stall_server.abort();
+
+        // 3. Explicit CancellationToken mid-stream emits a non-retryable aborted error immediately.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let cancel_server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_http_headers(&mut socket).await;
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+            socket.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        let cancel = CancellationToken::new();
+        let c2 = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            c2.cancel();
+        });
+        let mut rx = post_sse(&format!("http://{addr}/v1/chat/completions"), &[], &json!({}), cancel, Duration::from_secs(10)).await.unwrap();
+        let err = rx.recv().await.unwrap().expect_err("cancelled stream must abort");
+        assert!(err.aborted);
+        assert!(!err.retryable);
+        cancel_server.abort();
     }
 }

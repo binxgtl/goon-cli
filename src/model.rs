@@ -140,6 +140,14 @@ impl ApiError {
         ApiError { message: message.into(), status: None, retryable: true, headers: BTreeMap::new(), aborted: false }
     }
 
+    pub fn request_timeout(duration: Duration) -> Self {
+        ApiError { message: format!("Model request timed out after {} ms.", duration.as_millis()), status: None, retryable: true, headers: BTreeMap::new(), aborted: false }
+    }
+
+    pub fn stream_idle_timeout(duration: Duration) -> Self {
+        ApiError { message: format!("Model stream idle timed out after {} ms.", duration.as_millis()), status: None, retryable: true, headers: BTreeMap::new(), aborted: false }
+    }
+
     pub fn aborted() -> Self {
         ApiError { message: "Model request cancelled or timed out.".into(), status: None, retryable: false, headers: BTreeMap::new(), aborted: true }
     }

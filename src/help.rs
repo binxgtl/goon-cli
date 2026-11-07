@@ -40,7 +40,7 @@ Options:
       --context-window N    Actual model context window (default 128000); input budget = N - max-output-tokens
       --max-output-tokens N  Per-request output limit (default 16384)
       --run-token-budget N   Run token budget (default 0 = unlimited)
-      --timeout-ms N        Model request deadline (default 300000)
+      --timeout-ms N        Model stream idle timeout (default 300000)
       --no-verify           Skip the post-edit verification hook
       --verify-cmd CMD      Verification command (repeatable; replaces auto-detected commands)
       --max-cost-usd N      Stop the run when estimated cost reaches N USD (0 = unlimited)
