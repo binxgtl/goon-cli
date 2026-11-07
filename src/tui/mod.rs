@@ -25,6 +25,12 @@ pub const USER_MARK: char = '\u{E000}';
 const TRANSCRIPT_MAX_CHARS: usize = 160_000;
 const TRANSCRIPT_KEEP_CHARS: usize = 120_000;
 const LARGE_PASTE_CHAR_THRESHOLD: usize = 150;
+const PASTE_COALESCE_WINDOW_MS: i64 = 250;
+const CSI_ESCAPE_TIMEOUT_MS: u64 = 15;
+const BRACKETED_PASTE_IDLE_TIMEOUT_MS: u64 = 250;
+const BURST_DRAIN_WINDOW_MS: u64 = 30;
+const BURST_MAX_DURATION_MS: u64 = 250;
+const CLIPBOARD_OUTPUT_LIMIT_BYTES: usize = 2 * 1024 * 1024;
 
 pub mod glyph {
     pub const BRAND: &str = "◆";
@@ -345,6 +351,9 @@ pub(crate) struct State {
     pub last_body_total_lines: usize,
     pub needs_full_clear: bool,
     last_paste_token: Option<String>,
+    last_inline_paste: Option<String>,
+    last_paste_trailing_nl: bool,
+    last_paste_ended_cr: bool,
     last_paste_at: i64,
     pub attached_images: IndexMap<String, String>,
     image_archive: IndexMap<String, String>,
@@ -488,6 +497,9 @@ impl Tui {
             last_body_total_lines: 0,
             needs_full_clear: true,
             last_paste_token: None,
+            last_inline_paste: None,
+            last_paste_trailing_nl: false,
+            last_paste_ended_cr: false,
             last_paste_at: 0,
             attached_images: IndexMap::new(),
             image_archive: IndexMap::new(),
@@ -704,6 +716,7 @@ impl Tui {
         st.next_image_idx = 1;
         st.pasted_texts.clear();
         st.next_paste_idx = 1;
+        Self::clear_paste_burst(&mut st);
         let mut restored = text.to_string();
         let archive: Vec<(String, String)> = st.paste_archive.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         for (placeholder, content) in archive {
@@ -1645,6 +1658,13 @@ impl Tui {
         st.cursor = at + chars.len();
     }
 
+    fn clear_paste_burst(st: &mut State) {
+        st.last_paste_token = None;
+        st.last_inline_paste = None;
+        st.last_paste_trailing_nl = false;
+        st.last_paste_ended_cr = false;
+    }
+
     /// Integrates pasted text; multi-line or long pastes collapse into atomic placeholders.
     fn handle_paste(&self, st: &mut State, raw: &str, allow_coalesce: bool) {
         if let Some(p) = st.picker.as_mut() {
@@ -1655,8 +1675,96 @@ impl Tui {
             self.schedule(st, 0);
             return;
         }
-        let normalized = terminal_text(&raw.replace("\r\n", "\n").replace('\r', "\n"));
-        let cleaned = if normalized.ends_with('\n') && !normalized[..normalized.len() - 1].contains('\n') { normalized[..normalized.len() - 1].to_string() } else { normalized };
+        let split_trailing_nl = |s: String| -> (String, bool) {
+            match s.strip_suffix('\n') {
+                Some(without_nl) if !without_nl.contains('\n') => (without_nl.to_string(), true),
+                _ => (s, false),
+            }
+        };
+        let within_window = allow_coalesce && (st.last_paste_token.is_some() || st.last_inline_paste.is_some()) && now() - st.last_paste_at <= PASTE_COALESCE_WINDOW_MS;
+        let ended_cr = raw.ends_with('\r');
+        let effective_raw = if within_window && st.last_paste_ended_cr { raw.strip_prefix('\n').unwrap_or(raw) } else { raw };
+        if within_window && effective_raw.is_empty() && !raw.is_empty() {
+            st.last_paste_ended_cr = false;
+            st.last_paste_at = now();
+            return;
+        }
+        let normalized = terminal_text(&effective_raw.replace("\r\n", "\n").replace('\r', "\n"));
+        // Coalesce consecutive non-bracketed chunks arriving within PASTE_COALESCE_WINDOW_MS.
+        if within_window && !normalized.is_empty() {
+            st.input_restored_from_revert = false;
+            st.scroll = 0;
+            if let Some(last) = st.last_paste_token.clone().filter(|t| st.pasted_texts.contains_key(t)) {
+                let current: String = st.input.iter().collect();
+                if current.contains(&last) {
+                    let prev = &st.pasted_texts[&last];
+                    let combined = if st.last_paste_trailing_nl { format!("{prev}\n{normalized}") } else { format!("{prev}{normalized}") };
+                    let (merged, trailing_nl) = split_trailing_nl(combined);
+                    let idx = re!(r"^\[Pasted text #(\d+)").captures(&last).and_then(|c| c[1].parse::<usize>().ok()).unwrap_or(1);
+                    let lines = merged.split('\n').count();
+                    let token = if lines >= 2 { format!("[Pasted text #{idx} +{lines} lines]") } else { format!("[Pasted text #{idx} ({} chars)]", merged.chars().count()) };
+                    st.pasted_texts.shift_remove(&last);
+                    st.paste_archive.shift_remove(&last);
+                    st.pasted_texts.insert(token.clone(), merged.clone());
+                    Self::record_paste_archive(st, &token, &merged);
+                    let next = current.replacen(&last, &token, 1);
+                    let delta = token.chars().count() as i64 - last.chars().count() as i64;
+                    st.input = chars_of(&next);
+                    st.cursor = ((st.cursor as i64 + delta).max(0) as usize).min(st.input.len());
+                    st.last_paste_token = Some(token);
+                    st.last_inline_paste = None;
+                    st.last_paste_trailing_nl = trailing_nl;
+                    st.last_paste_ended_cr = ended_cr;
+                    st.last_paste_at = now();
+                    self.schedule(st, 0);
+                    return;
+                }
+            }
+            if let Some(prev_inline) = st.last_inline_paste.clone() {
+                let cursor = st.cursor.min(st.input.len());
+                let before: String = st.input[..cursor].iter().collect();
+                if before.ends_with(&prev_inline) {
+                    let combined = if st.last_paste_trailing_nl { format!("{prev_inline}\n{normalized}") } else { format!("{prev_inline}{normalized}") };
+                    let (merged, trailing_nl) = split_trailing_nl(combined);
+                    let remove_chars = prev_inline.chars().count();
+                    let start = cursor - remove_chars;
+                    st.input.drain(start..cursor);
+                    st.cursor = start;
+                    let line_count = merged.split('\n').count();
+                    let char_count = merged.chars().count();
+                    let transient = st.pending.is_some() && !st.remember;
+                    if line_count >= 2 || (char_count > LARGE_PASTE_CHAR_THRESHOLD && (!transient || char_count > 500)) {
+                        if st.pasted_texts.is_empty() && st.queued_prompts.is_empty() {
+                            st.next_paste_idx = 1;
+                        }
+                        let idx = st.next_paste_idx;
+                        st.next_paste_idx += 1;
+                        let placeholder = if line_count >= 2 { format!("[Pasted text #{idx} +{line_count} lines]") } else { format!("[Pasted text #{idx} ({char_count} chars)]") };
+                        st.pasted_texts.insert(placeholder.clone(), merged.clone());
+                        Self::record_paste_archive(st, &placeholder, &merged);
+                        let suffix = if st.input.get(st.cursor) == Some(&' ') { "" } else { " " };
+                        Self::insert_chars(st, &chars_of(&format!("{placeholder}{suffix}")));
+                        st.last_paste_token = Some(placeholder);
+                        st.last_inline_paste = None;
+                    } else {
+                        Self::insert_chars(st, &chars_of(&merged));
+                        if self.collapse_pasted_image_paths(st) {
+                            Self::clear_paste_burst(st);
+                            self.schedule(st, 0);
+                            return;
+                        }
+                        st.last_paste_token = None;
+                        st.last_inline_paste = Some(merged);
+                    }
+                    st.last_paste_trailing_nl = trailing_nl;
+                    st.last_paste_ended_cr = ended_cr;
+                    st.last_paste_at = now();
+                    self.schedule(st, 0);
+                    return;
+                }
+            }
+        }
+        let (cleaned, trailing_nl) = split_trailing_nl(normalized);
         if cleaned.is_empty() {
             return;
         }
@@ -1673,34 +1781,11 @@ impl Tui {
             st.attached_images.insert(placeholder.clone(), unquoted.clone());
             Self::record_image_archive(st, &placeholder, &unquoted);
             Self::insert_chars(st, &chars_of(&format!("{placeholder} ")));
+            Self::clear_paste_burst(st);
             self.schedule(st, 0);
             return;
         }
-        // 2. Coalesce consecutive non-bracketed chunks arriving within 25ms.
-        if allow_coalesce {
-            if let Some(last) = st.last_paste_token.clone().filter(|t| now() - st.last_paste_at <= 25 && st.pasted_texts.contains_key(t)) {
-                let merged = format!("{}{cleaned}", st.pasted_texts[&last]);
-                let idx = re!(r"^\[Pasted text #(\d+)").captures(&last).and_then(|c| c[1].parse::<usize>().ok()).unwrap_or(1);
-                let lines = merged.split('\n').count();
-                let token = if lines >= 2 { format!("[Pasted text #{idx} +{lines} lines]") } else { format!("[Pasted text #{idx} ({} chars)]", merged.chars().count()) };
-                let current: String = st.input.iter().collect();
-                if current.contains(&last) {
-                    st.pasted_texts.shift_remove(&last);
-                    st.paste_archive.shift_remove(&last);
-                    st.pasted_texts.insert(token.clone(), merged.clone());
-                    Self::record_paste_archive(st, &token, &merged);
-                    let next = current.replacen(&last, &token, 1);
-                    let delta = token.chars().count() as i64 - last.chars().count() as i64;
-                    st.input = chars_of(&next);
-                    st.cursor = ((st.cursor as i64 + delta).max(0) as usize).min(st.input.len());
-                    st.last_paste_token = Some(token);
-                    st.last_paste_at = now();
-                    self.schedule(st, 0);
-                    return;
-                }
-            }
-        }
-        // 3. Multi-line or long single-line pastes become an atomic placeholder.
+        // 2. Multi-line or long single-line pastes become an atomic placeholder.
         let line_count = cleaned.split('\n').count();
         let char_count = cleaned.chars().count();
         let transient = st.pending.is_some() && !st.remember;
@@ -1715,14 +1800,30 @@ impl Tui {
             Self::record_paste_archive(st, &placeholder, &cleaned);
             let suffix = if st.input.get(st.cursor) == Some(&' ') { "" } else { " " };
             Self::insert_chars(st, &chars_of(&format!("{placeholder}{suffix}")));
-            st.last_paste_token = Some(placeholder);
-            st.last_paste_at = now();
+            if allow_coalesce {
+                st.last_paste_token = Some(placeholder);
+                st.last_inline_paste = None;
+                st.last_paste_trailing_nl = trailing_nl;
+                st.last_paste_ended_cr = ended_cr;
+                st.last_paste_at = now();
+            } else {
+                Self::clear_paste_burst(st);
+            }
             self.schedule(st, 0);
             return;
         }
-        // 4. Short single-line paste: inline, then look for embedded image paths.
+        // 3. Short single-line paste: inline, then look for embedded image paths.
         Self::insert_chars(st, &chars_of(&cleaned));
-        self.collapse_pasted_image_paths(st);
+        let collapsed_img = self.collapse_pasted_image_paths(st);
+        if allow_coalesce && !collapsed_img {
+            st.last_paste_token = None;
+            st.last_inline_paste = Some(cleaned);
+            st.last_paste_trailing_nl = trailing_nl;
+            st.last_paste_ended_cr = ended_cr;
+            st.last_paste_at = now();
+        } else {
+            Self::clear_paste_burst(st);
+        }
         self.schedule(st, 0);
     }
 
@@ -1801,7 +1902,14 @@ impl Tui {
         let cancel = CancellationToken::new();
         let cwd = std::env::current_dir().unwrap_or_default();
         let args: Vec<String> = ["-NoProfile", "-NonInteractive", "-Sta", "-Command", script].iter().map(|s| s.to_string()).collect();
-        let options = crate::process::RunOptions { cwd: &cwd, cancel: &cancel, timeout_ms: 4000, env: None, output_limit_bytes: None, hard_output_bytes: None };
+        let options = crate::process::RunOptions {
+            cwd: &cwd,
+            cancel: &cancel,
+            timeout_ms: 4000,
+            env: None,
+            output_limit_bytes: Some(CLIPBOARD_OUTPUT_LIMIT_BYTES),
+            hard_output_bytes: Some(CLIPBOARD_OUTPUT_LIMIT_BYTES),
+        };
         let Ok(res) = crate::process::run_command("powershell.exe", &args, options).await else { return };
         if res.code != 0 || res.output.trim().is_empty() {
             return;
@@ -1869,8 +1977,11 @@ impl Tui {
         let without = re!(r"\r$").replace(&re!(r"\r?\n$").replace(raw, ""), "").to_string();
         let multi = without.contains(['\r', '\n']);
         let large = without.chars().count() > LARGE_PASTE_CHAR_THRESHOLD;
-        let burst = st.last_paste_token.is_some() && now() - st.last_paste_at <= 25 && without.chars().count() > 1;
-        if multi || large || burst {
+        let nl_terminated_paste = raw.ends_with('\n') && !without.is_empty();
+        let fast_inline_chunk = !raw.contains(['\r', '\n']) && without.chars().count() >= 8;
+        let has_active_burst = st.last_paste_token.is_some() || st.last_inline_paste.is_some();
+        let burst = has_active_burst && now() - st.last_paste_at <= PASTE_COALESCE_WINDOW_MS && (raw.chars().count() >= 2 || raw == "\n");
+        if multi || large || nl_terminated_paste || fast_inline_chunk || burst {
             self.handle_paste(&mut st, raw, true);
             return true;
         }
@@ -1939,6 +2050,7 @@ impl Tui {
         st.input_restored_from_revert = false;
         st.attached_images.clear();
         st.pasted_texts.clear();
+        Self::clear_paste_burst(st);
     }
 
     pub fn key(&self, text: Option<&str>, key: Key) {
@@ -1954,6 +2066,7 @@ impl Tui {
         if st.closed {
             return;
         }
+        Self::clear_paste_burst(st);
         if st.picker.is_some() {
             self.picker_key(st, text, key);
             return;
@@ -2382,7 +2495,11 @@ fn key_from_event(ev: &crossterm::event::KeyEvent) -> Option<(Option<String>, Ke
     let shift = ev.modifiers.contains(KeyModifiers::SHIFT);
     let named = |n: &str| Key { name: n.into(), ctrl, meta, shift, sequence: String::new() };
     Some(match ev.code {
-        KeyCode::Char(c) if ctrl && (c == 'j' || c == 'J') => (None, Key { name: "enter".into(), ..Default::default() }),
+        KeyCode::Char(c) if ctrl && !meta && (c == 'j' || c == 'J') => (None, Key { name: "enter".into(), ..Default::default() }),
+        KeyCode::Char(c) if ctrl && meta && !c.is_control() => {
+            let name = if c.is_ascii_alphabetic() { c.to_ascii_lowercase().to_string() } else { String::new() };
+            (Some(c.to_string()), Key { name, ctrl: false, meta: false, shift: c.is_ascii_uppercase(), sequence: c.to_string() })
+        }
         KeyCode::Char(c) if ctrl || meta => {
             let lower = c.to_ascii_lowercase();
             let mut k = named(&lower.to_string());
@@ -2413,17 +2530,321 @@ fn key_from_event(ev: &crossterm::event::KeyEvent) -> Option<(Option<String>, Ke
     })
 }
 
+fn csi_char(ev: &crossterm::event::KeyEvent) -> Option<char> {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let ctrl = ev.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = ev.modifiers.contains(KeyModifiers::ALT);
+    match ev.code {
+        KeyCode::Char(c) if (!ctrl && !alt) || (ctrl && alt && !c.is_control()) => Some(c),
+        _ => None,
+    }
+}
+
+fn csi_lead(ev: &crossterm::event::KeyEvent) -> Option<&'static str> {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let ctrl = ev.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = ev.modifiers.contains(KeyModifiers::ALT);
+    match ev.code {
+        KeyCode::Esc if !ctrl && !alt => Some("\x1b"),
+        KeyCode::Char('[') if alt && !ctrl => Some("\x1b["),
+        _ => None,
+    }
+}
+
+fn paste_char_from_key(ev: &crossterm::event::KeyEvent, in_bracketed: bool) -> Option<char> {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let ctrl = ev.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = ev.modifiers.contains(KeyModifiers::ALT);
+    let shift = ev.modifiers.contains(KeyModifiers::SHIFT);
+    match ev.code {
+        KeyCode::Char(c) if (!ctrl && !alt) || (ctrl && alt && !c.is_control()) => Some(c),
+        KeyCode::Char(c) if ctrl && !alt && c.eq_ignore_ascii_case(&'j') => Some('\n'),
+        KeyCode::Char(c) if ctrl && !alt && c.eq_ignore_ascii_case(&'m') => Some('\r'),
+        KeyCode::Char(c) if ctrl && !alt && c.eq_ignore_ascii_case(&'i') => Some('\t'),
+        KeyCode::Enter if !ctrl && !alt => Some('\r'),
+        KeyCode::Tab if !ctrl && !alt && (!shift || in_bracketed) => Some('\t'),
+        KeyCode::BackTab if !ctrl && !alt && in_bracketed => Some('\t'),
+        _ => None,
+    }
+}
+
+#[derive(Default, Clone)]
+struct CsiBuffer {
+    prefix: String,
+    raw: Vec<crossterm::event::KeyEvent>,
+}
+
+enum CsiStep {
+    None,
+    Buffering,
+    PasteStart,
+    PasteEnd,
+    Mismatch(Vec<crossterm::event::KeyEvent>),
+}
+
+impl CsiBuffer {
+    fn is_empty(&self) -> bool {
+        self.prefix.is_empty()
+    }
+
+    fn take(&mut self) -> Vec<crossterm::event::KeyEvent> {
+        self.prefix.clear();
+        std::mem::take(&mut self.raw)
+    }
+
+    fn step(&mut self, key: crossterm::event::KeyEvent) -> CsiStep {
+        if self.prefix.is_empty() {
+            if let Some(lead) = csi_lead(&key) {
+                self.prefix.push_str(lead);
+                self.raw.push(key);
+                return CsiStep::Buffering;
+            }
+            return CsiStep::None;
+        }
+        let matched = match self.prefix.as_str() {
+            "\x1b" if csi_char(&key) == Some('[') => Some('['),
+            "\x1b[" if csi_char(&key) == Some('2') => Some('2'),
+            "\x1b[2" if csi_char(&key) == Some('0') => Some('0'),
+            "\x1b[20" => csi_char(&key).filter(|c| matches!(c, '0' | '1')),
+            "\x1b[200" | "\x1b[201" if csi_char(&key) == Some('~') => {
+                let is_start = self.prefix == "\x1b[200";
+                self.prefix.clear();
+                self.raw.clear();
+                return if is_start { CsiStep::PasteStart } else { CsiStep::PasteEnd };
+            }
+            _ => None,
+        };
+        if let Some(ch) = matched {
+            self.prefix.push(ch);
+            self.raw.push(key);
+            CsiStep::Buffering
+        } else {
+            CsiStep::Mismatch(self.take())
+        }
+    }
+}
+
+pub(crate) struct BatchProbe {
+    pub in_bracketed: bool,
+    pub has_pending_csi: bool,
+    pub ended_on_paste_end: bool,
+    pub press_count: usize,
+}
+
+#[derive(Default)]
+pub(crate) struct InputDecoder {
+    pending_csi: CsiBuffer,
+    in_bracketed_paste: bool,
+    bracketed_buf: String,
+    end_csi: CsiBuffer,
+}
+
+impl InputDecoder {
+    pub(crate) fn has_pending_csi(&self) -> bool {
+        !self.in_bracketed_paste && !self.pending_csi.is_empty()
+    }
+
+    pub(crate) fn in_bracketed_paste(&self) -> bool {
+        self.in_bracketed_paste
+    }
+
+    pub(crate) fn probe_batch(&self, events: &[crossterm::event::Event]) -> BatchProbe {
+        use crossterm::event::{Event, KeyEventKind};
+        let mut in_bracketed = self.in_bracketed_paste;
+        let mut pending_csi = self.pending_csi.clone();
+        let mut end_csi = self.end_csi.clone();
+        let mut ended_on_paste_end = false;
+        let mut press_count = 0usize;
+        for ev in events {
+            match ev {
+                Event::Key(k) if k.kind == KeyEventKind::Release => continue,
+                Event::Key(k) => {
+                    press_count += 1;
+                    ended_on_paste_end = false;
+                    if in_bracketed {
+                        match end_csi.step(*k) {
+                            CsiStep::PasteEnd => {
+                                in_bracketed = false;
+                                ended_on_paste_end = true;
+                            }
+                            CsiStep::Mismatch(_) => {
+                                let _ = end_csi.step(*k);
+                            }
+                            _ => {}
+                        }
+                    } else {
+                        match pending_csi.step(*k) {
+                            CsiStep::PasteStart => {
+                                in_bracketed = true;
+                                end_csi.take();
+                            }
+                            CsiStep::Mismatch(_) => {
+                                let _ = pending_csi.step(*k);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Event::Paste(_) => {
+                    ended_on_paste_end = !in_bracketed;
+                    if !in_bracketed {
+                        pending_csi.take();
+                    }
+                }
+                _ => {}
+            }
+        }
+        BatchProbe { in_bracketed, has_pending_csi: if in_bracketed { !end_csi.is_empty() } else { !pending_csi.is_empty() }, ended_on_paste_end, press_count }
+    }
+
+    fn flush_normal_run(tui: &Tui, normal_run: &mut Vec<crossterm::event::KeyEvent>) {
+        if normal_run.is_empty() {
+            return;
+        }
+        let keys = std::mem::take(normal_run);
+        if keys.iter().all(|k| paste_char_from_key(k, false).is_some()) {
+            let raw: String = keys.iter().filter_map(|k| paste_char_from_key(k, false)).collect();
+            if tui.raw_chunk(&raw) {
+                return;
+            }
+        }
+        for k in keys {
+            if let Some((text, key)) = key_from_event(&k) {
+                tui.key(text.as_deref(), key);
+            }
+        }
+    }
+
+    pub(crate) fn feed_batch(&mut self, tui: &Tui, batch: Vec<crossterm::event::Event>) {
+        use crossterm::event::{Event, KeyEventKind};
+        let mut normal_run = vec![];
+        for ev in batch {
+            match ev {
+                Event::Key(k) if k.kind == KeyEventKind::Release => {}
+                Event::Key(k) if self.in_bracketed_paste => match self.end_csi.step(k) {
+                    CsiStep::None => {
+                        if let Some(ch) = paste_char_from_key(&k, true) {
+                            self.bracketed_buf.push(ch);
+                        }
+                    }
+                    CsiStep::Buffering | CsiStep::PasteStart => {}
+                    CsiStep::PasteEnd => {
+                        self.in_bracketed_paste = false;
+                        let text = std::mem::take(&mut self.bracketed_buf);
+                        tui.paste(&text);
+                    }
+                    CsiStep::Mismatch(flushed) => {
+                        for fk in flushed {
+                            if let Some(ch) = paste_char_from_key(&fk, true) {
+                                self.bracketed_buf.push(ch);
+                            }
+                        }
+                        if let CsiStep::None = self.end_csi.step(k) {
+                            if let Some(ch) = paste_char_from_key(&k, true) {
+                                self.bracketed_buf.push(ch);
+                            }
+                        }
+                    }
+                },
+                Event::Key(k) => match self.pending_csi.step(k) {
+                    CsiStep::None => normal_run.push(k),
+                    CsiStep::Buffering | CsiStep::PasteEnd => {}
+                    CsiStep::PasteStart => {
+                        Self::flush_normal_run(tui, &mut normal_run);
+                        self.in_bracketed_paste = true;
+                        self.bracketed_buf.clear();
+                        self.end_csi.take();
+                    }
+                    CsiStep::Mismatch(flushed) => {
+                        normal_run.extend(flushed);
+                        if let CsiStep::None = self.pending_csi.step(k) {
+                            normal_run.push(k);
+                        }
+                    }
+                },
+                Event::Paste(text) => {
+                    if self.in_bracketed_paste {
+                        for fk in self.end_csi.take() {
+                            if let Some(ch) = paste_char_from_key(&fk, true) {
+                                self.bracketed_buf.push(ch);
+                            }
+                        }
+                        self.bracketed_buf.push_str(&text);
+                    } else {
+                        normal_run.extend(self.pending_csi.take());
+                        Self::flush_normal_run(tui, &mut normal_run);
+                        tui.paste(&text);
+                    }
+                }
+                Event::Resize(_, _) => tui.resize(),
+                _ => {}
+            }
+        }
+        Self::flush_normal_run(tui, &mut normal_run);
+    }
+
+    pub(crate) fn flush_timeout(&mut self, tui: &Tui) {
+        if self.in_bracketed_paste {
+            for fk in self.end_csi.take() {
+                if let Some(ch) = paste_char_from_key(&fk, true) {
+                    self.bracketed_buf.push(ch);
+                }
+            }
+            self.in_bracketed_paste = false;
+            let text = std::mem::take(&mut self.bracketed_buf);
+            tui.paste(&text);
+        } else if !self.pending_csi.is_empty() {
+            let mut flushed = self.pending_csi.take();
+            Self::flush_normal_run(tui, &mut flushed);
+        }
+    }
+}
+
+fn drain_ready_events(batch: &mut Vec<crossterm::event::Event>) -> bool {
+    use crossterm::event::{poll, read};
+    match read() {
+        Ok(ev) => batch.push(ev),
+        Err(_) => return false,
+    }
+    while batch.len() < 100_000 {
+        match poll(Duration::ZERO) {
+            Ok(true) => match read() {
+                Ok(ev) => batch.push(ev),
+                Err(_) => return false,
+            },
+            _ => break,
+        }
+    }
+    true
+}
+
 fn input_thread(tui: Weak<Tui>) {
-    use crossterm::event::{poll, read, Event, KeyCode, KeyEventKind, KeyModifiers};
+    use crossterm::event::poll;
+    use std::time::Instant;
+    let mut decoder = InputDecoder::default();
     loop {
         let Some(t) = tui.upgrade() else { return };
         if t.is_closed() {
             return;
         }
         drop(t);
-        match poll(Duration::from_millis(100)) {
+        let wait = if decoder.has_pending_csi() {
+            Duration::from_millis(CSI_ESCAPE_TIMEOUT_MS)
+        } else if decoder.in_bracketed_paste() {
+            Duration::from_millis(BRACKETED_PASTE_IDLE_TIMEOUT_MS)
+        } else {
+            Duration::from_millis(100)
+        };
+        match poll(wait) {
             Ok(true) => {}
-            Ok(false) => continue,
+            Ok(false) => {
+                if decoder.has_pending_csi() || decoder.in_bracketed_paste() {
+                    if let Some(t) = tui.upgrade() {
+                        decoder.flush_timeout(&t);
+                    }
+                }
+                continue;
+            }
             Err(_) => {
                 if let Some(t) = tui.upgrade() {
                     t.ended();
@@ -2431,46 +2852,78 @@ fn input_thread(tui: Weak<Tui>) {
                 return;
             }
         }
-        // Drain everything already available: one read() of a paste becomes one batch.
         let mut batch = vec![];
-        while let Ok(true) = poll(Duration::ZERO) {
-            match read() {
-                Ok(ev) => batch.push(ev),
-                Err(_) => break,
+        if !drain_ready_events(&mut batch) {
+            if let Some(t) = tui.upgrade() {
+                t.ended();
             }
-            if batch.len() > 100_000 {
+            return;
+        }
+        let burst_start = Instant::now();
+        let mut last_event_at = burst_start;
+        let mut csi_timed_out = false;
+        while batch.len() < 100_000 {
+            let probe = decoder.probe_batch(&batch);
+            if probe.ended_on_paste_end {
+                break;
+            }
+            if probe.has_pending_csi {
+                match poll(Duration::from_millis(CSI_ESCAPE_TIMEOUT_MS)) {
+                    Ok(true) => {
+                        if !drain_ready_events(&mut batch) {
+                            break;
+                        }
+                        last_event_at = Instant::now();
+                    }
+                    Ok(false) => {
+                        csi_timed_out = true;
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            } else if probe.in_bracketed {
+                if last_event_at.elapsed() >= Duration::from_millis(BRACKETED_PASTE_IDLE_TIMEOUT_MS) {
+                    csi_timed_out = true;
+                    break;
+                }
+                let remain = Duration::from_millis(BRACKETED_PASTE_IDLE_TIMEOUT_MS).saturating_sub(last_event_at.elapsed());
+                match poll(Duration::from_millis(50).min(remain)) {
+                    Ok(true) => {
+                        if !drain_ready_events(&mut batch) {
+                            break;
+                        }
+                        last_event_at = Instant::now();
+                    }
+                    Ok(false) => {
+                        if last_event_at.elapsed() >= Duration::from_millis(BRACKETED_PASTE_IDLE_TIMEOUT_MS) {
+                            csi_timed_out = true;
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            } else if probe.press_count >= 2 {
+                if burst_start.elapsed() >= Duration::from_millis(BURST_MAX_DURATION_MS) {
+                    break;
+                }
+                let remain = Duration::from_millis(BURST_MAX_DURATION_MS).saturating_sub(burst_start.elapsed());
+                match poll(Duration::from_millis(BURST_DRAIN_WINDOW_MS).min(remain)) {
+                    Ok(true) => {
+                        if !drain_ready_events(&mut batch) {
+                            break;
+                        }
+                        last_event_at = Instant::now();
+                    }
+                    _ => break,
+                }
+            } else {
                 break;
             }
         }
         let Some(t) = tui.upgrade() else { return };
-        let keys: Vec<&crossterm::event::KeyEvent> = batch.iter().filter_map(|e| if let Event::Key(k) = e { Some(k) } else { None }).filter(|k| k.kind != KeyEventKind::Release).collect();
-        let only_text = batch.len() > 1
-            && keys.len() == batch.iter().filter(|e| !matches!(e, Event::Key(k) if k.kind == KeyEventKind::Release)).count()
-            && keys.iter().all(|k| matches!(k.code, KeyCode::Char(_) | KeyCode::Enter | KeyCode::Tab) && !k.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT));
-        if only_text {
-            let raw: String = keys
-                .iter()
-                .map(|k| match k.code {
-                    KeyCode::Char(c) => c.to_string(),
-                    KeyCode::Enter => "\r".into(),
-                    _ => "\t".into(),
-                })
-                .collect();
-            if t.raw_chunk(&raw) {
-                continue;
-            }
-        }
-        for ev in batch {
-            match ev {
-                Event::Key(k) if k.kind != KeyEventKind::Release => {
-                    if let Some((text, key)) = key_from_event(&k) {
-                        t.key(text.as_deref(), key);
-                    }
-                }
-                Event::Paste(text) => t.paste(&text),
-                Event::Resize(_, _) => t.resize(),
-                _ => {}
-            }
+        decoder.feed_batch(&t, batch);
+        if csi_timed_out {
+            decoder.flush_timeout(&t);
         }
     }
 }
