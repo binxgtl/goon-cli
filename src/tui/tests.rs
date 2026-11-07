@@ -1006,11 +1006,13 @@ async fn windows_bracketed_paste_key_stream_collapses_without_splitting_or_queue
     let frame = tty.frame();
     assert!(frame.contains("[Pasted text #1 +40 lines]"), "{frame}");
 
-    // Immediate user typing + Enter right after paste (0ms delay) works cleanly without swallowing Enter.
+    // Simulated interactive user typing + Enter right after bracketed paste submits cleanly.
+    let mut now = std::time::Instant::now();
     for ev in windows_key_events_for_str("hãy review kỹ") {
-        decoder.feed_batch(&tty.ui, vec![ev]);
+        decoder.feed_batch_at(&tty.ui, vec![ev], now, true);
+        now += paste_burst::PasteBurst::recommended_char_flush_delay();
     }
-    decoder.feed_batch(&tty.ui, vec![Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))]);
+    decoder.feed_batch_at(&tty.ui, vec![Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))], now, true);
     let submitted = q.await.unwrap().unwrap();
     assert_eq!(submitted, format!("{expected}\nhãy review kỹ"));
     assert!(tty.ui.state.lock().unwrap().queued_prompts.is_empty());
@@ -1051,39 +1053,164 @@ async fn non_bracketed_conpty_multiline_chunks_and_crlf_splits_coalesce_into_sin
     tokio::time::sleep(Duration::from_millis(5)).await;
 
     let mut decoder = InputDecoder::default();
+    let mut now = std::time::Instant::now();
     // Batch 1: short first line (< 150 chars) with FocusGained + Mouse + CRLF (Enter + Ctrl+J).
     let mut first_batch = vec![Event::FocusGained, Event::Mouse(MouseEvent { kind: MouseEventKind::Up(MouseButton::Left), column: 2, row: 2, modifiers: KeyModifiers::empty() })];
     first_batch.extend(windows_key_events_for_str("Hãy tối ưu hàm xử lý sự kiện sau:\r\n"));
-    decoder.feed_batch(&tty.ui, first_batch);
+    decoder.feed_batch_at(&tty.ui, first_batch, now, true);
     assert!(!q.is_finished(), "short first line of Windows CRLF paste must not auto-submit");
 
-    // Batches 2..30: delivered line-by-line (worst-case ConPTY chunking when `\x1b[200~` is swallowed).
+    // Batches 2..30: delivered line-by-line across 450ms total wall duration (> 250ms).
     let mut expected_lines = vec!["Hãy tối ưu hàm xử lý sự kiện sau:".to_string()];
     for i in 2..=30 {
+        now += Duration::from_millis(15);
         let line = format!("    let item_{i} = map[@key_{i}].clone();");
         expected_lines.push(line.clone());
-        decoder.feed_batch(&tty.ui, windows_key_events_for_str(&format!("{line}\r\n")));
-        assert!(!q.is_finished(), "line {i} must coalesce into pill without submitting");
+        decoder.feed_batch_at(&tty.ui, windows_key_events_for_str(&format!("{line}\r\n")), now, true);
+        assert!(!q.is_finished(), "line {i} must stay buffered without submitting");
     }
 
     // Batch 31 & Batch 32: split CRLF right between `\r` and `\n` before the final closing brace!
     expected_lines.push("    Ok(())".into());
     expected_lines.push("}".into());
-    decoder.feed_batch(&tty.ui, windows_key_events_for_str("    Ok(())\r"));
-    decoder.feed_batch(&tty.ui, windows_key_events_for_str("\n}"));
+    now += Duration::from_millis(15);
+    decoder.feed_batch_at(&tty.ui, windows_key_events_for_str("    Ok(())\r"), now, true);
+    now += Duration::from_millis(15);
+    decoder.feed_batch_at(&tty.ui, windows_key_events_for_str("\n}"), now, true);
 
+    now += paste_burst::PasteBurst::recommended_active_flush_delay(true);
+    assert!(tty.ui.flush_paste_burst_at(now, true));
     assert!(!q.is_finished());
     assert!(tty.ui.state.lock().unwrap().queued_prompts.is_empty());
     let frame = tty.frame();
     assert!(frame.contains("[Pasted text #1 +32 lines]"), "{frame}");
 
-    // Single-character interactive typing right after burst stays outside the pill, and Enter submits intact.
+    // Single-character interactive typing after the suppression window stays outside the pill, and Enter submits intact.
+    now += Duration::from_millis(150);
     for ch in "xong".chars() {
-        decoder.feed_batch(&tty.ui, windows_key_events_for_str(&ch.to_string()));
+        decoder.feed_batch_at(&tty.ui, windows_key_events_for_str(&ch.to_string()), now, true);
+        now += paste_burst::PasteBurst::recommended_char_flush_delay();
     }
-    decoder.feed_batch(&tty.ui, vec![Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))]);
+    decoder.feed_batch_at(&tty.ui, vec![Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))], now, true);
     let submitted = q.await.unwrap().unwrap();
     assert_eq!(submitted, format!("{}\nxong", expected_lines.join("\n")));
+}
+
+#[tokio::test]
+async fn windows_codex_paste_burst_prevents_screenshot_split_inline_leak_and_autosubmit() {
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, ModifierKeyCode, MouseEvent, MouseEventKind};
+    let tty = Tty::new(110, 28);
+    let ui = tty.ui.clone();
+    let q = tokio::spawn(async move { ui.question("goon> ", None, true, QuestionOpts::default()).await });
+    tokio::time::sleep(Duration::from_millis(5)).await;
+
+    let mut lines = Vec::with_capacity(28);
+    lines.push("Nếu chạy theo cách truyền thống, hệ thống mutation testing phải biên dịch lại từng biến thể:".to_string());
+    for i in 2..=13 {
+        lines.push(if i == 7 { String::new() } else { format!("  - Bước {i}: kiểm tra AST node #{i} & ánh xạ bytecode\t[ok]") });
+    }
+    let middle_line = "Spawn process mới từ đầu cho từng mutant sẽ khiến thời gian chạy CI bùng nổ cấp số nhân (Combinatorial Explosion)";
+    lines.push(middle_line.to_string());
+    for i in 15..=28 {
+        lines.push(format!("  - Ràng buộc {i}: giữ worker pool cô lập bộ nhớ mà không fork lại toàn bộ runtime"));
+    }
+    assert_eq!(lines.len(), 28);
+    let expected = lines.join("\n");
+
+    let mut decoder = InputDecoder::default();
+    let t0 = std::time::Instant::now();
+    let mut now = t0;
+
+    // 1. First character `'N'` wakes `poll()` completely alone: must be held, NOT rendered inline!
+    decoder.feed_batch_at(&tty.ui, windows_key_events_for_str("N"), now, true);
+    let initial_frame = tty.frame();
+    assert!(!initial_frame.contains("› N"), "first paste char must not leak inline before burst decision:\n{initial_frame}");
+
+    // 2. Remainder of line 1 arrives 2ms later, promoting `'N'` into PasteBurst, followed by lines 2..13 across >250ms.
+    now += Duration::from_millis(2);
+    decoder.feed_batch_at(&tty.ui, windows_key_events_for_str(&format!("{}\r\n", &lines[0]["N".len()..])), now, true);
+    for line in &lines[1..13] {
+        now += Duration::from_millis(22);
+        decoder.feed_batch_at(&tty.ui, windows_key_events_for_str(&format!("{line}\r\n")), now, true);
+    }
+    assert!(now.duration_since(t0) > Duration::from_millis(250), "burst spans >250ms without artificial wall-clock cut");
+
+    // 3. Single-char `'S'`, 111-char middle fragment with non-char noise (Modifier, Null, Focus, Mouse), and single-char `')'`.
+    now += Duration::from_millis(25);
+    decoder.feed_batch_at(&tty.ui, windows_key_events_for_str("S"), now, true);
+    now += Duration::from_millis(18);
+    let mid_body = &middle_line[1..middle_line.len() - 1];
+    let mut noisy_mid = vec![
+        Event::FocusGained,
+        Event::Key(KeyEvent::new_with_kind(KeyCode::Modifier(ModifierKeyCode::LeftShift), KeyModifiers::SHIFT, KeyEventKind::Press)),
+        Event::Key(KeyEvent::new(KeyCode::Null, KeyModifiers::empty())),
+        Event::Mouse(MouseEvent { kind: MouseEventKind::Moved, column: 10, row: 5, modifiers: KeyModifiers::empty() }),
+    ];
+    noisy_mid.extend(windows_key_events_for_str(mid_body));
+    decoder.feed_batch_at(&tty.ui, noisy_mid, now, true);
+    now += Duration::from_millis(20);
+    decoder.feed_batch_at(&tty.ui, windows_key_events_for_str(")\r\n"), now, true);
+
+    // 4. Remaining 14 lines + standalone trailing Windows Terminal `KeyCode::Enter` (`\r` without `\n`).
+    for (idx, line) in lines[14..].iter().enumerate() {
+        now += Duration::from_millis(18);
+        let chunk = if idx + 1 < lines[14..].len() { format!("{line}\r\n") } else { line.clone() };
+        decoder.feed_batch_at(&tty.ui, windows_key_events_for_str(&chunk), now, true);
+    }
+    now += Duration::from_millis(25);
+    decoder.feed_batch_at(&tty.ui, vec![Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))], now, true);
+
+    // 5. Flush after Windows active idle timeout (61ms): ONE pill `+28 lines`, zero inline leak, zero auto-submit!
+    let flush_at = now + paste_burst::PasteBurst::recommended_active_flush_delay(true);
+    assert!(tty.ui.flush_paste_burst_at(flush_at, true));
+    assert!(!q.is_finished(), "trailing Enter at end of Windows paste must NEVER auto-submit");
+    assert!(tty.ui.state.lock().unwrap().queued_prompts.is_empty(), "must never auto-queue");
+
+    // 6. A slightly-late trailing Enter inside the 120ms suppression window is ALSO suppressed.
+    decoder.feed_batch_at(&tty.ui, vec![Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))], now + Duration::from_millis(95), true);
+    assert!(!q.is_finished(), "late trailing Enter within 120ms suppress window must not auto-submit");
+
+    let frame = tty.frame();
+    assert!(frame.contains("› [Pasted text #1 +28 lines]"), "{frame}");
+    assert!(!frame.contains("› N["), "leading 'N' must not leak outside pill:\n{frame}");
+    assert!(!frame.contains("Combinatorial Explosion"), "middle line must not leak inline:\n{frame}");
+    assert!(!frame.contains("[Pasted text #2"), "must not split into multiple paste pills:\n{frame}");
+
+    // 7. Explicit user Enter after the suppression window submits the exact 28-line payload intact.
+    decoder.feed_batch_at(&tty.ui, vec![Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))], now + Duration::from_millis(250), true);
+    let submitted = q.await.unwrap().unwrap();
+    assert_eq!(submitted, expected);
+}
+
+#[tokio::test]
+async fn paste_burst_tabs_ctrl_j_and_csi_u_shift_enter_never_complete_or_submit() {
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    let tty = Tty::new(100, 24);
+    let ui = tty.ui.clone();
+    let q = tokio::spawn(async move { ui.question("goon> ", None, true, QuestionOpts::default()).await });
+    tokio::time::sleep(Duration::from_millis(5)).await;
+
+    let mut decoder = InputDecoder::default();
+    let mut now = std::time::Instant::now();
+    // Start with `/` + tab + `\x1b[13;2u` (Shift+Enter) + `Ctrl+J`: must buffer as paste, NOT autocomplete `/help` or submit!
+    let mut burst = windows_key_events_for_str("/he\tfirst\x1b[13;2u\tsecond");
+    burst.push(Event::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL)));
+    burst.extend(windows_key_events_for_str("third"));
+    decoder.feed_batch_at(&tty.ui, burst, now, true);
+    now += paste_burst::PasteBurst::recommended_active_flush_delay(true);
+    assert!(tty.ui.flush_paste_burst_at(now, true));
+    assert!(!q.is_finished(), "Shift+Enter and Ctrl+J inside paste must never submit");
+    assert!(tty.frame().contains("[Pasted text #1 +3 lines]"));
+
+    // Outside a burst, standalone `\x1b[13;2u` and `Ctrl+J` also never submit.
+    now += Duration::from_millis(200);
+    decoder.feed_batch_at(&tty.ui, windows_key_events_for_str("\x1b[13;2u"), now, true);
+    decoder.feed_batch_at(&tty.ui, vec![Event::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL))], now, true);
+    assert!(!q.is_finished(), "standalone Shift+Enter / Ctrl+J must never submit");
+
+    decoder.feed_batch_at(&tty.ui, vec![Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))], now, true);
+    let submitted = q.await.unwrap().unwrap();
+    assert_eq!(submitted, "/he\tfirst\n\tsecond\nthird");
 }
 
 #[tokio::test]
@@ -1115,17 +1242,39 @@ async fn standalone_escape_timeout_and_short_pty_commands_preserve_interactive_s
     decoder.feed_batch(&tty.ui, vec![Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))]);
     assert_eq!(q1.await.unwrap().unwrap(), "alpha\n[2x\ngamma");
 
-    // 3. Short single-line `\r`-terminated PTY writes (`terminal.py` / `terminal-mode-switch.py`) still submit immediately.
+    // 3. Short single-line `\r`-terminated POSIX raw PTY writes (`terminal.py` / `terminal-mode-switch.py`, `is_windows = false`)
+    //    auto-submit cleanly via the async PasteBurst tick, while multi-line Unix unbracketed bursts stay collapsed!
+    for cmd in ["/status", "y"] {
+        let ui = tty.ui.clone();
+        let q2 = tokio::spawn(async move { ui.question("goon> ", None, true, QuestionOpts::default()).await });
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let pty_cmd: Vec<Event> = format!("{cmd}\r")
+            .chars()
+            .map(|c| {
+                let code = if c == '\r' { KeyCode::Enter } else { KeyCode::Char(c) };
+                Event::Key(KeyEvent::new(code, KeyModifiers::empty()))
+            })
+            .collect();
+        decoder.feed_batch_at(&tty.ui, pty_cmd, std::time::Instant::now(), false);
+        let got = tokio::time::timeout(Duration::from_millis(250), q2).await.expect("POSIX PTY command auto-submits").unwrap().unwrap();
+        assert_eq!(got, cmd);
+    }
+
     let ui = tty.ui.clone();
-    let q2 = tokio::spawn(async move { ui.question("goon> ", None, true, QuestionOpts::default()).await });
+    let q3 = tokio::spawn(async move { ui.question("goon> ", None, true, QuestionOpts::default()).await });
     tokio::time::sleep(Duration::from_millis(5)).await;
-    let pty_cmd: Vec<Event> = "/status\r"
+    let unix_multiline: Vec<Event> = "line 1\rline 2\r"
         .chars()
         .map(|c| {
             let code = if c == '\r' { KeyCode::Enter } else { KeyCode::Char(c) };
             Event::Key(KeyEvent::new(code, KeyModifiers::empty()))
         })
         .collect();
-    decoder.feed_batch(&tty.ui, pty_cmd);
-    assert_eq!(q2.await.unwrap().unwrap(), "/status");
+    let t_unix = std::time::Instant::now();
+    decoder.feed_batch_at(&tty.ui, unix_multiline, t_unix, false);
+    assert!(tty.ui.flush_paste_burst_at(t_unix + paste_burst::PasteBurst::recommended_active_flush_delay(false), false));
+    assert!(!q3.is_finished(), "multi-line Unix unbracketed burst must collapse without submitting");
+    assert!(tty.frame().contains("[Pasted text #1 +2 lines]"));
+    decoder.feed_batch_at(&tty.ui, vec![Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))], t_unix + Duration::from_millis(200), false);
+    assert_eq!(q3.await.unwrap().unwrap(), "line 1\nline 2");
 }

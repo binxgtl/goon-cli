@@ -2,8 +2,11 @@
 //! paste placeholders and slash popup, pickers, approvals, transcript overlay and row-diff
 //! rendering (unchanged rows are never rewritten, so native text selection survives streaming).
 
+mod paste_burst;
 mod render;
 pub mod text;
+#[cfg(windows)]
+mod windows_console;
 
 use crate::session::SessionGoal;
 use crate::term::{terminal_text, InputCancelled};
@@ -28,8 +31,6 @@ const LARGE_PASTE_CHAR_THRESHOLD: usize = 150;
 const PASTE_COALESCE_WINDOW_MS: i64 = 250;
 const CSI_ESCAPE_TIMEOUT_MS: u64 = 15;
 const BRACKETED_PASTE_IDLE_TIMEOUT_MS: u64 = 250;
-const BURST_DRAIN_WINDOW_MS: u64 = 30;
-const BURST_MAX_DURATION_MS: u64 = 250;
 const CLIPBOARD_OUTPUT_LIMIT_BYTES: usize = 2 * 1024 * 1024;
 
 pub mod glyph {
@@ -374,6 +375,8 @@ pub(crate) struct State {
     esc_primed: Option<EscPrime>,
     esc_gen: u64,
     paste_gen: u64,
+    paste_burst: paste_burst::PasteBurst,
+    paste_tick_running: bool,
     pub status_notice: Option<String>,
     pub view_mode: String,
     pub in_transcript_overlay: bool,
@@ -449,6 +452,8 @@ impl Tui {
     /// Takes over the real terminal (alternate screen, raw mode, bracketed paste).
     pub fn start(title: &str, cancel: Callback0) -> Result<Arc<Tui>> {
         crossterm::terminal::enable_raw_mode()?;
+        #[cfg(windows)]
+        let _ = windows_console::set_input_record_mode();
         let size: SizeFn = Box::new(|| crossterm::terminal::size().map(|(c, r)| (c as usize, r as usize)).unwrap_or((80, 24)));
         let tui = Tui::with_io(title, cancel, Box::new(std::io::stdout()), size, true);
         let weak = Arc::downgrade(&tui);
@@ -520,6 +525,8 @@ impl Tui {
             esc_primed: None,
             esc_gen: 0,
             paste_gen: 0,
+            paste_burst: paste_burst::PasteBurst::default(),
+            paste_tick_running: false,
             status_notice: None,
             view_mode: "verbose".into(),
             in_transcript_overlay: false,
@@ -542,8 +549,12 @@ impl Tui {
             real_terminal,
         });
         // Alternate screen, mouse capture off (native selection works), alternate scroll for the
-        // wheel, bracketed paste, hidden cursor.
+        // wheel, bracketed paste, hidden cursor. On Windows real terminals, disable focus events
+        // (matching Codex) so focus changes never inject spurious sequences.
         tui.write_raw("\x1b[?1049h\x1b[?1000l\x1b[?1006l\x1b[?1007h\x1b[?2004h\x1b[?25l");
+        if real_terminal && cfg!(windows) {
+            tui.write_raw("\x1b[?1004l");
+        }
         tui.render_now();
         tui
     }
@@ -626,9 +637,16 @@ impl Tui {
         self.handle.spawn(async move {
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
             if let Some(t) = me.upgrade() {
-                let mut st = t.state.lock().unwrap();
-                st.timer = false;
-                t.render(&mut st);
+                let mut actions = vec![];
+                {
+                    let mut st = t.state.lock().unwrap();
+                    st.timer = false;
+                    t.flush_paste_burst_if_due(&mut st, std::time::Instant::now(), cfg!(windows), &mut actions);
+                    if !st.paste_burst.is_active() {
+                        t.render(&mut st);
+                    }
+                }
+                t.run_actions(actions);
             }
         });
     }
@@ -716,6 +734,7 @@ impl Tui {
         st.next_image_idx = 1;
         st.pasted_texts.clear();
         st.next_paste_idx = 1;
+        st.paste_burst.clear_after_explicit_paste();
         Self::clear_paste_burst(&mut st);
         let mut restored = text.to_string();
         let archive: Vec<(String, String)> = st.paste_archive.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
@@ -743,6 +762,7 @@ impl Tui {
 
     pub fn insert_text(&self, text: &str) {
         let mut st = self.state.lock().unwrap();
+        st.paste_burst.clear_after_explicit_paste();
         self.handle_paste(&mut st, text, false);
     }
 
@@ -1677,7 +1697,7 @@ impl Tui {
         }
         let split_trailing_nl = |s: String| -> (String, bool) {
             match s.strip_suffix('\n') {
-                Some(without_nl) if !without_nl.contains('\n') => (without_nl.to_string(), true),
+                Some(without_nl) if !without_nl.is_empty() => (without_nl.to_string(), true),
                 _ => (s, false),
             }
         };
@@ -1936,6 +1956,7 @@ impl Tui {
         }
         if let Some(text) = out.strip_prefix("TXT:") {
             let text = text.to_string();
+            st.paste_burst.clear_after_explicit_paste();
             self.handle_paste(&mut st, &text, false);
         }
     }
@@ -1990,8 +2011,15 @@ impl Tui {
 
     /// Bracketed paste content.
     pub fn paste(&self, text: &str) {
-        let mut st = self.state.lock().unwrap();
-        self.handle_paste(&mut st, text, false);
+        let mut actions = vec![];
+        {
+            let mut st = self.state.lock().unwrap();
+            let flushed = st.paste_burst.flush_before_modified_input();
+            self.apply_flush_result(&mut st, flushed, cfg!(windows), &mut actions);
+            st.paste_burst.clear_after_explicit_paste();
+            self.handle_paste(&mut st, text, false);
+        }
+        self.run_actions(actions);
     }
 
     pub fn resize(&self) {
@@ -2050,6 +2078,7 @@ impl Tui {
         st.input_restored_from_revert = false;
         st.attached_images.clear();
         st.pasted_texts.clear();
+        st.paste_burst.clear_after_explicit_paste();
         Self::clear_paste_burst(st);
     }
 
@@ -2057,6 +2086,8 @@ impl Tui {
         let mut actions = vec![];
         {
             let mut st = self.state.lock().unwrap();
+            let flushed = st.paste_burst.flush_before_modified_input();
+            self.apply_flush_result(&mut st, flushed, cfg!(windows), &mut actions);
             self.keypress(&mut st, text, &key, &mut actions);
         }
         self.run_actions(actions);
@@ -2446,6 +2477,234 @@ impl Tui {
         self.schedule(st, 16);
     }
 
+    fn apply_flush_result(&self, st: &mut State, res: paste_burst::FlushResult, is_windows: bool, actions: &mut Vec<Action>) -> bool {
+        match res {
+            paste_burst::FlushResult::None => false,
+            paste_burst::FlushResult::Typed(ch) => {
+                if st.esc_primed.is_some() {
+                    st.esc_primed = None;
+                    st.esc_gen += 1;
+                }
+                if st.status_notice.is_some() {
+                    st.status_notice = None;
+                }
+                Self::clear_paste_burst(st);
+                if st.input.len() < 16_000 {
+                    st.input_restored_from_revert = false;
+                    let cleaned = terminal_text(&ch.to_string());
+                    let chars = chars_of(&cleaned);
+                    if !chars.is_empty() {
+                        Self::insert_chars(st, &chars);
+                        st.scroll = 0;
+                        if "gfpe\"'GFPE".contains(ch) {
+                            self.schedule_paste_burst_check(st);
+                        }
+                    }
+                }
+                self.schedule(st, 16);
+                true
+            }
+            paste_burst::FlushResult::Paste(pasted) => {
+                if st.esc_primed.is_some() {
+                    st.esc_primed = None;
+                    st.esc_gen += 1;
+                }
+                if st.status_notice.is_some() {
+                    st.status_notice = None;
+                }
+                if !is_windows && pasted.ends_with('\r') && !pasted.ends_with("\r\n") {
+                    let line = &pasted[..pasted.len() - 1];
+                    if !line.contains(['\r', '\n']) && line.chars().count() <= LARGE_PASTE_CHAR_THRESHOLD {
+                        st.paste_burst.clear_after_explicit_paste();
+                        Self::clear_paste_burst(st);
+                        let cleaned = terminal_text(line);
+                        if !cleaned.is_empty() {
+                            st.input_restored_from_revert = false;
+                            Self::insert_chars(st, &chars_of(&cleaned));
+                        }
+                        self.keypress(st, Some("\r"), &Key::named("return"), actions);
+                        return true;
+                    }
+                }
+                self.handle_paste(st, &pasted, true);
+                true
+            }
+        }
+    }
+
+    fn flush_paste_burst_if_due(&self, st: &mut State, now: std::time::Instant, is_windows: bool, actions: &mut Vec<Action>) -> bool {
+        let res = st.paste_burst.flush_if_due(now, is_windows);
+        self.apply_flush_result(st, res, is_windows, actions)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn flush_paste_burst_at(&self, now: std::time::Instant, is_windows: bool) -> bool {
+        let mut actions = vec![];
+        let flushed = {
+            let mut st = self.state.lock().unwrap();
+            let did = self.flush_paste_burst_if_due(&mut st, now, is_windows, &mut actions);
+            if did && !st.paste_burst.is_active() {
+                self.schedule(&mut st, 0);
+            }
+            did
+        };
+        self.run_actions(actions);
+        flushed
+    }
+
+    fn ensure_paste_tick(&self, st: &mut State, is_windows: bool) {
+        if st.closed || st.paste_tick_running || !st.paste_burst.is_active() {
+            return;
+        }
+        st.paste_tick_running = true;
+        let me = self.me.clone();
+        self.handle.spawn(async move {
+            loop {
+                let sleep_dur = {
+                    let Some(t) = me.upgrade() else { return };
+                    let mut st = t.state.lock().unwrap();
+                    if st.closed {
+                        st.paste_tick_running = false;
+                        return;
+                    }
+                    match st.paste_burst.next_flush_delay(std::time::Instant::now(), is_windows) {
+                        Some(d) => d,
+                        None => {
+                            st.paste_tick_running = false;
+                            return;
+                        }
+                    }
+                };
+                tokio::time::sleep(sleep_dur).await;
+                let Some(t) = me.upgrade() else { return };
+                let mut actions = vec![];
+                let keep_going = {
+                    let mut st = t.state.lock().unwrap();
+                    if st.closed {
+                        st.paste_tick_running = false;
+                        false
+                    } else {
+                        let did = t.flush_paste_burst_if_due(&mut st, std::time::Instant::now(), is_windows, &mut actions);
+                        if did && !st.paste_burst.is_active() {
+                            t.schedule(&mut st, 0);
+                        }
+                        if st.paste_burst.is_active() {
+                            true
+                        } else {
+                            st.paste_tick_running = false;
+                            false
+                        }
+                    }
+                };
+                t.run_actions(actions);
+                if !keep_going {
+                    return;
+                }
+            }
+        });
+    }
+
+    pub(crate) fn handle_crossterm_key(&self, ev: crossterm::event::KeyEvent, now: std::time::Instant, is_windows: bool) {
+        use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+        if ev.kind == KeyEventKind::Release
+            || matches!(
+                ev.code,
+                KeyCode::Modifier(_)
+                    | KeyCode::CapsLock
+                    | KeyCode::ScrollLock
+                    | KeyCode::NumLock
+                    | KeyCode::PrintScreen
+                    | KeyCode::Pause
+                    | KeyCode::Menu
+                    | KeyCode::KeypadBegin
+                    | KeyCode::Media(_)
+                    | KeyCode::Null
+            )
+        {
+            return;
+        }
+        let mut actions = vec![];
+        {
+            let mut st = self.state.lock().unwrap();
+            self.flush_paste_burst_if_due(&mut st, now, is_windows, &mut actions);
+            if st.closed {
+                drop(st);
+                self.run_actions(actions);
+                return;
+            }
+            if st.picker.is_some() || st.in_transcript_overlay {
+                let flushed = st.paste_burst.flush_before_modified_input();
+                self.apply_flush_result(&mut st, flushed, is_windows, &mut actions);
+                if let Some((text, key)) = key_from_event(&ev) {
+                    self.keypress(&mut st, text.as_deref(), &key, &mut actions);
+                }
+            } else {
+                let ctrl = ev.modifiers.contains(KeyModifiers::CONTROL);
+                let alt = ev.modifiers.contains(KeyModifiers::ALT);
+                let shift = ev.modifiers.contains(KeyModifiers::SHIFT);
+                let super_meta = ev.modifiers.intersects(KeyModifiers::SUPER | KeyModifiers::HYPER | KeyModifiers::META);
+                let is_altgr = is_windows && ctrl && alt;
+                let has_non_text_modifier = ((ctrl || alt) && !is_altgr) || super_meta;
+
+                if ev.code == KeyCode::Enter && !has_non_text_modifier && !shift {
+                    if st.paste_burst.append_control_char_if_active('\r', now) {
+                        self.ensure_paste_tick(&mut st, is_windows);
+                    } else if st.paste_burst.newline_should_insert_instead_of_submit(now) {
+                        st.paste_burst.extend_window(now);
+                        self.handle_paste(&mut st, "\n", true);
+                    } else {
+                        self.keypress(&mut st, Some("\r"), &Key::named("return"), &mut actions);
+                    }
+                } else if (ev.code == KeyCode::Enter && (shift || alt) && !ctrl && !super_meta) || matches!(ev.code, KeyCode::Char(c) if ctrl && !alt && !super_meta && c.eq_ignore_ascii_case(&'j')) {
+                    if st.paste_burst.append_control_char_if_active('\n', now) {
+                        self.ensure_paste_tick(&mut st, is_windows);
+                    } else if st.paste_burst.newline_should_insert_instead_of_submit(now) {
+                        st.paste_burst.extend_window(now);
+                        self.handle_paste(&mut st, "\n", true);
+                    } else {
+                        let flushed = st.paste_burst.flush_before_modified_input();
+                        self.apply_flush_result(&mut st, flushed, is_windows, &mut actions);
+                    }
+                } else if matches!(ev.code, KeyCode::Char(c) if ctrl && !alt && !super_meta && c.eq_ignore_ascii_case(&'m')) {
+                    if st.paste_burst.append_control_char_if_active('\r', now) {
+                        self.ensure_paste_tick(&mut st, is_windows);
+                    } else if st.paste_burst.newline_should_insert_instead_of_submit(now) {
+                        st.paste_burst.extend_window(now);
+                        self.handle_paste(&mut st, "\n", true);
+                    } else {
+                        self.keypress(&mut st, Some("\r"), &Key::named("return"), &mut actions);
+                    }
+                } else if (ev.code == KeyCode::Tab && !has_non_text_modifier && !shift) || matches!(ev.code, KeyCode::Char(c) if ctrl && !alt && !super_meta && c.eq_ignore_ascii_case(&'i')) {
+                    if st.paste_burst.append_control_char_if_active('\t', now) {
+                        self.ensure_paste_tick(&mut st, is_windows);
+                    } else {
+                        let flushed = st.paste_burst.flush_before_modified_input();
+                        self.apply_flush_result(&mut st, flushed, is_windows, &mut actions);
+                        self.keypress(&mut st, Some("\t"), &Key::named("tab"), &mut actions);
+                    }
+                } else if matches!(ev.code, KeyCode::Char(ch) if !has_non_text_modifier && !ch.is_control()) {
+                    let KeyCode::Char(ch) = ev.code else { unreachable!() };
+                    match st.paste_burst.on_plain_char(ch, now) {
+                        paste_burst::CharDecision::RetainFirstChar => {
+                            self.ensure_paste_tick(&mut st, is_windows);
+                        }
+                        paste_burst::CharDecision::BeginBufferFromPending | paste_burst::CharDecision::BufferAppend => {
+                            st.paste_burst.append_char_to_buffer(ch, now);
+                            self.ensure_paste_tick(&mut st, is_windows);
+                        }
+                    }
+                } else {
+                    let flushed = st.paste_burst.flush_before_modified_input();
+                    self.apply_flush_result(&mut st, flushed, is_windows, &mut actions);
+                    if let Some((text, key)) = key_from_event(&ev) {
+                        self.keypress(&mut st, text.as_deref(), &key, &mut actions);
+                    }
+                }
+            }
+        }
+        self.run_actions(actions);
+    }
+
     pub fn close(&self) {
         {
             let mut st = self.state.lock().unwrap();
@@ -2455,6 +2714,8 @@ impl Tui {
             st.closed = true;
             st.spin_gen += 1;
             st.spinning = false;
+            st.paste_burst.clear_after_explicit_paste();
+            st.paste_tick_running = false;
             if let Some(pending) = st.pending.take() {
                 let _ = pending.tx.send(Err(QErr::Closed));
             }
@@ -2465,6 +2726,8 @@ impl Tui {
             }
         }
         if self.real_terminal {
+            #[cfg(windows)]
+            let _ = windows_console::restore_input_mode();
             let _ = crossterm::terminal::disable_raw_mode();
         }
         self.write_raw("\x1b[?2004l\x1b[?1007l\x1b[?1006l\x1b[?1000l\x1b[?25h\x1b[?1049l");
@@ -2478,6 +2741,8 @@ impl Tui {
 impl Drop for Tui {
     fn drop(&mut self) {
         if self.real_terminal && !self.state.lock().map(|s| s.closed).unwrap_or(true) {
+            #[cfg(windows)]
+            let _ = windows_console::restore_input_mode();
             let _ = crossterm::terminal::disable_raw_mode();
             self.write_raw("\x1b[?2004l\x1b[?1007l\x1b[?1006l\x1b[?1000l\x1b[?25h\x1b[?1049l");
         }
@@ -2495,7 +2760,7 @@ fn key_from_event(ev: &crossterm::event::KeyEvent) -> Option<(Option<String>, Ke
     let shift = ev.modifiers.contains(KeyModifiers::SHIFT);
     let named = |n: &str| Key { name: n.into(), ctrl, meta, shift, sequence: String::new() };
     Some(match ev.code {
-        KeyCode::Char(c) if ctrl && !meta && (c == 'j' || c == 'J') => (None, Key { name: "enter".into(), ..Default::default() }),
+        KeyCode::Char(c) if ctrl && !meta && (c == 'j' || c == 'J') => return None,
         KeyCode::Char(c) if ctrl && meta && !c.is_control() => {
             let name = if c.is_ascii_alphabetic() { c.to_ascii_lowercase().to_string() } else { String::new() };
             (Some(c.to_string()), Key { name, ctrl: false, meta: false, shift: c.is_ascii_uppercase(), sequence: c.to_string() })
@@ -2579,6 +2844,7 @@ enum CsiStep {
     Buffering,
     PasteStart,
     PasteEnd,
+    ShiftEnter,
     Mismatch(Vec<crossterm::event::KeyEvent>),
 }
 
@@ -2592,7 +2858,7 @@ impl CsiBuffer {
         std::mem::take(&mut self.raw)
     }
 
-    fn step(&mut self, key: crossterm::event::KeyEvent) -> CsiStep {
+    fn step(&mut self, key: crossterm::event::KeyEvent, in_bracketed: bool) -> CsiStep {
         if self.prefix.is_empty() {
             if let Some(lead) = csi_lead(&key) {
                 self.prefix.push_str(lead);
@@ -2603,7 +2869,7 @@ impl CsiBuffer {
         }
         let matched = match self.prefix.as_str() {
             "\x1b" if csi_char(&key) == Some('[') => Some('['),
-            "\x1b[" if csi_char(&key) == Some('2') => Some('2'),
+            "\x1b[" => csi_char(&key).filter(|c| *c == '2' || (!in_bracketed && *c == '1')),
             "\x1b[2" if csi_char(&key) == Some('0') => Some('0'),
             "\x1b[20" => csi_char(&key).filter(|c| matches!(c, '0' | '1')),
             "\x1b[200" | "\x1b[201" if csi_char(&key) == Some('~') => {
@@ -2611,6 +2877,14 @@ impl CsiBuffer {
                 self.prefix.clear();
                 self.raw.clear();
                 return if is_start { CsiStep::PasteStart } else { CsiStep::PasteEnd };
+            }
+            "\x1b[1" if !in_bracketed && csi_char(&key) == Some('3') => Some('3'),
+            "\x1b[13" if !in_bracketed && csi_char(&key) == Some(';') => Some(';'),
+            "\x1b[13;" if !in_bracketed && csi_char(&key) == Some('2') => Some('2'),
+            "\x1b[13;2" if !in_bracketed && csi_char(&key) == Some('u') => {
+                self.prefix.clear();
+                self.raw.clear();
+                return CsiStep::ShiftEnter;
             }
             _ => None,
         };
@@ -2628,7 +2902,6 @@ pub(crate) struct BatchProbe {
     pub in_bracketed: bool,
     pub has_pending_csi: bool,
     pub ended_on_paste_end: bool,
-    pub press_count: usize,
 }
 
 #[derive(Default)]
@@ -2654,32 +2927,30 @@ impl InputDecoder {
         let mut pending_csi = self.pending_csi.clone();
         let mut end_csi = self.end_csi.clone();
         let mut ended_on_paste_end = false;
-        let mut press_count = 0usize;
         for ev in events {
             match ev {
                 Event::Key(k) if k.kind == KeyEventKind::Release => continue,
                 Event::Key(k) => {
-                    press_count += 1;
                     ended_on_paste_end = false;
                     if in_bracketed {
-                        match end_csi.step(*k) {
+                        match end_csi.step(*k, true) {
                             CsiStep::PasteEnd => {
                                 in_bracketed = false;
                                 ended_on_paste_end = true;
                             }
                             CsiStep::Mismatch(_) => {
-                                let _ = end_csi.step(*k);
+                                let _ = end_csi.step(*k, true);
                             }
                             _ => {}
                         }
                     } else {
-                        match pending_csi.step(*k) {
+                        match pending_csi.step(*k, false) {
                             CsiStep::PasteStart => {
                                 in_bracketed = true;
                                 end_csi.take();
                             }
                             CsiStep::Mismatch(_) => {
-                                let _ = pending_csi.step(*k);
+                                let _ = pending_csi.step(*k, false);
                             }
                             _ => {}
                         }
@@ -2694,40 +2965,25 @@ impl InputDecoder {
                 _ => {}
             }
         }
-        BatchProbe { in_bracketed, has_pending_csi: if in_bracketed { !end_csi.is_empty() } else { !pending_csi.is_empty() }, ended_on_paste_end, press_count }
-    }
-
-    fn flush_normal_run(tui: &Tui, normal_run: &mut Vec<crossterm::event::KeyEvent>) {
-        if normal_run.is_empty() {
-            return;
-        }
-        let keys = std::mem::take(normal_run);
-        if keys.iter().all(|k| paste_char_from_key(k, false).is_some()) {
-            let raw: String = keys.iter().filter_map(|k| paste_char_from_key(k, false)).collect();
-            if tui.raw_chunk(&raw) {
-                return;
-            }
-        }
-        for k in keys {
-            if let Some((text, key)) = key_from_event(&k) {
-                tui.key(text.as_deref(), key);
-            }
-        }
+        BatchProbe { in_bracketed, has_pending_csi: if in_bracketed { !end_csi.is_empty() } else { !pending_csi.is_empty() }, ended_on_paste_end }
     }
 
     pub(crate) fn feed_batch(&mut self, tui: &Tui, batch: Vec<crossterm::event::Event>) {
-        use crossterm::event::{Event, KeyEventKind};
-        let mut normal_run = vec![];
+        self.feed_batch_at(tui, batch, std::time::Instant::now(), cfg!(windows));
+    }
+
+    pub(crate) fn feed_batch_at(&mut self, tui: &Tui, batch: Vec<crossterm::event::Event>, now: std::time::Instant, is_windows: bool) {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
         for ev in batch {
             match ev {
                 Event::Key(k) if k.kind == KeyEventKind::Release => {}
-                Event::Key(k) if self.in_bracketed_paste => match self.end_csi.step(k) {
+                Event::Key(k) if self.in_bracketed_paste => match self.end_csi.step(k, true) {
                     CsiStep::None => {
                         if let Some(ch) = paste_char_from_key(&k, true) {
                             self.bracketed_buf.push(ch);
                         }
                     }
-                    CsiStep::Buffering | CsiStep::PasteStart => {}
+                    CsiStep::Buffering | CsiStep::PasteStart | CsiStep::ShiftEnter => {}
                     CsiStep::PasteEnd => {
                         self.in_bracketed_paste = false;
                         let text = std::mem::take(&mut self.bracketed_buf);
@@ -2739,26 +2995,30 @@ impl InputDecoder {
                                 self.bracketed_buf.push(ch);
                             }
                         }
-                        if let CsiStep::None = self.end_csi.step(k) {
+                        if let CsiStep::None = self.end_csi.step(k, true) {
                             if let Some(ch) = paste_char_from_key(&k, true) {
                                 self.bracketed_buf.push(ch);
                             }
                         }
                     }
                 },
-                Event::Key(k) => match self.pending_csi.step(k) {
-                    CsiStep::None => normal_run.push(k),
+                Event::Key(k) => match self.pending_csi.step(k, false) {
+                    CsiStep::None => tui.handle_crossterm_key(k, now, is_windows),
                     CsiStep::Buffering | CsiStep::PasteEnd => {}
+                    CsiStep::ShiftEnter => tui.handle_crossterm_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT), now, is_windows),
                     CsiStep::PasteStart => {
-                        Self::flush_normal_run(tui, &mut normal_run);
                         self.in_bracketed_paste = true;
                         self.bracketed_buf.clear();
                         self.end_csi.take();
                     }
                     CsiStep::Mismatch(flushed) => {
-                        normal_run.extend(flushed);
-                        if let CsiStep::None = self.pending_csi.step(k) {
-                            normal_run.push(k);
+                        for fk in flushed {
+                            tui.handle_crossterm_key(fk, now, is_windows);
+                        }
+                        match self.pending_csi.step(k, false) {
+                            CsiStep::None => tui.handle_crossterm_key(k, now, is_windows),
+                            CsiStep::ShiftEnter => tui.handle_crossterm_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT), now, is_windows),
+                            _ => {}
                         }
                     }
                 },
@@ -2771,8 +3031,9 @@ impl InputDecoder {
                         }
                         self.bracketed_buf.push_str(&text);
                     } else {
-                        normal_run.extend(self.pending_csi.take());
-                        Self::flush_normal_run(tui, &mut normal_run);
+                        for fk in self.pending_csi.take() {
+                            tui.handle_crossterm_key(fk, now, is_windows);
+                        }
                         tui.paste(&text);
                     }
                 }
@@ -2780,10 +3041,13 @@ impl InputDecoder {
                 _ => {}
             }
         }
-        Self::flush_normal_run(tui, &mut normal_run);
     }
 
     pub(crate) fn flush_timeout(&mut self, tui: &Tui) {
+        self.flush_timeout_at(tui, std::time::Instant::now(), cfg!(windows));
+    }
+
+    pub(crate) fn flush_timeout_at(&mut self, tui: &Tui, now: std::time::Instant, is_windows: bool) {
         if self.in_bracketed_paste {
             for fk in self.end_csi.take() {
                 if let Some(ch) = paste_char_from_key(&fk, true) {
@@ -2794,8 +3058,9 @@ impl InputDecoder {
             let text = std::mem::take(&mut self.bracketed_buf);
             tui.paste(&text);
         } else if !self.pending_csi.is_empty() {
-            let mut flushed = self.pending_csi.take();
-            Self::flush_normal_run(tui, &mut flushed);
+            for fk in self.pending_csi.take() {
+                tui.handle_crossterm_key(fk, now, is_windows);
+            }
         }
     }
 }
@@ -2828,6 +3093,8 @@ fn input_thread(tui: Weak<Tui>) {
             return;
         }
         drop(t);
+        #[cfg(windows)]
+        let _ = windows_console::ensure_input_record_mode();
         let wait = if decoder.has_pending_csi() {
             Duration::from_millis(CSI_ESCAPE_TIMEOUT_MS)
         } else if decoder.in_bracketed_paste() {
@@ -2859,8 +3126,7 @@ fn input_thread(tui: Weak<Tui>) {
             }
             return;
         }
-        let burst_start = Instant::now();
-        let mut last_event_at = burst_start;
+        let mut last_event_at = Instant::now();
         let mut csi_timed_out = false;
         while batch.len() < 100_000 {
             let probe = decoder.probe_batch(&batch);
@@ -2901,20 +3167,6 @@ fn input_thread(tui: Weak<Tui>) {
                         }
                     }
                     Err(_) => break,
-                }
-            } else if probe.press_count >= 2 {
-                if burst_start.elapsed() >= Duration::from_millis(BURST_MAX_DURATION_MS) {
-                    break;
-                }
-                let remain = Duration::from_millis(BURST_MAX_DURATION_MS).saturating_sub(burst_start.elapsed());
-                match poll(Duration::from_millis(BURST_DRAIN_WINDOW_MS).min(remain)) {
-                    Ok(true) => {
-                        if !drain_ready_events(&mut batch) {
-                            break;
-                        }
-                        last_event_at = Instant::now();
-                    }
-                    _ => break,
                 }
             } else {
                 break;
