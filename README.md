@@ -143,20 +143,91 @@ ask   glm-5.3-flash   effort max        shop-api (main)   ctx 34%   69k tokens
 | `Ctrl+T` | Bật/tắt **Transcript Mode** toàn màn hình — hiển thị đầy đủ cả khối suy luận (`Thinking`), cuộn xem toàn bộ lịch sử; nhấn `Ctrl+T`, `Esc` hoặc `q` để quay lại ngay |
 | `Shift+Tab` | Chuyển nhanh chế độ quyền: `ask` → `auto` (auto-approve) → `plan` → `readonly` |
 | `Alt+.` / `Alt+,` | Tăng / giảm mức suy luận (`effort`: `low` ↔ `medium` ↔ `high` ↔ `xhigh` ↔ `max`) |
-| `Esc Esc` (nhấn đúp) | Mở bảng **Rewind / Revert** về checkpoint của các lượt trước và khôi phục file |
-| `Up` / `Down` / `Tab` | Di chuyển chọn lệnh trong popup `/slash` (hoặc gọi lại lịch sử lệnh khi không mở popup) |
-| `PgUp` / `PgDn` / Lăn chuột | Cuộn khung hội thoại hoặc khung Transcript |
-| `Ctrl+C` | Huỷ lượt model/tool đang chạy |
-| `Ctrl+D` | Thoát khi ô nhập trống |
+| `Esc Esc` (ô nhập trống, lúc rảnh) | Quay lại lượt trước, khôi phục file và prompt; dùng `/checkpoints` để chọn checkpoint cụ thể |
+| `Up` / `Down` | Chọn mục trong popup; di chuyển giữa các dòng nhập. Gọi lịch sử khi ô trống hoặc đang ở đầu/cuối một mục vừa gọi lại chưa sửa; Down qua mục mới nhất xoá ô nhập |
+| `Alt+Up` | Lấy prompt mới nhất khỏi hàng đợi để sửa, thay nội dung ô nhập hiện tại |
+| `Tab` | Hoàn thành gợi ý; nếu không có popup thì gửi lúc rảnh, xếp hàng lúc đang chạy |
+| `Enter` | Gửi prompt; lúc đang chạy thì bổ sung chỉ dẫn vào lượt hiện tại ở điểm an toàn tiếp theo |
+| `Shift+Enter` / `Alt+Enter` / `Ctrl+J/M` | Xuống dòng trong prompt, không gửi |
+| `Ctrl+R` / `Ctrl+S` | Tìm lịch sử về trước / sau, kể cả phiên trước; Enter nhận kết quả vào ô nhập, Esc huỷ và khôi phục bản nháp |
+| `Ctrl+A/E`, `Ctrl+K/U/Y` | Đầu/cuối dòng, cắt đến cuối/đầu dòng, dán lại phần vừa cắt |
+| `PgUp` / `PgDn` / Lăn chuột | Cuộn khung hội thoại/Transcript; wheel được bắt riêng trong Transcript. Với `--no-alt-screen`, scrollback thường thuộc terminal |
+| `Esc` khi đang cuộn lên | Về output mới nhất trước, **không hủy lượt agent**. Esc ở cuối hội thoại mới dừng lượt đang chạy |
+| `Ctrl+End` (fullscreen) / `End` (Transcript) | Về output mới nhất, giữ nguyên bản nháp và không hủy lượt |
+| `Ctrl+T` / `Esc` trong Transcript | Đóng Transcript và về cuối hội thoại, không hủy lượt; nếu có vùng chọn thì Esc đầu tiên chỉ bỏ vùng chọn |
+| `Ctrl+C` | Xoá bản nháp nếu có; khi ô nhập trống thì dừng lượt model/tool và tất cả subagent đang chạy (kể cả lúc parent đã Ready). Nhấn lại cùng phím trong 1 giây để thoát |
+| `Ctrl+D` | Khi ô nhập trống, nhấn hai lần trong 1 giây để thoát |
+| `Ctrl+G` | Mở bản nháp bằng `VISUAL` (hoặc `EDITOR`), lưu/đóng để trở lại ô nhập; không tự gửi |
+| `Ctrl+Z` (Unix) | Tạm dừng job, trả terminal về shell; dùng `fg` để trở lại, giữ bản nháp và lượt chạy |
+| `?` (ô nhập trống) | Mở hướng dẫn phím tắt; `Esc` hoặc `?` đóng, không gửi prompt |
+
+`Ctrl+G` được kiểm tra bằng editor thật qua Windows ConPTY và Linux PTY. Trên Unix,
+editor nhận foreground process group riêng để đọc terminal ngay; khi đóng thì Goon
+nhận lại terminal. Nếu tiến trình Goon bị yêu cầu dừng trong lúc sửa, nhóm editor và
+tiến trình con được dừng trước khi khôi phục chế độ terminal. Chưa kiểm chứng trên macOS.
+
+Trên Unix, `Ctrl+Z` khôi phục chế độ terminal trước khi gửi SIGTSTP cho foreground
+process group của Goon. Sau `bg`, Goon không vẽ lại hoặc bật raw mode cho đến khi
+`fg` trả lại terminal; bản nháp vẫn giữ nguyên. Đã kiểm tra bằng Linux PTY cho cả
+fullscreen/inline và dừng tiến trình khi đang suspend. Không áp dụng cho Windows.
+
+Gõ `@` để tìm file hoặc `$` để tìm skill: dùng `↑`/`↓` chọn, `Tab`/`Enter` nhận,
+`Esc` đóng trước khi dừng agent. Đường dẫn có khoảng trắng được đặt trong dấu ngoặc kép;
+hoàn thành giữa dòng vẫn giữ nguyên phần prompt phía sau.
+
+Trong fullscreen và Transcript, kéo chuột trái để chọn văn bản, `Ctrl+O` hoặc `Ctrl+C`
+sao chép vùng chọn; nhấn vào ô nhập sẽ bỏ vùng chọn. `Esc` đầu tiên xoá vùng chọn trước
+khi đóng Transcript. Khi đang cuộn lên, `Ctrl+End` (fullscreen), `End` (Transcript) hoặc
+nhấn rồi thả bên trong nút **Follow output** để trở lại cuối, không hủy lượt agent.
+Cuộn chuột chỉ áp dụng trong vùng hội thoại (hoặc khi đang kéo vùng chọn), mặc định 1 dòng/tick.
+Đặt `"mouseScrollSpeed": 0.5` trong config hoặc `GOON_MOUSE_SCROLL_SPEED=0.5` để cuộn chậm;
+hỗ trợ mọi số dương hữu hạn, tích lũy phần lẻ và bỏ phần dư khi đổi chiều/quay về cuối.
+Với `--no-alt-screen`, ngoài Transcript, terminal giữ thao tác chọn văn bản gốc.
+Đo chiều rộng, xuống dòng và cắt hiển thị giữ nguyên cụm Unicode/emoji (kể cả ZWJ và màu da).
+Vùng chọn giữ bản hiển thị bất biến theo nội dung và tồn tại qua resize, kể cả khi output
+mới tiếp tục chạy hoặc lịch sử chính bị cắt bớt. Sao chép không thêm newline ở dòng wrap
+và bỏ gutter trang trí của code/list/quote; `Esc` bỏ vùng chọn để trở lại output mới nhất.
+Sao chép ngữ nghĩa từng ô bảng và rich Markdown vẫn chưa đạt đầy đủ parity với Codex.
+
+Lịch sử prompt văn bản được lưu chung trong `history.jsonl` ở thư mục dữ liệu Goon,
+tải tối đa 1.000 mục gần nhất và chờ ghi hết khi thoát. Nội dung bí mật được che trước
+khi lưu; prompt hỏi API key không vào lịch sử, ảnh/placeholder đính kèm không được khôi phục
+từ phiên cũ. Đây không phải cơ chế khôi phục bản nháp chưa gửi.
+
+Bản nháp, vị trí con trỏ và hàng đợi được giữ **trong bộ nhớ theo session** khi chuyển
+`/new`/`/resume` trong cùng tiến trình, không ghi ra history. Dừng lượt sẽ đưa các prompt
+đang xếp hàng trở lại ô nhập theo thứ tự, không tự chạy tiếp; ảnh và paste vẫn giữ payload.
+Thoát tiến trình không lưu bản nháp chưa gửi.
+
+`goon --no-alt-screen` dùng viewport inline và scrollback gốc thay vì chiếm alternate screen.
+Đã kiểm tra luồng status/resize/duyệt/thoát bằng Windows ConPTY và Linux PTY cho cả hai chế độ,
+kể cả thu/phóng cửa sổ nhiều lần khi đang nhập. Lịch sử đã commit được theo dõi theo
+nguồn, không in lại khi đổi độ rộng. Khi không xác định chắc vị trí sau reflow (Unicode
+hoặc truy vấn con trỏ thất bại), giao diện mở viewport mới bằng newline thay vì xóa
+output của shell; khung đang hiển thị cũ có thể còn trong scrollback. Chưa đạt parity
+resize/reflow trên mọi terminal.
+Mặc định vẫn là giao diện fullscreen.
+
+Hộp duyệt quyền rủi ro thấp/vừa hỗ trợ `↑`/`↓`/`Tab`, `Enter`, phím chữ hoặc số của lựa chọn;
+`Esc` từ chối và trả lại bản nháp. Dán văn bản không tự duyệt quyền. Thao tác rủi ro cao
+vẫn yêu cầu gõ tên tool để xác nhận.
+
+Câu hỏi lựa chọn của agent dùng `↑`/`↓`/`Enter`; chọn **Other** để trả lời khác, `Tab` mở
+ghi chú cho lựa chọn. Với nhiều câu hỏi, `←`/`→` khi chọn phương án hoặc `PgUp`/`PgDn`
+chuyển câu và giữ nguyên bản nháp/ghi chú từng câu. Enter xác nhận lần lượt rồi gửi cùng lúc;
+`Esc` huỷ toàn bộ form (không tự chọn phương án đầu tiên).
 
 ### Thực thi lệnh ngay khi Agent đang chạy (`Running`)
 
 Khi model đang suy nghĩ hoặc chạy tool:
-- Gõ các lệnh điều khiển như `/auto`, `/yolo`, `/view`, `/mode`, `/effort`, `/model`,
-  `/status`, `/cost`, `/help`, `/tools`, `/diff`, `/git`, `/todo`, `/plan`, `/copy`, `!<lệnh shell>`
+- Gõ các lệnh điều khiển như `/auto`, `/yolo`, `/view`, `/mode`,
+  `/status`, `/cost`, `/help`, `/tools`, `/diff`, `/todo`, `/copy`, `!<lệnh shell>`
   sẽ **chạy và áp dụng ngay lập tức** mà không cần chờ xong lượt.
-- Gõ tin nhắn prompt bình thường khi máy đang bận sẽ được đưa vào hàng đợi (`queuedPrompts`)
-  để tự động chạy ngay khi lượt hiện tại kết thúc.
+- **Enter** bổ sung prompt vào lượt đang chạy; **Tab** giữ prompt trong hàng đợi để chạy sau.
+  Nếu lượt kết thúc đúng lúc gửi Enter, prompt được giữ trong hàng đợi, không bị mất.
+- `/model`, `/effort` và `/plan` được xếp hàng để áp dụng khi lượt hiện tại kết thúc.
+- **Esc** đóng popup hoặc từ chối hộp phê duyệt trước; nếu không có hộp thoại thì dừng lượt
+  và mọi subagent còn chạy, kể cả agent được tạo từ lượt trước. Session con vẫn có thể tiếp tục.
 
 ### Danh sách Slash Commands tiêu biểu
 
@@ -164,11 +235,11 @@ Khi model đang suy nghĩ hoặc chạy tool:
 - `/mode [ask|auto|plan|readonly]`: Xem hoặc đổi chế độ quyền thực thi.
 - `/view [normal|verbose]`: Đổi chế độ hiển thị suy nghĩ (`normal` ẩn khối `Thinking` cho gọn; `verbose` hiện đầy đủ toàn bộ quá trình suy luận).
 - `/transcript`: Bật/tắt chế độ xem Transcript toàn màn hình (giống `Ctrl+T`).
-- `/model [tên_model]` & `/models`: Đổi model hoặc quét trực tiếp danh sách model từ API.
+- `/model [tên_model]`: Đổi model hoặc quét trực tiếp danh sách model từ API.
 - `/effort [low|medium|high|xhigh|max|clear]`: Chỉnh mức độ suy luận (`reasoning_effort` / thinking budget).
 - `/resume [latest|số_thứ_tự|id_prefix]`: Mở bảng chọn phiên với 2 tab **This folder** / **All projects** (`←`/`→` hoặc `Tab` để đổi tab, `↑`/`↓` chọn, gõ để lọc theo nội dung, tên thư mục hoặc model, `Enter` để resume). Chọn phiên của dự án khác sẽ tự chuyển workspace sang thư mục đó, nên không cần nhớ phiên nằm ở thư mục nào. `goon resume` (hoặc `goon --resume ID`) cũng chạy được từ bất kỳ thư mục nào.
 - `/new`, `/clear`, `/fork [tên]`, `/rename <tiêu_đề>`: Tạo phiên mới, xoá màn hình, nhân bản nhánh hội thoại hoặc đặt tên phiên.
-- `/rewind [N]` & `/revert [N] [both|code|messages]`: Quay lui hội thoại và/hoặc khôi phục trạng thái file về trước lượt thứ `N`.
+- `/revert [N] [both|code|messages]`: Quay lui hội thoại và/hoặc khôi phục trạng thái file; `/checkpoints` mở bảng chọn.
 - `/undo`: Hoàn tác các thay đổi file của lượt vừa chạy.
 - `/btw <câu_hỏi>`: Hỏi nhanh câu hỏi phụ (ephemeral side question) dựa trên ngữ cảnh hiện tại mà không làm bẩn lịch sử phiên.
 - `/goal [set|done|clear]`, `/memories [list|add|rm|clear]`, `/recap`: Đặt mục tiêu phiên, lưu ghi nhớ dài hạn (`memories.json`) hoặc tóm tắt tiến độ.
@@ -178,7 +249,7 @@ Khi model đang suy nghĩ hoặc chạy tool:
 - `/workflow [list|show|create|rm|run <tên> [tham_số]]`: Quản lý và thực thi các pipeline đa bước tuỳ chỉnh (`.json` hoặc `.md` trong `.goon/workflows/`) hoặc workflow tích hợp sẵn (`feature-dev`, `bug-hunt`, `tdd-cycle`, `security-audit`).
 - `/network [<chủ_đề>|board|send|clear]` (hoặc `/brainstorm`, `/council`): Triệu tập **Agent Network** (nhiều vai trò `Architect`, `Researcher`, `Critic`, `Pragmatist`, `Security` thảo luận, phản biện qua lại nhiều vòng để lên ý tưởng và chốt phương án) hoặc kiểm tra **P2P Message Bus** giữa các subagents.
 - `/dag <mục_tiêu>`: Chạy **multi-agent DAG** v0.6 — planner phân rã mục tiêu thành các todo theo vai trò, coder chạy tuần tự có snapshot/rollback, kết thúc bằng merge + verify (xem mục *Multi-agent DAG*).
-- `/diff`, `/git`, `/review`: Xem `git status` + `git diff`, hoặc yêu cầu model review toàn bộ thay đổi hiện tại.
+- `/diff`, `/review`: Xem `git status` + `git diff`, hoặc yêu cầu model review toàn bộ thay đổi hiện tại.
 - `/compact [trọng_tâm]`: Chủ động nén ngữ cảnh hội thoại (có lưu archive đầy đủ trước khi nén).
 - `/setup` (hoặc `/provider`), `/key`, `/doctor`: Cấu hình lại provider (nhấn `Esc` để huỷ), đổi API key (nhập ẩn) hoặc kiểm tra kết nối/môi trường.
 - `/prompts`, `/prompts:<tên> [tham số]`: Liệt kê và chạy prompt tuỳ biến từ file Markdown (xem mục *Prompt tuỳ biến*).

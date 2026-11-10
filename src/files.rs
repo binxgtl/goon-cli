@@ -704,7 +704,7 @@ impl WorkspaceFiles {
             bail!("Expected a regular text file no larger than 2 MiB.");
         }
         let bytes = std::fs::read(file)?;
-        let text = String::from_utf8_lossy(&bytes).to_string();
+        let text = String::from_utf8(bytes).map_err(|_| anyhow!("Expected a UTF-8 text file; refusing lossy decoding that could corrupt file contents."))?;
         if text.contains('\0') {
             bail!("Binary files are not supported.");
         }
@@ -933,6 +933,9 @@ impl WorkspaceFiles {
         // Validate syntax of every resulting file before touching disk.
         for slot in slots.values() {
             if let Some(Some(after)) = &slot.after {
+                if after.len() as u64 > MAX_FILE_BYTES {
+                    bail!("Patch result for {} exceeds 2 MiB.", slot.rel_path);
+                }
                 if let Err(error) = validate_syntax(&slot.rel_path, after) {
                     bail!("Syntax validation failed for {}: {}", slot.rel_path, error);
                 }

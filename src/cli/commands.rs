@@ -1710,9 +1710,10 @@ impl App {
         }
         let cmd = crate::tools::sanitize_bash_command(raw);
         self.display(&format!("\n$ {cmd}\n"));
-        // When idle, Ctrl+C cancels this command instead of quitting goon.
-        let token = CancellationToken::new();
-        let owns = self.controller().is_none();
+        // Busy shell commands belong to the same stop tree as the active model/tools.
+        let parent = self.controller();
+        let token = parent.as_ref().map(CancellationToken::child_token).unwrap_or_default();
+        let owns = parent.is_none();
         if owns {
             self.set_controller(Some(token.clone()));
         }
@@ -2127,21 +2128,45 @@ impl App {
             ));
             let discovered = crate::provider::discover_models(&runtime.base_url, Some(&runtime.api_key), &runtime.provider, None).await;
             if !discovered.is_empty() {
-                let shown: Vec<_> = discovered.iter().take(30).cloned().collect();
-                for (idx, m) in shown.iter().enumerate() {
-                    self.display(&format!("  [{}] {}{}\n", idx + 1, m.id, crate::provider::format_model_badge(m)));
-                }
-                let pick = self.question(&format!("Select [1-{}] or enter model ID (Enter to keep {}): ", shown.len(), runtime.model), None, false).await.unwrap_or_default().trim().to_string();
-                match pick.parse::<usize>().ok().filter(|n| *n >= 1 && *n <= shown.len() && pick.chars().all(|c| c.is_ascii_digit())) {
-                    Some(n) => {
-                        selected = Some(shown[n - 1].clone());
-                        next_model = Some(shown[n - 1].id.clone());
+                if let Some(tui) = self.tui() {
+                    loop {
+                        let items = discovered
+                            .iter()
+                            .map(|model| PickerItem { id: model.id.clone(), label: model.id.clone(), meta: Some(crate::provider::format_model_badge(model)), detail: None, search: None })
+                            .collect();
+                        let picked = tui.pick("Select model", vec![PickerTab { label: "Available".into(), items, empty: None }], 0, "Use model").await;
+                        let Some((_, item)) = picked else { return Ok(()) };
+                        let candidate = discovered.iter().find(|model| model.id == item.id).cloned();
+                        let default_effort = candidate.as_ref().and_then(|model| model.default_effort.clone()).or_else(|| config.effort.clone());
+                        let mut efforts = vec![PickerItem { id: "keep".into(), label: format!("Keep {}", default_effort.as_deref().unwrap_or("provider default")), ..Default::default() }];
+                        efforts.extend(EFFORT_LEVELS.iter().map(|level| PickerItem { id: (*level).into(), label: (*level).into(), ..Default::default() }));
+                        let effort = tui.pick(&format!("Reasoning effort · {}", item.id), vec![PickerTab { label: "Effort".into(), items: efforts, empty: None }], 0, "Apply model + effort").await;
+                        let Some((_, effort)) = effort else { continue };
+                        if effort.id != "keep" {
+                            next_effort = Some(effort.id);
+                            effort_changed = true;
+                        }
+                        selected = candidate;
+                        next_model = Some(item.id);
+                        break;
                     }
-                    None if !pick.is_empty() => {
-                        selected = discovered.iter().find(|m| m.id == pick).cloned();
-                        next_model = Some(pick);
+                } else {
+                    let shown: Vec<_> = discovered.iter().take(30).cloned().collect();
+                    for (idx, m) in shown.iter().enumerate() {
+                        self.display(&format!("  [{}] {}{}\n", idx + 1, m.id, crate::provider::format_model_badge(m)));
                     }
-                    None => {}
+                    let pick = self.question(&format!("Select [1-{}] or enter model ID (Enter to keep {}): ", shown.len(), runtime.model), None, false).await.unwrap_or_default().trim().to_string();
+                    match pick.parse::<usize>().ok().filter(|n| *n >= 1 && *n <= shown.len() && pick.chars().all(|c| c.is_ascii_digit())) {
+                        Some(n) => {
+                            selected = Some(shown[n - 1].clone());
+                            next_model = Some(shown[n - 1].id.clone());
+                        }
+                        None if !pick.is_empty() => {
+                            selected = discovered.iter().find(|m| m.id == pick).cloned();
+                            next_model = Some(pick);
+                        }
+                        None => {}
+                    }
                 }
             } else {
                 let typed = self.question(&format!("Enter model ID (Enter to keep {}): ", runtime.model), None, false).await.unwrap_or_default().trim().to_string();
@@ -2341,6 +2366,9 @@ impl App {
 
     async fn switch_store(&self, new_store: Arc<SessionStore>, reconnect: bool) -> Result<()> {
         let old = std::mem::replace(&mut *self.store.lock().unwrap(), new_store.clone());
+        if let Some(t) = self.tui() {
+            t.switch_input_session(&new_store.id());
+        }
         if let Some(w) = self.event_writer.lock().unwrap().as_mut() {
             w.switch_session(&new_store.id(), None);
         }
@@ -2592,6 +2620,9 @@ impl App {
             let old_id = self.session_id();
             let new_store = Arc::new(SessionStore::open(&root, SessionRoute::from_runtime(&runtime), None, None)?);
             let old = std::mem::replace(&mut *self.store.lock().unwrap(), new_store.clone());
+            if let Some(t) = self.tui() {
+                t.switch_input_session(&new_store.id());
+            }
             if let Some(w) = self.event_writer.lock().unwrap().as_mut() {
                 w.switch_session(&new_store.id(), None);
             }

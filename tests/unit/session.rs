@@ -252,6 +252,7 @@ fn tui_resume_command_does_not_deadlock_renders_single_todo_and_continues_turn()
             }),
             allowed: Mutex::new(Default::default()),
             event_writer: Mutex::new(None),
+            history_writer: Mutex::new(None),
             input_cancel: Mutex::new(CancellationToken::new()),
             rebuild_lock: tokio::sync::Mutex::new(()),
         });

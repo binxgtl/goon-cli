@@ -33,6 +33,7 @@ Options:
       --allow-net-hosts H   Allow only these exact hosts (repeatable or comma-separated)
       --json                Emit NDJSON events instead of terminal output
       --no-tui              Use plain readline instead of the full-screen UI
+      --no-alt-screen       Inline TUI with native terminal scrollback (no alternate screen)
       --no-mcp              Disable configured MCP servers for this run
       --no-subagents        Disable delegation tools for this run
       --inline-reasoning MODE leading-think (default) | off

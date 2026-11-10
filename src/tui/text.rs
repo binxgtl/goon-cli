@@ -1,9 +1,9 @@
 //! Width-aware terminal text helpers and the inline Markdown painter used by the TUI.
 
 use crate::term::{strip_vt, terminal_text};
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::OnceLock;
 use unicode_normalization::UnicodeNormalization;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 pub const RESET: &str = "\x1b[0m";
 pub const DIM: &str = "\x1b[2m";
@@ -37,71 +37,46 @@ impl Theme {
     pub const DEL_FG: &'static str = ERR;
 }
 
-fn slow_width(c: char) -> u8 {
-    let s = c.to_string();
-    if re!(r"\p{M}").is_match(&s) {
-        return 0;
-    }
-    if re!(r"[\p{Extended_Pictographic}\x{1100}-\x{115f}\x{2e80}-\x{a4cf}\x{ac00}-\x{d7a3}\x{f900}-\x{faff}\x{fe10}-\x{fe6f}\x{ff01}-\x{ff60}]").is_match(&s) {
-        return 2;
-    }
-    1
-}
-
-/// Column width per code point (0 for combining marks, 2 for wide/emoji, else 1), cached for the BMP.
+/// Width of a standalone code point. Layout must measure complete graphemes instead.
 pub fn width(c: char) -> usize {
-    let code = c as u32;
-    if code < 0x300 {
-        return 1;
-    }
-    if code > 0xffff {
-        return slow_width(c) as usize;
-    }
-    static CACHE: OnceLock<Vec<AtomicU8>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| (0..0x10000).map(|_| AtomicU8::new(0)).collect());
-    let cached = cache[code as usize].load(Ordering::Relaxed);
-    if cached != 0 {
-        return (cached - 1) as usize;
-    }
-    let w = slow_width(c);
-    cache[code as usize].store(w + 1, Ordering::Relaxed);
-    w as usize
+    UnicodeWidthChar::width(c).unwrap_or(0)
 }
 
 pub fn wrap_terminal(text: &str, columns: usize) -> Vec<String> {
     let max = columns.max(1);
     let mut lines = vec![String::new()];
     let mut used = 0;
-    for c in terminal_text(text).replace('\t', "  ").chars() {
-        if c == '\n' {
+    for grapheme in terminal_text(text).replace('\t', "  ").graphemes(true) {
+        if grapheme == "\n" {
             lines.push(String::new());
             used = 0;
             continue;
         }
-        let size = width(c);
-        if used + size > max {
+        let size = UnicodeWidthStr::width(grapheme);
+        if used + size > max && !lines.last().unwrap().is_empty() {
             lines.push(String::new());
             used = 0;
         }
-        lines.last_mut().unwrap().push(c);
+        lines.last_mut().unwrap().push_str(grapheme);
         used += size;
     }
     lines
 }
 
 pub fn visible_length(text: &str) -> usize {
-    strip_vt(text).chars().map(width).sum()
+    UnicodeWidthStr::width(strip_vt(text).as_ref())
 }
 
 pub fn slice_visible(text: &str, max_cols: usize) -> String {
     let mut out = String::new();
     let mut used = 0;
-    for c in text.nfc() {
-        let w = width(c);
+    let normalized: String = text.nfc().collect();
+    for grapheme in normalized.graphemes(true) {
+        let w = UnicodeWidthStr::width(grapheme);
         if used + w > max_cols {
             break;
         }
-        out.push(c);
+        out.push_str(grapheme);
         used += w;
     }
     out
@@ -113,7 +88,19 @@ pub fn slice_ansi_line(line: &str, cols: usize) -> String {
         return line.to_string();
     }
     let mut out = String::new();
+    // Determine a plain-text grapheme boundary first, even if an SGR sequence
+    // occurs inside that grapheme. Then replay styles up to that byte boundary.
+    let plain = strip_vt(line);
     let mut used = 0;
+    let mut remaining = 0;
+    for grapheme in plain.graphemes(true) {
+        let width = UnicodeWidthStr::width(grapheme);
+        if used + width > cols {
+            break;
+        }
+        used += width;
+        remaining += grapheme.len();
+    }
     let sgr = re!(r"\x1b\[[0-9;]*m");
     let mut last = 0;
     let mut pieces: Vec<(bool, &str)> = vec![];
@@ -128,14 +115,12 @@ pub fn slice_ansi_line(line: &str, cols: usize) -> String {
             out.push_str(part);
             continue;
         }
-        for c in part.chars() {
-            let w = width(c);
-            if used + w > cols {
-                out.push_str(RESET);
-                return out;
-            }
-            out.push(c);
-            used += w;
+        let take = remaining.min(part.len());
+        out.push_str(&part[..take]);
+        remaining -= take;
+        if take < part.len() {
+            out.push_str(RESET);
+            return out;
         }
     }
     out
@@ -165,37 +150,74 @@ pub fn format_inline_markdown_default(raw: &str) -> String {
 /// `words`, breaks at the last space when the carried tail still fits; otherwise hard-wraps.
 pub fn wrap_chunks(text: &str, first: usize, cont: usize, words: bool) -> Vec<String> {
     let clean = terminal_text(text).replace('\t', "  ");
+    wrap_ranges(&clean, first, cont, words).into_iter().map(|range| clean[range].to_string()).collect()
+}
+
+/// Wrapping provenance in the sanitized input, including gaps for elided spaces.
+pub(super) fn wrap_ranges(clean: &str, first: usize, cont: usize, words: bool) -> Vec<std::ops::Range<usize>> {
     let cont_limit = cont.max(1);
     let mut out = vec![];
     let mut avail = first.max(1);
-    let mut cur = String::new();
+    let mut start = 0;
     let mut used = 0;
-    for c in clean.chars() {
-        let w = width(c);
-        if used + w > avail && !cur.is_empty() {
-            if words && c == ' ' {
-                out.push(std::mem::take(&mut cur));
+    for (index, grapheme) in clean.grapheme_indices(true) {
+        let w = UnicodeWidthStr::width(grapheme);
+        if used + w > avail && index > start {
+            if words && grapheme == " " {
+                out.push(start..index);
+                start = index + 1;
                 used = 0;
                 avail = cont_limit;
                 continue;
             }
-            let cut = if words { cur.rfind(' ') } else { None };
-            match cut.filter(|i| *i > 0) {
-                Some(i) if visible_length(&cur[i + 1..]) + w <= cont_limit => {
-                    let tail = cur[i + 1..].to_string();
-                    cur.truncate(i);
-                    out.push(std::mem::replace(&mut cur, tail));
+            let cut = if words { clean[start..index].rfind(' ').map(|i| start + i) } else { None };
+            match cut.filter(|i| *i > start) {
+                Some(i) if visible_length(&clean[i + 1..index]) + w <= cont_limit => {
+                    out.push(start..i);
+                    start = i + 1;
                 }
-                _ => out.push(std::mem::take(&mut cur)),
+                _ => {
+                    out.push(start..index);
+                    start = index;
+                }
             }
-            used = visible_length(&cur);
+            used = visible_length(&clean[start..index]);
             avail = cont_limit;
         }
-        cur.push(c);
         used += w;
     }
-    out.push(cur);
+    out.push(start..clean.len());
     out
+}
+
+/// Slice styled text by bytes in its plain projection, replaying prior SGR state.
+pub(super) fn styled_range(text: &str, range: std::ops::Range<usize>) -> String {
+    let mut output = String::new();
+    let mut offset = 0;
+    let mut last = 0;
+    for sgr in re!(r"\x1b\[[0-9;]*m").find_iter(text) {
+        let part = &text[last..sgr.start()];
+        let start = range.start.saturating_sub(offset).min(part.len());
+        let end = range.end.saturating_sub(offset).min(part.len());
+        if start < end {
+            output.push_str(&part[start..end]);
+        }
+        offset += part.len();
+        if offset >= range.end {
+            output.push_str(RESET);
+            return output;
+        }
+        output.push_str(sgr.as_str());
+        last = sgr.end();
+    }
+    let part = &text[last..];
+    let start = range.start.saturating_sub(offset).min(part.len());
+    let end = range.end.saturating_sub(offset).min(part.len());
+    if start < end {
+        output.push_str(&part[start..end]);
+    }
+    output.push_str(RESET);
+    output
 }
 
 pub fn format_token_count(n: f64) -> String {
@@ -350,6 +372,24 @@ pub fn basename(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn emoji_and_combining_graphemes_are_measured_wrapped_and_clipped_atomically() {
+        for grapheme in ["👩‍💻", "👨‍👩‍👧‍👦", "👍🏽", "🇺🇸", "1️⃣", "❤️"] {
+            assert_eq!(visible_length(grapheme), 2, "{grapheme}");
+            assert_eq!(wrap_terminal(&format!("a{grapheme}b"), 3), vec![format!("a{grapheme}"), "b".into()]);
+            assert_eq!(wrap_chunks(&format!("a{grapheme}b"), 3, 3, false), vec![format!("a{grapheme}"), "b".into()]);
+            assert_eq!(slice_visible(&format!("a{grapheme}b"), 2), "a");
+            assert_eq!(slice_visible(&format!("a{grapheme}b"), 3), format!("a{grapheme}"));
+            let styled = format!("\x1b[1ma{grapheme}b\x1b[0m");
+            assert_eq!(strip_vt(&slice_ansi_line(&styled, 2)), "a");
+            assert_eq!(strip_vt(&slice_ansi_line(&styled, 3)), format!("a{grapheme}"));
+        }
+        assert_eq!(visible_length("e\u{301}"), 1);
+        assert_eq!(wrap_terminal("ae\u{301}b", 2), vec!["aé", "b"]);
+        assert_eq!(wrap_terminal("界", 1), vec!["界"], "oversized grapheme must not create an empty leading row");
+        assert_eq!(strip_vt(&slice_ansi_line("👩\x1b[1m‍💻x", 2)), "👩‍💻", "styles inside an emoji cannot split it");
+    }
 
     #[test]
     fn widths_and_wrapping() {

@@ -27,3 +27,27 @@ A deeper stream/subagent review for 0.2.1 rechecked ZCode at the same commit
 and DeepSeek Harness at `1517a4dbca0a2789ff1d41ba439600f8547d23fa`.
 See [docs/REFERENCE_REVIEW.md](docs/REFERENCE_REVIEW.md) for exact source links,
 contracts adopted, independent compatibility choices and remaining scope.
+
+## OpenAI Codex adaptations
+
+This distribution includes modified code and behavior adapted from
+[OpenAI Codex](https://github.com/openai/codex), inspected at commit
+`7b44ac1661433ae3a6f375fde873fa7123c935fe` (Apache License 2.0).
+OpenAI Codex — Copyright 2025 OpenAI.
+
+Adaptations include paste-burst detection, terminal input and job-control lifecycle,
+stream idle-timeout behavior, and transcript/composer interaction patterns. These
+have been modified for Goon's renderer, provider transport, session model and
+cross-platform process management; this is not an unmodified Codex distribution.
+See [docs/CODEX-UX-PARITY.md](docs/CODEX-UX-PARITY.md) for source references and
+implementation differences. No affiliation with or endorsement by OpenAI is implied.
+
+The upstream Codex notice also states:
+
+> This project includes code derived from [Ratatui](https://github.com/ratatui/ratatui),
+> licensed under the MIT license.
+> Copyright (c) 2016-2022 Florian Dehau
+> Copyright (c) 2023-2025 The Ratatui Developers
+
+The complete Apache-2.0 license for the Codex adaptations is included in
+`THIRD-PARTY-NOTICES.txt` alongside the linked dependency licenses.

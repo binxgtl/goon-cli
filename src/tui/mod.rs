@@ -1,9 +1,18 @@
 //! Full-screen terminal UI: transcript with Markdown/diff/cell rendering, composer with history,
 //! paste placeholders and slash popup, pickers, approvals, transcript overlay and row-diff
-//! rendering (unchanged rows are never rewritten, so native text selection survives streaming).
+//! rendering with owned-screen selection; inline mode retains terminal-native selection.
 
+mod completion;
+mod composer;
+mod editor;
+#[cfg(unix)]
+mod job_control;
+mod native;
 mod paste_burst;
+mod pointer;
+mod questions;
 mod render;
+mod selection;
 pub mod text;
 #[cfg(windows)]
 mod windows_console;
@@ -208,6 +217,9 @@ pub struct QuestionOpts {
     pub esc_cancels: bool,
     pub esc_hint: Option<String>,
     pub mask: bool,
+    pub choices: Vec<(String, String)>,
+    /// User questions may switch to free-form input; approvals never do.
+    pub allow_custom: bool,
 }
 
 enum QErr {
@@ -219,6 +231,11 @@ enum QErr {
 struct Pending {
     id: u64,
     tx: oneshot::Sender<std::result::Result<String, QErr>>,
+    choices: Vec<(String, String)>,
+    selected: usize,
+    allow_custom: bool,
+    custom: bool,
+    form: Option<questions::QuestionForm>,
 }
 
 /// A decoded key press (names follow Node's `readline` keypress events).
@@ -295,6 +312,7 @@ pub(crate) struct Row {
     pub glyph: Option<String>,
     pub sign: Option<char>,
     pub level: usize,
+    origin: Option<selection::Origin>,
 }
 
 pub(crate) struct BodyCache {
@@ -305,6 +323,7 @@ pub(crate) struct BodyCache {
     pub state: ParseState,
     pub rows: Vec<Row>,
     pub styled: Vec<String>,
+    pub source_ends: Vec<usize>,
 }
 
 #[derive(Clone)]
@@ -317,6 +336,7 @@ pub(crate) struct State {
     pub transcript: String,
     pub input: Vec<char>,
     pub cursor: usize,
+    vertical_goal_col: Option<usize>,
     pub scroll: usize,
     pub max_scroll: usize,
     pub label: String,
@@ -325,6 +345,9 @@ pub(crate) struct State {
     pub effort_label: String,
     pub todo_label: String,
     workspace_files: Vec<String>,
+    workspace_skills: Vec<(String, String)>,
+    mention_for: String,
+    dismissed_mention: Option<String>,
     pub tokens: f64,
     pub cost_usd: f64,
     pending: Option<Pending>,
@@ -335,7 +358,13 @@ pub(crate) struct State {
     spinning: bool,
     pub spin_tick: usize,
     history: Vec<String>,
+    history_payloads: Vec<Option<composer::QueuedPrompt>>,
     history_index: usize,
+    history_draft: Option<composer::Draft>,
+    history_search: Option<composer::HistorySearch>,
+    input_session: Option<String>,
+    thread_inputs: IndexMap<String, composer::ThreadInput>,
+    kill_buffer: String,
     remember: bool,
     pub tool_states: IndexMap<String, String>,
     output_channel: Option<&'static str>,
@@ -363,9 +392,10 @@ pub(crate) struct State {
     paste_archive: IndexMap<String, String>,
     recent_expanded: Vec<(String, String)>,
     next_paste_idx: usize,
-    pub queued_prompts: Vec<String>,
+    queued_prompts: Vec<composer::QueuedPrompt>,
     pub popup_index: usize,
     popup_for: String,
+    dismissed_slash: Option<String>,
     esc_cancels: bool,
     pub esc_hint: String,
     turn_snapshots: Vec<String>,
@@ -374,6 +404,8 @@ pub(crate) struct State {
     input_restored_from_revert: bool,
     esc_primed: Option<EscPrime>,
     esc_gen: u64,
+    quit_armed: Option<(String, std::time::Instant)>,
+    shortcuts_open: bool,
     paste_gen: u64,
     paste_burst: paste_burst::PasteBurst,
     paste_tick_running: bool,
@@ -387,6 +419,26 @@ pub(crate) struct State {
     pub goal: Option<SessionGoal>,
     pub title: String,
     pub body_cache: Option<BodyCache>,
+    body_source_ends: Vec<usize>,
+    body_layout: selection::Layout,
+    native: Option<native::NativeViewport>,
+    native_resize_cursor: Option<(usize, usize, usize)>,
+    editor_requested: bool,
+    editor_active: bool,
+    suspend_requested: bool,
+    input_yielded: bool,
+    terminal_restored: bool,
+    mouse_capture: bool,
+    focused: bool,
+    selection: Option<selection::Selection>,
+    transcript_top_row: usize,
+    transcript_screen_row: usize,
+    transcript_view_rows: Vec<String>,
+    selection_dragging: bool,
+    selection_pointer_valid: bool,
+    mouse_scroll_speed: f64,
+    mouse_wheel: pointer::Wheel,
+    follow_control: pointer::Follow,
 }
 
 type Callback0 = Arc<dyn Fn() + Send + Sync>;
@@ -398,19 +450,26 @@ struct Callbacks {
     on_cycle_effort: Option<Arc<dyn Fn(i32) + Send + Sync>>,
     on_toggle_transcript: Option<Arc<dyn Fn(bool) + Send + Sync>>,
     on_immediate_command: Option<Arc<dyn Fn(String) -> BoxFuture<'static, ()> + Send + Sync>>,
+    on_steer: Option<Arc<dyn Fn(String) -> bool + Send + Sync>>,
+    on_history: Option<Arc<dyn Fn(String) + Send + Sync>>,
+    on_interrupt_idle: Option<Callback0>,
     on_copy: Option<AsyncCallback0>,
 }
 
 /// Side effects decided while the state lock is held and run after it is released.
 enum Action {
     Cancel,
+    InterruptIdle,
     ToggleMode,
     CycleEffort(i32),
     ToggleTranscript(bool),
     Immediate(String),
+    Steer { expanded: String, queued: composer::QueuedPrompt },
     Copy,
     Ended,
+    Quit,
     ClipboardPaste,
+    RecordHistory(String),
 }
 
 pub type SizeFn = Box<dyn Fn() -> (usize, usize) + Send + Sync>;
@@ -451,11 +510,15 @@ fn unquote(trimmed: &str) -> &str {
 impl Tui {
     /// Takes over the real terminal (alternate screen, raw mode, bracketed paste).
     pub fn start(title: &str, cancel: Callback0) -> Result<Arc<Tui>> {
+        Self::start_with_alt_screen(title, cancel, true)
+    }
+
+    pub fn start_with_alt_screen(title: &str, cancel: Callback0, alternate: bool) -> Result<Arc<Tui>> {
         crossterm::terminal::enable_raw_mode()?;
         #[cfg(windows)]
         let _ = windows_console::set_input_record_mode();
         let size: SizeFn = Box::new(|| crossterm::terminal::size().map(|(c, r)| (c as usize, r as usize)).unwrap_or((80, 24)));
-        let tui = Tui::with_io(title, cancel, Box::new(std::io::stdout()), size, true);
+        let tui = Tui::with_io_mode(title, cancel, Box::new(std::io::stdout()), size, true, alternate);
         let weak = Arc::downgrade(&tui);
         std::thread::Builder::new().name("goon-tui-input".into()).spawn(move || input_thread(weak))?;
         Ok(tui)
@@ -463,10 +526,15 @@ impl Tui {
 
     /// A UI over an arbitrary writer and size source (tests, pseudo-terminals).
     pub fn with_io(title: &str, cancel: Callback0, out: Box<dyn Write + Send>, size: SizeFn, real_terminal: bool) -> Arc<Tui> {
+        Self::with_io_mode(title, cancel, out, size, real_terminal, true)
+    }
+
+    pub fn with_io_mode(title: &str, cancel: Callback0, out: Box<dyn Write + Send>, size: SizeFn, real_terminal: bool, alternate: bool) -> Arc<Tui> {
         let state = State {
             transcript: String::new(),
             input: vec![],
             cursor: 0,
+            vertical_goal_col: None,
             scroll: 0,
             max_scroll: 0,
             label: "goon> ".into(),
@@ -475,6 +543,9 @@ impl Tui {
             effort_label: "default".into(),
             todo_label: String::new(),
             workspace_files: vec![],
+            workspace_skills: vec![],
+            mention_for: String::new(),
+            dismissed_mention: None,
             tokens: 0.0,
             cost_usd: 0.0,
             pending: None,
@@ -485,7 +556,13 @@ impl Tui {
             spinning: false,
             spin_tick: 0,
             history: vec![],
+            history_payloads: vec![],
             history_index: 0,
+            history_draft: None,
+            history_search: None,
+            input_session: None,
+            thread_inputs: IndexMap::new(),
+            kill_buffer: String::new(),
             remember: false,
             tool_states: IndexMap::new(),
             output_channel: None,
@@ -516,6 +593,7 @@ impl Tui {
             queued_prompts: vec![],
             popup_index: 0,
             popup_for: String::new(),
+            dismissed_slash: None,
             esc_cancels: false,
             esc_hint: "skip".into(),
             turn_snapshots: vec![],
@@ -524,6 +602,8 @@ impl Tui {
             input_restored_from_revert: false,
             esc_primed: None,
             esc_gen: 0,
+            quit_armed: None,
+            shortcuts_open: false,
             paste_gen: 0,
             paste_burst: paste_burst::PasteBurst::default(),
             paste_tick_running: false,
@@ -537,6 +617,26 @@ impl Tui {
             goal: None,
             title: title.to_string(),
             body_cache: None,
+            body_source_ends: vec![],
+            body_layout: selection::Layout::default(),
+            native: (!alternate).then(native::NativeViewport::default),
+            native_resize_cursor: None,
+            editor_requested: false,
+            editor_active: false,
+            suspend_requested: false,
+            input_yielded: false,
+            terminal_restored: false,
+            mouse_capture: false,
+            focused: true,
+            selection: None,
+            transcript_top_row: 0,
+            transcript_screen_row: 0,
+            transcript_view_rows: vec![],
+            selection_dragging: false,
+            selection_pointer_valid: false,
+            mouse_scroll_speed: 1.0,
+            mouse_wheel: pointer::Wheel::default(),
+            follow_control: pointer::Follow::default(),
         };
         let tui = Arc::new_cyclic(|me| Tui {
             me: me.clone(),
@@ -549,12 +649,12 @@ impl Tui {
             real_terminal,
         });
         // Alternate screen, mouse capture off (native selection works), alternate scroll for the
-        // wheel, bracketed paste, hidden cursor. On Windows real terminals, disable focus events
-        // (matching Codex) so focus changes never inject spurious sequences.
-        tui.write_raw("\x1b[?1049h\x1b[?1000l\x1b[?1006l\x1b[?1007h\x1b[?2004h\x1b[?25l");
-        if real_terminal && cfg!(windows) {
-            tui.write_raw("\x1b[?1004l");
+        // wheel, bracketed paste, hidden cursor. Decode focus events separately from input.
+        if alternate {
+            tui.write_raw("\x1b[?1049h");
         }
+        tui.write_raw("\x1b[?1000l\x1b[?1006l\x1b[?1007h\x1b[?2004h\x1b[?25l");
+        tui.write_raw("\x1b[?1004h");
         tui.render_now();
         tui
     }
@@ -563,6 +663,12 @@ impl Tui {
         let mut out = self.out.lock().unwrap();
         let _ = out.write_all(text.as_bytes());
         let _ = out.flush();
+    }
+
+    pub fn set_mouse_scroll_speed(&self, speed: f64) {
+        let mut st = self.state.lock().unwrap();
+        st.mouse_scroll_speed = if speed.is_finite() && speed > 0.0 { speed } else { 1.0 };
+        st.mouse_wheel = pointer::Wheel::default();
     }
 
     pub fn set_on_toggle_mode(&self, f: Callback0) {
@@ -577,6 +683,19 @@ impl Tui {
     pub fn set_on_immediate_command(&self, f: Arc<dyn Fn(String) -> BoxFuture<'static, ()> + Send + Sync>) {
         self.callbacks.lock().unwrap().on_immediate_command = Some(f);
     }
+    pub fn set_on_steer(&self, f: Arc<dyn Fn(String) -> bool + Send + Sync>) {
+        self.callbacks.lock().unwrap().on_steer = Some(f);
+    }
+    pub fn set_on_interrupt_idle(&self, f: Callback0) {
+        self.callbacks.lock().unwrap().on_interrupt_idle = Some(f);
+    }
+    pub fn set_prompt_history(&self, entries: Vec<String>, record: Arc<dyn Fn(String) + Send + Sync>) {
+        let mut st = self.state.lock().unwrap();
+        st.history = entries;
+        st.history_payloads = vec![None; st.history.len()];
+        st.history_index = st.history.len();
+        self.callbacks.lock().unwrap().on_history = Some(record);
+    }
     pub fn set_on_copy(&self, f: AsyncCallback0) {
         self.callbacks.lock().unwrap().on_copy = Some(f);
     }
@@ -586,6 +705,16 @@ impl Tui {
         for action in actions {
             match action {
                 Action::Cancel => (self.cancel)(),
+                Action::InterruptIdle => {
+                    if let Some(interrupt) = &callbacks.on_interrupt_idle {
+                        interrupt();
+                    }
+                }
+                Action::RecordHistory(text) => {
+                    if let Some(record) = &callbacks.on_history {
+                        record(text);
+                    }
+                }
                 Action::ToggleMode => {
                     if let Some(f) = &callbacks.on_toggle_mode {
                         f();
@@ -606,14 +735,33 @@ impl Tui {
                         self.handle.spawn(f(cmd));
                     }
                 }
+                Action::Steer { expanded, queued } => {
+                    if !callbacks.on_steer.as_ref().map(|f| f(expanded)).unwrap_or(false) {
+                        let mut st = self.state.lock().unwrap();
+                        st.queued_prompts.push(queued);
+                        self.schedule(&mut st, 0);
+                    }
+                }
                 Action::Copy => {
-                    if let Some(f) = &callbacks.on_copy {
+                    if let Some(text) = self.selected_transcript_text() {
+                        self.handle.spawn(async move {
+                            crate::cli::copy_text_to_clipboard(&text).await;
+                        });
+                    } else if let Some(f) = &callbacks.on_copy {
                         self.handle.spawn(f());
                     }
                 }
                 Action::Ended => {
                     (self.cancel)();
                     self.close();
+                }
+                Action::Quit => {
+                    if let Some(f) = &callbacks.on_immediate_command {
+                        self.handle.spawn(f("/exit".into()));
+                    } else {
+                        (self.cancel)();
+                        self.close();
+                    }
                 }
                 Action::ClipboardPaste => {
                     let me = self.me.clone();
@@ -629,7 +777,7 @@ impl Tui {
 
     // ------------------------------------------------------------------ scheduling
     fn schedule(&self, st: &mut State, delay_ms: u64) {
-        if st.closed || st.timer {
+        if st.closed || st.timer || st.input_yielded || st.suspend_requested {
             return;
         }
         st.timer = true;
@@ -673,8 +821,12 @@ impl Tui {
     pub fn clear(&self) {
         let mut st = self.state.lock().unwrap();
         st.transcript.clear();
+        st.selection = None;
         st.scroll = 0;
         st.max_scroll = 0;
+        if let Some(native) = st.native.as_mut() {
+            native.reset();
+        }
         st.explore_group.clear();
         st.turn_snapshots.clear();
         st.input_restored_from_revert = false;
@@ -712,6 +864,7 @@ impl Tui {
             let restored = st.turn_snapshots[target].clone();
             st.turn_snapshots.truncate(target);
             st.transcript = restored;
+            st.selection = None;
             st.scroll = 0;
             st.max_scroll = 0;
             st.last_frame_rows.clear();
@@ -730,6 +883,7 @@ impl Tui {
         st.input.clear();
         st.cursor = 0;
         st.input_restored_from_revert = from_revert;
+        st.vertical_goal_col = None;
         st.attached_images.clear();
         st.next_image_idx = 1;
         st.pasted_texts.clear();
@@ -797,7 +951,11 @@ impl Tui {
 
     pub fn set_view_mode(&self, mode: &str) {
         let mut st = self.state.lock().unwrap();
+        st.selection = None;
+        st.selection_dragging = false;
         st.view_mode = mode.into();
+        st.mouse_wheel = pointer::Wheel::default();
+        st.follow_control = pointer::Follow::default();
         st.in_transcript_overlay = mode == "transcript";
         st.scroll = 0;
         st.needs_full_clear = true;
@@ -816,7 +974,16 @@ impl Tui {
     pub fn set_transcript_overlay(&self, active: bool) {
         {
             let mut st = self.state.lock().unwrap();
+            if active != st.in_transcript_overlay {
+                st.selection = None;
+                st.selection_dragging = false;
+                st.mouse_wheel = pointer::Wheel::default();
+                st.follow_control = pointer::Follow::default();
+            }
             st.in_transcript_overlay = active;
+            if !active && st.native.is_some() {
+                st.scroll = 0;
+            }
             if active {
                 self.flush_explore_group(&mut st);
             }
@@ -828,6 +995,10 @@ impl Tui {
 
     pub fn is_transcript_overlay(&self) -> bool {
         self.state.lock().unwrap().in_transcript_overlay
+    }
+
+    pub fn is_focused(&self) -> bool {
+        self.state.lock().unwrap().focused
     }
 
     pub fn set_effort(&self, effort: Option<&str>) {
@@ -891,7 +1062,8 @@ impl Tui {
             return;
         }
         let mut st = self.state.lock().unwrap();
-        st.queued_prompts.push(text.to_string());
+        let prompt = composer::QueuedPrompt::capture(&st, text);
+        st.queued_prompts.push(prompt);
         self.schedule(&mut st, 0);
     }
 
@@ -942,6 +1114,10 @@ impl Tui {
                 (_, Some(l)) => l + 1,
                 _ => from,
             };
+            if let Some(native) = st.native.as_mut() {
+                native.trim_source_prefix(cut);
+            }
+            // A selection owns its immutable revision, including trimmed history.
             next = next[cut..].to_string();
         }
         st.transcript = next;
@@ -999,35 +1175,16 @@ impl Tui {
     }
 
     pub async fn ask_transient(&self, block: &str, label: &str, cancel: Option<&CancellationToken>, opts: QuestionOpts) -> Result<String> {
-        let (saved, appended) = {
+        let appended = {
             let mut st = self.state.lock().unwrap();
             self.flush_explore_group(&mut st);
             st.output_channel = None;
-            let saved = (st.label.clone(), st.input.clone(), st.cursor, st.attached_images.clone(), st.next_image_idx, st.pasted_texts.clone(), st.next_paste_idx);
-            st.input.clear();
-            st.cursor = 0;
-            st.attached_images.clear();
-            st.pasted_texts.clear();
             let appended = format!("{}{}", Self::block_reset(&st), terminal_text(block));
             self.append_transcript(&mut st, &appended, true);
-            (saved, appended)
+            appended
         };
-        let result = self.question(label, cancel, false, opts).await;
-        let mut st = self.state.lock().unwrap();
-        // Remove only the transient block: output appended meanwhile (parallel agents) stays.
-        if let Some(pos) = st.transcript.rfind(&appended) {
-            st.transcript.replace_range(pos..pos + appended.len(), "");
-        }
-        st.label = saved.0;
-        st.input = saved.1;
-        st.cursor = saved.2;
-        st.attached_images = saved.3;
-        st.next_image_idx = saved.4;
-        st.pasted_texts = saved.5;
-        st.next_paste_idx = saved.6;
-        st.body_cache = None;
-        self.schedule(&mut st, 16);
-        result
+        let _guard = composer::TransientGuard { tui: self.me.clone(), appended };
+        self.question(label, cancel, false, opts).await
     }
 
     pub fn event(&self, event: &Value) {
@@ -1064,17 +1221,23 @@ impl Tui {
                 if state == "start" {
                     self.flush_explore_group(st);
                     self.append_cell(st, &format!("\n{} Agent {} · {}\n", glyph::AGENT, crate::jsutil::take_chars(&id, 8), crate::jsutil::slice_chars(&s("task"), 0, 160)));
-                } else if state == "done" || state == "error" {
+                } else if state == "done" || state == "error" || state == "interrupted" {
                     self.flush_explore_group(st);
                     let text = if state == "done" {
                         format!("\n{} Agent {} finished\n", glyph::AGENT, crate::jsutil::take_chars(&id, 8))
+                    } else if state == "interrupted" {
+                        format!("\n{} Agent {} interrupted\n", glyph::AGENT, crate::jsutil::take_chars(&id, 8))
                     } else {
                         format!("\n{} Agent {} failed\n", glyph::FAILED, crate::jsutil::take_chars(&id, 8))
                     };
                     self.append_cell(st, &text);
                 }
             }
-            "tool_stream" => {}
+            "tool_stream" => {
+                if !s("preview").is_empty() {
+                    st.reasoning_header = Some(format!("Preparing {} · {}", s("name"), crate::jsutil::take_chars(&s("preview"), 90)));
+                }
+            }
             "text" | "reasoning" => {
                 if kind == "text" {
                     self.flush_explore_group(st);
@@ -1307,6 +1470,12 @@ impl Tui {
             return;
         }
         if kind == "edit" {
+            if state == "error" {
+                let error = meta.get("error").and_then(Value::as_str).filter(|s| !s.is_empty());
+                let detail = error.map(|s| format!("\n  └ {}", terminal_text(s))).unwrap_or_default();
+                self.append_cell(st, &format!("\n{} Failed to edit {summary}{dur}{detail}\n", glyph::FAILED));
+                return;
+            }
             let verb = meta.get("verb").and_then(Value::as_str).unwrap_or("Edited");
             let added = meta.get("added").and_then(Value::as_u64);
             let removed = meta.get("removed").and_then(Value::as_u64);
@@ -1320,7 +1489,7 @@ impl Tui {
             };
             let diff_lines = meta.get("diff").and_then(Value::as_str).filter(|d| !d.is_empty()).map(|d| text::format_compact_diff(d, max)).unwrap_or_default();
             let diff_block = if diff_lines.is_empty() { String::new() } else { format!("\n{}", diff_lines.join("\n")) };
-            self.append_cell(st, &format!("\n{} {verb} {summary}{stats}{diff_block}\n", if state == "error" { glyph::FAILED } else { glyph::EDIT }));
+            self.append_cell(st, &format!("\n{} {verb} {summary}{stats}{diff_block}\n", glyph::EDIT));
             return;
         }
         if name != "todo_write" && name != "update_plan" {
@@ -1393,53 +1562,109 @@ impl Tui {
     }
 
     pub async fn question(&self, label: &str, cancel: Option<&CancellationToken>, remember: bool, opts: QuestionOpts) -> Result<String> {
-        let (id, rx) = {
-            let mut st = self.state.lock().unwrap();
-            if st.closed {
+        self.question_inner(label, cancel, remember, opts, None).await
+    }
+
+    async fn question_inner(&self, label: &str, cancel: Option<&CancellationToken>, remember: bool, opts: QuestionOpts, form: Option<questions::QuestionForm>) -> Result<String> {
+        let mut form = form;
+        let (id, rx, saved) = loop {
+            let installed = {
+                let mut st = self.state.lock().unwrap();
+                if st.editor_active || st.editor_requested || st.input_yielded || st.suspend_requested {
+                    None
+                } else {
+                    if st.closed {
+                        return Err(anyhow!("Terminal closed."));
+                    }
+                    if st.pending.is_some() {
+                        return Err(anyhow!("A terminal question is already active."));
+                    }
+                    if cancel.map(|c| c.is_cancelled()).unwrap_or(false) {
+                        return Err(anyhow!("This operation was aborted"));
+                    }
+                    if !remember {
+                        // A held composer character belongs to the draft, never to a new approval
+                        // or secret question. Resolve it before the modal snapshot and reset timing.
+                        match st.paste_burst.flush_before_modified_input() {
+                            paste_burst::FlushResult::Typed(ch) => Self::insert_chars(&mut st, &[ch]),
+                            paste_burst::FlushResult::Paste(text) => self.handle_paste(&mut st, &text, true),
+                            paste_burst::FlushResult::None => {}
+                        }
+                        st.quit_armed = None;
+                        st.shortcuts_open = false;
+                    }
+                    let saved = if remember {
+                        None
+                    } else {
+                        Some(composer::QuestionSnapshot {
+                            draft: composer::Draft::capture(&st),
+                            label: st.label.clone(),
+                            remember: st.remember,
+                            masked: st.masked,
+                            esc_cancels: st.esc_cancels,
+                            esc_hint: st.esc_hint.clone(),
+                            history_index: st.history_index,
+                            history_draft: st.history_draft.take(),
+                            history_search: st.history_search.take(),
+                            kill_buffer: st.kill_buffer.clone(),
+                            image_archive: st.image_archive.clone(),
+                            paste_archive: st.paste_archive.clone(),
+                            recent_expanded: st.recent_expanded.clone(),
+                        })
+                    };
+                    st.label = terminal_text(label);
+                    // Secrets render as bullets and never enter the prompt history.
+                    st.masked = opts.mask && !remember;
+                    st.esc_cancels = opts.esc_cancels;
+                    st.esc_hint = opts.esc_hint.clone().unwrap_or_else(|| {
+                        if opts.esc_cancels {
+                            "cancel".into()
+                        } else if label.contains("y/N") {
+                            "deny".into()
+                        } else {
+                            "skip".into()
+                        }
+                    });
+                    if remember && !st.queued_prompts.is_empty() {
+                        let next = st.queued_prompts.remove(0);
+                        let value = next.expand();
+                        self.schedule(&mut st, 0);
+                        return Ok(value);
+                    }
+                    if !remember {
+                        st.input.clear();
+                        st.cursor = 0;
+                        st.attached_images.clear();
+                        st.next_image_idx = 1;
+                        st.pasted_texts.clear();
+                        st.next_paste_idx = 1;
+                    }
+                    st.history_index = st.history.len();
+                    st.remember = remember;
+                    let id = st.next_pending;
+                    st.next_pending += 1;
+                    let (tx, rx) = oneshot::channel();
+                    st.pending = Some(Pending { id, tx, choices: opts.choices.clone(), selected: 0, allow_custom: opts.allow_custom, custom: false, form: form.take() });
+                    self.schedule(&mut st, 16);
+                    Some((id, rx, saved))
+                }
+            };
+            if let Some(installed) = installed {
+                break installed;
+            }
+            if self.is_closed() {
                 return Err(anyhow!("Terminal closed."));
             }
-            if st.pending.is_some() {
-                return Err(anyhow!("A terminal question is already active."));
-            }
-            if cancel.map(|c| c.is_cancelled()).unwrap_or(false) {
-                return Err(anyhow!("This operation was aborted"));
-            }
-            st.label = terminal_text(label);
-            // Secrets render as bullets and never enter the prompt history.
-            st.masked = opts.mask && !remember;
-            st.esc_cancels = opts.esc_cancels;
-            st.esc_hint = opts.esc_hint.clone().unwrap_or_else(|| {
-                if opts.esc_cancels {
-                    "cancel".into()
-                } else if label.contains("y/N") {
-                    "deny".into()
-                } else {
-                    "skip".into()
+            if let Some(cancel) = cancel {
+                tokio::select! {
+                    _ = cancel.cancelled() => return Err(anyhow!("This operation was aborted")),
+                    _ = tokio::time::sleep(Duration::from_millis(25)) => {}
                 }
-            });
-            if remember && !st.queued_prompts.is_empty() {
-                let next = st.queued_prompts.remove(0);
-                let value = self.expand_placeholders(&mut st, &next);
-                self.schedule(&mut st, 0);
-                return Ok(value);
+            } else {
+                tokio::time::sleep(Duration::from_millis(25)).await;
             }
-            if !remember {
-                st.input.clear();
-                st.cursor = 0;
-                st.attached_images.clear();
-                st.next_image_idx = 1;
-                st.pasted_texts.clear();
-                st.next_paste_idx = 1;
-            }
-            st.history_index = st.history.len();
-            st.remember = remember;
-            let id = st.next_pending;
-            st.next_pending += 1;
-            let (tx, rx) = oneshot::channel();
-            st.pending = Some(Pending { id, tx });
-            self.schedule(&mut st, 16);
-            (id, rx)
         };
+        let _guard = composer::QuestionGuard { tui: self.me.clone(), id, saved };
         let never = CancellationToken::new();
         let cancel = cancel.unwrap_or(&never);
         let outcome = tokio::select! {
@@ -1468,7 +1693,7 @@ impl Tui {
         let mut actions = vec![];
         {
             let mut st = self.state.lock().unwrap();
-            if trimmed.is_empty() || st.closed {
+            if trimmed.is_empty() || st.closed || st.editor_active || st.editor_requested || st.input_yielded || st.suspend_requested {
                 return;
             }
             if st.pending.is_some() && st.remember {
@@ -1483,7 +1708,8 @@ impl Tui {
                 self.schedule(&mut st, 0);
                 actions.push(Action::Immediate(trimmed));
             } else {
-                st.queued_prompts.push(trimmed);
+                let prompt = composer::QueuedPrompt::capture(&st, &trimmed);
+                st.queued_prompts.push(prompt);
                 self.schedule(&mut st, 0);
             }
         }
@@ -1687,6 +1913,29 @@ impl Tui {
 
     /// Integrates pasted text; multi-line or long pastes collapse into atomic placeholders.
     fn handle_paste(&self, st: &mut State, raw: &str, allow_coalesce: bool) {
+        if st.editor_active || st.editor_requested || st.input_yielded || st.suspend_requested {
+            return;
+        }
+        // Pasting text must never approve a tool or leak into the restored composer.
+        if st.pending.as_ref().map(|p| !p.choices.is_empty() && !p.custom).unwrap_or(false) {
+            return;
+        }
+        if let Some(form) = st.pending.as_mut().and_then(|p| p.form.as_mut()) {
+            form.questions[form.index].committed = false;
+            form.questions[form.index].notes = true;
+        }
+        st.quit_armed = None;
+        if st.masked {
+            Self::insert_chars(st, &chars_of(&terminal_text(raw)));
+            self.schedule(st, 0);
+            return;
+        }
+        if let Some(search) = st.history_search.as_mut() {
+            search.query.push_str(&terminal_text(raw));
+            self.search_history(st, true, true);
+            self.schedule(st, 0);
+            return;
+        }
         if let Some(p) = st.picker.as_mut() {
             let first = re!(r"\r?\n").split(raw).next().unwrap_or("");
             let next = format!("{}{}", p.filter, terminal_text(first));
@@ -1964,7 +2213,10 @@ impl Tui {
     /// Slash popup: commands matching the typed `/prefix` (exact first) and the selection.
     pub(crate) fn slash_popup(st: &mut State) -> (Vec<&'static str>, usize) {
         let typed: String = st.input.iter().collect();
-        if st.label != "goon> " || !typed.starts_with('/') || typed.chars().any(char::is_whitespace) {
+        if st.dismissed_slash.as_ref().map(|s| s != &typed).unwrap_or(false) {
+            st.dismissed_slash = None;
+        }
+        if st.label != "goon> " || st.history_search.is_some() || st.dismissed_slash.as_ref() == Some(&typed) || !typed.starts_with('/') || typed.chars().any(char::is_whitespace) {
             st.popup_for.clear();
             st.popup_index = 0;
             return (vec![], 0);
@@ -1983,8 +2235,106 @@ impl Tui {
         if delta == 0 {
             return;
         }
-        st.scroll = (st.scroll as i64 + delta).clamp(0, st.max_scroll as i64) as usize;
+        st.scroll = (st.scroll as i64).saturating_add(delta).clamp(0, st.max_scroll as i64) as usize;
         self.schedule(st, 0);
+    }
+
+    fn handle_mouse(&self, event: crossterm::event::MouseEvent) {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut st = self.state.lock().unwrap();
+        if st.closed
+            || st.editor_active
+            || st.editor_requested
+            || st.input_yielded
+            || st.suspend_requested
+            || (st.native.is_some() && !st.in_transcript_overlay)
+            || st.picker.is_some()
+            || (st.pending.is_some() && !st.remember)
+        {
+            return;
+        }
+        // Scroll, streaming output and popup layout may have changed since the
+        // last paint. Hit-test the frame we are about to show, never stale rows.
+        self.render(&mut st);
+        if let Some(jump) = st.follow_control.handle(event) {
+            if jump {
+                st.selection = None;
+                st.selection_dragging = false;
+                st.scroll = 0;
+                st.mouse_wheel = pointer::Wheel::default();
+            }
+            self.schedule(&mut st, 0);
+            return;
+        }
+        match event.kind {
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let row = event.row as usize;
+                let inside = row >= st.transcript_screen_row && row < st.transcript_screen_row + st.transcript_view_rows.len() && (event.column as usize) < self.size().0;
+                if inside || st.selection_dragging {
+                    st.selection_pointer_valid = false;
+                    let direction = if event.kind == MouseEventKind::ScrollUp { 1.0 } else { -1.0 };
+                    let speed = st.mouse_scroll_speed;
+                    let delta = st.mouse_wheel.rows(direction, speed);
+                    self.scroll_by(&mut st, delta);
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let row = event.row as usize;
+                if row >= st.transcript_screen_row && row < st.transcript_screen_row + st.transcript_view_rows.len() {
+                    let local = row - st.transcript_screen_row;
+                    let Some(point) = st.body_layout.hit(st.transcript_top_row + local, event.column as usize) else { return };
+                    let source = st.selection.as_ref().map(|s| s.source.as_ref()).unwrap_or(&st.transcript);
+                    st.selection = Some(selection::Selection::new(point, source, &st.body_layout));
+                    st.selection_dragging = true;
+                    st.selection_pointer_valid = true;
+                    self.schedule(&mut st, 0);
+                } else if st.selection.take().is_some() {
+                    st.selection_dragging = false;
+                    self.schedule(&mut st, 0);
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left) => {
+                if !st.selection_dragging || st.transcript_view_rows.is_empty() {
+                    return;
+                }
+                if matches!(event.kind, MouseEventKind::Drag(_)) {
+                    st.selection_pointer_valid = true;
+                }
+                let row = (event.row as usize).clamp(st.transcript_screen_row, st.transcript_screen_row + st.transcript_view_rows.len().saturating_sub(1));
+                let local = row - st.transcript_screen_row;
+                if st.selection_pointer_valid {
+                    if let Some(point) = st.body_layout.hit(st.transcript_top_row + local, event.column as usize) {
+                        if let Some(selection) = st.selection.as_mut() {
+                            selection.end = point;
+                        }
+                    }
+                }
+                if matches!(event.kind, MouseEventKind::Up(_)) {
+                    st.selection_dragging = false;
+                    if st.selection.as_ref().is_some_and(|s| s.anchor == s.end) {
+                        st.selection = None;
+                    }
+                }
+                self.schedule(&mut st, 0);
+            }
+            _ => {}
+        }
+    }
+
+    fn sync_mouse_mode(&self, st: &mut State) {
+        let capture = (st.in_transcript_overlay || st.native.is_none()) && st.picker.is_none() && !(st.pending.is_some() && !st.remember);
+        if capture == st.mouse_capture {
+            return;
+        }
+        st.mouse_capture = capture;
+        st.mouse_wheel = pointer::Wheel::default();
+        st.follow_control = pointer::Follow::default();
+        if capture {
+            // SGR is essential on ConPTY; otherwise wheel records can masquerade as keys.
+            self.write_raw("\x1b[?1007l\x1b[?1000h\x1b[?1006h\x1b[?1002h");
+        } else {
+            self.write_raw("\x1b[?1002l\x1b[?1000l\x1b[?1006l\x1b[?1007h");
+        }
     }
 
     // ------------------------------------------------------------------ input
@@ -2024,6 +2374,20 @@ impl Tui {
 
     pub fn resize(&self) {
         let mut st = self.state.lock().unwrap();
+        // Resize events are dispatched on the sole input reader. On POSIX a DSR
+        // query from the render task would contend with that reader's poll/read
+        // lock for up to two seconds. Probe here instead, with painting excluded.
+        let geometry_changed = self.size() != (st.last_cols, st.last_rows);
+        if self.real_terminal && st.native.is_some() && geometry_changed {
+            let (cols, rows) = self.size();
+            st.native_resize_cursor = crossterm::cursor::position().ok().map(|(_, y)| (cols, rows, y as usize));
+        }
+        if geometry_changed {
+            // Logical anchors survive reflow; only the old pointer gesture ends.
+            st.selection_dragging = false;
+            st.mouse_wheel = pointer::Wheel::default();
+            st.follow_control = pointer::Follow::default();
+        }
         st.last_frame_rows.clear();
         st.needs_full_clear = true;
         self.schedule(&mut st, 16);
@@ -2075,6 +2439,7 @@ impl Tui {
     fn clear_composer(st: &mut State) {
         st.input.clear();
         st.cursor = 0;
+        st.vertical_goal_col = None;
         st.input_restored_from_revert = false;
         st.attached_images.clear();
         st.pasted_texts.clear();
@@ -2094,12 +2459,104 @@ impl Tui {
     }
 
     fn keypress(&self, st: &mut State, text: Option<&str>, key: &Key, actions: &mut Vec<Action>) {
-        if st.closed {
+        let before = st.pending.as_ref().and_then(|p| p.form.as_ref().map(|form| (p.id, form.index, st.input.clone())));
+        self.keypress_inner(st, text, key, actions);
+        if let Some((pending_id, index, input)) = before {
+            if input != st.input {
+                if let Some(pending) = st.pending.as_mut().filter(|p| p.id == pending_id) {
+                    if let Some(form) = pending.form.as_mut().filter(|f| f.index == index) {
+                        form.questions[index].committed = false;
+                    }
+                }
+            }
+        }
+    }
+
+    fn keypress_inner(&self, st: &mut State, text: Option<&str>, key: &Key, actions: &mut Vec<Action>) {
+        if st.closed || st.editor_active || st.editor_requested || st.input_yielded || st.suspend_requested {
             return;
+        }
+        if key.ctrl
+            && !key.meta
+            && key.is("g")
+            && st.picker.is_none()
+            && !st.masked
+            && !st.in_transcript_overlay
+            && !st.shortcuts_open
+            && st.history_search.is_none()
+            && Self::mention_popup(st).is_none()
+            && Self::slash_popup(st).0.is_empty()
+            && (st.pending.is_none() || st.remember)
+        {
+            st.editor_requested = true;
+            st.status_notice = Some("Opening external editor…".into());
+            self.schedule(st, 0);
+            return;
+        }
+        if !key.ctrl || !(key.is("c") || key.is("d")) {
+            st.quit_armed = None;
+        }
+        if !(key.is("up") || key.is("down") || (key.ctrl && (key.is("p") || key.is("n")))) {
+            st.vertical_goal_col = None;
         }
         Self::clear_paste_burst(st);
         if st.picker.is_some() {
             self.picker_key(st, text, key);
+            return;
+        }
+        if st.pending.as_ref().and_then(|p| p.form.as_ref()).is_some() && self.form_key(st, text, key) {
+            return;
+        }
+        if st.pending.as_ref().map(|p| !p.choices.is_empty() && !p.custom).unwrap_or(false) {
+            let pending = st.pending.as_mut().unwrap();
+            if pending.allow_custom && !key.ctrl && !key.meta && text == Some("o") {
+                pending.custom = true;
+            } else if key.is("up") || (key.ctrl && key.is("p")) {
+                pending.selected = pending.selected.saturating_sub(1);
+            } else if key.is("down") || (key.ctrl && key.is("n")) || key.is("tab") {
+                pending.selected = (pending.selected + 1).min(pending.choices.len() - 1);
+            } else if key.is("escape") || (key.ctrl && (key.is("c") || key.is("d"))) {
+                let pending = st.pending.take().unwrap();
+                let _ = pending.tx.send(if pending.allow_custom { Err(QErr::Esc) } else { Ok("n".into()) });
+            } else if key.is("return") || key.is("enter") {
+                let pending = st.pending.take().unwrap();
+                let answer = pending.choices[pending.selected].0.clone();
+                let _ = pending.tx.send(Ok(answer));
+            } else if let Some(text) = text.filter(|_| !key.ctrl && !key.meta) {
+                let selected = pending.choices.iter().position(|(value, _)| value.eq_ignore_ascii_case(text));
+                if let Some(index) = selected {
+                    let pending = st.pending.take().unwrap();
+                    let _ = pending.tx.send(Ok(pending.choices[index].0.clone()));
+                } else if let Ok(index) = text.parse::<usize>() {
+                    if index > 0 && index <= pending.choices.len() {
+                        let pending = st.pending.take().unwrap();
+                        let _ = pending.tx.send(Ok(pending.choices[index - 1].0.clone()));
+                    }
+                }
+            }
+            self.schedule(st, 0);
+            return;
+        }
+        // Search owns input until accepted/cancelled; neither Enter nor Ctrl+C can send/exit.
+        if st.history_search.is_some() {
+            if key.is("escape") || (key.ctrl && key.is("c")) {
+                Self::cancel_history_search(st);
+            } else if key.is("return") || key.is("enter") {
+                if st.history_search.as_ref().unwrap().matched.is_some() {
+                    st.history_search = None;
+                    st.history_index = st.history.len();
+                    st.history_draft = None;
+                }
+            } else if key.ctrl && (key.is("r") || key.is("s")) {
+                self.search_history(st, key.is("r"), false);
+            } else if key.is("backspace") {
+                st.history_search.as_mut().unwrap().query.pop();
+                self.search_history(st, true, true);
+            } else if let Some(text) = text.filter(|_| !key.ctrl && !key.meta) {
+                st.history_search.as_mut().unwrap().query.push_str(text);
+                self.search_history(st, true, true);
+            }
+            self.schedule(st, 0);
             return;
         }
         if !key.is("escape") && st.esc_primed.is_some() {
@@ -2110,12 +2567,43 @@ impl Tui {
             st.status_notice = None;
         }
         if key.ctrl && key.is("c") {
-            actions.push(Action::Cancel);
+            if st.selection.as_ref().map(|s| s.anchor != s.end).unwrap_or(false) {
+                actions.push(Action::Copy);
+                return;
+            }
+            if st.pending.is_some() && !st.remember {
+                let pending = st.pending.take().unwrap();
+                let _ = pending.tx.send(if st.esc_cancels { Err(QErr::Esc) } else { Ok(String::new()) });
+                self.schedule(st, 0);
+                return;
+            }
+            if self.quit_shortcut(st, "c", actions) {
+                return;
+            }
+            if !st.input.is_empty() && (st.pending.is_none() || st.remember) {
+                Self::clear_composer(st);
+                st.history_index = st.history.len();
+                st.history_draft = None;
+                self.schedule(st, 0);
+                return;
+            }
+            if matches!(st.status.as_str(), "Running" | "Compacting" | "Connecting MCP" | "Stopping") {
+                actions.push(Action::Cancel);
+            } else {
+                actions.push(Action::InterruptIdle);
+            }
             return;
         }
         if (key.ctrl && key.is("t")) || key.sequence == "\x14" {
             let next = !st.in_transcript_overlay;
+            st.selection = None;
+            st.selection_dragging = false;
             st.in_transcript_overlay = next;
+            st.mouse_wheel = pointer::Wheel::default();
+            st.follow_control = pointer::Follow::default();
+            if !next {
+                st.scroll = 0;
+            }
             if next {
                 self.flush_explore_group(st);
             }
@@ -2129,9 +2617,28 @@ impl Tui {
             return;
         }
         let plain = !key.ctrl && !key.meta;
+        if st.shortcuts_open {
+            st.shortcuts_open = false;
+            self.schedule(st, 0);
+            if key.is("escape") || (plain && text == Some("?")) {
+                return;
+            }
+        } else if plain && text == Some("?") && st.input.is_empty() && (st.pending.is_none() || st.remember) {
+            st.shortcuts_open = true;
+            self.schedule(st, 0);
+            return;
+        }
         if st.in_transcript_overlay {
             if key.is("escape") || (plain && text == Some("q") && st.input.is_empty()) {
+                if st.selection.take().is_some() {
+                    st.selection_dragging = false;
+                    self.schedule(st, 0);
+                    return;
+                }
                 st.in_transcript_overlay = false;
+                st.scroll = 0;
+                st.mouse_wheel = pointer::Wheel::default();
+                st.follow_control = pointer::Follow::default();
                 st.needs_full_clear = true;
                 self.schedule(st, 0);
                 actions.push(Action::ToggleTranscript(false));
@@ -2147,19 +2654,59 @@ impl Tui {
                 return;
             }
             if key.is("end") || (plain && text == Some("G") && st.input.is_empty()) {
+                st.selection = None;
+                st.selection_dragging = false;
                 st.scroll = 0;
+                st.mouse_wheel = pointer::Wheel::default();
+                st.follow_control = pointer::Follow::default();
                 self.schedule(st, 0);
                 return;
             }
         }
+        if key.ctrl && !key.meta && key.is("end") && (st.pending.is_none() || st.remember) && (st.native.is_none() || st.in_transcript_overlay) {
+            st.selection = None;
+            st.selection_dragging = false;
+            st.scroll = 0;
+            st.mouse_wheel = pointer::Wheel::default();
+            st.follow_control = pointer::Follow::default();
+            self.schedule(st, 0);
+            return;
+        }
         if key.is("escape") {
-            if st.status == "Running" || st.status == "Compacting" {
-                actions.push(Action::Cancel);
+            if st.selection.take().is_some() {
+                st.selection_dragging = false;
+                self.schedule(st, 0);
                 return;
             }
+            if let Some(popup) = Self::mention_popup(st) {
+                st.dismissed_mention = Some(popup.signature);
+                self.schedule(st, 0);
+                return;
+            }
+            if !Self::slash_popup(st).0.is_empty() {
+                st.dismissed_slash = Some(st.input.iter().collect());
+                self.schedule(st, 0);
+                return;
+            }
+            if st.pending.is_some() && !st.remember {
+                let pending = st.pending.take().unwrap();
+                st.masked = false;
+                Self::clear_composer(st);
+                let _ = pending.tx.send(if st.esc_cancels { Err(QErr::Esc) } else { Ok(String::new()) });
+                self.schedule(st, 0);
+                return;
+            }
+            // Transcript navigation owns this Escape before turn cancellation.
+            // Returning to live output must not also stop the work being viewed.
             if st.scroll > 0 {
                 st.scroll = 0;
+                st.mouse_wheel = pointer::Wheel::default();
+                st.follow_control = pointer::Follow::default();
                 self.schedule(st, 0);
+                return;
+            }
+            if st.status == "Running" || st.status == "Compacting" || st.status == "Stopping" {
+                actions.push(Action::Cancel);
                 return;
             }
             if st.pending.is_some() && st.remember {
@@ -2202,6 +2749,10 @@ impl Tui {
             }
         }
         if key.ctrl && key.is("l") {
+            if let Some(native) = st.native.as_mut() {
+                native.reset();
+                self.write_raw("\x1b[3J");
+            }
             st.transcript.clear();
             st.scroll = 0;
             st.max_scroll = 0;
@@ -2217,19 +2768,24 @@ impl Tui {
             return;
         }
         if key.ctrl && key.is("d") && st.input.is_empty() {
-            actions.push(Action::Ended);
+            if st.pending.is_some() && !st.remember {
+                let pending = st.pending.take().unwrap();
+                let _ = pending.tx.send(if st.esc_cancels { Err(QErr::Esc) } else { Ok(String::new()) });
+                self.schedule(st, 0);
+                return;
+            }
+            self.quit_shortcut(st, "d", actions);
             return;
         }
-        if key.meta && key.is("up") && !st.queued_prompts.is_empty() {
-            let popped = st.queued_prompts.pop().unwrap();
-            st.input = chars_of(&popped);
-            st.cursor = st.input.len();
-            st.input_restored_from_revert = false;
-            self.rehydrate_placeholders(st);
-            self.schedule(st, 0);
+        if key.meta && key.is("up") && !st.queued_prompts.is_empty() && (st.pending.is_none() || st.remember) && Self::mention_popup(st).is_none() && Self::slash_popup(st).0.is_empty() {
+            self.edit_latest_queued(st);
             return;
         }
         let (_, rows) = self.size();
+        if st.native.is_some() && !st.in_transcript_overlay && (key.is("pageup") || key.is("pagedown") || ((key.is("up") || key.is("down")) && (key.shift || key.ctrl))) {
+            // Native terminal scrollback owns paging; do not move a second transcript offset.
+            return;
+        }
         if key.is("pageup") || (key.is("up") && (key.shift || key.ctrl)) {
             let step = if key.is("pageup") { (rows as i64 - 8).max(2) } else { 4 };
             self.scroll_by(st, step);
@@ -2241,6 +2797,11 @@ impl Tui {
             return;
         }
         if key.is("up") || key.is("down") {
+            if let Some(popup) = Self::mention_popup(st) {
+                st.popup_index = if key.is("up") { (popup.selected + popup.items.len() - 1) % popup.items.len() } else { (popup.selected + 1) % popup.items.len() };
+                self.schedule(st, 0);
+                return;
+            }
             let (matches, index) = Self::slash_popup(st);
             if !matches.is_empty() {
                 let len = matches.len();
@@ -2248,19 +2809,16 @@ impl Tui {
                 self.schedule(st, 0);
                 return;
             }
-            let dir = if key.is("up") { 2 } else { -2 };
-            if st.pending.is_none() && st.input.is_empty() {
-                self.scroll_by(st, dir);
-                return;
-            }
-            if st.scroll > 0 {
-                self.scroll_by(st, dir);
-                return;
-            }
-            if key.is("up") && st.max_scroll > 0 && st.input.is_empty() && st.history_index == st.history.len() {
-                self.scroll_by(st, 2);
-                return;
-            }
+        }
+        if key.ctrl && key.is("r") && (st.pending.is_none() || st.remember) {
+            self.begin_history_search(st);
+            self.schedule(st, 0);
+            return;
+        }
+        if ((key.is("return") || key.is("enter")) && (key.shift || key.meta || key.ctrl)) || (key.ctrl && (key.is("j") || key.is("m"))) {
+            Self::insert_newline(st);
+            self.schedule(st, 0);
+            return;
         }
         if (key.is("tab") && key.shift) || key.sequence == "\x1b[Z" {
             actions.push(Action::ToggleMode);
@@ -2282,6 +2840,10 @@ impl Tui {
             return;
         }
         if key.is("tab") {
+            if let Some(popup) = Self::mention_popup(st) {
+                self.accept_mention(st, popup);
+                return;
+            }
             let current: String = st.input.iter().collect();
             if current.starts_with('/') {
                 let (matches, index) = Self::slash_popup(st);
@@ -2294,22 +2856,25 @@ impl Tui {
                 }
                 return;
             }
-            if let Some(c) = re!(r"(?:^|\s)@([A-Za-z0-9_./\\-]*)$").captures(&current) {
-                if !st.workspace_files.is_empty() {
-                    let query = c[1].to_lowercase();
-                    let found = st.workspace_files.iter().find(|f| f.to_lowercase().starts_with(&query)).or_else(|| st.workspace_files.iter().find(|f| f.to_lowercase().contains(&query))).cloned();
-                    if let Some(found) = found {
-                        let prefix_len = current.len() - c[1].len();
-                        st.input = chars_of(&format!("{}{found} ", &current[..prefix_len]));
-                        st.cursor = st.input.len();
-                        st.input_restored_from_revert = false;
-                        self.schedule(st, 16);
-                    }
+            if !current.trim().is_empty() && (st.pending.is_none() || st.remember) {
+                if st.pending.is_none() {
+                    Self::remember_prompt(st, &current);
+                    actions.push(Action::RecordHistory(self.expand_placeholders(st, &current)));
+                    let prompt = composer::QueuedPrompt::capture(st, current.trim_end());
+                    st.queued_prompts.push(prompt);
+                    Self::clear_composer(st);
+                    self.schedule(st, 0);
+                } else {
+                    self.keypress(st, None, &Key::named("return"), actions);
                 }
             }
             return;
         }
         if key.is("return") || key.is("enter") {
+            if let Some(popup) = Self::mention_popup(st) {
+                self.accept_mention(st, popup);
+                return;
+            }
             let (matches, index) = Self::slash_popup(st);
             if let Some(sel) = matches.get(index) {
                 let joined: String = st.input.iter().collect();
@@ -2324,10 +2889,9 @@ impl Tui {
             let Some(pending) = st.pending.take() else {
                 let trimmed = value.trim().to_string();
                 if !trimmed.is_empty() {
-                    st.history.push(raw_joined.trim_end().to_string());
-                    if st.history.len() > 100 {
-                        st.history.remove(0);
-                    }
+                    Self::remember_prompt(st, &raw_joined);
+                    actions.push(Action::RecordHistory(value.clone()));
+                    let queued = composer::QueuedPrompt::capture(st, raw_joined.trim_end());
                     Self::clear_composer(st);
                     // Slash commands and !cmd run immediately even while the agent works.
                     if (trimmed.starts_with('/') || trimmed.starts_with('!')) && self.callbacks.lock().unwrap().on_immediate_command.is_some() {
@@ -2335,18 +2899,16 @@ impl Tui {
                         actions.push(Action::Immediate(trimmed));
                         return;
                     }
-                    // Otherwise queue the prompt for the next turn (compact placeholders kept).
-                    st.queued_prompts.push(raw_joined.trim_end().to_string());
+                    // Enter steers the current run; Tab explicitly queues for a later turn.
+                    actions.push(Action::Steer { expanded: trimmed, queued });
                     self.schedule(st, 0);
                 }
                 return;
             };
             st.masked = false;
             if st.remember && !value.trim().is_empty() {
-                st.history.push(raw_joined.trim_end().to_string());
-                if st.history.len() > 100 {
-                    st.history.remove(0);
-                }
+                Self::remember_prompt(st, &raw_joined);
+                actions.push(Action::RecordHistory(value.clone()));
             }
             Self::clear_composer(st);
             st.scroll = 0;
@@ -2358,29 +2920,39 @@ impl Tui {
             self.schedule(st, 16);
             return;
         }
-        if key.is("left") {
+        if ((key.is("left") || key.is("right")) && (key.ctrl || key.meta)) || (key.meta && (key.is("b") || key.is("f"))) {
+            let forward = key.is("right") || key.is("f");
+            let target = if forward { composer::word_right(st) } else { composer::word_left(st) };
+            st.cursor = composer::snap_atomic(st, target, forward);
+        } else if key.is("left") || (key.ctrl && key.is("b")) {
             if st.cursor > 0 {
                 st.cursor = match Self::atomic_before(st) {
                     Some(t) => st.cursor.saturating_sub(t.chars().count()),
-                    None => st.cursor - 1,
+                    None => composer::previous_grapheme(&st.input, st.cursor),
                 };
             }
-        } else if key.is("right") {
+        } else if key.is("right") || (key.ctrl && key.is("f")) {
             if st.cursor < st.input.len() {
                 st.cursor = match Self::atomic_after(st) {
                     Some(t) => (st.cursor + t.chars().count()).min(st.input.len()),
-                    None => st.cursor + 1,
+                    None => composer::next_grapheme(&st.input, st.cursor),
                 };
             }
         } else if key.is("home") || (key.ctrl && key.is("a")) {
-            st.cursor = 0;
+            st.cursor = composer::line_start(st);
         } else if key.is("end") || (key.ctrl && key.is("e")) {
             if st.scroll > 0 && st.cursor == st.input.len() {
                 st.scroll = 0;
             } else {
-                st.cursor = st.input.len();
+                st.cursor = composer::line_end(st);
             }
-        } else if key.is("backspace") {
+        } else if (key.is("backspace") && (key.ctrl || key.meta)) || (key.ctrl && key.is("w")) {
+            let start = composer::word_left(st);
+            Self::kill_range(st, start, st.cursor);
+        } else if (key.is("delete") && (key.ctrl || key.meta)) || (key.meta && key.is("d")) {
+            let end = composer::word_right(st);
+            Self::kill_range(st, st.cursor, end);
+        } else if key.is("backspace") || (key.ctrl && key.is("h")) {
             st.input_restored_from_revert = false;
             if st.cursor > 0 {
                 match Self::atomic_before(st) {
@@ -2392,13 +2964,13 @@ impl Tui {
                         st.cursor = start;
                     }
                     None => {
-                        st.cursor -= 1;
-                        let at = st.cursor;
-                        st.input.remove(at);
+                        let start = composer::previous_grapheme(&st.input, st.cursor);
+                        st.input.drain(start..st.cursor);
+                        st.cursor = start;
                     }
                 }
             }
-        } else if key.is("delete") {
+        } else if key.is("delete") || (key.ctrl && key.is("d")) {
             st.input_restored_from_revert = false;
             if st.cursor < st.input.len() {
                 match Self::atomic_after(st) {
@@ -2410,54 +2982,28 @@ impl Tui {
                     }
                     None => {
                         let at = st.cursor;
-                        st.input.remove(at);
+                        let end = composer::next_grapheme(&st.input, at);
+                        st.input.drain(at..end);
                     }
                 }
             }
-        } else if key.ctrl && key.is("w") {
-            st.input_restored_from_revert = false;
-            match Self::atomic_before(st) {
-                Some(token) => {
-                    Self::drop_token(st, &token);
-                    let n = token.chars().count();
-                    let start = st.cursor - n;
-                    st.input.drain(start..st.cursor);
-                    st.cursor = start;
-                }
-                None => {
-                    while st.cursor > 0 && st.input[st.cursor - 1] == ' ' {
-                        st.cursor -= 1;
-                        let at = st.cursor;
-                        st.input.remove(at);
-                    }
-                    while st.cursor > 0 && st.input[st.cursor - 1] != ' ' {
-                        st.cursor -= 1;
-                        let at = st.cursor;
-                        st.input.remove(at);
-                    }
-                }
+        } else if key.is("up") || key.is("down") || (key.ctrl && (key.is("p") || key.is("n"))) {
+            let older = key.is("up") || key.is("p");
+            let label_cols = if st.label == "goon> " { 2 } else { visible_length(&st.label) };
+            let cols = self.size().0.saturating_sub(1 + label_cols).max(1);
+            if !Self::move_vertical(st, older, cols) && (st.pending.is_none() || st.remember) {
+                self.navigate_history(st, older);
             }
-        } else if (key.is("up") || key.is("down") || (key.ctrl && (key.is("p") || key.is("n")))) && st.remember {
-            st.input_restored_from_revert = false;
-            let delta: i64 = if key.is("up") || key.is("p") { -1 } else { 1 };
-            st.history_index = (st.history_index as i64 + delta).clamp(0, st.history.len() as i64) as usize;
-            st.input = chars_of(st.history.get(st.history_index).map(String::as_str).unwrap_or(""));
-            st.cursor = st.input.len();
-            self.rehydrate_placeholders(st);
         } else if key.ctrl && key.is("u") {
-            st.input_restored_from_revert = false;
-            if !st.input.is_empty() {
-                st.input.clear();
-                st.cursor = 0;
-                st.attached_images.clear();
-                st.pasted_texts.clear();
-                if st.queued_prompts.is_empty() {
-                    st.next_image_idx = 1;
-                    st.next_paste_idx = 1;
-                }
-            } else {
-                self.scroll_by(st, 5);
-            }
+            let start = composer::line_start(st);
+            Self::kill_range(st, if start == st.cursor { start.saturating_sub(1) } else { start }, st.cursor);
+        } else if key.ctrl && key.is("k") {
+            let end = composer::line_end(st);
+            Self::kill_range(st, st.cursor, if end == st.cursor { (end + 1).min(st.input.len()) } else { end });
+        } else if key.ctrl && key.is("y") {
+            let killed = chars_of(&st.kill_buffer);
+            Self::insert_chars(st, &killed);
+            self.rehydrate_placeholders(st);
         } else if let Some(t) = text.filter(|t| !t.is_empty() && plain && st.input.len() < 16_000) {
             st.input_restored_from_revert = false;
             let normalized = t.replace("\r\n", "\n").replace('\r', "\n");
@@ -2632,7 +3178,18 @@ impl Tui {
                 self.run_actions(actions);
                 return;
             }
-            if st.picker.is_some() || st.in_transcript_overlay {
+            let choice_question = st
+                .pending
+                .as_ref()
+                .map(|p| {
+                    (!p.choices.is_empty() && !p.custom)
+                        || p.form.as_ref().map(|form| form.confirm.is_some() || (!form.questions[form.index].notes && !form.questions[form.index].options.is_empty())).unwrap_or(false)
+                })
+                .unwrap_or(false);
+            let shortcut_help = ev.code == KeyCode::Char('?')
+                && st.input.is_empty()
+                && !ev.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER | KeyModifiers::HYPER | KeyModifiers::META);
+            if st.picker.is_some() || st.in_transcript_overlay || st.history_search.is_some() || choice_question || st.shortcuts_open || shortcut_help {
                 let flushed = st.paste_burst.flush_before_modified_input();
                 self.apply_flush_result(&mut st, flushed, is_windows, &mut actions);
                 if let Some((text, key)) = key_from_event(&ev) {
@@ -2664,6 +3221,7 @@ impl Tui {
                     } else {
                         let flushed = st.paste_burst.flush_before_modified_input();
                         self.apply_flush_result(&mut st, flushed, is_windows, &mut actions);
+                        self.keypress(&mut st, None, &Key { name: "return".into(), shift: true, ..Default::default() }, &mut actions);
                     }
                 } else if matches!(ev.code, KeyCode::Char(c) if ctrl && !alt && !super_meta && c.eq_ignore_ascii_case(&'m')) {
                     if st.paste_burst.append_control_char_if_active('\r', now) {
@@ -2672,7 +3230,7 @@ impl Tui {
                         st.paste_burst.extend_window(now);
                         self.handle_paste(&mut st, "\n", true);
                     } else {
-                        self.keypress(&mut st, Some("\r"), &Key::named("return"), &mut actions);
+                        self.keypress(&mut st, None, &Key { name: "m".into(), ctrl: true, ..Default::default() }, &mut actions);
                     }
                 } else if (ev.code == KeyCode::Tab && !has_non_text_modifier && !shift) || matches!(ev.code, KeyCode::Char(c) if ctrl && !alt && !super_meta && c.eq_ignore_ascii_case(&'i')) {
                     if st.paste_burst.append_control_char_if_active('\t', now) {
@@ -2683,6 +3241,7 @@ impl Tui {
                         self.keypress(&mut st, Some("\t"), &Key::named("tab"), &mut actions);
                     }
                 } else if matches!(ev.code, KeyCode::Char(ch) if !has_non_text_modifier && !ch.is_control()) {
+                    st.quit_armed = None;
                     let KeyCode::Char(ch) = ev.code else { unreachable!() };
                     match st.paste_burst.on_plain_char(ch, now) {
                         paste_burst::CharDecision::RetainFirstChar => {
@@ -2724,13 +3283,33 @@ impl Tui {
                     let _ = tx.send(None);
                 }
             }
+            if st.editor_active || st.input_yielded {
+                // The editor owns stdio until its child has been reaped. Its
+                // handoff guard performs terminal restoration after cleanup.
+                return;
+            }
         }
+        self.restore_terminal();
+    }
+
+    pub(super) fn restore_terminal(&self) {
+        let mut st = self.state.lock().unwrap();
+        if st.terminal_restored {
+            return;
+        }
+        st.terminal_restored = true;
         if self.real_terminal {
             #[cfg(windows)]
             let _ = windows_console::restore_input_mode();
             let _ = crossterm::terminal::disable_raw_mode();
         }
-        self.write_raw("\x1b[?2004l\x1b[?1007l\x1b[?1006l\x1b[?1000l\x1b[?25h\x1b[?1049l");
+        self.write_raw("\x1b[?1002l\x1b[?1004l\x1b[?2004l\x1b[?1007l\x1b[?1006l\x1b[?1000l\x1b[?25h");
+        if st.native.is_none() {
+            self.write_raw("\x1b[?1049l");
+        } else {
+            let finish = st.native.as_mut().unwrap().finish();
+            self.write_raw(&finish);
+        }
     }
 
     pub fn is_closed(&self) -> bool {
@@ -2744,7 +3323,13 @@ impl Drop for Tui {
             #[cfg(windows)]
             let _ = windows_console::restore_input_mode();
             let _ = crossterm::terminal::disable_raw_mode();
-            self.write_raw("\x1b[?2004l\x1b[?1007l\x1b[?1006l\x1b[?1000l\x1b[?25h\x1b[?1049l");
+            self.write_raw("\x1b[?1002l\x1b[?1004l\x1b[?2004l\x1b[?1007l\x1b[?1006l\x1b[?1000l\x1b[?25h");
+            if self.state.lock().unwrap().native.is_none() {
+                self.write_raw("\x1b[?1049l");
+            } else {
+                let finish = self.state.lock().unwrap().native.as_mut().unwrap().finish();
+                self.write_raw(&finish);
+            }
         }
     }
 }
@@ -2974,6 +3559,7 @@ impl InputDecoder {
 
     pub(crate) fn feed_batch_at(&mut self, tui: &Tui, batch: Vec<crossterm::event::Event>, now: std::time::Instant, is_windows: bool) {
         use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+        let mut resized = false;
         for ev in batch {
             match ev {
                 Event::Key(k) if k.kind == KeyEventKind::Release => {}
@@ -3002,6 +3588,10 @@ impl InputDecoder {
                         }
                     }
                 },
+                #[cfg(unix)]
+                Event::Key(k) if !is_windows && job_control::is_suspend(k) && self.pending_csi.is_empty() => {
+                    tui.request_suspend();
+                }
                 Event::Key(k) => match self.pending_csi.step(k, false) {
                     CsiStep::None => tui.handle_crossterm_key(k, now, is_windows),
                     CsiStep::Buffering | CsiStep::PasteEnd => {}
@@ -3037,9 +3627,18 @@ impl InputDecoder {
                         tui.paste(&text);
                     }
                 }
-                Event::Resize(_, _) => tui.resize(),
-                _ => {}
+                Event::Resize(_, _) => resized = true,
+                Event::Mouse(event) => tui.handle_mouse(event),
+                Event::FocusGained => {
+                    tui.state.lock().unwrap().focused = true;
+                }
+                Event::FocusLost => {
+                    tui.state.lock().unwrap().focused = false;
+                }
             }
+        }
+        if resized {
+            tui.resize();
         }
     }
 
@@ -3176,6 +3775,15 @@ fn input_thread(tui: Weak<Tui>) {
         decoder.feed_batch(&t, batch);
         if csi_timed_out {
             decoder.flush_timeout(&t);
+        }
+        if t.state.lock().unwrap().editor_requested {
+            decoder = InputDecoder::default();
+            t.run_external_editor();
+        }
+        #[cfg(unix)]
+        if t.state.lock().unwrap().suspend_requested {
+            decoder = InputDecoder::default();
+            t.run_suspend();
         }
     }
 }

@@ -16,6 +16,11 @@ const DIVERGENCES: &[(&str, &str, &str)] = &[
     ("risk.classifyBashRisk", "${HOME}", "rm -rf ${HOME} deletes the home directory; TS only recognised the bare $HOME spelling"),
     ("risk.classifyBashRisk", "$HOME/", "rm -rf \"$HOME/\" deletes the home directory; TS missed the trailing-slash spelling"),
     ("risk.tokenize", "$'\\\\x", "ANSI-C $'\\xHH' escapes decode to the real bytes (rm $'\\x2drf' is rm -rf); TS mangled them into -drf"),
+    ("tui.visibleLength", "😀 emoji 👍🏽", "emoji modifiers occupy the base grapheme's cells, not additional cells; covered by text grapheme regressions"),
+    ("tui.padEndVisible", "😀 emoji 👍🏽", "padding uses grapheme display widths rather than summing emoji modifier code points"),
+    ("tui.wrapTerminal", "😀 emoji 👍🏽", "wrapping preserves emoji graphemes and does not prepend an empty row for an oversized glyph"),
+    ("tui.wrapTerminal", "[\"界界界\",1]", "a glyph wider than the viewport does not create an empty leading row"),
+    ("tui.wrapTerminal", "[\"ｆｕｌｌｗｉｄｔｈ\",1]", "a glyph wider than the viewport does not create an empty leading row"),
 ];
 
 const UNDEF: &str = "$undefined";

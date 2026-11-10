@@ -93,6 +93,33 @@ fn exact_edit_rejects_ambiguous_replacements_and_supports_replace_all() {
     assert_eq!(f.read("a.txt"), "two two");
 }
 
+#[test]
+fn invalid_utf8_is_rejected_without_rewriting_original_bytes() {
+    let f = fixture();
+    let files = ws(&f);
+    let original = b"keep\xfforiginal\n";
+    let path = f.cwd.join("legacy.txt");
+    std::fs::write(&path, original).unwrap();
+    assert_match(&err(files.read("legacy.txt", 1, 200)), "UTF-8");
+    assert!(files.edit("legacy.txt", "keep", "changed", false).is_err());
+    assert!(files.write("legacy.txt", "replacement").is_err());
+    assert!(files.apply_patch("*** Begin Patch\n*** Update File: legacy.txt\n@@\n-keep\n+changed\n*** End Patch").is_err());
+    assert_eq!(std::fs::read(path).unwrap(), original);
+}
+
+#[test]
+fn oversized_patch_is_rejected_before_any_file_changes() {
+    let f = fixture();
+    let files = ws(&f);
+    files.write("keep.txt", "before\n").unwrap();
+    let content = "x".repeat(2 * 1024 * 1024);
+    let patch = format!("*** Begin Patch\n*** Update File: keep.txt\n@@\n-before\n+after\n*** Add File: huge.txt\n+{content}\n*** End Patch");
+    assert_match(&err(files.apply_patch(&patch)), "2 MiB");
+    assert_eq!(f.read("keep.txt"), "before\n");
+    assert!(!f.exists("huge.txt"));
+    assert!(files.peek_turn_backups().iter().all(|backup| backup.path != "huge.txt"));
+}
+
 #[cfg(unix)]
 #[test]
 fn portable_search_is_bounded_and_skips_symlinks() {

@@ -129,6 +129,36 @@ async fn writable_delegated_tasks_run_sequentially_with_the_parent_approval_poli
 }
 
 #[tokio::test]
+async fn managed_child_denial_stops_parent_and_other_live_children() {
+    let f = fixture();
+    let p = provider(|body, _| {
+        let messages = body["messages"].as_array().unwrap();
+        if messages.iter().any(|m| m["content"].as_str().is_some_and(|s| s.contains("attempt denied write"))) {
+            calls(vec![tc("denied-write", "write_file", json!({ "path": "denied.txt", "content": "no" }))])
+        } else {
+            let mut reply = text("slow sibling");
+            reply.delay_ms = 2000;
+            reply
+        }
+    })
+    .await;
+    let (approve, _) = recording(|tool| tool != "write_file");
+    let h = parent(&f, &p.url, approve, json!({}));
+    let call = |name: &str, input: Value| tools::ToolCall { tool_call_id: uuid::Uuid::new_v4().to_string(), tool_name: name.into(), input };
+    let older_parent = token();
+    h.tools.execute(&call("spawn_agent", json!({ "nickname": "sibling", "message": "slow work", "agent_type": "explorer" })), &older_parent).await.unwrap();
+    let current_parent = token();
+    h.tools.execute(&call("spawn_agent", json!({ "nickname": "denied-child", "message": "attempt denied write", "agent_type": "worker" })), &current_parent).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), h.subagents.wait_until_idle()).await.unwrap();
+    assert!(current_parent.is_cancelled(), "a background child denial must stop its originating parent run");
+    assert!(!f.exists("denied.txt"));
+    assert!(h.subagents.list_subagent_summaries().iter().all(|a| a.status != "completed"), "denial must not be reported as success and sibling must stop");
+    assert!(h.events.lock().unwrap().iter().any(|e| e["type"] == "stopped"), "app must receive the denial, not only a nested child progress event");
+    assert_eq!(locks_in(&h.child_dir()), 0);
+    h.subagents.close_all().await;
+}
+
+#[tokio::test]
 async fn child_usage_consumes_the_shared_parent_run_budget() {
     let f = fixture();
     let p = provider(|body, _| if is_child(body) { text("Child finished.") } else { calls(vec![tc("delegate1", "delegate_task", json!({ "tasks": ["Inspect files"] }))]) }).await;
@@ -319,7 +349,8 @@ async fn child_registries_inherit_the_parent_network_policy_and_deny_before_appr
     let (approve, approvals) = recording(|_| true);
     let h = parent(&f, &p.url, approve, json!({}));
     h.tools.set_policy(Some(deny_policy()));
-    assert_eq!(h.run("delegate").await.unwrap(), "Parent done.");
+    assert!(h.run("delegate").await.is_err(), "a policy denial in a child must stop the parent run");
+    assert_eq!(p.count(), 2, "neither child nor parent should make another model request after denial");
     assert_eq!(*approvals.lock().unwrap(), vec!["delegate_edit"]);
     let transcripts: Vec<String> =
         std::fs::read_dir(h.child_dir()).unwrap().filter_map(|e| e.ok()).filter(|e| e.file_name().to_string_lossy().ends_with(".json")).map(|e| std::fs::read_to_string(e.path()).unwrap()).collect();
@@ -492,4 +523,185 @@ async fn explicit_max_time_ms_enforces_budget_and_cancel_interrupts_subagent_wai
     assert!(started.elapsed() < std::time::Duration::from_millis(450), "cancel took {:?}", started.elapsed());
     assert!(harness::is_aborted(&err2), "expected Aborted, got: {err2}");
     sub2.close_all().await;
+}
+
+#[tokio::test]
+async fn interrupt_all_stops_prior_turn_children_discards_queued_work_and_preserves_sessions() {
+    let f = fixture();
+    let started = Arc::new(AtomicUsize::new(0));
+    let requests = started.clone();
+    let p = provider(move |_, _| {
+        requests.fetch_add(1, Ordering::SeqCst);
+        let mut response = text("child result");
+        response.delay_ms = 800;
+        response
+    })
+    .await;
+    let h = parent(&f, &p.url, tools::approve_all(), json!({}));
+    let call = |name: &str, input: Value| tools::ToolCall { tool_call_id: uuid::Uuid::new_v4().to_string(), tool_name: name.into(), input };
+    // These tokens belong to distinct completed parent turns. A later turn's cancel token
+    // cannot reach either one; the app's global interrupt must cover both and the queue.
+    let first_turn = token();
+    let second_turn = token();
+    for (nickname, cancel) in [("older-child", &first_turn), ("newer-child", &second_turn)] {
+        h.tools.execute(&call("spawn_agent", json!({ "nickname": nickname, "message": "inspect", "agent_type": "explorer" })), cancel).await.unwrap();
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while started.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    h.tools.execute(&call("send_input", json!({ "target": "older-child", "message": "queued must not run" })), &token()).await.unwrap();
+    assert_eq!(h.subagents.interrupt_all(), 2);
+    assert_eq!(h.subagents.interrupt_all(), 0, "repeated stop must not count already-cancelled workers");
+    tokio::time::timeout(std::time::Duration::from_millis(500), h.subagents.wait_until_idle()).await.expect("stop must release workers promptly");
+    assert!(!first_turn.is_cancelled(), "interrupting children must not cancel parent tokens");
+    assert!(!second_turn.is_cancelled());
+    assert!(h.subagents.list_subagent_summaries().iter().all(|a| a.status == "interrupted"));
+    assert_eq!(started.load(Ordering::SeqCst), 2, "queued input must not start after stop");
+    assert_eq!(locks_in(&h.child_dir()), 0);
+    assert_eq!(h.subagents.interrupt_all(), 0, "stop is idempotent after cleanup");
+    // Interrupted is not closed: a fresh explicit message can continue the same session.
+    let reply = h.tools.execute(&call("send_input", json!({ "target": "older-child", "message": "continue explicitly", "wait": true })), &token()).await.unwrap();
+    assert!(reply.text.contains("child result"), "{}", reply.text);
+    assert_eq!(started.load(Ordering::SeqCst), 3);
+    h.subagents.close_all().await;
+}
+
+#[tokio::test]
+async fn steering_during_a_stream_is_seen_in_the_same_run_before_final_completion() {
+    let f = fixture();
+    let started = Arc::new(tokio::sync::Notify::new());
+    let notify = started.clone();
+    let p = provider(move |body, n| {
+        if n == 1 {
+            notify.notify_one();
+            let mut response = text("initial response");
+            response.delay_ms = 100;
+            response
+        } else {
+            assert!(body["messages"].to_string().contains("new direction"));
+            text("followed new direction")
+        }
+    })
+    .await;
+    let h = parent(&f, &p.url, tools::approve_all(), json!({}));
+    let harness = h.harness();
+    assert!(!harness.steer("idle must not accept").unwrap());
+    let runner = harness.clone();
+    let run = tokio::spawn(async move { runner.run("initial request", &token(), None).await });
+    started.notified().await;
+    assert!(harness.steer("new direction").unwrap());
+    let result = run.await.unwrap().unwrap();
+    assert!(result.contains("followed new direction"));
+    assert_eq!(p.count(), 2);
+    assert!(!harness.steer("finished must not accept").unwrap());
+}
+
+#[tokio::test]
+async fn app_stop_cancels_current_turn_and_earlier_children_without_exiting() {
+    use goon::cli::app::{AllowSets, App, AppState, Ui};
+    let f = fixture();
+    let p = provider(|_, _| {
+        let mut response = text("should be interrupted");
+        response.delay_ms = 800;
+        response
+    })
+    .await;
+    let h = parent(&f, &p.url, tools::approve_all(), json!({}));
+    let previous = token();
+    h.tools
+        .execute(
+            &tools::ToolCall { tool_call_id: "spawn".into(), tool_name: "spawn_agent".into(), input: json!({ "nickname": "previous-turn", "message": "inspect", "agent_type": "explorer" }) },
+            &previous,
+        )
+        .await
+        .unwrap();
+    let current = token();
+    let app = Arc::new_cyclic(|me| App {
+        me: me.clone(),
+        values: Default::default(),
+        json: false,
+        interactive: true,
+        output_last_message: None,
+        policy: deny_policy(),
+        notify_enabled: false,
+        ui: Ui::None,
+        memory_store: None,
+        config: Mutex::new(h.rt.config.clone()),
+        runtime: Mutex::new(h.rt.clone()),
+        store: Mutex::new(h.store.clone()),
+        tools: Mutex::new(Some(h.tools.clone())),
+        harness: Mutex::new(Some(h.harness())),
+        manager: Mutex::new(None),
+        subagents: Mutex::new(Some(h.subagents.clone())),
+        pair: Mutex::new(None),
+        controller: Mutex::new(Some(current.clone())),
+        st: Mutex::new(AppState {
+            mode: "ask".into(),
+            pre_plan_mode: "ask".into(),
+            view_mode: "normal".into(),
+            denied: false,
+            exiting: false,
+            terminating: false,
+            starting: false,
+            goal_deferred: false,
+            rebuild_pending: false,
+            reasoning_source: None,
+        }),
+        allowed: Mutex::new(AllowSets::default()),
+        event_writer: Mutex::new(None),
+        history_writer: Mutex::new(None),
+        input_cancel: Mutex::new(token()),
+        rebuild_lock: tokio::sync::Mutex::new(()),
+    });
+    app.stop();
+    assert!(current.is_cancelled());
+    assert!(!previous.is_cancelled());
+    assert!(!app.exiting());
+    app.stop();
+    assert!(!app.exiting(), "repeated stop during cleanup must not exit the interactive session");
+    h.subagents.wait_until_idle().await;
+    assert_eq!(h.subagents.list_subagent_summaries()[0].status, "interrupted");
+    assert_eq!(locks_in(&h.child_dir()), 0);
+}
+
+#[tokio::test]
+async fn parent_cancel_stops_synchronous_delegates_before_queued_tasks_start() {
+    let f = fixture();
+    let started = Arc::new(AtomicUsize::new(0));
+    let requests = started.clone();
+    let p = provider(move |_, _| {
+        requests.fetch_add(1, Ordering::SeqCst);
+        let mut response = text("child result");
+        response.delay_ms = 800;
+        response
+    })
+    .await;
+    let h = parent(&f, &p.url, tools::approve_all(), json!({}));
+    let cancel = token();
+    let c = cancel.clone();
+    let agents = h.subagents.clone();
+    let run = tokio::spawn(async move {
+        agents
+            .run_tasks(
+                vec!["first".into(), "second".into(), "must not start".into()],
+                goon::subagents::RunTasksOptions { read_only: true, cancel: c, budget: None, allowed_tools: None, role: Some("explorer".into()) },
+            )
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while started.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    cancel.cancel();
+    let result = tokio::time::timeout(std::time::Duration::from_millis(500), run).await.unwrap().unwrap();
+    assert!(harness::is_aborted(&result.unwrap_err()));
+    assert_eq!(started.load(Ordering::SeqCst), 2);
+    assert_eq!(locks_in(&h.child_dir()), 0);
 }

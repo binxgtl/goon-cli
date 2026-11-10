@@ -4,6 +4,48 @@ use goon::provider::{discover_models, format_model_badge, resolve_model_capabili
 
 const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
 
+#[tokio::test]
+async fn command_cancellation_waits_for_the_entire_process_tree() {
+    let f = fixture();
+    f.write(
+        "parent.cjs",
+        r#"
+const {spawn} = require('node:child_process');
+const fs = require('node:fs');
+const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {stdio: 'inherit'});
+fs.writeFileSync('child.pid', String(child.pid));
+setInterval(() => {}, 1000);
+"#,
+    );
+    let cancel = token();
+    let c = cancel.clone();
+    let cwd = f.cwd.clone();
+    let running = tokio::spawn(async move {
+        goon::process::run_command(
+            "node",
+            &["parent.cjs".into()],
+            goon::process::RunOptions { cwd: &cwd, cancel: &c, timeout_ms: 10_000, env: None, output_limit_bytes: None, hard_output_bytes: None },
+        )
+        .await
+    });
+    let ready = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Ok(pid) = std::fs::read_to_string(f.cwd.join("child.pid")) {
+                if let Ok(pid) = pid.parse::<u32>() {
+                    break pid;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    cancel.cancel();
+    let outcome = running.await.unwrap();
+    assert!(matches!(outcome, Err(goon::process::CommandError::Cancelled)), "{outcome:?}");
+    let pid = ready.expect("grandchild should start");
+    assert!(!goon::process::process_alive(pid), "cancelled command left grandchild {pid} running");
+}
+
 fn tool_names(body: &Value) -> Vec<String> {
     body["tools"].as_array().map(|t| t.iter().filter_map(|t| t["function"]["name"].as_str().map(str::to_string)).collect()).unwrap_or_default()
 }

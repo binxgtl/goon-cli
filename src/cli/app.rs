@@ -77,6 +77,7 @@ pub struct App {
     pub st: Mutex<AppState>,
     pub allowed: Mutex<AllowSets>,
     pub event_writer: Mutex<Option<EventLogWriter>>,
+    pub history_writer: Mutex<Option<crate::history::HistoryWriter>>,
     pub input_cancel: Mutex<CancellationToken>,
     pub rebuild_lock: tokio::sync::Mutex<()>,
 }
@@ -193,7 +194,7 @@ impl App {
     }
 
     pub fn notify_attention(&self) {
-        if self.notify_enabled && crate::term::stdout_is_tty() && !self.json {
+        if self.notify_enabled && crate::term::stdout_is_tty() && !self.json && !self.tui().map(|t| t.is_focused()).unwrap_or(false) {
             stdout_write("\x07");
         }
     }
@@ -414,9 +415,13 @@ impl App {
     pub fn refresh_workspace_files(&self) {
         let Some(t) = self.tui() else { return };
         let files = self.tools().files.clone();
+        let cwd = self.runtime().cwd.clone();
         tokio::spawn(async move {
             if let Ok(list) = tokio::task::spawn_blocking(move || files.list_workspace_files(5000)).await {
                 t.set_workspace_files(list);
+            }
+            if let Ok(skills) = tokio::task::spawn_blocking(move || crate::context::discover_skills(&cwd)).await {
+                t.set_workspace_skills(skills.into_iter().map(|s| (s.name, s.description)).collect());
             }
         });
     }
@@ -510,6 +515,16 @@ impl App {
             "[y/N/a(lways)] ".into()
         };
         self.notify_attention();
+        let mut choices = vec![("y".into(), "Yes, proceed once (y)".into())];
+        if let Some(p) = &prefix {
+            choices.push(("p".into(), format!("Allow commands starting with {p} for this session (p)")));
+        }
+        if let Some(e) = &exact {
+            choices.push(("e".into(), format!("Allow exactly {e} for this session (e)")));
+        }
+        choices.push(("a".into(), format!("Allow {} for this session (a)", request.tool)));
+        choices.push(("n".into(), "No, do not proceed (n / esc)".into()));
+        let opts = QuestionOpts { choices: if high { vec![] } else { choices }, ..Default::default() };
         if let Some(pair) = self.pair().filter(|p| p.is_running()) {
             let race = CancellationToken::new();
             let parent = cancel.clone();
@@ -520,9 +535,17 @@ impl App {
             });
             let remote = pair.request_remote_approval(&request.tool, &preview, race.clone());
             let terminal = async {
-                let answer = self.ask_block(&block, &label, Some(&race), QuestionOpts::default()).await;
+                let answer = self.ask_block(&block, &label, Some(&race), opts.clone()).await;
                 let clean = answer.unwrap_or_default().trim().to_lowercase();
-                if clean == "a" || clean == "always" {
+                if high {
+                    if clean == request.tool.to_lowercase() {
+                        "yes".into()
+                    } else {
+                        "no".into()
+                    }
+                } else if exact.is_some() && (clean == "e" || clean == "exact") {
+                    "exact".into()
+                } else if clean == "a" || clean == "always" {
                     "always".to_string()
                 } else if prefix.is_some() && (clean == "p" || clean == "prefix") {
                     "prefix".into()
@@ -534,7 +557,7 @@ impl App {
             };
             let winner = tokio::select! {
                 dec = terminal => {
-                    remote.cancel(if dec == "prefix" { "yes" } else { &dec });
+                    remote.cancel(if dec == "prefix" || dec == "exact" { "yes" } else { &dec });
                     dec
                 }
                 dec = remote.wait() => {
@@ -558,9 +581,15 @@ impl App {
                     return true;
                 }
             }
+            if winner == "exact" && !high {
+                if let Some(e) = exact {
+                    self.allowed.lock().unwrap().exact.insert(e);
+                    return true;
+                }
+            }
             return winner == "yes";
         }
-        let reply = self.ask_block(&block, &label, Some(&cancel), QuestionOpts::default()).await.unwrap_or_default().trim().to_lowercase();
+        let reply = self.ask_block(&block, &label, Some(&cancel), opts).await.unwrap_or_default().trim().to_lowercase();
         if high {
             return reply == request.tool.to_lowercase();
         }
@@ -585,6 +614,9 @@ impl App {
             let me = me.clone();
             Box::pin(async move {
                 let app = me.upgrade().ok_or_else(|| anyhow!("Terminal closed."))?;
+                if let Some(tui) = app.tui() {
+                    return tui.ask_user_questions(questions, &cancel).await;
+                }
                 let mut out = indexmap::IndexMap::new();
                 for q in questions {
                     let options = q.get("options").and_then(Value::as_array).cloned().unwrap_or_default();
@@ -600,7 +632,19 @@ impl App {
                     let header = q.get("header").and_then(Value::as_str).filter(|h| !h.is_empty()).unwrap_or("Question");
                     let block = format!("\n◇ {header}\n  {}\n{}\n", q.get("question").map(jsutil::js_string).unwrap_or_default(), lines.join("\n"));
                     let prompt = format!("Select [1-{}] or type answer (Enter for 1): ", options.len());
-                    let reply = app.ask_block(&block, &prompt, Some(&cancel), QuestionOpts { esc_hint: Some("picks 1".into()), ..Default::default() }).await?.trim().to_string();
+                    let choices = options
+                        .iter()
+                        .enumerate()
+                        .map(|(i, option)| {
+                            let description = option.get("description").and_then(Value::as_str).filter(|s| !s.is_empty()).map(|s| format!(" — {s}")).unwrap_or_default();
+                            ((i + 1).to_string(), format!("{}{description}", label_of(option)))
+                        })
+                        .collect();
+                    let reply = app
+                        .ask_block(&block, &prompt, Some(&cancel), QuestionOpts { esc_cancels: true, esc_hint: Some("cancel".into()), choices, allow_custom: true, ..Default::default() })
+                        .await?
+                        .trim()
+                        .to_string();
                     let id = q.get("id").map(jsutil::js_string).unwrap_or_default();
                     let pick = if reply.is_empty() {
                         options.first().map(label_of).unwrap_or_default()
@@ -765,6 +809,9 @@ impl App {
         if save {
             config::save_config(&next)?;
         }
+        if let Some(tui) = self.tui() {
+            tui.set_mouse_scroll_speed(next.mouse_scroll_speed.unwrap_or(1.0));
+        }
         *self.config.lock().unwrap() = next;
         Ok(())
     }
@@ -867,6 +914,18 @@ impl App {
                 }
             }
             Err(error) => self.turn_error(&error, &controller, &mut result),
+        }
+        if result.aborted {
+            if let Some(agents) = self.subagents() {
+                agents.interrupt_all();
+                if let Some(t) = self.tui() {
+                    t.set_status("Stopping");
+                }
+                agents.wait_until_idle().await;
+            }
+            if let Some(t) = self.tui() {
+                t.restore_queued_after_interrupt();
+            }
         }
         self.set_controller(None);
         if self.interactive && jsutil::now_millis() - started >= 15_000 {
@@ -1024,12 +1083,25 @@ impl App {
 
     // ------------------------------------------------------------------ signals
     pub fn stop(&self) {
+        // SIGINT belongs to the foreground editor during a terminal handoff.
+        // Explicit termination still tears down managed work via terminate().
+        if self.tui().map(|t| t.external_editor_active()).unwrap_or(false) {
+            return;
+        }
         let starting = self.st.lock().unwrap().starting;
         if starting {
             set_exit(130);
         }
+        // A child can outlive its spawning turn; the current turn's token is not enough.
+        let children = self.subagents().map(|s| s.interrupt_all()).unwrap_or(0);
         match self.controller() {
             Some(c) if !c.is_cancelled() => c.cancel(),
+            Some(_) if self.interactive => {
+                self.notice("Stopping current work and subagents — waiting for cleanup");
+            }
+            None if children > 0 => {
+                self.notice("Stopping subagents — their sessions remain available in /subagents");
+            }
             _ => {
                 self.st.lock().unwrap().exiting = true;
                 self.close_input();
@@ -1045,6 +1117,9 @@ impl App {
         }
         if let Some(c) = self.controller() {
             c.cancel();
+        }
+        if let Some(agents) = self.subagents() {
+            agents.interrupt_all();
         }
         self.close_input();
         set_exit(143);
@@ -1282,16 +1357,18 @@ pub async fn run_session(values: Parsed, mut config: Config, policy: ExecutionPo
             }
         };
         let slot = app_slot.clone();
-        let tui = Tui::start(
+        let tui = Tui::start_with_alt_screen(
             &title,
             Arc::new(move || {
                 if let Some(app) = slot.get().and_then(Weak::upgrade) {
                     app.stop();
                 }
             }),
+            !values.flag("no-alt-screen"),
         )?;
         tui.set_mode(&mode);
         tui.set_view_mode(&view_mode);
+        tui.set_mouse_scroll_speed(config.mouse_scroll_speed.unwrap_or(1.0));
         tui.set_effort(runtime.effort.as_deref());
         let (tokens, cost) = {
             let s = store.session.lock().unwrap();
@@ -1338,6 +1415,7 @@ pub async fn run_session(values: Parsed, mut config: Config, policy: ExecutionPo
         }),
         allowed: Mutex::new(AllowSets::default()),
         event_writer: Mutex::new(event_writer),
+        history_writer: Mutex::new(None),
         input_cancel: Mutex::new(CancellationToken::new()),
         rebuild_lock: tokio::sync::Mutex::new(()),
     });
@@ -1355,7 +1433,12 @@ pub async fn run_session(values: Parsed, mut config: Config, policy: ExecutionPo
     let _signals = super::on_signals(handler.clone());
     let _control = super::on_control_channel(handler);
     let outcome = app.clone().session_body(prompt, initial_command, launch_resume_picker, launch_pair).await;
+    let unsent = if outcome.is_err() && !app.exiting() { app.tui().and_then(|t| t.unsent_draft_for_recovery()) } else { None };
     app.shutdown().await;
+    if let Some(text) = unsent {
+        let text = crate::redact::redact_secrets(&text, &[app.runtime().api_key.clone()]);
+        stderr_write(&format!("\nUnsent draft:\n{text}\n"));
+    }
     outcome
 }
 
@@ -1402,6 +1485,39 @@ impl App {
         *self.harness.lock().unwrap() = Some(harness);
         if let Some(t) = self.tui() {
             self.refresh_workspace_files();
+            t.switch_input_session(&self.session_id());
+            let history = crate::history::PromptHistory::new(&self.runtime().data_dir, &self.session_id(), vec![self.runtime().api_key.clone()]);
+            let loader = history.clone();
+            let entries = tokio::task::spawn_blocking(move || loader.load()).await.ok().and_then(Result::ok).unwrap_or_default();
+            let writer = crate::history::HistoryWriter::start(history);
+            t.set_prompt_history(entries, writer.recorder());
+            *self.history_writer.lock().unwrap() = Some(writer);
+            let me = self.me.clone();
+            t.set_on_interrupt_idle(Arc::new(move || {
+                let Some(app) = me.upgrade() else { return };
+                if app.subagents().map(|s| s.interrupt_all()).unwrap_or(0) > 0 {
+                    app.notice("Stopping subagents — their sessions remain available in /subagents");
+                }
+            }));
+            let me = self.me.clone();
+            t.set_on_steer(Arc::new(move |prompt| {
+                let Some(app) = me.upgrade() else { return false };
+                if app.controller().map(|c| c.is_cancelled()).unwrap_or(true) {
+                    return false;
+                }
+                match app.harness().steer(&prompt) {
+                    Ok(true) => {
+                        app.display(&format!("\n> {prompt}\n"));
+                        app.publish_event(&json!({ "type": "user", "text": prompt, "steering": true }), true);
+                        true
+                    }
+                    Ok(false) => false,
+                    Err(error) => {
+                        app.notice(&super::safe_error(&error));
+                        false
+                    }
+                }
+            }));
             let me = self.me.clone();
             t.set_on_copy(Arc::new(move || {
                 let me = me.clone();
@@ -1517,8 +1633,13 @@ impl App {
     async fn shutdown(&self) {
         if let Some(t) = self.tui() {
             t.close();
+            t.wait_for_editor_cleanup().await;
         }
         self.input_cancel.lock().unwrap().cancel();
+        let history_writer = self.history_writer.lock().unwrap().take();
+        if let Some(writer) = history_writer {
+            writer.finish().await;
+        }
         if let Some(p) = self.pair() {
             p.stop().await;
         }

@@ -15,7 +15,12 @@ import time
 ANSI_RE = re.compile(rb'\x1b\[[0-9;?]*[A-Za-z]')
 master, slave = pty.openpty()
 fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 24, 72, 0, 0))
-child = subprocess.Popen(sys.argv[1:], stdin=slave, stdout=slave, stderr=slave, env={**os.environ, 'TERM': 'xterm-256color'})
+def own_terminal():
+    os.setsid()
+    fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+
+child = subprocess.Popen(sys.argv[1:], stdin=slave, stdout=slave, stderr=slave,
+                         preexec_fn=own_terminal, env={**os.environ, 'TERM': 'xterm-256color'})
 output = bytearray()
 
 def wait_for(needle):
@@ -34,18 +39,30 @@ def wait_for(needle):
 
 try:
     wait_for('/help commands')
-    os.write(master, b'/status\r')
+    os.write(master, b'\x1b[200~editor seed one\neditor seed two\neditor seed three\x1b[201~')
+    time.sleep(0.15)
+    os.write(master, b'\x07')
+    wait_for('editor-restored-marker')
+    os.write(master, b'\x15')
+    time.sleep(0.1)
+    os.write(master, b'\x1b[200~/status\x1b[201~')
+    time.sleep(0.15)
+    os.write(master, b'\r')
     wait_for('Session tokens 0')
     # Resize the actual terminal while the UI is live.
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 18, 48, 0, 0))
     child.send_signal(__import__('signal').SIGWINCH)
-    os.write(master, b'create ui.txt\r')
+    os.write(master, b'\x1b[200~create ui.txt\x1b[201~')
+    time.sleep(0.15)
+    os.write(master, b'\r')
     wait_for('Allow write_file?')
-    os.write(master, b'y\r')
+    os.write(master, b'y')
     wait_for('Created by TUI.')
     wait_for('Worked for ')
     time.sleep(0.1)
-    os.write(master, b'/exit\r')
+    os.write(master, b'\x1b[200~/exit\x1b[201~')
+    time.sleep(0.15)
+    os.write(master, b'\r')
     # Keep draining the pty while the child exits: a full pty buffer (small on macOS) would
     # otherwise block the child's final writes and turn a clean exit into a timeout.
     deadline = time.monotonic() + 15

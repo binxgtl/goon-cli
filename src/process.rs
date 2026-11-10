@@ -185,8 +185,14 @@ fn kill_group(pid: u32, signal: i32) {
 }
 
 #[cfg(windows)]
-fn kill_tree(pid: u32) {
-    let _ = std::process::Command::new("taskkill").args(["/pid", &pid.to_string(), "/T", "/F"]).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn();
+async fn kill_tree(pid: u32) {
+    // Wait before killing the root ourselves: taskkill /T discovers descendants through
+    // that root. Fire-and-forget races root exit and can leave grandchildren alive.
+    let mut command = tokio::process::Command::new("taskkill");
+    command.args(["/pid", &pid.to_string(), "/T", "/F"]).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).kill_on_drop(true);
+    if let Ok(mut killer) = command.spawn() {
+        let _ = tokio::time::timeout(Duration::from_secs(5), killer.wait()).await;
+    }
 }
 
 /// Runs a command with a timeout, cancellation and bounded head/tail output capture. The child gets
@@ -304,7 +310,7 @@ pub async fn run_command(command: &str, args: &[String], options: RunOptions<'_>
         #[cfg(windows)]
         {
             if pid > 0 {
-                kill_tree(pid);
+                kill_tree(pid).await;
             }
             let _ = child.kill().await;
         }

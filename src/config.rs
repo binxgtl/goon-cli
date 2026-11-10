@@ -70,6 +70,7 @@ pub struct Config {
     pub allow_net: bool,
     pub allow_net_hosts: Vec<String>,
     pub view_mode: Option<String>,
+    pub mouse_scroll_speed: Option<f64>,
     pub verify: VerifyConfig,
     pub event_log: bool,
     pub stub: bool,
@@ -348,6 +349,7 @@ const CONFIG_KEYS: &[&str] = &[
     "allowNet",
     "allowNetHosts",
     "viewMode",
+    "mouseScrollSpeed",
     "verify",
     "eventLog",
     "stub",
@@ -430,6 +432,10 @@ pub fn parse_config(value: &Value) -> Result<Config> {
     let allow_net = get_bool(map, "allowNet", false, &mut issues);
     let allow_net_hosts = get_string_array(map, "allowNetHosts", &mut issues);
     let view_mode = get_enum(map, "viewMode", &["normal", "verbose", "transcript"], None, &mut issues);
+    let mouse_scroll_speed = get_number(map, "mouseScrollSpeed", false, Some(0.0), None, &mut issues);
+    if mouse_scroll_speed == Some(0.0) {
+        issues.push("mouseScrollSpeed", "Expected a positive finite number");
+    }
     let verify = parse_verify(map.get("verify"), &mut issues);
     let event_log = get_bool(map, "eventLog", false, &mut issues);
     let stub = get_bool(map, "stub", false, &mut issues);
@@ -489,6 +495,7 @@ pub fn parse_config(value: &Value) -> Result<Config> {
         allow_net,
         allow_net_hosts,
         view_mode,
+        mouse_scroll_speed,
         verify,
         event_log,
         stub,
@@ -563,6 +570,9 @@ impl Config {
         m.insert("allowNetHosts".into(), json!(self.allow_net_hosts));
         if let Some(v) = &self.view_mode {
             m.insert("viewMode".into(), json!(v));
+        }
+        if let Some(v) = self.mouse_scroll_speed {
+            m.insert("mouseScrollSpeed".into(), num(v));
         }
         m.insert("verify".into(), self.verify.to_value());
         m.insert("eventLog".into(), json!(self.event_log));
@@ -770,7 +780,7 @@ pub fn load_config(overrides: &Map<String, Value>) -> Result<Config> {
     };
     let validated = parse_config(&stored)?;
     let mut env = Map::new();
-    let env_keys: [(&str, &str); 15] = [
+    let env_keys: [(&str, &str); 16] = [
         ("provider", "GOON_PROVIDER"),
         ("baseUrl", "GOON_BASE_URL"),
         ("model", "GOON_MODEL"),
@@ -783,11 +793,12 @@ pub fn load_config(overrides: &Map<String, Value>) -> Result<Config> {
         ("maxCostUsd", "GOON_MAX_COST_USD"),
         ("maxTimeMs", "GOON_MAX_TIME_MS"),
         ("inlineReasoning", "GOON_INLINE_REASONING"),
+        ("mouseScrollSpeed", "GOON_MOUSE_SCROLL_SPEED"),
         ("embedderProvider", "GOON_EMBEDDER_PROVIDER"),
         ("embedderModel", "GOON_EMBEDDER_MODEL"),
         ("embedderBaseUrl", "GOON_EMBEDDER_BASE_URL"),
     ];
-    let numeric = ["contextWindow", "maxOutputTokens", "timeoutMs", "runTokenBudget", "maxCostUsd", "maxTimeMs"];
+    let numeric = ["contextWindow", "maxOutputTokens", "timeoutMs", "runTokenBudget", "maxCostUsd", "maxTimeMs", "mouseScrollSpeed"];
     for (key, name) in env_keys {
         if let Ok(raw) = std::env::var(name) {
             let value = if numeric.contains(&key) { number_value(js_number(&raw)) } else { Value::String(raw) };
@@ -1022,6 +1033,18 @@ mod tests {
         assert!(parse_config(&json!({"pricing": {"m": {"inputPer1M": 1, "outputPer1M": 2}}})).is_ok());
         assert!(parse_config(&json!({"pricing": {"models": {"m": {"inputPer1M": 1, "outputPer1M": 2}}}})).is_ok());
         assert!(parse_config(&json!({"pricing": {"m": {"inputPer1M": -1, "outputPer1M": 2}}})).is_err());
+    }
+
+    #[test]
+    fn fractional_mouse_scroll_speed_roundtrips_and_rejects_invalid_values() {
+        for value in [0.1, 0.5, 1.0, 3.25] {
+            let config = parse_config(&json!({"mouseScrollSpeed": value})).unwrap();
+            assert_eq!(config.mouse_scroll_speed, Some(value));
+            assert_eq!(parse_config(&config.to_value()).unwrap(), config);
+        }
+        for value in [json!(0), json!(-1), json!("0.5"), Value::Null] {
+            assert!(parse_config(&json!({"mouseScrollSpeed": value})).is_err());
+        }
     }
 
     #[test]

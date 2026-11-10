@@ -80,6 +80,7 @@ pub fn build_role_prompt(role: &str, task: &str) -> String {
 pub enum AgentStatus {
     Running,
     Completed,
+    Interrupted,
     Errored,
     Shutdown,
 }
@@ -89,6 +90,7 @@ impl AgentStatus {
         match self {
             AgentStatus::Running => "running",
             AgentStatus::Completed => "completed",
+            AgentStatus::Interrupted => "interrupted",
             AgentStatus::Errored => "errored",
             AgentStatus::Shutdown => "shutdown",
         }
@@ -103,6 +105,7 @@ pub struct QueuedTurn {
     pub prompt: String,
     pub budget: SharedBudget,
     pub cancel: CancellationToken,
+    pub parent_cancel: CancellationToken,
 }
 
 pub struct ManagedSubagent {
@@ -118,6 +121,7 @@ pub struct ManagedSubagent {
     pub last_error: Option<String>,
     pub updated_at: String,
     pub controller: CancellationToken,
+    pub parent_cancel: CancellationToken,
     /// Completion of the current worker loop (`true` once active + queued turns finish).
     pub done: Option<tokio::sync::watch::Receiver<bool>>,
     pub queued_inputs: VecDeque<QueuedTurn>,
@@ -131,6 +135,7 @@ fn status_payload(agent: Option<&ManagedSubagent>) -> Value {
             AgentStatus::Running => json!("running"),
             AgentStatus::Shutdown => json!("shutdown"),
             AgentStatus::Completed => json!({ "completed": a.last_output.clone().unwrap_or_default() }),
+            AgentStatus::Interrupted => json!("interrupted"),
             AgentStatus::Errored => json!({ "errored": a.last_error.clone().unwrap_or_else(|| "Subagent failed.".into()) }),
         },
     }
@@ -401,9 +406,17 @@ impl Subagents {
         })
     }
 
-    fn child_emit(&self, id: String) -> Emit {
+    fn child_emit(&self, id: String, denied: Arc<Mutex<bool>>, parent_cancel: CancellationToken) -> Emit {
         let emit = self.emit.clone();
+        let manager = self.arc();
         Arc::new(move |event: Value| {
+            // A denial stops the whole run, including policy denials that bypass approval.
+            if event["type"] == "stopped" {
+                *denied.lock().unwrap() = true;
+                emit(event.clone());
+                manager.interrupt_all();
+                parent_cancel.cancel();
+            }
             if is_child_progress_event(&event) {
                 emit(json!({ "type": "subagent", "id": id, "state": "progress", "event": event }));
             }
@@ -422,6 +435,9 @@ impl Subagents {
     }
 
     async fn spawn_agent_tool(&self, input: Value, parent_cancel: CancellationToken) -> Result<String> {
+        if parent_cancel.is_cancelled() {
+            return Err(Aborted::default().into());
+        }
         let s = |k: &str| input.get(k).and_then(Value::as_str).map(str::to_string);
         let raw_role = s("agent_type").unwrap_or_else(|| if self.registry.effective_read_only() { "explorer".into() } else { "default".into() });
         let role = match raw_role.as_str() {
@@ -476,6 +492,7 @@ impl Subagents {
                 last_error: None,
                 updated_at: now_iso(),
                 controller: controller.clone(),
+                parent_cancel: parent_cancel.clone(),
                 done: None,
                 queued_inputs: VecDeque::new(),
                 notify,
@@ -524,10 +541,10 @@ impl Subagents {
     }
 
     async fn execute_managed_turn(&self, id: &str, config: Arc<RuntimeConfig>, prompt: String, budget: SharedBudget) -> ManagedTurnStep {
-        let (cancel, read_only, nickname, agent_type, task) = {
+        let (cancel, parent_cancel, read_only, nickname, agent_type, task) = {
             let s = self.spawned.lock().unwrap();
             let a = &s[id];
-            (a.controller.clone(), a.read_only, a.nickname.clone(), a.agent_type.clone(), a.task.clone())
+            (a.controller.clone(), a.parent_cancel.clone(), a.read_only, a.nickname.clone(), a.agent_type.clone(), a.task.clone())
         };
         let denied = Arc::new(Mutex::new(false));
         let mut store: Option<Arc<SessionStore>> = None;
@@ -555,7 +572,14 @@ impl Subagents {
             self.bus.register_peer_tools(&tools, &nickname, &agent_type)?;
             let inbox = self.bus.drain_unread_prompt_block(&nickname);
             let effective = if inbox.is_empty() { prompt.clone() } else { format!("{prompt}\n{inbox}") };
-            let harness = Harness::new(config.clone(), st.clone(), tools, self.child_emit(id.to_string()), None, HarnessDeps { verify_enabled: Some(false), ..Default::default() })?;
+            let harness = Harness::new(
+                config.clone(),
+                st.clone(),
+                tools,
+                self.child_emit(id.to_string(), denied.clone(), parent_cancel),
+                None,
+                HarnessDeps { verify_enabled: Some(false), ..Default::default() },
+            )?;
             harness.set_untrusted_prompts(true);
             let before = st.session.lock().unwrap().cost();
             let run = harness.run(&effective, &cancel, Some(budget.clone())).await;
@@ -601,7 +625,7 @@ impl Subagents {
                 a.last_error = None;
             }
             a.updated_at = now_iso();
-            if was_denied || a.status == AgentStatus::Shutdown {
+            if was_denied || cancel.is_cancelled() || a.status == AgentStatus::Shutdown {
                 a.queued_inputs.clear();
             }
             let mut next_turn = None;
@@ -616,6 +640,7 @@ impl Subagents {
             match next_turn {
                 Some(q) => {
                     a.controller = q.cancel.clone();
+                    a.parent_cancel = q.parent_cancel.clone();
                     a.status = AgentStatus::Running;
                     a.task = q.prompt.clone();
                     a.model = q.config.model.clone();
@@ -625,7 +650,13 @@ impl Subagents {
                 }
                 None => {
                     if a.status != AgentStatus::Shutdown {
-                        a.status = if failure.is_some() { AgentStatus::Errored } else { AgentStatus::Completed };
+                        a.status = if cancel.is_cancelled() {
+                            AgentStatus::Interrupted
+                        } else if failure.is_some() {
+                            AgentStatus::Errored
+                        } else {
+                            AgentStatus::Completed
+                        };
                     }
                     a.done = None;
                     (ManagedTurnStep::Finished(Some(a.notify.clone())), a.status.as_str().to_string(), a.task.clone(), store.is_some())
@@ -634,7 +665,7 @@ impl Subagents {
         };
         self.bus.update_node_status(&nickname, &status, Some(take_chars(&current_task, 120)));
         if emit_terminal {
-            (self.emit)(json!({ "type": "subagent", "id": id, "state": if failure.is_some() { "error" } else { "done" } }));
+            (self.emit)(json!({ "type": "subagent", "id": id, "state": if cancel.is_cancelled() { "interrupted" } else if failure.is_some() { "error" } else { "done" } }));
         }
         step
     }
@@ -690,6 +721,9 @@ impl Subagents {
     }
 
     async fn send_input_tool(&self, input: Value, parent_cancel: CancellationToken) -> Result<String> {
+        if parent_cancel.is_cancelled() {
+            return Err(Aborted::default().into());
+        }
         let target = input["target"].as_str().unwrap_or("").to_string();
         let message = input["message"].as_str().unwrap_or("").to_string();
         let interrupt = input.get("interrupt") == Some(&Value::Bool(true));
@@ -706,6 +740,9 @@ impl Subagents {
             }
             let nickname = a.nickname.clone();
             if a.status == AgentStatus::Running {
+                if a.controller.is_cancelled() {
+                    bail!("Agent \"{nickname}\" is stopping. Wait for it to become interrupted before sending new input.");
+                }
                 if interrupt {
                     a.queued_inputs.clear();
                     (nickname, Some((a.controller.clone(), a.done.clone())), None)
@@ -715,7 +752,13 @@ impl Subagents {
                     if a.effort.is_some() {
                         child_config.config.effort = a.effort.clone();
                     }
-                    a.queued_inputs.push_back(QueuedTurn { config: Arc::new(child_config), prompt: message.clone(), budget: budget.clone(), cancel: parent_cancel.child_token() });
+                    a.queued_inputs.push_back(QueuedTurn {
+                        config: Arc::new(child_config),
+                        prompt: message.clone(),
+                        budget: budget.clone(),
+                        cancel: parent_cancel.child_token(),
+                        parent_cancel: parent_cancel.clone(),
+                    });
                     (nickname, None, Some(a.done.clone()))
                 }
             } else {
@@ -748,6 +791,7 @@ impl Subagents {
                 bail!("Agent \"{nickname}\" ({id}) is closed. Call resume_agent first.");
             }
             a.controller = parent_cancel.child_token();
+            a.parent_cancel = parent_cancel.clone();
             a.status = AgentStatus::Running;
             a.task = message.clone();
             (a.model.clone(), a.effort.clone())
@@ -812,6 +856,31 @@ impl Subagents {
         }
         for d in waits {
             wait_done(d).await;
+        }
+    }
+
+    /// Stop every live child, including children spawned in an earlier parent turn.
+    /// Preserve their sessions so send_input can start a fresh turn after the interrupt.
+    pub fn interrupt_all(&self) -> usize {
+        let mut spawned = self.spawned.lock().unwrap();
+        let mut count = 0;
+        for agent in spawned.values_mut() {
+            for queued in agent.queued_inputs.drain(..) {
+                queued.cancel.cancel();
+            }
+            if agent.status == AgentStatus::Running && !agent.controller.is_cancelled() {
+                agent.controller.cancel();
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// Wait for cancelled workers to release their sessions and processes before UI readiness.
+    pub async fn wait_until_idle(&self) {
+        let waits: Vec<_> = self.spawned.lock().unwrap().values().filter_map(|a| a.done.clone()).collect();
+        for done in waits {
+            wait_done(done).await;
         }
     }
 
@@ -965,7 +1034,14 @@ impl Subagents {
             tools.update_flags(|f| f.unrestricted = self.registry.unrestricted());
             tools.set_policy(self.registry.policy());
             tools.set_cost_ledger(self.registry.cost_ledger());
-            let harness = Harness::new(self.config.clone(), st.clone(), tools, self.child_emit(id.clone()), None, HarnessDeps { verify_enabled: Some(false), ..Default::default() })?;
+            let harness = Harness::new(
+                self.config.clone(),
+                st.clone(),
+                tools,
+                self.child_emit(id.clone(), denied.clone(), cancel.clone()),
+                None,
+                HarnessDeps { verify_enabled: Some(false), ..Default::default() },
+            )?;
             harness.set_untrusted_prompts(true);
             let before = st.session.lock().unwrap().cost();
             let run = harness.run(&build_role_prompt(&role, task), cancel, Some(budget.clone())).await;

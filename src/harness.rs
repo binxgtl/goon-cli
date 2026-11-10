@@ -331,6 +331,7 @@ struct StepResult {
 #[derive(Default)]
 struct HarnessState {
     running: bool,
+    accepting_steering: bool,
     pending_context: Vec<Value>,
     last_call_sig: String,
     repeat_count: u32,
@@ -551,6 +552,38 @@ impl Harness {
             drop(state);
             self.store.session.lock().unwrap().messages.push(message);
         }
+    }
+
+    /// Accept steering only while a run owns the conversation. Otherwise the caller retains
+    /// the prompt in its next-turn queue. File/image mentions follow normal submission rules.
+    pub fn steer(&self, prompt: &str) -> Result<bool> {
+        let mut state = self.state.lock().unwrap();
+        if !state.running || !state.accepting_steering {
+            return Ok(false);
+        }
+        if prompt.len() > 1024 * 1024 {
+            bail!("Prompt exceeds 1 MiB.");
+        }
+        let untrusted = *self.untrusted_prompts.lock().unwrap();
+        let expanded = expand_file_mentions(
+            prompt,
+            &self.tools.files,
+            &MentionOptions {
+                model: Some(&self.config.model),
+                supports_vision: None,
+                allow_outside_workspace: !untrusted,
+                max_chars: allocate_context_budget(&ContextBudgetConfig::from_config(&self.config), "").files as usize * 3,
+            },
+        );
+        let content = if expanded.image_parts.is_empty() {
+            json!(expanded.expanded_prompt)
+        } else {
+            let mut parts = vec![json!({ "type": "text", "text": expanded.expanded_prompt })];
+            parts.extend(expanded.image_parts);
+            json!(parts)
+        };
+        state.pending_context.push(json!({ "role": "user", "content": content }));
+        Ok(true)
     }
 
     fn drain_pending_context(&self) -> bool {
@@ -1007,6 +1040,7 @@ impl Harness {
             }
             state.running = true;
             state.last_call_sig.clear();
+            state.accepting_steering = true;
             state.repeat_count = 0;
             state.turn_had_successful_tool = false;
             state.turn_had_failed_exec = false;
@@ -1120,6 +1154,7 @@ impl Harness {
                 self.emit(e);
             }
         }
+        self.state.lock().unwrap().accepting_steering = false;
         self.drain_pending_context();
         let _ = self.store.save();
         self.drain_memory_tasks().await;
@@ -1290,6 +1325,20 @@ impl Harness {
                 }
             };
             if step.calls.is_empty() {
+                let steered = {
+                    let mut state = self.state.lock().unwrap();
+                    if state.pending_context.is_empty() {
+                        state.accepting_steering = false;
+                        false
+                    } else {
+                        self.store.session.lock().unwrap().messages.extend(std::mem::take(&mut state.pending_context));
+                        true
+                    }
+                };
+                if steered {
+                    self.store.save()?;
+                    continue;
+                }
                 self.enforce_final_verification()?;
                 if step.text.trim().is_empty() {
                     bail!("Model finished without a visible answer.");
@@ -1552,6 +1601,9 @@ impl Harness {
                 String::new()
             };
             let output = json!({ "type": if result.denied { "error-text" } else { "text" }, "value": format!("{}{loop_note}", result.text) });
+            if result.denied && meta["kind"] == "edit" {
+                meta.insert("error".into(), json!(safe_error(&result.text, Some(&self.config.api_key))));
+            }
             self.emit(json!({ "type": "tool", "name": call.tool_name, "id": call.tool_call_id, "state": if result.denied { "error" } else { "done" }, "meta": meta.clone() }));
             Ok(output)
         }
@@ -1564,6 +1616,9 @@ impl Harness {
                 }
                 let message = if is_aborted(&error) { Aborted::default().0 } else { error.to_string() };
                 let out = json!({ "type": "error-text", "value": safe_error(&message, Some(&self.config.api_key)) });
+                if meta["kind"] == "edit" {
+                    meta.insert("error".into(), json!(safe_error(&message, Some(&self.config.api_key))));
+                }
                 self.emit(json!({ "type": "tool", "name": call.tool_name, "id": call.tool_call_id, "state": "error", "meta": meta.clone() }));
                 out
             }

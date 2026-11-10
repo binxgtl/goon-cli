@@ -23,12 +23,15 @@ struct Tty {
 
 impl Tty {
     fn new(cols: usize, rows: usize) -> Tty {
+        Self::with_mode(cols, rows, true)
+    }
+    fn with_mode(cols: usize, rows: usize, alternate: bool) -> Tty {
         let sink = Sink::default();
         let size = Arc::new(Mutex::new((cols, rows)));
         let s = size.clone();
         let cancelled = Arc::new(AtomicUsize::new(0));
         let c = cancelled.clone();
-        let ui = Tui::with_io(
+        let ui = Tui::with_io_mode(
             "test-model",
             Arc::new(move || {
                 c.fetch_add(1, Ordering::SeqCst);
@@ -36,6 +39,7 @@ impl Tty {
             Box::new(sink.clone()),
             Box::new(move || *s.lock().unwrap()),
             false,
+            alternate,
         );
         Tty { ui, sink, size, cancelled }
     }
@@ -53,6 +57,255 @@ impl Tty {
     fn frame(&self) -> String {
         self.ui.render_now();
         crate::term::strip_vt(&self.ui.rendered_frame()).to_string()
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn suspend_yields_rendering_and_restores_both_modes_even_on_failure() {
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    for alternate in [true, false] {
+        let tty = Tty::with_mode(80, 24, alternate);
+        tty.text("unsent draft");
+        tty.frame();
+        let mut decoder = InputDecoder::default();
+        decoder.feed_batch_at(&tty.ui, vec![Event::Key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL))], std::time::Instant::now(), false);
+        assert!(tty.ui.state.lock().unwrap().suspend_requested);
+        tty.ui.suspend_with(|| {
+            let before = tty.written();
+            tty.ui.render_now();
+            assert_eq!(before, tty.written());
+            assert!(tty.ui.state.lock().unwrap().input_yielded);
+            Err(std::io::ErrorKind::TimedOut.into())
+        });
+        let st = tty.ui.state.lock().unwrap();
+        assert!(!st.input_yielded);
+        assert_eq!(st.input.iter().collect::<String>(), "unsent draft");
+        assert!(st.status_notice.as_ref().unwrap().contains("Suspend/resume failed"));
+        drop(st);
+        assert!(tty.frame().contains("unsent draft"));
+        assert_eq!(tty.cancelled.load(Ordering::SeqCst), 0);
+        if !alternate {
+            assert!(!tty.written().contains("\x1b[?1049"));
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn suspend_is_excluded_from_paste_and_editor_and_defers_new_questions() {
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    let tty = Tty::new(80, 24);
+    let mut decoder = InputDecoder::default();
+    decoder.feed_batch(&tty.ui, vec![Event::Paste("pasted\u{1a}text".into())]);
+    assert!(!tty.ui.state.lock().unwrap().suspend_requested);
+    tty.ui.state.lock().unwrap().editor_active = true;
+    tty.ui.request_suspend();
+    assert!(!tty.ui.state.lock().unwrap().suspend_requested);
+    tty.ui.state.lock().unwrap().editor_active = false;
+    decoder.feed_batch_at(&tty.ui, vec![Event::Key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL))], std::time::Instant::now(), false);
+    let ui = tty.ui.clone();
+    let question = tokio::spawn(async move { ui.question("Approval: ", None, false, QuestionOpts { esc_cancels: true, ..Default::default() }).await });
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(tty.ui.state.lock().unwrap().pending.is_none());
+    tty.ui.suspend_with(|| Ok(()));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(tty.ui.state.lock().unwrap().pending.is_some());
+    tty.key("escape");
+    assert!(question.await.unwrap().is_err());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn closing_while_yielded_never_reenters_raw_or_alternate_screen() {
+    for alternate in [true, false] {
+        let tty = Tty::with_mode(80, 24, alternate);
+        tty.ui.request_suspend();
+        let mut yielded = String::new();
+        tty.ui.suspend_with(|| {
+            tty.ui.close();
+            assert!(!tty.ui.state.lock().unwrap().terminal_restored);
+            yielded = tty.written();
+            Ok(())
+        });
+        let st = tty.ui.state.lock().unwrap();
+        assert!(st.closed && st.terminal_restored && !st.input_yielded);
+        assert_eq!(tty.written(), yielded, "closed yielded terminal must not move the shell's cursor again");
+    }
+}
+
+#[tokio::test]
+async fn external_editor_shortcut_is_modal_safe_and_applies_literal_draft_without_submission() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let tty = Tty::new(100, 24);
+    tty.ui.paste("large\npasted\ncontent");
+    let token = {
+        let mut st = tty.ui.state.lock().unwrap();
+        st.attached_images.insert("[Image #1]".into(), "one.png".into());
+        st.attached_images.insert("[Image #2]".into(), "two.png".into());
+        st.pasted_texts.keys().next().unwrap().clone()
+    };
+    tty.ui.handle_crossterm_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL), std::time::Instant::now(), true);
+    assert!(tty.ui.state.lock().unwrap().editor_requested);
+    tty.text("ignored after handoff request");
+    {
+        let mut st = tty.ui.state.lock().unwrap();
+        assert!(!st.input.iter().collect::<String>().contains("ignored"));
+        st.editor_requested = false;
+        Tui::apply_external_edit(&mut st, "edited [Image #2] text\n\n");
+        assert!(st.pasted_texts.is_empty());
+        assert!(!st.input.iter().collect::<String>().contains(&token));
+        assert_eq!(st.input.iter().collect::<String>(), "edited [Image #2] text");
+        assert_eq!(st.attached_images.len(), 1);
+        assert!(st.attached_images.contains_key("[Image #2]"));
+        assert_eq!(st.cursor, st.input.len());
+        assert!(st.history.is_empty());
+    }
+
+    let ui = tty.ui.clone();
+    let modal = tokio::spawn(async move { ui.question("Secret: ", None, false, QuestionOpts { mask: true, esc_cancels: true, ..Default::default() }).await });
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    tty.ui.key(None, modified("g", true, false, false));
+    assert!(!tty.ui.state.lock().unwrap().editor_requested);
+    tty.key("escape");
+    assert!(modal.await.unwrap().is_err());
+}
+
+#[tokio::test]
+async fn close_during_editor_waits_for_handoff_before_terminal_teardown() {
+    let tty = Tty::new(100, 24);
+    tty.text("owned draft");
+    tty.ui.state.lock().unwrap().editor_active = true;
+    tty.ui.submit_external_prompt("must not submit");
+    assert!(!tty.ui.has_queued_prompts());
+    let guard = editor::EditorGuard(&tty.ui);
+    tty.sink.0.lock().unwrap().clear();
+    tty.ui.close();
+    assert!(tty.ui.is_closed());
+    assert!(tty.written().is_empty(), "terminal must remain owned by editor until cleanup");
+    let ui = tty.ui.clone();
+    let waiter = tokio::spawn(async move { ui.wait_for_editor_cleanup().await });
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(!waiter.is_finished());
+    drop(guard);
+    tokio::time::timeout(Duration::from_secs(1), waiter).await.unwrap().unwrap();
+    assert!(tty.written().ends_with("\x1b[?25h\x1b[?1049l"));
+    tty.sink.0.lock().unwrap().clear();
+    tty.ui.close();
+    assert!(tty.written().is_empty(), "teardown is idempotent");
+}
+
+#[tokio::test]
+async fn editor_handoff_suppresses_rendering_and_defers_cancellable_approvals() {
+    let tty = Tty::new(100, 24);
+    tty.text("owned draft");
+    tty.ui.state.lock().unwrap().editor_active = true;
+    tty.sink.0.lock().unwrap().clear();
+    tty.ui.write("background output\n");
+    tty.ui.render_now();
+    assert!(tty.written().is_empty());
+    let ui = tty.ui.clone();
+    let cancel = CancellationToken::new();
+    let c = cancel.clone();
+    let modal = tokio::spawn(async move { ui.question("Approve? ", Some(&c), false, QuestionOpts::default()).await });
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(!modal.is_finished());
+    assert_eq!(draft(&tty), "owned draft");
+    cancel.cancel();
+    assert!(modal.await.unwrap().is_err());
+    tty.ui.state.lock().unwrap().editor_active = false;
+}
+
+#[tokio::test]
+async fn approval_waits_for_requested_editor_and_restores_the_edited_draft() {
+    let tty = Tty::new(100, 24);
+    tty.text("before edit");
+    tty.ui.state.lock().unwrap().editor_requested = true;
+    let ui = tty.ui.clone();
+    let modal = tokio::spawn(async move { ui.question("Approve? ", None, false, QuestionOpts { esc_cancels: true, ..Default::default() }).await });
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(tty.ui.state.lock().unwrap().pending.is_none());
+    assert_eq!(draft(&tty), "before edit");
+    {
+        let mut st = tty.ui.state.lock().unwrap();
+        Tui::apply_external_edit(&mut st, "after edit");
+        st.editor_requested = false;
+    }
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert!(tty.ui.state.lock().unwrap().pending.is_some());
+    tty.key("escape");
+    assert!(modal.await.unwrap().is_err());
+    assert_eq!(draft(&tty), "after edit");
+}
+
+#[tokio::test]
+async fn native_resize_does_not_reemit_committed_transcript() {
+    let tty = Tty::with_mode(90, 20, false);
+    let mut st = tty.ui.state.lock().unwrap();
+    st.transcript = (0..35).map(|i| format!("committed-{i:02} Unicode 👩‍💻 content to wrap after resizing the terminal\n")).collect();
+    tty.ui.render(&mut st);
+    assert!(tty.written().contains("committed-00"));
+    tty.sink.0.lock().unwrap().clear();
+    drop(st);
+    *tty.size.lock().unwrap() = (35, 16);
+    tty.ui.resize();
+    tty.ui.render_now();
+    assert!(!tty.written().contains("committed-00"), "resize must not duplicate source committed at the old width");
+    assert!(tty.frame().contains("committed-34") || tty.frame().contains("Unicode"));
+    tty.ui.close();
+}
+
+#[tokio::test]
+async fn transcript_presentation_changes_never_reinterpret_stale_selection_rows() {
+    let tty = Tty::new(100, 24);
+    tty.ui.write("[reasoning]\nhidden thinking\n[answer]\nvisible answer\n");
+    tty.ui.set_view_mode("normal");
+    tty.frame();
+    {
+        let mut st = tty.ui.state.lock().unwrap();
+        st.selection = Some(selection::Selection::new(selection::Point { line: 0, offset: 0 }, &st.transcript, &st.body_layout));
+        st.selection_dragging = true;
+    }
+    tty.ui.set_transcript_overlay(true);
+    assert!(tty.ui.state.lock().unwrap().selection.is_none());
+    tty.frame();
+    {
+        let mut st = tty.ui.state.lock().unwrap();
+        st.selection = Some(selection::Selection::new(selection::Point { line: 0, offset: 0 }, &st.transcript, &st.body_layout));
+    }
+    tty.ui.key(None, modified("t", true, false, false));
+    assert!(tty.ui.state.lock().unwrap().selection.is_none());
+    assert!(!tty.ui.state.lock().unwrap().selection_dragging);
+}
+
+#[tokio::test]
+async fn native_full_height_modals_restore_compact_viewport_at_bottom_without_alt_screen() {
+    for modal in ["transcript", "approval"] {
+        let tty = Tty::with_mode(100, 24, false);
+        tty.ui.write(&(0..40).map(|n| format!("native-{n}\n")).collect::<String>());
+        tty.frame();
+        let task = if modal == "transcript" {
+            tty.ui.set_transcript_overlay(true);
+            None
+        } else {
+            let ui = tty.ui.clone();
+            Some(tokio::spawn(async move { ui.question("Approval: ", None, false, QuestionOpts { esc_cancels: true, ..Default::default() }).await }))
+        };
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        tty.frame();
+        assert_eq!(tty.ui.state.lock().unwrap().last_frame_rows.len(), 24);
+        tty.sink.0.lock().unwrap().clear();
+        tty.key("escape");
+        if let Some(task) = task {
+            assert!(task.await.unwrap().is_err());
+        }
+        tty.frame();
+        let written = tty.written();
+        assert!(!written.contains("\x1b[?1049"), "no-alt-screen must apply to modal entry and exit");
+        assert!(!written.contains("native-0\x1b[0m\r\n"), "committed history is not replayed");
+        let height = tty.ui.state.lock().unwrap().last_frame_rows.len();
+        assert!(height < 24);
+        assert!(written.contains(&format!("\x1b[{}B", 24 - height)), "compact viewport must be restored at bottom: {written:?}");
     }
 }
 
@@ -93,7 +346,7 @@ async fn cancels_approvals_handles_ctrl_c_and_narrow_terminals() {
     cancel.cancel();
     assert!(approval.await.unwrap().unwrap_err().to_string().contains("cancelled"));
     tty.ui.key(None, Key { name: "c".into(), ctrl: true, ..Default::default() });
-    assert_eq!(tty.cancelled.load(Ordering::SeqCst), 1);
+    assert_eq!(tty.cancelled.load(Ordering::SeqCst), 0, "idle Ctrl+C arms quit instead of exiting");
     tty.ui.event(&serde_json::json!({ "type": "text", "text": "hello\nworld\x1b[2J" }));
     tty.ui.event(&serde_json::json!({ "type": "tool", "name": "read_file", "id": "one", "state": "start" }));
     tty.ui.event(&serde_json::json!({ "type": "subagent", "id": "child", "task": "Inspect", "state": "start" }));
@@ -174,7 +427,7 @@ async fn cells_markdown_and_diffs() {
     let frame = crate::term::strip_vt(&raw).to_string();
     assert!(tty.written().contains("\x1b[?2026h"));
     assert!(!tty.written().contains("Streaming write_file:"));
-    assert!(frame.contains("Working"));
+    assert!(frame.contains("Preparing write_file"));
     assert!(frame.contains("Explored"));
     assert!(regex::Regex::new(r"Read.*src/index\.ts").unwrap().is_match(&frame));
     assert!(regex::Regex::new(r"Search.*createModel in src").unwrap().is_match(&frame));
@@ -186,6 +439,23 @@ async fn cells_markdown_and_diffs() {
     assert!(!bullet.contains(text::ERR));
     let removed = lines.iter().find(|l| l.contains("const oldVal = 1;")).unwrap();
     assert!(removed.contains(text::ERR));
+}
+
+#[tokio::test]
+async fn failed_edit_does_not_claim_success_or_show_proposed_diff_as_applied() {
+    let tty = Tty::new(100, 30);
+    tty.ui.event(&serde_json::json!({ "type": "tool", "id": "failed-edit", "name": "apply_patch", "state": "error", "meta": {
+        "kind": "edit", "verb": "Edited", "summary": "src/subagents.rs", "added": 1, "removed": 1,
+        "diff": "--- a/src/subagents.rs\n+++ b/src/subagents.rs\n@@\n-before_marker\n+after_marker",
+        "error": "Patch hunk is ambiguous (matched 2 times)"
+    } }));
+    tty.ui.render_now();
+    let frame = crate::term::strip_vt(&tty.ui.rendered_frame()).to_string();
+    assert!(frame.contains("Failed to edit src/subagents.rs"), "{frame}");
+    assert!(frame.contains("Patch hunk is ambiguous"), "{frame}");
+    assert!(!frame.contains("Edited"), "{frame}");
+    assert!(!frame.contains("after_marker"), "{frame}");
+    assert!(!frame.contains("(+1 -1)"), "{frame}");
 }
 
 #[tokio::test]
@@ -408,9 +678,17 @@ async fn incremental_rendering_is_identical_to_a_full_re_render() {
         let cols = tty.size.lock().unwrap().0 - 1;
         let mut st = tty.ui.state.lock().unwrap();
         let incremental = tty.ui.render_styled_body_lines(&mut st, cols, true);
+        let incremental_ends = st.body_source_ends.clone();
+        let incremental_logical = st.body_layout.text.clone();
+        let incremental_hits = (0..incremental.len()).flat_map(|row| [0, 1, 5, cols].map(|col| st.body_layout.hit(row, col))).collect::<Vec<_>>();
         let cached = st.body_cache.take();
         let full = tty.ui.render_styled_body_lines(&mut st, cols, true);
         assert_eq!(incremental, full, "step {step}");
+        assert_eq!(incremental_ends, st.body_source_ends, "source map step {step}");
+        assert_eq!(incremental_logical, st.body_layout.text, "logical text step {step}");
+        let full_hits = (0..full.len()).flat_map(|row| [0, 1, 5, cols].map(|col| st.body_layout.hit(row, col))).collect::<Vec<_>>();
+        assert_eq!(incremental_hits, full_hits, "logical hit map step {step}");
+        assert_eq!(full.len(), st.body_source_ends.len());
         st.body_cache = cached;
     }
     tty.ui.close();
@@ -483,7 +761,7 @@ fn terminal_text_strips_escapes_and_wrapping_counts_wide_characters() {
 }
 
 #[tokio::test]
-async fn long_output_never_drifts_past_the_width_scrolls_with_up_and_pasted_image_paths_collapse() {
+async fn long_output_never_drifts_past_the_width_scrolls_with_pageup_and_pasted_image_paths_collapse() {
     let dir = tempfile::tempdir().unwrap();
     let image = dir.path().join("{25D1BD96-7B57-4392-BBF0-17E774BEEFF2}.png");
     use base64::Engine;
@@ -501,10 +779,10 @@ async fn long_output_never_drifts_past_the_width_scrolls_with_up_and_pasted_imag
     let ui = tty.ui.clone();
     let q = tokio::spawn(async move { ui.question("goon> ", None, true, QuestionOpts::default()).await });
     tokio::time::sleep(Duration::from_millis(5)).await;
-    tty.key("up");
-    assert!(tty.frame().contains("lines above the latest output"));
+    tty.key("pageup");
+    assert!(tty.frame().contains("Follow output"));
     tty.key("escape");
-    assert!(!tty.frame().contains("lines above the latest output"));
+    assert!(!tty.frame().contains("Follow output"));
     tty.ui.paste(&image);
     let frame = tty.frame();
     assert!(frame.contains("[Image #1]"), "{frame}");
@@ -552,7 +830,8 @@ async fn minimal_chrome_transient_cleanup_differential_rendering_and_queued_prom
     assert!(!frame.contains(['╭', '╮', '╰', '╯']));
     assert!(regex::Regex::new(r"^─+$").unwrap().is_match(&lines[n - 3]), "{:?}", lines[n - 3]);
     assert!(lines[n - 2].starts_with("› Ask anything   / commands"), "{:?}", lines[n - 2]);
-    assert!(regex::Regex::new(r"^ask   test-model   effort default\s+0 tokens$").unwrap().is_match(&lines[n - 1]), "{:?}", lines[n - 1]);
+    assert!(lines[n - 1].starts_with("ask   test-model   effort default"), "{:?}", lines[n - 1]);
+    assert!(lines[n - 1].contains("ctrl+r history") && lines[n - 1].ends_with("0 tokens"));
     assert!(!frame.contains("Ready ·") && !frame.contains("Queue"));
 
     let before = tty.written().len();
@@ -1041,7 +1320,7 @@ async fn windows_alt_bracket_paste_while_running_does_not_cancel_or_auto_queue()
 
     // Explicit Enter queues the entire collapsed paste as a single item.
     decoder.feed_batch(&tty.ui, vec![Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))]);
-    assert_eq!(tty.ui.state.lock().unwrap().queued_prompts, vec!["[Pasted text #1 +25 lines]".to_string()]);
+    assert_eq!(tty.ui.state.lock().unwrap().queued_prompts.iter().map(|q| q.text.clone()).collect::<Vec<_>>(), vec!["[Pasted text #1 +25 lines]".to_string()]);
 }
 
 #[tokio::test]
@@ -1210,7 +1489,73 @@ async fn paste_burst_tabs_ctrl_j_and_csi_u_shift_enter_never_complete_or_submit(
 
     decoder.feed_batch_at(&tty.ui, vec![Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))], now, true);
     let submitted = q.await.unwrap().unwrap();
-    assert_eq!(submitted, "/he\tfirst\n\tsecond\nthird");
+    assert_eq!(submitted, "/he\tfirst\n\tsecond\nthird\n\n");
+}
+
+#[tokio::test]
+async fn escape_returns_scrolled_running_view_to_latest_before_cancelling_agent() {
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    for windows in [false, true] {
+        for status in ["Running", "Compacting", "Stopping"] {
+            let tty = Tty::new(80, 24);
+            tty.ui.write(&(0..80).map(|n| format!("history line {n}\n")).collect::<String>());
+            tty.ui.set_status(status);
+            tty.text("preserved follow-up draft");
+            tty.frame();
+            tty.key("pageup");
+            assert!(tty.ui.state.lock().unwrap().scroll > 0);
+            let mut decoder = InputDecoder::default();
+            let escape = || Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            decoder.feed_batch_at(&tty.ui, vec![escape()], std::time::Instant::now(), windows);
+            decoder.flush_timeout_at(&tty.ui, std::time::Instant::now(), windows);
+            assert_eq!(tty.cancelled.load(Ordering::SeqCst), 0, "{status}: returning to current output must consume Escape");
+            assert_eq!(tty.ui.state.lock().unwrap().scroll, 0);
+            assert_eq!(draft(&tty), "preserved follow-up draft");
+            assert_eq!(tty.ui.state.lock().unwrap().status, status);
+            // A distinct Escape at the live tail still intentionally stops the turn.
+            decoder.feed_batch_at(&tty.ui, vec![escape()], std::time::Instant::now(), windows);
+            decoder.flush_timeout_at(&tty.ui, std::time::Instant::now(), windows);
+            assert_eq!(tty.cancelled.load(Ordering::SeqCst), 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn transcript_return_shortcuts_never_cancel_running_turn_or_leave_hidden_scroll() {
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    for alternate in [false, true] {
+        for (code, modifiers, closes) in [(KeyCode::Esc, KeyModifiers::NONE, true), (KeyCode::Char('t'), KeyModifiers::CONTROL, true), (KeyCode::End, KeyModifiers::NONE, false)] {
+            let tty = Tty::with_mode(80, 24, alternate);
+            tty.ui.write(&(0..80).map(|n| format!("history line {n}\n")).collect::<String>());
+            tty.ui.set_status("Running");
+            tty.text("unsent draft");
+            tty.ui.set_transcript_overlay(true);
+            tty.frame();
+            tty.key("pageup");
+            assert!(tty.ui.state.lock().unwrap().scroll > 0);
+            let mut decoder = InputDecoder::default();
+            decoder.feed_batch(&tty.ui, vec![Event::Key(KeyEvent::new(code, modifiers))]);
+            decoder.flush_timeout(&tty.ui);
+            assert_eq!(tty.cancelled.load(Ordering::SeqCst), 0);
+            assert_eq!(tty.ui.state.lock().unwrap().scroll, 0);
+            assert_eq!(tty.ui.is_transcript_overlay(), !closes);
+            assert_eq!(draft(&tty), "unsent draft");
+            assert_eq!(tty.ui.state.lock().unwrap().status, "Running");
+        }
+    }
+    let tty = Tty::new(80, 24);
+    tty.ui.write(&(0..80).map(|n| format!("history line {n}\n")).collect::<String>());
+    tty.text("draft with caret");
+    tty.key("home");
+    tty.ui.set_status("Running");
+    tty.frame();
+    tty.key("pageup");
+    let cursor = tty.ui.state.lock().unwrap().cursor;
+    let mut decoder = InputDecoder::default();
+    decoder.feed_batch(&tty.ui, vec![Event::Key(KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL))]);
+    assert_eq!(tty.ui.state.lock().unwrap().scroll, 0);
+    assert_eq!(tty.ui.state.lock().unwrap().cursor, cursor, "Ctrl+End navigates transcript, not draft");
+    assert_eq!(tty.cancelled.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -1277,4 +1622,1271 @@ async fn standalone_escape_timeout_and_short_pty_commands_preserve_interactive_s
     assert!(tty.frame().contains("[Pasted text #1 +2 lines]"));
     decoder.feed_batch_at(&tty.ui, vec![Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))], t_unix + Duration::from_millis(200), false);
     assert_eq!(q3.await.unwrap().unwrap(), "line 1\nline 2");
+}
+
+fn modified(name: &str, ctrl: bool, meta: bool, shift: bool) -> Key {
+    Key { name: name.into(), ctrl, meta, shift, ..Default::default() }
+}
+
+fn draft(tty: &Tty) -> String {
+    tty.ui.state.lock().unwrap().input.iter().collect()
+}
+
+#[tokio::test]
+async fn multiline_composer_newlines_navigation_rendering_and_submission() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let tty = Tty::new(60, 18);
+    let ui = tty.ui.clone();
+    let q = tokio::spawn(async move { ui.question("goon> ", None, true, QuestionOpts::default()).await });
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    tty.text("first line");
+    let now = std::time::Instant::now();
+    tty.ui.handle_crossterm_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT), now, true);
+    tty.text("second line");
+    tty.ui.handle_crossterm_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL), now, true);
+    tty.text("third line");
+    assert!(!q.is_finished());
+    let frame = tty.frame();
+    for line in ["first line", "second line", "third line"] {
+        assert!(frame.contains(line), "{frame}");
+    }
+    tty.key("home");
+    assert_eq!(tty.ui.state.lock().unwrap().cursor, "first line\nsecond line\n".chars().count());
+    tty.key("up");
+    assert_eq!(tty.ui.state.lock().unwrap().cursor, "first line\n".chars().count());
+    tty.key("end");
+    tty.ui.key(None, modified("k", true, false, false));
+    assert_eq!(draft(&tty), "first line\nsecond linethird line");
+    tty.ui.key(None, modified("y", true, false, false));
+    assert_eq!(draft(&tty), "first line\nsecond line\nthird line");
+    tty.key("return");
+    assert_eq!(q.await.unwrap().unwrap(), "first line\nsecond line\nthird line");
+}
+
+#[tokio::test]
+async fn composer_graphemes_word_motion_kill_yank_and_draft_history() {
+    let tty = Tty::new(70, 20);
+    tty.text("a👩‍💻e\u{301}");
+    tty.key("left");
+    assert_eq!(tty.ui.state.lock().unwrap().cursor, 4);
+    tty.key("backspace");
+    assert_eq!(draft(&tty), "ae\u{301}");
+    tty.key("delete");
+    assert_eq!(draft(&tty), "a");
+    tty.ui.set_input("one two three", false);
+    tty.ui.key(None, modified("left", true, false, false));
+    assert_eq!(tty.ui.state.lock().unwrap().cursor, 8);
+    tty.ui.key(None, modified("u", true, false, false));
+    assert_eq!(draft(&tty), "three");
+    tty.ui.key(None, modified("y", true, false, false));
+    assert_eq!(draft(&tty), "one two three");
+    {
+        let mut st = tty.ui.state.lock().unwrap();
+        st.history = vec!["older prompt".into(), "latest prompt".into()];
+        st.history_index = st.history.len();
+    }
+    tty.ui.set_input("unfinished draft", false);
+    tty.key("up");
+    assert_eq!(draft(&tty), "unfinished draft", "ordinary history navigation must not replace a live draft");
+    tty.ui.set_input("", false);
+    tty.key("up");
+    assert_eq!(draft(&tty), "latest prompt");
+    tty.text(" edited");
+    tty.key("up");
+    assert_eq!(draft(&tty), "latest prompt edited", "editing a recall leaves history navigation");
+    tty.ui.set_input("", false);
+    tty.key("up");
+    tty.key("up");
+    assert_eq!(draft(&tty), "older prompt");
+    tty.key("down");
+    tty.key("down");
+    assert_eq!(draft(&tty), "", "Down past newest exits history with an empty composer");
+}
+
+#[tokio::test]
+async fn history_search_previews_accepts_without_sending_and_cancel_restores_draft() {
+    let tty = Tty::new(90, 20);
+    {
+        let mut st = tty.ui.state.lock().unwrap();
+        st.history = vec!["alpha older".into(), "beta".into(), "alpha latest".into()];
+        st.history_index = st.history.len();
+    }
+    tty.ui.set_input("my draft", false);
+    tty.ui.key(None, modified("r", true, false, false));
+    tty.text("alpha");
+    assert_eq!(draft(&tty), "alpha latest");
+    tty.ui.key(None, modified("r", true, false, false));
+    assert_eq!(draft(&tty), "alpha older");
+    tty.key("escape");
+    assert_eq!(draft(&tty), "my draft");
+    tty.ui.key(None, modified("r", true, false, false));
+    tty.ui.paste("no matching prompt");
+    assert!(tty.frame().contains("no match"));
+    tty.key("return");
+    assert!(tty.ui.state.lock().unwrap().history_search.is_some());
+    tty.ui.key(None, modified("c", true, false, false));
+    assert_eq!(draft(&tty), "my draft");
+    assert_eq!(tty.cancelled.load(Ordering::SeqCst), 0);
+    tty.ui.key(None, modified("r", true, false, false));
+    tty.text("beta");
+    tty.key("return");
+    assert_eq!(draft(&tty), "beta");
+    assert!(!tty.ui.has_queued_prompts(), "accepting search only edits the draft");
+}
+
+#[tokio::test]
+async fn questions_restore_draft_attachments_on_answer_escape_and_cancellation() {
+    let tty = Tty::new(90, 20);
+    let pasted = "draft payload\n".repeat(20);
+    tty.ui.paste(&pasted);
+    let original = draft(&tty);
+    let original_pastes = tty.ui.state.lock().unwrap().pasted_texts.clone();
+    for outcome in ["answer", "escape", "cancel"] {
+        let cancel = CancellationToken::new();
+        let ui = tty.ui.clone();
+        let c = cancel.clone();
+        let q = tokio::spawn(async move { ui.question("approve [y/N] ", Some(&c), false, QuestionOpts { esc_cancels: true, ..Default::default() }).await });
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        match outcome {
+            "answer" => {
+                tty.text("y");
+                tty.key("return");
+            }
+            "escape" => tty.key("escape"),
+            _ => cancel.cancel(),
+        }
+        let _ = q.await.unwrap();
+        assert_eq!(draft(&tty), original);
+        assert_eq!(tty.ui.state.lock().unwrap().pasted_texts, original_pastes);
+        assert_eq!(tty.ui.state.lock().unwrap().label, "goon> ");
+    }
+}
+
+#[tokio::test]
+async fn escape_dismisses_slash_before_interrupt_and_ctrl_c_clears_without_exiting() {
+    let tty = Tty::new(90, 20);
+    tty.ui.set_status("Running");
+    tty.text("/mod");
+    tty.key("escape");
+    assert_eq!(draft(&tty), "/mod");
+    assert_eq!(tty.cancelled.load(Ordering::SeqCst), 0);
+    assert!(Tui::slash_popup(&mut tty.ui.state.lock().unwrap()).0.is_empty());
+    tty.key("escape");
+    assert_eq!(tty.cancelled.load(Ordering::SeqCst), 1);
+    tty.ui.key(None, modified("c", true, false, false));
+    assert_eq!(draft(&tty), "");
+    assert_eq!(tty.cancelled.load(Ordering::SeqCst), 1);
+    tty.ui.key(None, modified("c", true, false, false));
+    assert_eq!(tty.cancelled.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn enter_steers_but_tab_queues_and_fallback_never_loses_input() {
+    let tty = Tty::new(90, 20);
+    let steered = Arc::new(Mutex::new(vec![]));
+    let received = steered.clone();
+    tty.ui.set_on_steer(Arc::new(move |text| {
+        received.lock().unwrap().push(text);
+        true
+    }));
+    tty.ui.set_status("Running");
+    tty.text("change direction now");
+    tty.key("return");
+    assert_eq!(*steered.lock().unwrap(), vec!["change direction now"]);
+    assert!(!tty.ui.has_queued_prompts());
+    tty.text("save this for later");
+    tty.key("tab");
+    assert_eq!(tty.ui.state.lock().unwrap().queued_prompts.iter().map(|q| q.text.clone()).collect::<Vec<_>>(), vec!["save this for later"]);
+    tty.ui.set_on_steer(Arc::new(|_| false));
+    tty.text("arrived as turn finished");
+    tty.key("return");
+    assert_eq!(tty.ui.state.lock().unwrap().queued_prompts.iter().map(|q| q.text.clone()).collect::<Vec<_>>(), vec!["save this for later", "arrived as turn finished"]);
+}
+
+#[tokio::test]
+async fn escape_denies_approval_before_interrupting_running_work() {
+    let tty = Tty::new(90, 20);
+    tty.ui.set_status("Running");
+    tty.text("keep my draft");
+    let ui = tty.ui.clone();
+    let q = tokio::spawn(async move { ui.question("Allow command [y/N] ", None, false, QuestionOpts::default()).await });
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    tty.key("escape");
+    assert_eq!(q.await.unwrap().unwrap(), "");
+    assert_eq!(tty.cancelled.load(Ordering::SeqCst), 0);
+    assert_eq!(draft(&tty), "keep my draft");
+    tty.key("escape");
+    assert_eq!(tty.cancelled.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn dropping_remote_race_question_restores_draft_and_does_not_strand_pending_input() {
+    let tty = Tty::new(90, 20);
+    tty.text("preserved draft");
+    let ui = tty.ui.clone();
+    let q = tokio::spawn(async move { ui.ask_transient("\n▲ remote race approval\n", "[y/N] ", None, QuestionOpts::default()).await });
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    assert!(tty.ui.state.lock().unwrap().pending.is_some());
+    q.abort();
+    let _ = q.await;
+    assert_eq!(draft(&tty), "preserved draft");
+    assert!(tty.ui.state.lock().unwrap().pending.is_none());
+    assert!(!tty.ui.transcript().contains("remote race approval"));
+    let ui = tty.ui.clone();
+    let next = tokio::spawn(async move { ui.question("goon> ", None, true, QuestionOpts::default()).await });
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    tty.key("return");
+    assert_eq!(next.await.unwrap().unwrap(), "preserved draft");
+}
+
+#[tokio::test]
+async fn mention_popup_is_fuzzy_cursor_local_selectable_and_never_submits_on_accept() {
+    let tty = Tty::new(90, 24);
+    tty.ui.set_workspace_files(vec!["src/app.rs".into(), "src/api.rs".into(), "docs/user guide.md".into()]);
+    tty.ui.set_workspace_skills(vec![("review-tests".into(), "Review test coverage".into())]);
+    tty.text("look @sr suffix");
+    for _ in 0..7 {
+        tty.key("left");
+    }
+    let frame = tty.frame();
+    assert!(frame.contains("@src/app.rs") && frame.contains("@src/api.rs"), "{frame}");
+    tty.key("down");
+    tty.key("tab");
+    assert_eq!(draft(&tty), "look @src/app.rs suffix");
+    assert!(!tty.ui.has_queued_prompts());
+    tty.ui.set_input("use $rev", false);
+    assert!(tty.frame().contains("Review test coverage"));
+    tty.key("return");
+    assert_eq!(draft(&tty), "use $review-tests ");
+    assert!(!tty.ui.has_queued_prompts());
+    tty.ui.set_input("read @user", false);
+    tty.key("tab");
+    assert_eq!(draft(&tty), "read @\"docs/user guide.md\" ");
+    tty.ui.set_status("Running");
+    tty.ui.set_input("read @src", false);
+    tty.key("escape");
+    assert_eq!(tty.cancelled.load(Ordering::SeqCst), 0);
+    assert!(Tui::mention_popup(&mut tty.ui.state.lock().unwrap()).is_none());
+    tty.key("escape");
+    assert_eq!(tty.cancelled.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn quit_requires_same_chord_twice_and_other_activity_disarms_it() {
+    let tty = Tty::new(90, 20);
+    let commands = Arc::new(Mutex::new(vec![]));
+    let output = commands.clone();
+    tty.ui.set_on_immediate_command(Arc::new(move |cmd| {
+        output.lock().unwrap().push(cmd);
+        Box::pin(async {})
+    }));
+    tty.ui.key(None, modified("c", true, false, false));
+    assert!(tty.frame().contains("Press ctrl+c again to quit"));
+    assert_eq!(tty.cancelled.load(Ordering::SeqCst), 0);
+    tty.ui.key(None, modified("d", true, false, false));
+    assert!(commands.lock().unwrap().is_empty(), "a different chord cannot confirm quit");
+    tty.text("draft");
+    tty.ui.key(None, modified("c", true, false, false));
+    assert_eq!(draft(&tty), "");
+    assert!(commands.lock().unwrap().is_empty());
+    tty.ui.state.lock().unwrap().quit_armed.as_mut().unwrap().1 = std::time::Instant::now() - Duration::from_secs(1);
+    tty.ui.key(None, modified("c", true, false, false));
+    assert!(commands.lock().unwrap().is_empty(), "expired confirmation must re-arm");
+    tty.ui.key(None, modified("c", true, false, false));
+    assert_eq!(*commands.lock().unwrap(), vec!["/exit"]);
+}
+
+#[tokio::test]
+async fn shortcut_help_is_reversible_and_normal_question_marks_still_type() {
+    let tty = Tty::new(100, 24);
+    tty.text("?");
+    assert_eq!(draft(&tty), "");
+    assert!(tty.frame().contains("ctrl+u/k cut line"));
+    tty.key("escape");
+    assert!(!tty.frame().contains("Shortcuts ·"));
+    tty.text("why?");
+    assert_eq!(draft(&tty), "why?");
+}
+
+#[tokio::test]
+async fn approval_choices_select_with_arrows_shortcuts_and_escape_and_preserve_draft() {
+    let tty = Tty::new(80, 20);
+    tty.ui.set_status("Running");
+    tty.text("my unfinished draft");
+    for method in ["arrow", "shortcut", "escape"] {
+        let ui = tty.ui.clone();
+        let q = tokio::spawn(async move {
+            ui.ask_transient(
+                "\nAllow bash?\n$ npm test\n",
+                "Allow? ",
+                None,
+                QuestionOpts { choices: vec![("y".into(), "Yes, once".into()), ("p".into(), "Allow prefix".into()), ("n".into(), "No".into())], ..Default::default() },
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(tty.frame().contains("Yes, once"));
+        match method {
+            "arrow" => {
+                tty.key("down");
+                tty.key("return");
+            }
+            "shortcut" => tty.text("y"),
+            _ => tty.key("escape"),
+        }
+        assert_eq!(
+            q.await.unwrap().unwrap(),
+            match method {
+                "arrow" => "p",
+                "shortcut" => "y",
+                _ => "n",
+            }
+        );
+        assert_eq!(draft(&tty), "my unfinished draft");
+        assert_eq!(tty.cancelled.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn persistent_history_callback_records_expanded_prompts_but_never_secret_questions() {
+    let tty = Tty::new(90, 20);
+    let recorded = Arc::new(Mutex::new(vec![]));
+    let output = recorded.clone();
+    tty.ui.set_prompt_history(vec!["from earlier session".into()], Arc::new(move |text| output.lock().unwrap().push(text)));
+    tty.key("up");
+    assert_eq!(draft(&tty), "from earlier session");
+    tty.ui.set_input("", false);
+    tty.ui.paste("first\nsecond\nthird");
+    tty.key("tab");
+    assert_eq!(*recorded.lock().unwrap(), vec!["first\nsecond\nthird"]);
+    let ui = tty.ui.clone();
+    let q = tokio::spawn(async move { ui.question("API key: ", None, false, QuestionOpts { mask: true, ..Default::default() }).await });
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    tty.ui.paste("private-secret-value");
+    tty.key("return");
+    assert_eq!(q.await.unwrap().unwrap(), "private-secret-value");
+    assert_eq!(recorded.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn crossterm_choices_bypass_paste_bursts_and_ignore_bracketed_paste() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    for is_windows in [false, true] {
+        for (code, expected) in [(KeyCode::Char('p'), "p"), (KeyCode::Char('2'), "p"), (KeyCode::Enter, "y"), (KeyCode::Esc, "n")] {
+            let tty = Tty::new(90, 24);
+            tty.text("keep draft");
+            let ui = tty.ui.clone();
+            let q = tokio::spawn(async move {
+                ui.question("Allow? ", None, false, QuestionOpts { choices: vec![("y".into(), "Once".into()), ("p".into(), "Prefix".into()), ("n".into(), "No".into())], ..Default::default() }).await
+            });
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            tty.ui.paste("y\n");
+            assert!(!q.is_finished(), "bracketed paste must not approve a tool");
+            assert_eq!(draft(&tty), "");
+            tty.ui.handle_crossterm_key(KeyEvent::new(code, KeyModifiers::NONE), std::time::Instant::now(), is_windows);
+            assert!(!tty.ui.state.lock().unwrap().paste_burst.is_active());
+            assert_eq!(tokio::time::timeout(Duration::from_secs(1), q).await.unwrap().unwrap().unwrap(), expected);
+            assert_eq!(draft(&tty), "keep draft");
+            assert_eq!(tty.cancelled.load(Ordering::SeqCst), 0);
+        }
+    }
+}
+
+#[tokio::test]
+async fn crossterm_help_and_quit_use_shortcuts_not_delayed_paste_input() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    for is_windows in [false, true] {
+        let tty = Tty::new(100, 24);
+        let idle_interrupts = Arc::new(AtomicUsize::new(0));
+        let interrupts = idle_interrupts.clone();
+        tty.ui.set_on_interrupt_idle(Arc::new(move || {
+            interrupts.fetch_add(1, Ordering::SeqCst);
+        }));
+        let commands = Arc::new(Mutex::new(vec![]));
+        let output = commands.clone();
+        tty.ui.set_on_immediate_command(Arc::new(move |cmd| {
+            output.lock().unwrap().push(cmd);
+            Box::pin(async {})
+        }));
+        let key = |code, modifiers| tty.ui.handle_crossterm_key(KeyEvent::new(code, modifiers), std::time::Instant::now(), is_windows);
+        key(KeyCode::Char('?'), KeyModifiers::SHIFT);
+        assert!(tty.frame().contains("Shortcuts ·"));
+        assert_eq!(draft(&tty), "");
+        key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!tty.frame().contains("Shortcuts ·"));
+        key(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(idle_interrupts.load(Ordering::SeqCst), 1);
+        assert_eq!(tty.cancelled.load(Ordering::SeqCst), 0, "idle interrupt must not exit");
+        key(KeyCode::Char('x'), KeyModifiers::NONE);
+        assert!(tty.ui.state.lock().unwrap().quit_armed.is_none(), "even a pending paste character must disarm quit");
+        tty.ui.flush_paste_burst_at(std::time::Instant::now() + Duration::from_millis(100), is_windows);
+        key(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(draft(&tty), "");
+        assert!(commands.lock().unwrap().is_empty());
+        key(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(*commands.lock().unwrap(), vec!["/exit"]);
+    }
+}
+
+#[tokio::test]
+async fn local_history_retains_the_same_limit_as_persistent_history() {
+    let tty = Tty::new(90, 24);
+    tty.ui.set_prompt_history((0..1000).map(|n| format!("old {n}")).collect(), Arc::new(|_| {}));
+    tty.text("new prompt");
+    tty.key("tab");
+    let st = tty.ui.state.lock().unwrap();
+    assert_eq!(st.history.len(), 1000);
+    assert_eq!(st.history.first().unwrap(), "old 1");
+    assert_eq!(st.history.last().unwrap(), "new prompt");
+}
+
+#[tokio::test]
+async fn quoted_file_completion_replaces_the_whole_token_and_keeps_suffix() {
+    let tty = Tty::new(100, 24);
+    tty.ui.set_workspace_files(vec!["docs/user guide.md".into(), "docs/user notes.md".into()]);
+    for text in ["read @\"docs/user gu\" then summarize", "read @\"docs/user gu"] {
+        tty.ui.set_input(text, false);
+        tty.ui.state.lock().unwrap().cursor = "read @\"docs/user gu".chars().count();
+        tty.key("tab");
+        assert_eq!(draft(&tty), if text.ends_with("summarize") { "read @\"docs/user guide.md\" then summarize" } else { "read @\"docs/user guide.md\" " });
+    }
+}
+
+#[tokio::test]
+async fn modal_questions_keep_pending_draft_keys_out_of_secrets_and_restore_kill_state() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let tty = Tty::new(100, 24);
+    tty.text("draft ");
+    tty.ui.state.lock().unwrap().kill_buffer = "saved kill buffer".into();
+    tty.ui.handle_crossterm_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), std::time::Instant::now(), true);
+    let ui = tty.ui.clone();
+    let q = tokio::spawn(async move { ui.question("Secret: ", None, false, QuestionOpts { mask: true, ..Default::default() }).await });
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    assert_eq!(draft(&tty), "");
+    assert!(!tty.ui.state.lock().unwrap().paste_burst.is_active());
+    tty.text("?");
+    assert_eq!(draft(&tty), "?", "masked prompts must treat shortcut discovery as literal input");
+    tty.ui.paste("private-secret-value");
+    tty.ui.key(None, modified("u", true, false, false));
+    tty.ui.key(None, modified("y", true, false, false));
+    tty.key("return");
+    assert_eq!(q.await.unwrap().unwrap(), "?private-secret-value");
+    let st = tty.ui.state.lock().unwrap();
+    assert_eq!(st.input.iter().collect::<String>(), "draft x");
+    assert_eq!(st.kill_buffer, "saved kill buffer");
+    assert!(st.paste_archive.is_empty());
+    assert!(st.history.is_empty());
+}
+
+#[tokio::test]
+async fn queued_attachments_survive_archive_eviction_and_queue_edit_replaces_current_draft() {
+    let tty = Tty::new(100, 24);
+    tty.ui.paste("first\nsecond\nthird");
+    tty.key("tab");
+    {
+        let mut st = tty.ui.state.lock().unwrap();
+        st.paste_archive.clear();
+        st.image_archive.clear();
+    }
+    tty.text("replaced draft");
+    tty.ui.key(None, modified("up", false, true, false));
+    assert!(!tty.ui.has_queued_prompts());
+    assert!(draft(&tty).contains("[Pasted text #1"));
+    tty.key("tab");
+    let answer = tty.ui.question("goon> ", None, true, QuestionOpts::default()).await.unwrap();
+    assert_eq!(answer, "first\nsecond\nthird");
+}
+
+#[tokio::test]
+async fn interrupted_queue_merges_in_order_rebases_collisions_and_does_not_submit() {
+    let tty = Tty::new(100, 24);
+    for (image, content) in [("C:/first.png", "one\ntwo"), ("C:/second.png", "three\nfour")] {
+        let mut st = tty.ui.state.lock().unwrap();
+        st.input = chars_of("[Image #1] [Pasted text #1 +2 lines]");
+        st.cursor = st.input.len();
+        st.attached_images.insert("[Image #1]".into(), image.into());
+        st.pasted_texts.insert("[Pasted text #1 +2 lines]".into(), content.into());
+        let queued = composer::QueuedPrompt::capture(&st, &st.input.iter().collect::<String>());
+        st.queued_prompts.push(queued);
+        Tui::clear_composer(&mut st);
+    }
+    tty.text("unfinished draft");
+    tty.ui.restore_queued_after_interrupt();
+    assert!(!tty.ui.has_queued_prompts());
+    {
+        let mut st = tty.ui.state.lock().unwrap();
+        assert_eq!(st.attached_images.len(), 2);
+        assert_eq!(st.pasted_texts.len(), 2);
+        let raw = st.input.iter().collect::<String>();
+        assert_eq!(tty.ui.expand_placeholders(&mut st, &raw), "@\"C:/first.png\" one\ntwo\n@\"C:/second.png\" three\nfour\nunfinished draft");
+    }
+    let ui = tty.ui.clone();
+    let question = tokio::spawn(async move { ui.question("goon> ", None, true, QuestionOpts::default()).await });
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    assert!(!question.is_finished(), "interrupted follow-ups require explicit user submission");
+    tty.key("return");
+    assert!(question.await.unwrap().unwrap().ends_with("unfinished draft"));
+}
+
+#[tokio::test]
+async fn switching_threads_restores_unsent_draft_cursor_queue_and_attachments_without_disk_history() {
+    let tty = Tty::new(100, 24);
+    tty.text("typed during startup");
+    tty.ui.switch_input_session("a");
+    assert_eq!(draft(&tty), "typed during startup");
+    tty.ui.set_input("", false);
+    tty.ui.paste("queued\nattachment");
+    tty.key("tab");
+    tty.text("thread a draft");
+    tty.key("left");
+    let original_cursor = tty.ui.state.lock().unwrap().cursor;
+    tty.ui.switch_input_session("b");
+    assert_eq!(draft(&tty), "");
+    assert!(!tty.ui.has_queued_prompts());
+    tty.text("thread b draft");
+    tty.ui.switch_input_session("a");
+    assert_eq!(draft(&tty), "thread a draft");
+    assert_eq!(tty.ui.state.lock().unwrap().cursor, original_cursor);
+    assert!(tty.ui.has_queued_prompts());
+    tty.ui.key(None, modified("up", false, true, false));
+    tty.key("tab");
+    assert_eq!(tty.ui.question("goon> ", None, true, QuestionOpts::default()).await.unwrap(), "queued\nattachment");
+    tty.ui.switch_input_session("b");
+    assert_eq!(draft(&tty), "thread b draft");
+}
+
+#[tokio::test]
+async fn native_mode_preserves_shell_scrollback_commits_history_and_balances_terminal_modes() {
+    let tty = Tty::with_mode(80, 24, false);
+    assert!(!tty.written().contains("\x1b[?1049h"));
+    for n in 0..40 {
+        tty.ui.write(&format!("native history {n}\n"));
+        tty.ui.render_now();
+    }
+    let output = tty.written();
+    assert!(!output.contains("\x1b[H") && !output.contains("\x1b[2J"), "inline rendering must not clear shell output");
+    assert!(output.contains("native history 0"));
+    tty.key("pageup");
+    assert_eq!(tty.ui.state.lock().unwrap().scroll, 0);
+    tty.ui.set_transcript_overlay(true);
+    assert!(tty.frame().contains("transcript"));
+    tty.key("escape");
+    tty.ui.close();
+    assert!(!tty.written().contains("\x1b[?1049l"));
+    assert!(tty.written().contains("\x1b[?2004l"));
+}
+
+#[tokio::test]
+async fn user_question_choices_support_freeform_and_escape_cancels_without_selecting_default() {
+    for method in ["arrows", "custom", "cancel"] {
+        let tty = Tty::new(100, 24);
+        tty.text("saved draft");
+        let ui = tty.ui.clone();
+        let q = tokio::spawn(async move {
+            ui.question("Pick: ", None, false, QuestionOpts { choices: vec![("1".into(), "First".into()), ("2".into(), "Second".into())], allow_custom: true, esc_cancels: true, ..Default::default() })
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(tty.frame().contains("o other answer"));
+        match method {
+            "arrows" => {
+                tty.key("down");
+                tty.key("return");
+            }
+            "custom" => {
+                tty.text("o");
+                tty.ui.paste("my own answer");
+                tty.key("return");
+            }
+            _ => tty.key("escape"),
+        }
+        let answer = q.await.unwrap();
+        match method {
+            "arrows" => assert_eq!(answer.unwrap(), "2"),
+            "custom" => assert_eq!(answer.unwrap(), "my own answer"),
+            _ => assert!(answer.unwrap_err().downcast_ref::<InputCancelled>().is_some()),
+        }
+        assert_eq!(draft(&tty), "saved draft");
+    }
+}
+
+#[tokio::test]
+async fn owned_transcript_wheel_scrolls_without_navigating_composer_history() {
+    use crossterm::event::{Event, KeyModifiers, MouseEvent, MouseEventKind};
+    let tty = Tty::new(80, 20);
+    tty.ui.write(&(0..80).map(|n| format!("history line {n}\n")).collect::<String>());
+    tty.text("unfinished composer");
+    let mut decoder = InputDecoder::default();
+    let wheel = |kind| Event::Mouse(MouseEvent { kind, column: 4, row: 4, modifiers: KeyModifiers::NONE });
+    tty.frame();
+    decoder.feed_batch(&tty.ui, vec![wheel(MouseEventKind::ScrollUp)]);
+    assert_eq!(tty.ui.state.lock().unwrap().scroll, 1);
+    decoder.feed_batch(&tty.ui, vec![wheel(MouseEventKind::ScrollDown)]);
+    tty.ui.set_transcript_overlay(true);
+    tty.frame();
+    assert!(tty.written().contains("\x1b[?1000h\x1b[?1006h"));
+    decoder.feed_batch(&tty.ui, vec![wheel(MouseEventKind::ScrollUp)]);
+    assert_eq!(tty.ui.state.lock().unwrap().scroll, 1);
+    decoder.feed_batch(&tty.ui, vec![wheel(MouseEventKind::ScrollDown)]);
+    assert_eq!(tty.ui.state.lock().unwrap().scroll, 0);
+    assert_eq!(draft(&tty), "unfinished composer");
+    tty.key("escape");
+    tty.frame();
+    assert!(tty.ui.state.lock().unwrap().mouse_capture, "normal owned screen also captures mouse");
+    let inline = Tty::with_mode(80, 20, false);
+    inline.ui.write(&(0..80).map(|n| format!("history line {n}\n")).collect::<String>());
+    inline.frame();
+    decoder.feed_batch(&inline.ui, vec![wheel(MouseEventKind::ScrollUp)]);
+    assert_eq!(inline.ui.state.lock().unwrap().scroll, 0);
+    assert!(!inline.ui.state.lock().unwrap().mouse_capture, "inline mode retains terminal-native selection");
+}
+
+#[tokio::test]
+async fn fractional_wheel_is_area_limited_and_follow_click_requires_matching_release_without_cancel() {
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    for overlay in [false, true] {
+        let tty = Tty::new(100, 24);
+        tty.ui.write(&(0..80).map(|n| format!("history line {n}\n")).collect::<String>());
+        tty.ui.set_status("Running");
+        tty.text("preserved draft");
+        tty.ui.set_transcript_overlay(overlay);
+        tty.ui.set_mouse_scroll_speed(0.1);
+        tty.frame();
+        let mouse = |kind, column, row| tty.ui.handle_mouse(MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE });
+        for _ in 0..10 {
+            mouse(MouseEventKind::ScrollUp, 5, if overlay { 0 } else { 23 });
+        }
+        assert_eq!(tty.ui.state.lock().unwrap().scroll, 0, "wheel outside transcript must not accumulate");
+        for _ in 0..9 {
+            mouse(MouseEventKind::ScrollUp, 5, 4);
+        }
+        assert_eq!(tty.ui.state.lock().unwrap().scroll, 0);
+        mouse(MouseEventKind::ScrollUp, 5, 4);
+        assert_eq!(tty.ui.state.lock().unwrap().scroll, 1);
+        tty.ui.set_mouse_scroll_speed(0.75);
+        mouse(MouseEventKind::ScrollUp, 5, 4);
+        mouse(MouseEventKind::ScrollDown, 5, 4);
+        assert_eq!(tty.ui.state.lock().unwrap().scroll, 1, "direction reversal drops old remainder");
+        mouse(MouseEventKind::ScrollDown, 5, 4);
+        assert_eq!(tty.ui.state.lock().unwrap().scroll, 0);
+        tty.key("pageup");
+        tty.frame();
+        let follow_row = if overlay { 23 } else { tty.ui.state.lock().unwrap().transcript_view_rows.len() as u16 };
+        let paused = tty.ui.state.lock().unwrap().scroll;
+        mouse(MouseEventKind::Down(MouseButton::Left), 0, follow_row);
+        mouse(MouseEventKind::Up(MouseButton::Left), 0, follow_row);
+        assert_eq!(tty.ui.state.lock().unwrap().scroll, paused, "whole status row is not a button");
+        mouse(MouseEventKind::Down(MouseButton::Left), 49, follow_row);
+        assert_eq!(tty.ui.state.lock().unwrap().scroll, paused);
+        mouse(MouseEventKind::Up(MouseButton::Left), 0, follow_row);
+        assert_eq!(tty.ui.state.lock().unwrap().scroll, paused, "release outside cancels click");
+        mouse(MouseEventKind::Up(MouseButton::Left), 49, follow_row);
+        assert_eq!(tty.ui.state.lock().unwrap().scroll, paused, "release alone cannot jump");
+        mouse(MouseEventKind::Down(MouseButton::Left), 49, follow_row);
+        mouse(MouseEventKind::Up(MouseButton::Left), 49, follow_row);
+        assert_eq!(tty.ui.state.lock().unwrap().scroll, 0);
+        assert_eq!(tty.cancelled.load(Ordering::SeqCst), 0);
+        assert_eq!(draft(&tty), "preserved draft");
+        tty.ui.set_mouse_scroll_speed(f64::MAX);
+        mouse(MouseEventKind::ScrollUp, 5, 4);
+        let st = tty.ui.state.lock().unwrap();
+        assert_eq!(st.scroll, st.max_scroll, "extreme valid speed saturates without arithmetic overflow");
+    }
+}
+
+#[tokio::test]
+async fn wheel_during_drag_keeps_selected_logical_text_on_release_and_keyboard_jump_drops_fraction() {
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    let tty = Tty::new(80, 24);
+    tty.ui.write(&(0..80).map(|n| format!("history line {n}\n")).collect::<String>());
+    tty.frame();
+    let mouse = |kind, col, row| tty.ui.handle_mouse(MouseEvent { kind, column: col, row, modifiers: KeyModifiers::NONE });
+    mouse(MouseEventKind::Down(MouseButton::Left), 0, 4);
+    mouse(MouseEventKind::Drag(MouseButton::Left), 7, 4);
+    let selected = tty.ui.selected_transcript_text().unwrap();
+    mouse(MouseEventKind::ScrollUp, 7, 4);
+    mouse(MouseEventKind::Up(MouseButton::Left), 7, 4);
+    assert_eq!(tty.ui.selected_transcript_text().as_deref(), Some(selected.as_str()), "wheel must not reinterpret the release row as another logical endpoint");
+    tty.key("escape"); // clear selection first
+    tty.ui.set_mouse_scroll_speed(0.75);
+    mouse(MouseEventKind::ScrollUp, 0, 4); // remainder .75 while scrolled
+    tty.key("escape"); // return to latest, discarding remainder
+    assert_eq!(tty.ui.state.lock().unwrap().scroll, 0);
+    mouse(MouseEventKind::ScrollUp, 0, 4);
+    assert_eq!(tty.ui.state.lock().unwrap().scroll, 0, "Esc navigation must reset fractional momentum");
+}
+
+#[tokio::test]
+async fn normal_owned_screen_selects_without_touching_composer_and_follows_output() {
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    let tty = Tty::new(100, 24);
+    tty.ui.write(&(0..60).map(|n| format!("line {n} 界👩‍💻 text\n")).collect::<String>());
+    tty.text("untouched draft");
+    tty.frame();
+    let mouse = |kind, column, row| tty.ui.handle_mouse(MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE });
+    let (row, col) = {
+        let st = tty.ui.state.lock().unwrap();
+        let row = st.transcript_view_rows.iter().position(|line| line.contains("界")).unwrap();
+        let plain = crate::term::strip_vt(&st.transcript_view_rows[row]);
+        (row, visible_length(plain.split('界').next().unwrap()))
+    };
+    mouse(MouseEventKind::Down(MouseButton::Left), col as u16, row as u16);
+    mouse(MouseEventKind::Drag(MouseButton::Left), (col + 4) as u16, row as u16);
+    mouse(MouseEventKind::Up(MouseButton::Left), (col + 4) as u16, row as u16);
+    assert_eq!(tty.ui.selected_transcript_text().as_deref(), Some("界👩‍💻"));
+    tty.frame();
+    assert!(tty.ui.rendered_frame().contains("\x1b[7m"));
+    tty.key("escape");
+    assert!(tty.ui.selected_transcript_text().is_none());
+    assert_eq!(draft(&tty), "untouched draft");
+    mouse(MouseEventKind::ScrollUp, 0, 0);
+    tty.frame();
+    let follow_row = tty.ui.state.lock().unwrap().transcript_view_rows.len() as u16;
+    assert!(tty.ui.state.lock().unwrap().scroll > 0);
+    mouse(MouseEventKind::Down(MouseButton::Left), 49, follow_row);
+    assert!(tty.ui.state.lock().unwrap().scroll > 0, "press alone cannot jump");
+    mouse(MouseEventKind::Up(MouseButton::Left), 49, follow_row);
+    assert_eq!(tty.ui.state.lock().unwrap().scroll, 0);
+    assert_eq!(draft(&tty), "untouched draft");
+}
+
+#[tokio::test]
+async fn emoji_layout_matches_mouse_copy_columns_and_compact_draft_window() {
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    let tty = Tty::new(100, 24);
+    tty.ui.write("a👩‍💻b 👍🏽 tail\n");
+    tty.frame();
+    let (row, col) = {
+        let st = tty.ui.state.lock().unwrap();
+        let row = st.transcript_view_rows.iter().position(|line| line.contains("👩‍💻")).unwrap();
+        let plain = crate::term::strip_vt(&st.transcript_view_rows[row]);
+        (row + st.transcript_screen_row, visible_length(plain.split("👩‍💻").next().unwrap()))
+    };
+    for (kind, column) in [(MouseEventKind::Down(MouseButton::Left), col), (MouseEventKind::Up(MouseButton::Left), col + 2)] {
+        tty.ui.handle_mouse(MouseEvent { kind, column: column as u16, row: row as u16, modifiers: KeyModifiers::NONE });
+    }
+    assert_eq!(tty.ui.selected_transcript_text().as_deref(), Some("👩‍💻"));
+
+    let compact = Tty::new(16, 10);
+    compact.ui.set_input("prefixprefix👩‍💻", false);
+    let frame = compact.frame();
+    assert!(frame.contains("👩‍💻"), "compact input must keep the complete emoji: {frame:?}");
+    assert!(frame.lines().all(|line| visible_length(line.trim_end_matches('\r')) < 16));
+}
+
+#[tokio::test]
+async fn pointer_hit_testing_refreshes_scroll_and_snaps_wide_glyph_carets() {
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    let tty = Tty::new(100, 24);
+    tty.ui.write(&(0..60).map(|n| format!("line {n:02} 界👩‍💻 tail\n")).collect::<String>());
+    tty.text("keep draft");
+    tty.frame();
+    let mouse = |kind, column, row| tty.ui.handle_mouse(MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE });
+    let (row, expected, wide_col) = {
+        let st = tty.ui.state.lock().unwrap();
+        let row = st.transcript_view_rows.iter().position(|line| line.contains("界")).unwrap();
+        let plain = crate::term::strip_vt(&st.transcript_view_rows[row]);
+        (row, plain[..7].to_string(), visible_length(plain.split('界').next().unwrap()))
+    };
+    mouse(MouseEventKind::ScrollUp, 0, row as u16);
+    // No frame() between wheel and click: the hit test must apply pending scroll.
+    mouse(MouseEventKind::Down(MouseButton::Left), 0, row as u16);
+    mouse(MouseEventKind::Up(MouseButton::Left), 7, row as u16);
+    let selected = tty.ui.selected_transcript_text().unwrap();
+    assert_ne!(selected, expected);
+    let current = {
+        let st = tty.ui.state.lock().unwrap();
+        crate::term::strip_vt(&st.transcript_view_rows[row]).to_string()
+    };
+    assert_eq!(selected, current[..7]);
+    mouse(MouseEventKind::Down(MouseButton::Left), wide_col as u16, row as u16);
+    mouse(MouseEventKind::Up(MouseButton::Left), (wide_col + 1) as u16, row as u16);
+    assert!(tty.ui.selected_transcript_text().is_none(), "half a wide glyph is not a caret after it");
+    mouse(MouseEventKind::Down(MouseButton::Left), wide_col as u16, row as u16);
+    mouse(MouseEventKind::Up(MouseButton::Left), (wide_col + 2) as u16, row as u16);
+    assert_eq!(tty.ui.selected_transcript_text().as_deref(), Some("界"));
+    tty.ui.resize(); // A duplicate resize notification cannot invalidate selection.
+    assert_eq!(tty.ui.selected_transcript_text().as_deref(), Some("界"));
+    tty.frame();
+    mouse(MouseEventKind::Down(MouseButton::Left), 5, 22);
+    assert!(tty.ui.selected_transcript_text().is_none(), "composer click releases transcript selection");
+    assert!(!tty.ui.state.lock().unwrap().selection_dragging);
+    assert_eq!(draft(&tty), "keep draft");
+
+    {
+        let mut st = tty.ui.state.lock().unwrap();
+        st.selection = Some(selection::Selection::new(selection::Point { line: 0, offset: 0 }, &st.transcript, &st.body_layout));
+        st.selection_dragging = true;
+    }
+    *tty.size.lock().unwrap() = (80, 20);
+    tty.ui.resize();
+    assert!(!tty.ui.state.lock().unwrap().selection_dragging, "aborted resize gesture cannot remain armed");
+    {
+        let mut st = tty.ui.state.lock().unwrap();
+        st.selection = Some(selection::Selection::new(selection::Point { line: 0, offset: 0 }, &st.transcript, &st.body_layout));
+        st.selection_dragging = true;
+    }
+    tty.ui.write(&format!("{}\nretained tail\n", "x".repeat(TRANSCRIPT_MAX_CHARS)));
+    let st = tty.ui.state.lock().unwrap();
+    assert!(st.selection.is_some(), "immutable selected revision survives canonical history trimming");
+}
+
+#[tokio::test]
+async fn logical_selection_survives_reflow_stream_replacement_and_trim_without_soft_wrap_newlines() {
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    let tty = Tty::new(54, 24);
+    let logical = "alpha bold text with 👩‍💻 and a link (https://example.test/path) then omega";
+    tty.ui.write("[answer]\nalpha **bold text** with 👩‍💻 and a [link](https://example.test/path) then omega\nsecond hard line\n");
+    tty.frame();
+    let (first, last, end_col) = {
+        let st = tty.ui.state.lock().unwrap();
+        let first = st.transcript_view_rows.iter().position(|row| row.contains("alpha")).unwrap();
+        let last = st.transcript_view_rows.iter().position(|row| row.contains("omega")).unwrap();
+        (first, last, visible_length(&st.transcript_view_rows[last]))
+    };
+    tty.ui.handle_mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: 0, row: first as u16, modifiers: KeyModifiers::NONE });
+    tty.ui.handle_mouse(MouseEvent { kind: MouseEventKind::Up(MouseButton::Left), column: end_col as u16, row: last as u16, modifiers: KeyModifiers::NONE });
+    assert_eq!(tty.ui.selected_transcript_text().as_deref(), Some(logical));
+    {
+        let mut st = tty.ui.state.lock().unwrap();
+        st.transcript = "[answer]\nnew live revision with unrelated content\n".into();
+    }
+    for size in [(19, 12), (90, 30), (50, 18)] {
+        *tty.size.lock().unwrap() = size;
+        tty.ui.resize();
+        let frame = tty.frame();
+        assert_eq!(tty.ui.selected_transcript_text().as_deref(), Some(logical));
+        assert!(tty.ui.rendered_frame().contains("\x1b[7m"), "selected endpoint remains visible: {frame:?}");
+        assert!(!frame.contains("unrelated content"), "selection owns the displayed revision");
+    }
+    tty.ui.write(&format!("{}\nretained canonical tail\n", "x".repeat(TRANSCRIPT_MAX_CHARS)));
+    tty.frame();
+    assert_eq!(tty.ui.selected_transcript_text().as_deref(), Some(logical));
+    tty.key("escape");
+    assert!(tty.ui.selected_transcript_text().is_none());
+    let frame = tty.frame();
+    assert!(frame.contains("retained canonical tail"), "clearing selection rejoins advancing canonical history");
+}
+
+#[tokio::test]
+async fn logical_copy_excludes_gutters_and_synthetic_fences_but_keeps_hard_blank_lines() {
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    for (source, expected, marker) in [
+        ("[answer]\n- list words repeated enough to wrap into several rows of content\n", "list words repeated enough to wrap into several rows of content", "list words"),
+        (
+            "[answer]\n```rust\nlet long_identifier = \"a long string that wraps\";\n\nsecond_code_line();\n```\n",
+            "let long_identifier = \"a long string that wraps\";\n\nsecond_code_line();",
+            "let long",
+        ),
+        ("[answer]\n> quote words repeated enough to wrap into several rows of content\n", "quote words repeated enough to wrap into several rows of content", "quote words"),
+        ("● Ran tools\n  └ 1. [é](http://x) and **bold** content\n", "1. é (http://x) and bold content", "é"),
+    ] {
+        let tty = Tty::new(30, 24);
+        tty.ui.write(source);
+        tty.frame();
+        let (first, last, last_col) = {
+            let st = tty.ui.state.lock().unwrap();
+            let first = st.transcript_view_rows.iter().position(|row| row.contains(marker)).unwrap();
+            let last = st.transcript_view_rows.iter().rposition(|row| row.contains("content") || row.contains("second_code_line")).unwrap();
+            (first, last, visible_length(&st.transcript_view_rows[last]))
+        };
+        tty.ui.handle_mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: 0, row: first as u16, modifiers: KeyModifiers::NONE });
+        tty.ui.handle_mouse(MouseEvent { kind: MouseEventKind::Up(MouseButton::Left), column: last_col as u16, row: last as u16, modifiers: KeyModifiers::NONE });
+        assert_eq!(tty.ui.selected_transcript_text().as_deref(), Some(expected));
+        *tty.size.lock().unwrap() = (70, 24);
+        tty.ui.resize();
+        tty.frame();
+        assert_eq!(tty.ui.selected_transcript_text().as_deref(), Some(expected));
+    }
+}
+
+#[tokio::test]
+async fn clipped_table_projection_and_synthetic_mouse_release_keep_valid_anchors() {
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    let tty = Tty::new(40, 20);
+    tty.ui.write("[answer]\n| [é](http://x) | **bold** and a very long clipped tail marker |\n|---|---|\n```rust\ncode body\n```\n");
+    tty.frame();
+    let (table, head, code) = {
+        let st = tty.ui.state.lock().unwrap();
+        (
+            st.transcript_view_rows.iter().position(|line| line.contains("é")).unwrap(),
+            st.transcript_view_rows.iter().position(|line| line.contains("rust")).unwrap(),
+            st.transcript_view_rows.iter().position(|line| line.contains("code body")).unwrap(),
+        )
+    };
+    let mouse = |kind, column, row| tty.ui.handle_mouse(MouseEvent { kind, column, row: row as u16, modifiers: KeyModifiers::NONE });
+    let col = {
+        let st = tty.ui.state.lock().unwrap();
+        visible_length(crate::term::strip_vt(&st.transcript_view_rows[table]).split('é').next().unwrap())
+    };
+    mouse(MouseEventKind::Down(MouseButton::Left), col as u16, table);
+    mouse(MouseEventKind::Up(MouseButton::Left), (col + 1) as u16, table);
+    assert_eq!(tty.ui.selected_transcript_text().as_deref(), Some("é"));
+    tty.frame(); // highlight cannot slice a multibyte glyph at a raw-markup byte.
+    mouse(MouseEventKind::Down(MouseButton::Left), 0, table);
+    mouse(MouseEventKind::Up(MouseButton::Left), 39, table);
+    assert!(tty.ui.selected_transcript_text().unwrap().contains("clipped tail marker"));
+    *tty.size.lock().unwrap() = (80, 24);
+    tty.ui.resize();
+    tty.frame();
+    assert!(tty.ui.selected_transcript_text().unwrap().contains("clipped tail marker"));
+    tty.key("escape");
+    // Re-establish small geometry so previously captured screen rows are valid.
+    *tty.size.lock().unwrap() = (40, 20);
+    tty.ui.resize();
+    tty.frame();
+    mouse(MouseEventKind::Down(MouseButton::Left), 4, code);
+    mouse(MouseEventKind::Up(MouseButton::Left), 2, head);
+    let st = tty.ui.state.lock().unwrap();
+    assert!(!st.selection_dragging);
+    assert!(st.selection.is_none(), "empty gesture released on a synthetic fence cannot freeze output");
+}
+
+#[tokio::test]
+async fn local_history_owns_attachment_payloads_and_collapses_adjacent_identical_entries() {
+    let tty = Tty::new(100, 24);
+    tty.ui.paste("original\npaste payload");
+    tty.key("tab");
+    tty.ui.state.lock().unwrap().paste_archive.clear();
+    tty.key("up");
+    assert_eq!(tty.ui.state.lock().unwrap().pasted_texts.values().next().unwrap(), "original\npaste payload");
+    tty.key("tab");
+    assert_eq!(tty.ui.state.lock().unwrap().history.len(), 1, "unchanged resubmission is not a second local history entry");
+}
+
+#[tokio::test]
+async fn fatal_recovery_expands_unsent_pastes_but_never_returns_secret_questions() {
+    let tty = Tty::new(100, 24);
+    tty.ui.paste("recover this\nexact draft");
+    assert_eq!(tty.ui.unsent_draft_for_recovery().as_deref(), Some("recover this\nexact draft"));
+    let ui = tty.ui.clone();
+    let question = tokio::spawn(async move { ui.question("API key: ", None, false, QuestionOpts { mask: true, ..Default::default() }).await });
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    tty.ui.paste("not-recoverable-secret");
+    assert!(tty.ui.unsent_draft_for_recovery().is_none());
+    question.abort();
+    let _ = question.await;
+    assert_eq!(tty.ui.unsent_draft_for_recovery().as_deref(), Some("recover this\nexact draft"));
+}
+
+#[tokio::test]
+async fn question_notes_motion_preserves_commit_but_actual_edits_invalidate_it() {
+    for motion in ["left", "right", "home", "end", "up", "down"] {
+        let tty = Tty::new(100, 24);
+        let ui = tty.ui.clone();
+        let task = tokio::spawn(async move {
+            ui.ask_user_questions(
+                vec![serde_json::json!({"id":"first","question":"First?"}), serde_json::json!({"id":"last","question":"Last?","options":[{"label":"Yes"}]})],
+                &CancellationToken::new(),
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        tty.ui.paste("committed notes");
+        tty.key("return");
+        tty.key("pageup");
+        tty.key(motion);
+        assert!(tty.ui.state.lock().unwrap().pending.as_ref().unwrap().form.as_ref().unwrap().questions[0].committed, "{motion} is not an edit");
+        tty.key("pagedown");
+        tty.key("return");
+        let answers = task.await.unwrap().unwrap();
+        assert_eq!(answers["first"], vec!["committed notes"]);
+    }
+
+    let tty = Tty::new(100, 24);
+    let ui = tty.ui.clone();
+    let task = tokio::spawn(async move {
+        ui.ask_user_questions(vec![serde_json::json!({"id":"first","question":"First?"}), serde_json::json!({"id":"last","question":"Last?"})], &CancellationToken::new()).await
+    });
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    tty.ui.paste("notes");
+    tty.key("return");
+    tty.key("pageup");
+    tty.ui.key(None, modified("u", true, false, false));
+    assert!(!tty.ui.state.lock().unwrap().pending.as_ref().unwrap().form.as_ref().unwrap().questions[0].committed, "kill-line edits invalidate commit");
+    tty.key("escape");
+    assert!(task.await.unwrap().is_err());
+}
+
+#[tokio::test]
+async fn pasting_on_question_options_focuses_notes_and_keeps_them_visible() {
+    use crossterm::event::Event;
+    let tty = Tty::new(100, 24);
+    let ui = tty.ui.clone();
+    let task = tokio::spawn(async move { ui.ask_user_questions(vec![serde_json::json!({"id":"q","question":"Choose?","options":[{"label":"Yes"}]})], &CancellationToken::new()).await });
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    InputDecoder::default().feed_batch(&tty.ui, vec![Event::Paste("visible note".into())]);
+    assert!(tty.ui.state.lock().unwrap().pending.as_ref().unwrap().form.as_ref().unwrap().questions[0].notes);
+    assert!(tty.frame().contains("Notes"));
+    tty.key("return");
+    assert_eq!(task.await.unwrap().unwrap()["q"], vec!["Yes", "visible note"]);
+}
+
+#[tokio::test]
+async fn terminal_focus_events_update_notification_state_without_touching_input() {
+    use crossterm::event::Event;
+    let tty = Tty::new(100, 24);
+    tty.text("preserved input");
+    let mut decoder = InputDecoder::default();
+    assert!(tty.ui.is_focused());
+    decoder.feed_batch(&tty.ui, vec![Event::FocusLost]);
+    assert!(!tty.ui.is_focused());
+    decoder.feed_batch(&tty.ui, vec![Event::FocusGained]);
+    assert!(tty.ui.is_focused());
+    assert_eq!(draft(&tty), "preserved input");
+    tty.ui.close();
+    assert!(tty.written().contains("\x1b[?1004h"));
+    assert!(tty.written().contains("\x1b[?1004l"));
+}
+
+#[tokio::test]
+async fn up_down_move_across_soft_wrapped_rows_with_grapheme_and_display_width() {
+    let tty = Tty::new(13, 24); // ten display columns after the composer label/margin.
+    tty.text("abcdefghijklmno");
+    tty.key("up");
+    assert_eq!(tty.ui.state.lock().unwrap().cursor, 5);
+    tty.key("down");
+    assert_eq!(tty.ui.state.lock().unwrap().cursor, 15);
+    tty.ui.set_input("界界界界界abcd", false);
+    tty.key("up");
+    assert_eq!(tty.ui.state.lock().unwrap().cursor, 2);
+    tty.key("down");
+    assert_eq!(tty.ui.state.lock().unwrap().cursor, 9);
+    tty.ui.set_input("", false);
+    tty.text("abcdefgh");
+    tty.ui.key(None, modified("j", true, false, false));
+    tty.text("x");
+    tty.ui.key(None, modified("j", true, false, false));
+    tty.text("abcdefgh");
+    tty.key("up");
+    assert_eq!(tty.ui.state.lock().unwrap().cursor, 10);
+    tty.key("up");
+    assert_eq!(tty.ui.state.lock().unwrap().cursor, 8, "vertical movement preserves preferred display column across short rows");
+    tty.ui.set_input("a👩‍💻bcdefghij", false);
+    tty.key("up");
+    let st = tty.ui.state.lock().unwrap();
+    let prefix = st.input[..st.cursor].iter().collect::<String>();
+    assert!(unicode_segmentation::UnicodeSegmentation::graphemes("a👩‍💻bcdefghij", true)
+        .scan(String::new(), |sum, g| {
+            sum.push_str(g);
+            Some(sum.clone())
+        })
+        .any(|boundary| boundary == prefix));
+}
+
+#[tokio::test]
+async fn grouped_questions_preserve_each_selection_and_notes_until_atomic_submission() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let tty = Tty::new(100, 24);
+    tty.text("original composer");
+    let ui = tty.ui.clone();
+    let task = tokio::spawn(async move {
+        ui.ask_user_questions(
+            vec![
+                serde_json::json!({"id":"one","header":"First","question":"Choose first","options":[{"label":"A"},{"label":"B"}]}),
+                serde_json::json!({"id":"two","header":"Second","question":"Choose second","options":[{"label":"C"},{"label":"D"}]}),
+            ],
+            &CancellationToken::new(),
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let key = |code| tty.ui.handle_crossterm_key(KeyEvent::new(code, KeyModifiers::NONE), std::time::Instant::now(), true);
+    assert!(tty.frame().contains("Question 1/2"));
+    key(KeyCode::Down);
+    key(KeyCode::Tab);
+    tty.ui.paste("first notes\nwith paste");
+    key(KeyCode::PageDown);
+    assert!(tty.frame().contains("Question 2/2"));
+    key(KeyCode::Down);
+    key(KeyCode::Down); // Other
+    key(KeyCode::Enter);
+    tty.ui.paste("custom second");
+    key(KeyCode::PageUp);
+    assert!(draft(&tty).contains("[Pasted text"));
+    key(KeyCode::Enter); // commit first, advance
+    assert_eq!(draft(&tty), "custom second");
+    assert!(!task.is_finished());
+    key(KeyCode::Enter);
+    let answers = tokio::time::timeout(Duration::from_secs(1), task).await.unwrap().unwrap().unwrap();
+    assert_eq!(answers["one"], vec!["B", "first notes\nwith paste"]);
+    assert_eq!(answers["two"], vec!["custom second"]);
+    assert_eq!(draft(&tty), "original composer");
+}
+
+#[tokio::test]
+async fn unanswered_confirmation_proceeds_only_after_confirmation_and_omits_uncommitted_drafts() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    for windows in [false, true] {
+        let tty = Tty::new(100, 24);
+        tty.text("saved composer");
+        let ui = tty.ui.clone();
+        let task = tokio::spawn(async move {
+            ui.ask_user_questions(
+                vec![serde_json::json!({"id":"skip","question":"Skipped?","options":[{"label":"Not an answer"}]}), serde_json::json!({"id":"last","question":"Last?"})],
+                &CancellationToken::new(),
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        tty.key("tab");
+        tty.ui.paste("uncommitted notes");
+        tty.key("pagedown");
+        tty.ui.paste("final notes");
+        tty.key("return");
+        assert!(tty.frame().contains("Submit with unanswered questions?"));
+        assert!(!task.is_finished());
+        let key = |code| tty.ui.handle_crossterm_key(KeyEvent::new(code, KeyModifiers::NONE), std::time::Instant::now(), windows);
+        key(KeyCode::Char('2'));
+        assert!(!task.is_finished(), "digits only select a confirmation row");
+        assert!(tty.frame().contains("› 2. Go back"));
+        key(KeyCode::Char('j')); // wrap to Proceed, even from a freeform composer.
+        assert!(tty.frame().contains("› 1. Proceed"));
+        key(KeyCode::Tab);
+        key(KeyCode::PageUp);
+        key(KeyCode::Char('x'));
+        assert_eq!(draft(&tty), "final notes", "confirmation consumes unrelated composer keys");
+        tty.ui.key(None, modified("d", true, false, false));
+        assert!(!task.is_finished());
+        key(KeyCode::Enter);
+        let answers = task.await.unwrap().unwrap();
+        assert!(answers["skip"].is_empty());
+        assert_eq!(answers["last"], vec!["final notes"]);
+        assert_eq!(draft(&tty), "saved composer");
+    }
+}
+
+#[tokio::test]
+async fn unanswered_confirmation_go_back_restores_first_skipped_draft_and_ctrl_c_cancels() {
+    for back in ["escape", "backspace", "select"] {
+        let tty = Tty::new(100, 24);
+        tty.text("original");
+        let ui = tty.ui.clone();
+        let task = tokio::spawn(async move {
+            ui.ask_user_questions(
+                vec![serde_json::json!({"id":"first","question":"First?","options":[{"label":"A"}]}), serde_json::json!({"id":"last","question":"Last?","options":[{"label":"B"}]})],
+                &CancellationToken::new(),
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        tty.key("tab");
+        tty.ui.paste("keep this draft");
+        tty.key("pagedown");
+        tty.key("return");
+        assert!(tty.frame().contains("Submit with unanswered questions?"));
+        if back == "select" {
+            tty.key("up"); // wraps to Go back
+            tty.key("return");
+        } else {
+            tty.key(back);
+        }
+        assert!(tty.frame().contains("Question 1/2"));
+        assert_eq!(draft(&tty), "keep this draft");
+        assert!(!task.is_finished());
+        tty.key("pagedown");
+        tty.key("return");
+        tty.ui.key(None, modified("c", true, false, false));
+        assert!(task.await.unwrap().is_err());
+        assert_eq!(draft(&tty), "original");
+    }
+}
+
+#[tokio::test]
+async fn grouped_question_cancellation_and_dropped_future_restore_draft_without_history() {
+    for cancel_by in ["escape", "token", "drop"] {
+        let tty = Tty::new(100, 24);
+        tty.text("preserve this");
+        let cancel = CancellationToken::new();
+        let c = cancel.clone();
+        let ui = tty.ui.clone();
+        let task = tokio::spawn(async move { ui.ask_user_questions(vec![serde_json::json!({"id":"q","question":"Question","options":[{"label":"A"}]})], &c).await });
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        tty.key("tab");
+        tty.ui.paste("private notes");
+        match cancel_by {
+            "escape" => tty.key("escape"),
+            "token" => cancel.cancel(),
+            _ => task.abort(),
+        }
+        assert!(!matches!(task.await, Ok(Ok(_))));
+        assert_eq!(draft(&tty), "preserve this");
+        assert!(tty.ui.state.lock().unwrap().history.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn grouped_question_layout_fits_small_terminals_and_freeform_empty_answers_are_allowed() {
+    for (cols, rows) in [(12, 8), (30, 10), (80, 24)] {
+        let tty = Tty::new(cols, rows);
+        let ui = tty.ui.clone();
+        let task = tokio::spawn(async move {
+            ui.ask_user_questions(vec![serde_json::json!({"id":"q","question":"A long question with enough words to wrap over several rows on narrow terminals"})], &CancellationToken::new()).await
+        });
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        tty.frame();
+        {
+            let st = tty.ui.state.lock().unwrap();
+            assert!(st.last_frame_rows.len() <= rows, "{} rows emitted into {rows}", st.last_frame_rows.len());
+            assert!(st.last_frame_rows.iter().all(|line| visible_length(line) < cols));
+        }
+        tty.key("return");
+        assert!(!task.is_finished());
+        tty.key("return"); // Explicitly confirm an empty freeform answer.
+        assert!(task.await.unwrap().unwrap()["q"].is_empty());
+    }
+}
+
+#[tokio::test]
+async fn transcript_drag_selection_uses_display_columns_and_follow_click_returns_to_tail() {
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    let tty = Tty::new(100, 24);
+    tty.ui.write("hello 界👩‍💻 world\nsecond line\n");
+    tty.ui.set_transcript_overlay(true);
+    tty.frame();
+    let row = {
+        let st = tty.ui.state.lock().unwrap();
+        st.transcript_view_rows.iter().position(|line| crate::term::strip_vt(line).contains("hello")).unwrap() + 1
+    };
+    let mouse = |kind, column, row| tty.ui.handle_mouse(MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE });
+    let first_line = tty.ui.state.lock().unwrap().transcript_view_rows[row - 1].clone();
+    let plain = crate::term::strip_vt(&first_line);
+    let start = visible_length(plain.split("界").next().unwrap());
+    mouse(MouseEventKind::Down(MouseButton::Left), start as u16, row as u16);
+    mouse(MouseEventKind::Drag(MouseButton::Left), (start + 4) as u16, row as u16);
+    assert_eq!(tty.ui.selected_transcript_text().as_deref(), Some("界👩‍💻"));
+    tty.frame();
+    assert!(tty.ui.rendered_frame().contains("\x1b[7m"));
+    mouse(MouseEventKind::ScrollUp, 0, row as u16);
+    assert_eq!(tty.ui.selected_transcript_text().as_deref(), Some("界👩‍💻"), "wheel must not clear selection");
+    tty.key("escape");
+    assert!(tty.ui.is_transcript_overlay(), "first Escape clears selection before closing transcript");
+    assert!(tty.ui.selected_transcript_text().is_none());
+    tty.ui.write(&(0..60).map(|n| format!("line {n}\n")).collect::<String>());
+    tty.frame();
+    mouse(MouseEventKind::ScrollUp, 0, 4);
+    assert!(tty.frame().contains("Follow output"));
+    mouse(MouseEventKind::Down(MouseButton::Left), 49, 23);
+    mouse(MouseEventKind::Up(MouseButton::Left), 49, 23);
+    assert_eq!(tty.ui.state.lock().unwrap().scroll, 0);
+    tty.ui.resize();
+    assert!(tty.ui.selected_transcript_text().is_none());
+}
+
+#[tokio::test]
+async fn clipped_question_options_cannot_be_submitted_until_fully_readable() {
+    let tty = Tty::new(20, 8);
+    let ui = tty.ui.clone();
+    let task = tokio::spawn(async move {
+        ui.ask_user_questions(vec![serde_json::json!({"id":"q","question":"Choose","options":[{"label":"A very long option that cannot be read completely in this tiny viewport", "description":"Important additional authorization details must remain visible"}]})], &CancellationToken::new()).await
+    });
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    tty.key("return");
+    assert!(!task.is_finished());
+    assert!(tty.frame().contains("Expand terminal"));
+    *tty.size.lock().unwrap() = (120, 30);
+    tty.ui.resize();
+    tty.frame();
+    tty.key("return");
+    assert_eq!(task.await.unwrap().unwrap()["q"].len(), 1);
 }

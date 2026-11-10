@@ -15,7 +15,12 @@ import time
 ANSI_RE = re.compile(rb'\x1b\[[0-9;?]*[A-Za-z]')
 master, slave = pty.openpty()
 fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 30, 100, 0, 0))
-child = subprocess.Popen(sys.argv[1:], stdin=slave, stdout=slave, stderr=slave, env={**os.environ, 'TERM': 'xterm-256color'})
+def own_terminal():
+    os.setsid()
+    fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+
+child = subprocess.Popen(sys.argv[1:], stdin=slave, stdout=slave, stderr=slave,
+                         preexec_fn=own_terminal, env={**os.environ, 'TERM': 'xterm-256color'})
 output = bytearray()
 
 
@@ -45,17 +50,26 @@ asked = False
 try:
     if not wait_for('/help commands'):
         raise RuntimeError('TUI did not start\n' + output.decode(errors='replace')[-3000:])
-    os.write(master, b'/mode ask\r')
+    os.write(master, b'\x1b[200~/mode ask\x1b[201~')
+    time.sleep(.15)
+    os.write(master, b'\r')
     if not wait_for('Mode switched to: ask'):
         raise RuntimeError('mode switch not acknowledged\n' + output.decode(errors='replace')[-3000:])
-    os.write(master, b'create guarded.txt\r')
+    os.write(master, b'\x1b[200~create guarded.txt\x1b[201~')
+    time.sleep(.15)
+    os.write(master, b'\r')
     asked = wait_for('Allow write_file?')
     if asked:
-        os.write(master, b'n\r')
+        os.write(master, b'n')
         wait_for('Permission denied')
     time.sleep(0.2)
-    os.write(master, b'/exit\r')
-    child.wait(timeout=8)
+    os.write(master, b'\x1b[200~/exit\x1b[201~')
+    time.sleep(.15)
+    os.write(master, b'\r')
+    deadline = time.monotonic() + 8
+    while child.poll() is None and time.monotonic() < deadline:
+        pump()
+    child.wait(timeout=1)
     print(json.dumps({'code': child.returncode, 'asked': asked}))
 finally:
     if child.poll() is None:

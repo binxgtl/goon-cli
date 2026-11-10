@@ -1,9 +1,9 @@
-//! Transcript parsing/styling and frame layout. Every row is wrapped to the terminal width
-//! before styling (prefixes included), so no emitted row can exceed it.
+//! Transcript parsing/styling and frame layout. Logical inline styles project before wrapping;
+//! explicit content ranges keep copy/selection independent of gutters and soft wraps.
 
 use super::text::{
-    format_compact_duration, format_inline_markdown, format_inline_markdown_default, format_token_count, slice_ansi_line, slice_visible, style_box_line, visible_length, wrap_chunks, wrap_terminal,
-    BOLD, BRAND, BRAND_BOLD, DEFAULT_FG, DIM, ERR, INFO, OK, RESET, WARN,
+    format_compact_duration, format_inline_markdown, format_inline_markdown_default, format_token_count, slice_ansi_line, slice_visible, style_box_line, visible_length, wrap_terminal, BOLD, BRAND,
+    BRAND_BOLD, DEFAULT_FG, DIM, ERR, INFO, OK, RESET, WARN,
 };
 use super::{glyph, slash_description, Block, BodyCache, PickerState, Row, RowKind, State, Tui, SPINNER, USER_MARK};
 use crate::session::format_goal_status_indicator;
@@ -38,7 +38,9 @@ fn plain_row(row: &Row, cols: usize) -> String {
     match row.kind {
         RowKind::Blank => String::new(),
         RowKind::CodeHead => slice_visible(&format!("  ─ {}", row.text), cols),
-        _ => format!("{}{}", row.pre, row.text),
+        RowKind::Cell | RowKind::Child => slice_visible(&crate::term::strip_vt(&Tui::style_row(row, cols)), cols),
+        RowKind::Table => slice_visible(&format!("{}{}", row.pre, crate::term::strip_vt(&format_inline_markdown_default(&row.text))), cols),
+        _ => slice_visible(&format!("{}{}", row.pre, crate::term::strip_vt(&row.text)), cols),
     }
 }
 
@@ -59,7 +61,7 @@ impl Tui {
     pub(crate) fn render_styled_body_lines(&self, st: &mut State, columns: usize, rich: bool) -> Vec<String> {
         let cols = columns.max(4);
         let show_reasoning = st.view_mode != "normal" || st.in_transcript_overlay;
-        let transcript = st.transcript.clone();
+        let transcript = st.selection.as_ref().map(|s| s.source.to_string()).unwrap_or_else(|| st.transcript.clone());
         let reuse = st
             .body_cache
             .as_ref()
@@ -70,6 +72,9 @@ impl Tui {
         let mut rows: Vec<Row> = cache.as_ref().map(|c| c.rows.clone()).unwrap_or_default();
         let base_styled: Vec<String> = cache.as_ref().map(|c| c.styled.clone()).unwrap_or_default();
         let base_len = cache.as_ref().map(|c| c.source.len()).unwrap_or(0);
+        let mut source_ends = cache.as_ref().map(|c| c.source_ends.clone()).unwrap_or_default();
+        let mut source_offset = base_len;
+        let mut previous_source_end = base_len;
         let raw_lines: Vec<&str> = transcript[base_len..].split('\n').collect();
 
         // Checkpoint for the next frame: the last (possibly streaming) line, moved back past any
@@ -112,13 +117,28 @@ impl Tui {
 
         fn blank(rows: &mut Vec<Row>) {
             if rows.last().map(|r| r.kind != RowKind::Blank).unwrap_or(false) {
-                rows.push(Row { kind: RowKind::Blank, pre: String::new(), text: String::new(), glyph: None, sign: None, level: 0 });
+                rows.push(Row { kind: RowKind::Blank, pre: String::new(), text: String::new(), glyph: None, sign: None, level: 0, origin: None });
             }
         }
         let wrap_into = |rows: &mut Vec<Row>, kind: RowKind, text: &str, first: &str, cont: &str, glyph: Option<String>, sign: Option<char>, level: usize, words: bool| {
-            let chunks = wrap_chunks(text, cols.saturating_sub(visible_length(first)), cols.saturating_sub(visible_length(cont)), words);
-            for (i, chunk) in chunks.into_iter().enumerate() {
-                rows.push(Row { kind, pre: if i == 0 { first.to_string() } else { cont.to_string() }, text: chunk, glyph: glyph.clone(), sign, level });
+            let markdown = !matches!(kind, RowKind::Code | RowKind::Diff);
+            let clean = crate::term::terminal_text(text).replace('\t', "  ");
+            // Project markup before wrapping: delimiters and link URLs must not
+            // change visibility or offset identity at a different terminal width.
+            let painted = if markdown { format_inline_markdown_default(&clean) } else { clean.clone() };
+            let logical: std::sync::Arc<str> = std::sync::Arc::from(crate::term::strip_vt(&painted).as_ref());
+            let ranges = super::text::wrap_ranges(&logical, cols.saturating_sub(visible_length(first)), cols.saturating_sub(visible_length(cont)), words);
+            for (i, range) in ranges.into_iter().enumerate() {
+                let text = if rich && markdown { super::text::styled_range(&painted, range.clone()) } else { logical[range.clone()].to_string() };
+                rows.push(Row {
+                    kind,
+                    pre: if i == 0 { first.to_string() } else { cont.to_string() },
+                    text,
+                    glyph: glyph.clone(),
+                    sign,
+                    level,
+                    origin: Some(super::selection::Origin { text: logical.clone(), range, projected: markdown }),
+                });
             }
         };
         let last_content_kind = |rows: &Vec<Row>| rows.iter().rev().find(|r| r.kind != RowKind::Blank).map(|r| r.kind);
@@ -133,8 +153,8 @@ impl Tui {
                 return;
             }
             if re!(r"^\s*(?:-{3,}|\*{3,}|_{3,})\s*$").is_match(raw_line) {
-                let n = cols.saturating_sub(base.chars().count() + 2).clamp(1, 48);
-                rows.push(Row { kind: RowKind::Rule, pre: first_pre(base), text: "─".repeat(n), glyph: None, sign: None, level: 0 });
+                let n = 48;
+                rows.push(Row { kind: RowKind::Rule, pre: first_pre(base), text: "─".repeat(n), glyph: None, sign: None, level: 0, origin: None });
                 return;
             }
             if let Some(b) = re!(r"^(\s*)[-*+]\s+(.*)$").captures(raw_line) {
@@ -155,17 +175,16 @@ impl Tui {
             if is_table_row(raw_line) {
                 let trimmed = raw_line.trim();
                 let widths = table_widths.get(&line_index).cloned().unwrap_or_default();
-                let avail = cols.saturating_sub(base.chars().count()).max(1);
                 if table_separator(trimmed) {
                     let grid = format!("├{}┤", widths.iter().map(|w| "─".repeat(w + 2)).collect::<Vec<_>>().join("┼"));
-                    rows.push(Row { kind: RowKind::Table, pre: first_pre(base), text: slice_visible(&grid, avail), glyph: None, sign: None, level: 0 });
+                    rows.push(Row { kind: RowKind::Table, pre: first_pre(base), text: grid, glyph: None, sign: None, level: 0, origin: None });
                 } else {
                     let cells: Vec<String> = split_table_cells(trimmed)
                         .iter()
                         .enumerate()
                         .map(|(i, c)| format!("{c}{}", " ".repeat(widths.get(i).copied().unwrap_or(0).saturating_sub(visible_length(&displayed_cell(c))))))
                         .collect();
-                    rows.push(Row { kind: RowKind::Table, pre: first_pre(base), text: slice_visible(&format!("│ {} │", cells.join(" │ ")), avail), glyph: None, sign: None, level: 0 });
+                    rows.push(Row { kind: RowKind::Table, pre: first_pre(base), text: format!("│ {} │", cells.join(" │ ")), glyph: None, sign: None, level: 0, origin: None });
                 }
                 return;
             }
@@ -176,6 +195,11 @@ impl Tui {
         };
 
         for (line_index, raw_line) in raw_lines.iter().enumerate() {
+            // All display rows emitted by a source line share its end offset. Delay
+            // filling until the next iteration because parser branches can continue.
+            source_ends.resize(rows.len(), previous_source_end);
+            source_offset += raw_line.len() + usize::from(source_offset + raw_line.len() < transcript.len());
+            previous_source_end = source_offset;
             let raw_line = *raw_line;
             if line_index == checkpoint {
                 checkpoint_rows = rows.len();
@@ -196,7 +220,7 @@ impl Tui {
                 state.in_diff = false;
                 if show_reasoning {
                     blank(&mut rows);
-                    rows.push(Row { kind: RowKind::ReasoningHead, pre: String::new(), text: format!("{} Thinking", glyph::THINKING), glyph: None, sign: None, level: 0 });
+                    rows.push(Row { kind: RowKind::ReasoningHead, pre: String::new(), text: format!("{} Thinking", glyph::THINKING), glyph: None, sign: None, level: 0, origin: None });
                 }
                 continue;
             }
@@ -236,7 +260,15 @@ impl Tui {
                     state.in_diff = false;
                     state.answer_first = false;
                     let label = fence_label.trim();
-                    rows.push(Row { kind: RowKind::CodeHead, pre: String::new(), text: if label.is_empty() { "code".into() } else { label.to_string() }, glyph: None, sign: None, level: 0 });
+                    rows.push(Row {
+                        kind: RowKind::CodeHead,
+                        pre: String::new(),
+                        text: if label.is_empty() { "code".into() } else { label.to_string() },
+                        glyph: None,
+                        sign: None,
+                        level: 0,
+                        origin: None,
+                    });
                 }
                 continue;
             }
@@ -252,7 +284,15 @@ impl Tui {
                 if state.block == Block::Answer && state.answer_first {
                     continue;
                 }
-                blank(&mut rows);
+                rows.push(Row {
+                    kind: RowKind::Blank,
+                    pre: String::new(),
+                    text: String::new(),
+                    glyph: None,
+                    sign: None,
+                    level: 0,
+                    origin: Some(super::selection::Origin { text: std::sync::Arc::from(""), range: 0..0, projected: false }),
+                });
                 continue;
             }
             if state.block == Block::Reasoning {
@@ -268,7 +308,7 @@ impl Tui {
             // Normal block: tool cells, diffs, CLI output, banner.
             if re!(r"^◆ goon v\S+\s*$").is_match(raw_line) {
                 blank(&mut rows);
-                rows.push(Row { kind: RowKind::BannerTitle, pre: String::new(), text: trimmed.to_string(), glyph: None, sign: None, level: 0 });
+                rows.push(Row { kind: RowKind::BannerTitle, pre: String::new(), text: trimmed.to_string(), glyph: None, sign: None, level: 0, origin: None });
                 state.in_banner = true;
                 continue;
             }
@@ -287,7 +327,7 @@ impl Tui {
             }
             if re!(r"^(?:--- |\+\+\+ |@@ )").is_match(raw_line) {
                 state.in_diff = true;
-                rows.push(Row { kind: RowKind::DiffMeta, pre: "  ".into(), text: slice_visible(raw_line.trim_end(), cols.saturating_sub(2).max(1)), glyph: None, sign: None, level: 0 });
+                rows.push(Row { kind: RowKind::DiffMeta, pre: "  ".into(), text: raw_line.trim_end().to_string(), glyph: None, sign: None, level: 0, origin: None });
                 continue;
             }
             if state.in_diff {
@@ -304,7 +344,7 @@ impl Tui {
                     continue;
                 }
                 if re!(r"^\s*(?:⋮|… \+\d+ more|\.\.\. \(\+\d+ more)").is_match(raw_line) || raw_line.starts_with("\\ No newline") {
-                    rows.push(Row { kind: RowKind::DiffMeta, pre: "    ".into(), text: slice_visible(trimmed, cols.saturating_sub(4).max(1)), glyph: None, sign: None, level: 0 });
+                    rows.push(Row { kind: RowKind::DiffMeta, pre: "    ".into(), text: trimmed.to_string(), glyph: None, sign: None, level: 0, origin: None });
                     continue;
                 }
                 state.in_diff = false;
@@ -323,7 +363,7 @@ impl Tui {
                 continue;
             }
             if raw_line.starts_with(['╭', '│', '╰']) {
-                rows.push(Row { kind: RowKind::Box, pre: String::new(), text: slice_visible(raw_line.trim_end(), cols), glyph: None, sign: None, level: 0 });
+                rows.push(Row { kind: RowKind::Box, pre: String::new(), text: raw_line.trim_end().to_string(), glyph: None, sign: None, level: 0, origin: None });
                 continue;
             }
             if raw_line.starts_with("Type /help") {
@@ -334,9 +374,10 @@ impl Tui {
         }
 
         let cached = cache.as_ref().map(|c| c.rows.len()).unwrap_or(0);
+        source_ends.resize(rows.len(), previous_source_end);
         let mut styled: Vec<String> = base_styled[..cached.min(base_styled.len())].to_vec();
         for row in &rows[cached..] {
-            styled.push(if rich { Self::style_row(row, cols) } else { plain_row(row, cols) });
+            styled.push(slice_ansi_line(&if rich { Self::style_row(row, cols) } else { plain_row(row, cols) }, cols));
         }
         // Remember everything before the checkpoint line for the next frame.
         let consumed: usize = raw_lines[..checkpoint].iter().map(|l| l.len() + 1).sum();
@@ -348,12 +389,22 @@ impl Tui {
             state: checkpoint_state,
             rows: rows[..checkpoint_rows].to_vec(),
             styled: styled[..checkpoint_rows].to_vec(),
+            source_ends: source_ends[..checkpoint_rows].to_vec(),
         });
+        st.body_source_ends = source_ends;
+        st.body_layout = super::selection::Layout::from_rows(&rows, &styled, rich);
         styled
     }
 
     fn style_row(row: &Row, cols: usize) -> String {
-        let md = |text: &str, base: &str| format!("{base}{}{RESET}", format_inline_markdown(text, &format!("{RESET}{base}")));
+        let inline = |text: &str, base: &str| {
+            if row.origin.as_ref().is_some_and(|o| o.projected) {
+                text.to_string()
+            } else {
+                format_inline_markdown(text, &format!("{RESET}{base}"))
+            }
+        };
+        let md = |text: &str, base: &str| format!("{base}{}{RESET}", inline(text, base));
         let prefix = |pre: &str, tone: &str| if pre.trim().is_empty() { pre.to_string() } else { format!("{tone}{pre}{RESET}") };
         let answer_pre = |pre: &str| {
             if let Some(rest) = pre.strip_prefix(glyph::ANSWER) {
@@ -366,10 +417,10 @@ impl Tui {
             RowKind::Blank => String::new(),
             RowKind::User => {
                 let pre = if row.pre.trim().is_empty() { row.pre.clone() } else { format!("{BRAND_BOLD}{}{RESET}", row.pre) };
-                format!("{pre}{BOLD}{}{RESET}", format_inline_markdown(&row.text, &format!("{RESET}{BOLD}")))
+                format!("{pre}{BOLD}{}{RESET}", inline(&row.text, BOLD))
             }
             RowKind::Answer => format!("{}{}", answer_pre(&row.pre), md(&row.text, DEFAULT_FG)),
-            RowKind::Normal => format!("{}{}", prefix(&row.pre, DIM), format_inline_markdown_default(&row.text)),
+            RowKind::Normal => format!("{}{}", prefix(&row.pre, DIM), inline(&row.text, RESET)),
             RowKind::Heading => {
                 let tone = if row.level == 1 { format!("{BOLD}\x1b[4m") } else { BOLD.to_string() };
                 format!("{}{}", answer_pre(&row.pre), md(&row.text, &tone))
@@ -485,13 +536,39 @@ impl Tui {
             return format!("{pre}{DIM}{text}{RESET}");
         }
         if let Some(c) = re!(r"^(\d{1,2})\. (.*)$").captures(text) {
-            return format!("{pre}{BRAND_BOLD}{}.{RESET} {}", &c[1], format_inline_markdown_default(&c[2]));
+            let body = if row.origin.as_ref().is_some_and(|o| o.projected) { c[2].to_string() } else { format_inline_markdown_default(&c[2]) };
+            return format!("{pre}{BRAND_BOLD}{}.{RESET} {body}", &c[1]);
         }
         format!("{pre}{DIM}{text}{RESET}")
     }
 
     /// Row-level differential flush: unchanged rows are never rewritten after the first frame.
     fn flush_screen_lines(&self, st: &mut State, lines: Vec<String>, columns: usize, rows: usize, cursor: String) {
+        if let Some(native) = st.native.as_mut() {
+            let cursor_y = st.native_resize_cursor.take().filter(|(c, r, _)| *c == columns && *r == rows).map(|(_, _, y)| y);
+            if st.last_cols > 0 && (columns != st.last_cols || rows != st.last_rows) {
+                native.resize(st.last_cols, columns, rows, cursor_y);
+            }
+            let modal = st.in_transcript_overlay || st.picker.is_some() || (st.pending.is_some() && !st.remember);
+            let mut lines = lines;
+            let cursor = if modal {
+                // Short questions also own a full-height frame; adjust the local caret.
+                let padding = rows.saturating_sub(lines.len());
+                lines.splice(0..0, std::iter::repeat_n(String::new(), padding));
+                re!(r"\x1b\[(\d+);(\d+)H").replace_all(&cursor, |c: &regex::Captures| format!("\x1b[{};{}H", c[1].parse::<usize>().unwrap_or(1) + padding, &c[2])).into_owned()
+            } else {
+                cursor
+            };
+            let mut output = native.transition_modal(modal, rows, lines.len());
+            output.push_str(&native.paint(&lines, &cursor));
+            st.last_cols = columns;
+            st.last_rows = rows;
+            st.last_frame_rows = lines;
+            st.last_cursor_seq = cursor;
+            st.needs_full_clear = false;
+            self.write_raw(&output);
+            return;
+        }
         if st.needs_full_clear || columns != st.last_cols || rows != st.last_rows || st.last_frame_rows.len() != lines.len() {
             st.needs_full_clear = false;
             st.last_cols = columns;
@@ -623,26 +700,33 @@ impl Tui {
     fn slice_input_window(st: &State, avail: usize) -> (String, String) {
         let max_before = avail.saturating_sub(1);
         let chars: Vec<char> = if st.masked { st.input.iter().map(|_| '•').collect() } else { st.input.clone() };
-        let mut start = st.cursor.min(chars.len());
+        use unicode_segmentation::UnicodeSegmentation;
+        let cursor = st.cursor.min(chars.len());
+        let prefix: String = chars[..cursor].iter().collect();
+        let mut start = prefix.len();
         let mut used = 0;
-        while start > 0 {
-            let w = super::text::width(chars[start - 1]);
-            if used + w > max_before {
+        for (index, grapheme) in prefix.grapheme_indices(true).rev() {
+            let w = visible_length(grapheme);
+            if grapheme == "\n" || used + w > max_before {
                 break;
             }
             used += w;
-            start -= 1;
+            start = index;
         }
-        let cursor = st.cursor.min(chars.len());
-        let before: String = chars[start..cursor].iter().collect();
-        let after: String = chars[cursor..(cursor + avail + 4).min(chars.len())].iter().collect();
+        let before = prefix[start..].to_string();
+        let after: String = chars[cursor..].iter().collect();
+        let after = slice_visible(&after, avail);
         let shown = wrap_terminal(&format!("{before}{after}"), avail).into_iter().next().unwrap_or_default();
         (before, shown)
     }
 
     pub(crate) fn render(&self, st: &mut State) {
-        if st.closed {
+        if st.closed || st.editor_active || st.input_yielded || st.suspend_requested {
             return;
+        }
+        self.sync_mouse_mode(st);
+        if st.picker.is_some() || (st.pending.is_some() && !st.remember) || st.scroll == 0 {
+            st.follow_control = super::pointer::Follow::default();
         }
         let (columns, rows) = self.size();
         let columns = columns.max(4);
@@ -660,11 +744,30 @@ impl Tui {
         let session_label = if parts.len() > 1 { parts[1..].join(" · ") } else { "session".into() };
         let elapsed = st.turn_started_at.map(|t| format_compact_duration(crate::jsutil::now_millis() - t)).unwrap_or_default();
 
-        let all = self.render_styled_body_lines(st, safe_cols, rich);
+        let mut all = self.render_styled_body_lines(st, safe_cols, rich);
+        if let Some(native) = st.native.as_mut() {
+            // Streaming Markdown and running tool cells can restyle previous lines. Only
+            // commit finalized turns; the live tail remains reversible until the run is idle.
+            native.commit_prefix(
+                &mut all,
+                &st.body_source_ends,
+                &st.transcript,
+                rows.saturating_sub(8).clamp(1, 8),
+                st.in_transcript_overlay || st.picker.is_some() || (st.pending.is_some() && !st.remember),
+                busy,
+            );
+        }
         if st.scroll > 0 && st.last_body_total_lines > 0 && all.len() > st.last_body_total_lines {
             st.scroll += all.len() - st.last_body_total_lines;
         }
         st.last_body_total_lines = all.len();
+        if columns != st.last_cols || rows != st.last_rows {
+            // Keep the selected endpoint in view instead of reinterpreting the
+            // old row offset after rewrap. Body-height clamping happens below.
+            if let Some(row) = st.selection.as_ref().and_then(|s| st.body_layout.row_for(s.end)) {
+                st.scroll = all.len().saturating_sub(row + 1);
+            }
+        }
 
         let active_secs = st.turn_started_at.map(|t| (crate::jsutil::now_millis() - t) as f64 / 1000.0).unwrap_or(0.0);
         let goal_indicator = st.goal.as_ref().map(|g| format_goal_status_indicator(g, active_secs)).unwrap_or_default();
@@ -707,6 +810,76 @@ impl Tui {
             return;
         }
 
+        if let Some(form) = st.pending.as_ref().and_then(|p| p.form.as_ref()) {
+            if let Some(selected) = form.confirm {
+                let unanswered = form.questions.iter().filter(|q| !q.committed).count();
+                let noun = if unanswered == 1 { "question" } else { "questions" };
+                let mut lines = wrap_terminal("Submit with unanswered questions?", safe_cols);
+                lines.push(clip(&format!("{unanswered} unanswered {noun}")));
+                for (index, label) in ["Proceed", "Go back"].iter().enumerate() {
+                    let marker = if index == selected { "›" } else { " " };
+                    lines.push(format!("{}{}{RESET}", if index == selected { BRAND_BOLD } else { DIM }, clip(&format!("{marker} {}. {label}", index + 1))));
+                    let description = if index == 0 { format!("Submit with {unanswered} unanswered {noun}") } else { "Return to the first unanswered question".into() };
+                    lines.push(clip(&description));
+                }
+                lines.push(clip("Press enter to confirm or esc to go back"));
+                self.flush_screen_lines(st, lines, columns, rows, "\x1b[?25l".into());
+                return;
+            }
+            let question = &form.questions[form.index];
+            let mut lines = vec![format!("{WARN}{}{RESET}", clip(&format!("Question {}/{} · {}", form.index + 1, form.questions.len(), question.header)))];
+            let (prompt, options, editor_rows, option_room) = Self::form_layout(question, safe_cols, rows);
+            lines.extend(prompt);
+            let mut start = question.selected;
+            let mut used = options[question.selected].len();
+            while start > 0 && used + options[start - 1].len() <= option_room {
+                start -= 1;
+                used += options[start].len();
+            }
+            let mut available = option_room;
+            for (index, option) in options.iter().enumerate().skip(start) {
+                for row in option.iter().take(available) {
+                    lines.push(format!("{}{row}{RESET}", if index == question.selected { BRAND_BOLD } else { DIM }));
+                }
+                available = available.saturating_sub(option.len());
+                if available == 0 {
+                    break;
+                }
+            }
+            let notes = question.notes || question.options.is_empty();
+            lines.push(format!("{DIM}{}{RESET}", clip(if notes { "Notes · tab options" } else { "tab notes · ↑↓ select · ←→ questions" })));
+            let (editor, row, col) = Self::composer_lines(st, safe_cols.saturating_sub(2).max(1), editor_rows);
+            let prompt_start = lines.len() + 1;
+            for line in editor {
+                lines.push(format!("› {line}"));
+            }
+            lines.push(format!("{DIM}{}{RESET}", clip(st.status_notice.as_deref().unwrap_or("enter next/submit · pgup/pgdn questions · esc cancel"))));
+            let cursor = if notes { format!("\x1b[{};{}H\x1b[?25h", prompt_start + row, col + 3) } else { "\x1b[?25l".into() };
+            self.flush_screen_lines(st, lines, columns, rows, cursor);
+            return;
+        }
+
+        if let Some(pending) = st.pending.as_ref().filter(|p| !p.choices.is_empty() && !p.custom) {
+            let count = pending.choices.len().min(rows.saturating_sub(5).max(1));
+            let start = (pending.selected + 1).saturating_sub(count);
+            let height = rows.saturating_sub(count + 3).max(1);
+            let mut lines: Vec<String> = all[all.len().saturating_sub(height)..].to_vec();
+            while lines.len() < height {
+                lines.push(String::new());
+            }
+            lines.push(format!("{WARN}{}{RESET}", "─".repeat(safe_cols)));
+            for (index, (_, label)) in pending.choices.iter().enumerate().skip(start).take(count) {
+                let selected = index == pending.selected;
+                let marker = if selected { "›" } else { " " };
+                let text = clip(&format!("{marker} {}. {label}", index + 1));
+                lines.push(format!("{}{text}{RESET}", if selected { BRAND_BOLD } else { DIM }));
+            }
+            lines.push(clip(if pending.allow_custom { "↑↓ select · enter confirm · o other answer · esc cancel" } else { "↑↓ select · enter confirm · esc deny" }));
+            lines.push(String::new());
+            self.flush_screen_lines(st, lines, columns, rows, "\x1b[?25l".into());
+            return;
+        }
+
         // Full-screen transcript (Ctrl+T or /transcript).
         if st.in_transcript_overlay {
             let header = Self::band(
@@ -720,6 +893,7 @@ impl Tui {
             st.scroll = st.scroll.min(st.max_scroll);
             let end = all.len() - st.scroll;
             let mut body: Vec<String> = all[end.saturating_sub(height)..end].to_vec();
+            Self::select_body(st, &mut body, end.saturating_sub(height), 1);
             while body.len() < height {
                 body.push(String::new());
             }
@@ -728,7 +902,23 @@ impl Tui {
                 live = vec![seg(format!("{indicator} "), BRAND), seg("working", DEFAULT_FG), seg(format!("  {elapsed}   "), DIM)];
             }
             live.push(seg(format!("line {} of {}", end.max(1), all.len().max(1)), DIM));
-            let footer = Self::band(&live, vec![vec![seg("↑↓ scroll   esc back", DIM)]], safe_cols, rich);
+            let footer = Self::band(
+                &live,
+                vec![vec![seg(
+                    if st.selection.is_some() {
+                        "ctrl+o copy selection · esc clear"
+                    } else if st.scroll > 0 {
+                        "↓ Follow output · End   ctrl+o copy selection"
+                    } else {
+                        "↑↓ scroll   esc back   drag select"
+                    },
+                    DIM,
+                )]],
+                safe_cols,
+                rich,
+            );
+            let follow = st.scroll > 0 && st.selection.is_none() && st.history_search.is_none();
+            let footer = st.follow_control.render(safe_cols, rows.saturating_sub(1), follow).unwrap_or(footer);
             let mut lines = vec![header];
             lines.extend(body);
             lines.push(footer);
@@ -738,8 +928,15 @@ impl Tui {
 
         // Live status row: only says something when there is something to say.
         let mut status_line = String::new();
-        if st.scroll > 0 {
-            let text = clip(&format!("↑ {} lines above the latest output   End or Esc returns", st.scroll));
+        if let Some((key, _)) = st.quit_armed.as_ref().filter(|(_, until)| std::time::Instant::now() < *until) {
+            let text = clip(&format!("Press ctrl+{key} again to quit"));
+            status_line = if rich { format!("{WARN}{text}{RESET}") } else { text };
+        } else if let Some(search) = &st.history_search {
+            let result = if search.matched.is_some() { "enter accept" } else { "no match" };
+            let text = clip(&format!("history search: {}   {result}   esc cancel", search.query));
+            status_line = if rich { format!("{DIM}{text}{RESET}") } else { text };
+        } else if st.scroll > 0 {
+            let text = clip(&format!("↑ {} lines above the latest output   Ctrl+End or Esc returns", st.scroll));
             status_line = if rich { format!("{DIM}{text}{RESET}") } else { text };
         } else if let Some(prime) = &st.esc_primed {
             let text = clip(match prime {
@@ -748,8 +945,9 @@ impl Tui {
             });
             status_line = if rich { format!("{WARN}{text}{RESET}") } else { text };
         } else if busy {
-            let working = if st.status == "Running" { "Working".to_string() } else { st.status.clone() };
+            let working = if st.status == "Running" { st.reasoning_header.clone().unwrap_or_else(|| "Working".to_string()) } else { st.status.clone() };
             let tail = format!("  {elapsed}   esc to interrupt");
+            let working = slice_visible(&working, safe_cols.saturating_sub(visible_length(&tail) + 2));
             status_line = if rich { format!("{BRAND}{indicator}{RESET} {working}{DIM}{}{RESET}", clip(&tail)) } else { clip(&format!("{indicator} {working}{tail}")) };
         } else if !st.attached_images.is_empty() || !st.pasted_texts.is_empty() {
             let mut items: Vec<String> = st.attached_images.iter().map(|(k, p)| format!("{k} {}", super::text::basename(p))).collect();
@@ -776,9 +974,12 @@ impl Tui {
             st.scroll = st.scroll.min(st.max_scroll);
             let end = all.len() - st.scroll;
             let mut body: Vec<String> = all[end.saturating_sub(height)..end].to_vec();
+            Self::select_body(st, &mut body, end.saturating_sub(height), 0);
             while body.len() < height {
                 body.push(String::new());
             }
+            let follow = st.scroll > 0 && st.selection.is_none() && st.history_search.is_none();
+            status_line = st.follow_control.render(safe_cols, body.len(), follow).unwrap_or(status_line);
             let label = clip(&st.label);
             let label_cols = visible_length(&label);
             let (before, shown) = Self::slice_input_window(st, safe_cols.saturating_sub(label_cols).max(1));
@@ -795,12 +996,27 @@ impl Tui {
 
         let queue_lines: Vec<String> = st.queued_prompts[st.queued_prompts.len().saturating_sub(3)..]
             .iter()
-            .map(|q| format!("{DIM}{}{RESET}", clip(&format!("  queued  {}   alt+↑ edit", q.split_whitespace().collect::<Vec<_>>().join(" ")))))
+            .map(|q| format!("{DIM}{}{RESET}", clip(&format!("  queued  {}   alt+↑ edit", q.text.split_whitespace().collect::<Vec<_>>().join(" ")))))
             .collect();
-        let fixed_rows = 1 + queue_lines.len() + 3;
+        let prompt_label = if asking { clip(&st.label) } else { "› ".to_string() };
+        let label_cols = visible_length(&prompt_label);
+        let input_cols = safe_cols.saturating_sub(label_cols).max(1);
+        let (editor_lines, editor_cursor_row, editor_cursor_col) = Self::composer_lines(st, input_cols, rows.saturating_sub(7 + queue_lines.len()).clamp(1, 8));
+        let fixed_rows = 1 + queue_lines.len() + 2 + editor_lines.len();
         let mut popup_lines: Vec<String> = vec![];
         let (matches, selected) = Self::slash_popup(st);
-        if !matches.is_empty() {
+        if st.shortcuts_open {
+            let hints = [
+                "Shortcuts · ? or esc to close",
+                "enter send/steer · tab queue · shift+enter newline",
+                "esc interrupt work and subagents · ctrl+c twice quit",
+                "ctrl+r / ctrl+s search history · ↑↓ recall / move",
+                "ctrl+a/e line start/end · alt+b/f move by word",
+                "ctrl+u/k cut line · ctrl+w cut word · ctrl+y paste cut",
+                "ctrl+g external editor · ctrl+t transcript · / commands",
+            ];
+            popup_lines.extend(hints.into_iter().take(rows.saturating_sub(fixed_rows + 2)).map(|line| format!("{DIM}{}{RESET}", clip(line))));
+        } else if !matches.is_empty() {
             let room = rows.saturating_sub(fixed_rows + 3).min(8);
             let shown_count = if matches.len() > room { room.saturating_sub(1) } else { matches.len() };
             let start = (selected + 1).saturating_sub(shown_count).min(matches.len().saturating_sub(shown_count));
@@ -817,6 +1033,19 @@ impl Tui {
             if matches.len() > shown_count && room > 0 {
                 popup_lines.push(format!("{DIM}{}{RESET}", clip(&format!("  {} of {}   ↑↓ select   tab accept", selected + 1, matches.len()))));
             }
+        } else if let Some(popup) = Self::mention_popup(st) {
+            let room = rows.saturating_sub(fixed_rows + 3).min(8);
+            let count = popup.items.len().min(room.saturating_sub(1));
+            let start = (popup.selected + 1).saturating_sub(count);
+            for (index, (name, description)) in popup.items.iter().enumerate().skip(start).take(count) {
+                let selected = index == popup.selected;
+                let marker = if selected { "›" } else { " " };
+                let label = clip(&format!("{marker} {}{name}  {description}", popup.sigil));
+                popup_lines.push(format!("{}{label}{RESET}", if selected { BRAND_BOLD } else { DIM }));
+            }
+            if room > 0 {
+                popup_lines.push(format!("{DIM}{}{RESET}", clip(&format!("  {} of {}   ↑↓ select   tab/enter accept   esc dismiss", popup.selected + 1, popup.items.len()))));
+            }
         }
         let chrome = fixed_rows + popup_lines.len();
         let height = rows.saturating_sub(chrome).max(2);
@@ -824,29 +1053,29 @@ impl Tui {
         st.scroll = st.scroll.min(st.max_scroll);
         let end = all.len() - st.scroll;
         let mut body: Vec<String> = all[end.saturating_sub(height)..end].to_vec();
-        while body.len() < height {
+        Self::select_body(st, &mut body, end.saturating_sub(height), 0);
+        while st.native.is_none() && body.len() < height {
             body.push(String::new());
         }
+        let follow = st.scroll > 0 && st.selection.is_none() && st.history_search.is_none() && st.native.is_none();
+        status_line = st.follow_control.render(safe_cols, body.len(), follow).unwrap_or(status_line);
 
         // Composer: a rule (amber while goon waits for an answer), the prompt and a footer.
         let awaiting = asking && st.pending.is_some();
         let rule = format!("{}{}{RESET}", if awaiting { WARN } else { DIM }, "─".repeat(safe_cols));
-        let prompt_label = if asking { clip(&st.label) } else { "› ".to_string() };
-        let label_cols = visible_length(&prompt_label);
-        let input_cols = safe_cols.saturating_sub(label_cols).max(1);
-        let (before, shown) = Self::slice_input_window(st, input_cols);
         let empty = st.input.is_empty() && !asking;
-        let placeholder_text = if busy { "Type to queue a follow-up; /commands run now" } else { "Ask anything   / commands   @ files   $ skills   ! shell" };
+        let placeholder_text = if busy { "Enter to steer · Tab to queue · Esc to interrupt" } else { "Ask anything   / commands   @ files   $ skills   ! shell" };
         let placeholder = if empty { wrap_terminal(placeholder_text, input_cols).into_iter().next().unwrap_or_default() } else { String::new() };
         let label_styled = if asking { format!("{WARN}{BOLD}{prompt_label}{RESET}") } else { format!("{BRAND_BOLD}{prompt_label}{RESET}") };
-        let content = if !placeholder.is_empty() {
-            format!("{DIM}{placeholder}{RESET}")
-        } else if st.masked {
-            shown.clone()
-        } else {
-            format_inline_markdown_default(&shown)
-        };
-        let prompt_line = format!("{label_styled}{content}");
+        let prompt_lines: Vec<String> = editor_lines
+            .iter()
+            .enumerate()
+            .map(|(i, line)| {
+                let label = if i == 0 { label_styled.clone() } else { " ".repeat(label_cols) };
+                let content = if empty { format!("{DIM}{placeholder}{RESET}") } else { line.clone() };
+                format!("{label}{content}")
+            })
+            .collect();
         let display_mode = if st.mode_label == "auto" { "auto-approve".to_string() } else { st.mode_label.clone() };
         // Auto-approve is the one risky state, so it is the one mode shown in a warning colour.
         let mode_tone = if display_mode == "auto-approve" {
@@ -860,7 +1089,13 @@ impl Tui {
         if st.view_mode == "transcript" {
             left.push(seg("   transcript view", DIM));
         }
-        let hint: Vec<Seg> = if awaiting { vec![seg(format!("enter submit   esc {}", st.esc_hint), DIM)] } else { vec![] };
+        let hint: Vec<Seg> = if awaiting {
+            vec![seg(format!("enter submit   esc {}", st.esc_hint), DIM)]
+        } else if busy {
+            vec![seg("enter steer   tab queue", DIM)]
+        } else {
+            vec![seg("ctrl+r history   shift+enter newline", DIM)]
+        };
         let place: Vec<Seg> =
             if st.workspace_name.is_empty() { vec![] } else { vec![seg(if st.branch.is_empty() { st.workspace_name.clone() } else { format!("{} ({})", st.workspace_name, st.branch) }, DIM)] };
         let footer = Self::band(&left, vec![hint, place, goal_group, todo_group, Self::context_group(st), token_group], safe_cols, rich);
@@ -869,11 +1104,51 @@ impl Tui {
         lines.extend(popup_lines);
         lines.extend(queue_lines);
         lines.push(rule);
-        lines.push(prompt_line);
+        let prompt_start = lines.len() + 1;
+        lines.extend(prompt_lines);
         lines.push(footer);
-        let prompt_row = lines.len() - 1;
-        let cursor_col = safe_cols.min(label_cols + visible_length(&before) + 1);
+        let prompt_row = prompt_start + editor_cursor_row;
+        let cursor_col = safe_cols.min(label_cols + editor_cursor_col + 1);
         let cursor = if st.pending.is_some() || !st.input.is_empty() { format!("\x1b[{prompt_row};{cursor_col}H\x1b[?25h") } else { String::new() };
         self.flush_screen_lines(st, lines, columns, rows, cursor);
+    }
+
+    /// Wrap the actual editable draft, not markdown, and keep the caret's row in view.
+    fn composer_lines(st: &State, cols: usize, max_rows: usize) -> (Vec<String>, usize, usize) {
+        use unicode_segmentation::UnicodeSegmentation;
+        let text: String = st.input.iter().collect();
+        let mut lines = vec![String::new()];
+        let (mut col, mut offset) = (0, 0);
+        let (mut cursor_row, mut cursor_col) = (0, 0);
+        for g in text.graphemes(true) {
+            let rendered = if st.masked { "•" } else { g };
+            let width = visible_length(rendered).min(cols);
+            if g != "\n" && col + width > cols {
+                lines.push(String::new());
+                col = 0;
+            }
+            if offset == st.cursor {
+                cursor_row = lines.len() - 1;
+                cursor_col = col;
+            }
+            if g == "\n" {
+                lines.push(String::new());
+                col = 0;
+            } else {
+                lines.last_mut().unwrap().push_str(rendered);
+                col += width;
+            }
+            offset += g.chars().count();
+        }
+        if st.cursor == st.input.len() {
+            if col >= cols {
+                lines.push(String::new());
+                col = 0;
+            }
+            cursor_row = lines.len() - 1;
+            cursor_col = col;
+        }
+        let start = (cursor_row + 1).saturating_sub(max_rows);
+        (lines.into_iter().skip(start).take(max_rows).collect(), cursor_row - start, cursor_col)
     }
 }

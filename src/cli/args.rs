@@ -53,6 +53,7 @@ pub const MAIN_OPTIONS: &[OptSpec] = &[
     b("allow-net", None),
     m("allow-net-hosts"),
     b("no-tui", None),
+    b("no-alt-screen", None),
     b("no-mcp", None),
     b("no-subagents", None),
     s("inline-reasoning", None),

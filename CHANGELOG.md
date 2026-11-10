@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### Terminal and interruption hotfix
+- Escape while reading scrolled output returns to the current response without cancelling the
+  running agent; closing Transcript and Ctrl+End navigation preserve the turn and unsent draft.
+- Preserve multiline/grapheme composer input, queued attachments and per-session drafts; harden
+  approvals, clarification forms, persistent redacted history and parent/subagent interruption.
+- Add logical, resize-stable transcript selection, Unicode-safe layout, fractional area-limited
+  mouse scrolling and a release-hit-tested Follow output control; improve native inline history.
+- Add external-editor handoff and Unix Ctrl+Z suspend/resume with foreground ownership and
+  process-tree cleanup. Include Codex attribution and the Apache-2.0 adaptation license.
+- Reject lossy non-UTF-8 edits and oversized patch results before writes. Failed edits report
+  their error instead of claiming `Edited` or displaying the proposed diff as applied.
+- Propagate managed subagent approval/policy denials to stop the parent run and live siblings,
+  rather than treating a denied background task as ordinary progress.
+- Full Codex UX parity is still in progress; remaining work is documented in
+  `docs/CODEX-UX-PARITY.md` rather than claimed complete by this hotfix.
+
 ### Turn completion duration
 - After a turn (or `/dag`, `/workflow`, `/network` run) completes, the TUI displays the elapsed
   duration (`✓ Worked for …`) beneath the response and plain non-JSON CLI runs log `[Worked for …]`

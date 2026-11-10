@@ -30,9 +30,12 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.10"
+shlex = "2"
+tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "io-util", "io-std", "time", "sync", "signal", "net"] }
 tokio-util = "0.7"
 unicode-normalization = "0.1"
+unicode-segmentation = "1"
 unicode-width = "0.2"
 url = "2"
 uuid = { version = "1", features = ["v4"] }
@@ -42,9 +45,6 @@ libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Threading"] }
-
-[dev-dependencies]
-tempfile = "3"
 
 # Small, single-unit release builds: ~4 MB gzipped per target. opt-level "s" measured within
 # noise of opt-level 3 on the parity corpus, and the download matters on phones.

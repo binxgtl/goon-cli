@@ -65,7 +65,9 @@ export function thirdPartyNotices(root) {
   const packages = linkedPackages(metadata);
   const missing = packages.filter(p => read(p).length === 0 && !p.license);
   if (missing.length) throw new Error(`No license information for: ${missing.map(p => `${p.name} ${p.version}`).join(', ')}`);
-  return renderNotices(packages, read);
+  const codexLicense = readFileSync(join(root, 'licenses', 'CODEX-APACHE-2.0.txt'), 'utf8');
+  const projectNotice = readFileSync(join(root, 'NOTICE.md'), 'utf8');
+  return `${projectNotice}\n\nOpenAI Codex adaptation license\n==============================\n${codexLicense}\n${renderNotices(packages, read)}`;
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

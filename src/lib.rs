@@ -25,6 +25,7 @@ pub mod files;
 pub mod generate;
 pub mod harness;
 pub mod help;
+pub mod history;
 pub mod jsutil;
 pub mod mcp;
 pub mod mcp_client;
