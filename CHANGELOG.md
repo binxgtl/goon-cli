@@ -15,6 +15,8 @@
   their error instead of claiming `Edited` or displaying the proposed diff as applied.
 - Propagate managed subagent approval/policy denials to stop the parent run and live siblings,
   rather than treating a denied background task as ordinary progress.
+- Wait for Unix process-group termination after cancellation and do not mistake unreaped
+  zombies for running processes or live session-lock owners.
 - Full Codex UX parity is still in progress; remaining work is documented in
   `docs/CODEX-UX-PARITY.md` rather than claimed complete by this hotfix.
 

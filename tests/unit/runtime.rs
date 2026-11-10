@@ -11,9 +11,11 @@ async fn command_cancellation_waits_for_the_entire_process_tree() {
         "parent.cjs",
         r#"
 const {spawn} = require('node:child_process');
-const fs = require('node:fs');
-const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {stdio: 'inherit'});
-fs.writeFileSync('child.pid', String(child.pid));
+spawn(process.execPath, ['-e', `
+process.on('SIGTERM', () => {});
+require('node:fs').writeFileSync('child.pid', String(process.pid));
+setInterval(() => {}, 1000);
+`], {stdio: 'inherit'});
 setInterval(() => {}, 1000);
 "#,
     );
@@ -44,6 +46,28 @@ setInterval(() => {}, 1000);
     assert!(matches!(outcome, Err(goon::process::CommandError::Cancelled)), "{outcome:?}");
     let pid = ready.expect("grandchild should start");
     assert!(!goon::process::process_alive(pid), "cancelled command left grandchild {pid} running");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn unreaped_zombie_is_not_a_live_process_or_lock_owner() {
+    let mut child = std::process::Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap();
+    let pid = child.id();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let zombie = loop {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+        if stat.rsplit_once(") ").is_some_and(|(_, fields)| fields.starts_with('Z')) {
+            break true;
+        }
+        if std::time::Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    let alive = goon::process::process_alive(pid);
+    child.wait().unwrap();
+    assert!(zombie, "fixture should leave an unreaped zombie until wait");
+    assert!(!alive, "a zombie cannot execute work or hold a session lock");
 }
 
 fn tool_names(body: &Value) -> Vec<String> {

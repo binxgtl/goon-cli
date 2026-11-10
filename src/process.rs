@@ -305,6 +305,12 @@ pub async fn run_command(command: &str, args: &[String], options: RunOptions<'_>
                 }
                 // Grandchildren holding the pipes open must not outlive the cancelled command.
                 kill_group(pid, libc::SIGKILL);
+                // Sending SIGKILL is not a completion barrier: a descendant may not yet have
+                // been scheduled to exit when the direct child has already been reaped.
+                let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+                while unsafe { libc::kill(-(pid as i32), 0) } == 0 && tokio::time::Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
             }
         }
         #[cfg(windows)]
@@ -327,8 +333,22 @@ pub async fn run_command(command: &str, args: &[String], options: RunOptions<'_>
     Ok(CommandResult { code, output: capture.render(output_limit), truncated: capture.bytes > output_limit })
 }
 
-/// True when a process with this PID exists (`process.kill(pid, 0)` without ESRCH).
+/// True when a process with this PID is alive. Unreaped zombies cannot execute or own locks.
 pub fn process_alive(pid: u32) -> bool {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        if stat.rsplit_once(") ").is_some_and(|(_, fields)| matches!(fields.as_bytes().first(), Some(b'Z' | b'X'))) {
+            return false;
+        }
+    }
+    #[cfg(target_os = "macos")]
+    unsafe {
+        let mut info: libc::proc_bsdinfo = std::mem::zeroed();
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        if libc::proc_pidinfo(pid as libc::c_int, libc::PROC_PIDTBSDINFO, 0, std::ptr::addr_of_mut!(info).cast::<libc::c_void>(), size) == size && info.pbi_status == libc::SZOMB {
+            return false;
+        }
+    }
     #[cfg(unix)]
     unsafe {
         if libc::kill(pid as i32, 0) == 0 {
