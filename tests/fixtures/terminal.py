@@ -6,6 +6,7 @@ import os
 import pty
 import re
 import select
+import signal
 import struct
 import subprocess
 import sys
@@ -15,9 +16,17 @@ import time
 ANSI_RE = re.compile(rb'\x1b\[[0-9;?]*[A-Za-z]')
 master, slave = pty.openpty()
 fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 24, 72, 0, 0))
+# Keep the session leader alive while inspecting the terminal after CLI exit.
+# macOS revokes the controlling PTY when its session leader exits.
+os.setsid()
+fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+signal.signal(signal.SIGHUP, signal.SIG_IGN)
+signal.signal(signal.SIGTTOU, signal.SIG_IGN)
 def own_terminal():
-    os.setsid()
-    fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+    os.setpgid(0, 0)
+    os.tcsetpgrp(slave, os.getpgrp())
+    signal.signal(signal.SIGHUP, signal.SIG_DFL)
+    signal.signal(signal.SIGTTOU, signal.SIG_DFL)
 
 child = subprocess.Popen(sys.argv[1:], stdin=slave, stdout=slave, stderr=slave,
                          preexec_fn=own_terminal, env={**os.environ, 'TERM': 'xterm-256color'})

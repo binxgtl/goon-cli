@@ -35,9 +35,17 @@ else:
 ''')
 
 def own_terminal():
-    os.setsid()
-    fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+    os.setpgid(0, 0)
+    os.tcsetpgrp(slave, os.getpgrp())
+    signal.signal(signal.SIGHUP, signal.SIG_DFL)
+    signal.signal(signal.SIGTTOU, signal.SIG_DFL)
 
+# Retain the session leader after CLI exit so macOS does not revoke the PTY
+# before the canonical-mode restoration assertion can inspect it.
+os.setsid()
+fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+signal.signal(signal.SIGHUP, signal.SIG_IGN)
+signal.signal(signal.SIGTTOU, signal.SIG_IGN)
 env = {**os.environ, 'TERM': 'xterm-256color', 'VISUAL': f'"{sys.executable}" "{editor}"',
        'EDITOR_TEST_MODE': mode, 'EDITOR_TEST_INFO': info}
 child = subprocess.Popen([binary, '--cwd', cwd, '--stub'],
