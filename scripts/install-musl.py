@@ -5,6 +5,7 @@ Run only on Ubuntu CI runners. No source files or system APT sources are changed
 The cache contains Debian packages plus their signed repository metadata; cached
 checksums alone are deliberately not accepted as proof of authenticity.
 """
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -178,6 +179,18 @@ def install_online(options, archives, lists, cache, arch):
     verify_installed()
 
 
+@contextmanager
+def apt_workspace():
+    # APT creates root/_apt-owned partial directories. Python 3.12's
+    # TemporaryDirectory may still raise while resetting their permissions even
+    # with ignore_cleanup_errors=True. Do not let cleanup mask install results.
+    directory = tempfile.mkdtemp(prefix="goon-apt-")
+    try:
+        yield directory
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
 def main():
     arch = run(["dpkg", "--print-architecture"]).strip()
     if arch not in MIRRORS or 'VERSION_CODENAME=noble' not in Path("/etc/os-release").read_text():
@@ -185,10 +198,7 @@ def main():
     cache = Path(os.environ.get("GOON_APT_CACHE", "/tmp/goon-apt-cache"))
     cache.parent.mkdir(parents=True, exist_ok=True)
     errors = []
-    # APT owns its partial/ directories as _apt/root. Leave those transient
-    # directories to the ephemeral runner rather than masking a successful
-    # install with an unprivileged TemporaryDirectory cleanup failure.
-    with tempfile.TemporaryDirectory(prefix="goon-apt-", ignore_cleanup_errors=True) as directory:
+    with apt_workspace() as directory:
         work = Path(directory)
         # _apt needs directory traversal permission for downloads.
         work.chmod(0o755)

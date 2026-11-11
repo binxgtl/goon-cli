@@ -140,6 +140,21 @@ class BootstrapTests(unittest.TestCase):
                 self.assertTrue(any(option.startswith("Dir::State::lists=") for option in call.args[0]))
             offline.assert_called_once()
 
+    def test_apt_workspace_ignores_foreign_owned_cleanup_without_masking_errors(self):
+        # Reproduce a runner's inaccessible _apt-owned partial directory.
+        with tempfile.TemporaryDirectory() as directory:
+            def inaccessible(path, *args, **kwargs):
+                raise PermissionError("partial is owned by _apt")
+            with patch.object(installer.tempfile, "mkdtemp", return_value=directory), \
+                 patch.object(installer.shutil.os, "open", side_effect=inaccessible), \
+                 patch.object(installer.shutil.os, "rmdir", side_effect=inaccessible):
+                with installer.apt_workspace() as work:
+                    self.assertEqual(work, directory)
+                with self.assertRaisesRegex(ValueError, "install failed"):
+                    with installer.apt_workspace():
+                        raise ValueError("install failed")
+            self.assertTrue(Path(directory).exists(), "ephemeral runner can reclaim inaccessible files")
+
     def test_uninstalled_package_is_not_success(self):
         with patch.object(installer, "run", return_value="unpacked"):
             with self.assertRaisesRegex(ValueError, "not installed"):
