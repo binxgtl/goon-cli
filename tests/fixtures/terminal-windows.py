@@ -92,7 +92,24 @@ def pump():
 
 
 def send(text):
-    data = text.encode("utf-8")
+    # ConPTY consumes bracketed-paste wrappers and buffers a standalone Escape.
+    # Its Win32-input protocol preserves the exact key records, independently of
+    # pipe scheduling, so the decoder sees explicit paste and distinct Escapes.
+    # Format: microsoft/terminal InputStateMachineEngine::_GenerateWin32Key.
+    records = []
+    keys = [(37, 0, 0)] if text == "\x1b[D" else []
+    if not keys:
+        for char in text:
+            code = ord(char)
+            virtual_key = 27 if char == "\x1b" else 13 if char in "\r\n" else 0
+            control = 0
+            if 1 <= code <= 26 and char not in "\r\n":
+                virtual_key, control = code + 64, 8  # LEFT_CTRL_PRESSED
+            keys.append((virtual_key, code, control))
+    for virtual_key, code, control in keys:
+        for down in (1, 0):
+            records.append(f"\x1b[{virtual_key};0;{code};{down};{control};1_")
+    data = "".join(records).encode("utf-8")
     count = wintypes.DWORD()
     checked(write(input_write, data, len(data), ctypes.byref(count), None))
     if count.value != len(data):
@@ -105,12 +122,12 @@ def status():
     return code.value
 
 
-def wait_for(text):
+def wait_for(text, after=0):
     deadline = time.monotonic() + 15
     needle = text.encode("utf-8")
     while time.monotonic() < deadline:
         pump()
-        if needle in output or needle in ansi.sub(b"", output):
+        if needle in output[after:] or needle in ansi.sub(b"", output[after:]):
             return
         if status() != 259:
             break
@@ -144,31 +161,30 @@ try:
     output_write = HANDLE()
     wait_for("/help commands")
     send("\x1b[200~editor seed one\neditor seed two\neditor seed three\x1b[201~")
-    time.sleep(0.15)
     send("\x07")  # Ctrl+G hands the terminal to VISUAL, then restores the unsent draft.
     wait_for("editor-restored-marker")
     send("\x15")
     time.sleep(0.1)
     # Bracketed paste avoids classifying synthetic command bytes as a rapid unbracketed paste.
     send("\x1b[200~/status\x1b[201~")
-    time.sleep(0.15)
     send("\r")
     wait_for("Session tokens 0")
     send("\x1b[200~/model\x1b[201~")
-    time.sleep(0.15)
     send("\r")
     wait_for("Select model")
     send("\r")
     wait_for("Reasoning effort")
     # Escape returns to model selection; Escape there cancels without applying either stage.
+    before = len(output)
     send("\x1b")
-    time.sleep(0.1)
+    wait_for("Select model", after=before)
+    before = len(output)
     send("\x1b")
-    time.sleep(0.1)
+    wait_for("shift+enter newline", after=before)
+    before = len(output)
     send("\x1b[200~/status\x1b[201~")
-    time.sleep(0.15)
     send("\r")
-    wait_for("Session tokens 0")
+    wait_for("Session tokens 0", after=before)
     time.sleep(0.25)
     checked(resize_console(console, Coord(80, 24)) >= 0)
     # Keep a non-empty composer/caret alive across repeated width and height changes.
@@ -188,7 +204,6 @@ try:
         send("\x15")  # Ctrl+U clears only the editable draft.
         time.sleep(0.1)
     send("\x1b[200~create ui.txt\x1b[201~")
-    time.sleep(0.15)
     send("\r")
     wait_for("Question 1/2")
     send("2")
@@ -203,7 +218,6 @@ try:
     wait_for("Created by TUI.")
     wait_for("Worked for ")
     send("\x1b[200~/exit\x1b[201~")
-    time.sleep(0.15)
     send("\r")
     deadline = time.monotonic() + 15
     while status() == 259 and time.monotonic() < deadline:

@@ -16,6 +16,11 @@
 - Full Codex parity remains unfinished; known selection and presentation gaps are tracked in
   `docs/CODEX-UX-PARITY.md`.
 
+### Windows terminal validation
+- Deliver explicit Win32 input records in ConPTY end-to-end tests so paste delimiters and
+  standalone Escape keys survive transport without timing-dependent sleeps. Require fresh
+  output when checking model-picker cancellation and the subsequent status command.
+
 ### macOS process liveness
 - Include zombie processes in the macOS BSD process-info query so terminated descendants and
   stale session-lock owners are not falsely reported as live while awaiting system reaping.
