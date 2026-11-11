@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Resilient Ubuntu build dependencies
+- Bound runner APT requests and fail on partial index errors, then try isolated HTTPS Ubuntu
+  mirrors with the installed archive keyring for amd64 and arm64 musl builds.
+- Cache packages together with signed Release metadata and package indexes. Revalidate the
+  signature and SHA256 chain before offline installation; reject missing packages, architecture
+  mismatches, downgrades and broken dependencies instead of weakening APT authentication.
+
 ### Transcript selection, tables and clipboard delivery
 - Preserve source colors and emphasis while highlighting selected text, and mark selected hard
   line breaks without adding padding to copied text. Add word/line multi-click selection,

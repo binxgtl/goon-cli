@@ -157,13 +157,25 @@ jobs:
             ~/.cargo/git/db
           key: registry-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: registry-${{ runner.os }}-${{ runner.arch }}-
+      - name: Restore authenticated musl package cache
+        if: matrix.musl
+        uses: actions/cache/restore@a7833574556fa59680c1b7cb190c1735db73ebf0 # v5.0.0
+        with:
+          path: /tmp/goon-apt-cache
+          key: apt-musl-v1-noble-${{ runner.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: apt-musl-v1-noble-${{ runner.arch }}-
       - name: Configure the musl C toolchain
         if: matrix.musl
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q musl-tools
+          python3 scripts/install-musl.py
           env_target=$(echo "$TARGET" | tr '-' '_')
           echo "CC_${env_target}=musl-gcc" >> "$GITHUB_ENV"
+      - name: Save authenticated musl package cache
+        if: matrix.musl && github.event_name != 'pull_request'
+        uses: actions/cache/save@a7833574556fa59680c1b7cb190c1735db73ebf0 # v5.0.0
+        with:
+          path: /tmp/goon-apt-cache
+          key: apt-musl-v1-noble-${{ runner.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Configure the Android NDK
         if: matrix.ndk
         run: |
