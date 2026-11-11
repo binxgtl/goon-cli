@@ -229,35 +229,58 @@ pub fn clipboard_candidates() -> Vec<(String, Vec<String>)> {
     }
 }
 
-pub async fn copy_text_to_clipboard(text: &str) -> bool {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClipboardStatus {
+    Confirmed,
+    Unconfirmed,
+    Failed,
+}
+
+impl ClipboardStatus {
+    pub fn message(self, label: &str) -> String {
+        match self {
+            Self::Confirmed => format!("Copied {label} to clipboard"),
+            Self::Unconfirmed => format!("Sent {label} to terminal clipboard; delivery not confirmed"),
+            Self::Failed => format!("Failed to copy {label} to system clipboard"),
+        }
+    }
+}
+
+async fn copy_with_helper(bin: &str, args: &[String], text: &str, timeout: std::time::Duration) -> bool {
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.args(args).env_clear().envs(crate::process::child_env(None)).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).kill_on_drop(true);
+    let Ok(mut child) = cmd.spawn() else { return false };
+    let delivered = tokio::time::timeout(timeout, async {
+        use tokio::io::AsyncWriteExt;
+        let mut stdin = child.stdin.take().ok_or_else(|| std::io::Error::other("Missing clipboard input pipe"))?;
+        stdin.write_all(text.as_bytes()).await?;
+        stdin.shutdown().await?;
+        drop(stdin);
+        child.wait().await.map(|status| status.success())
+    })
+    .await;
+    if matches!(delivered, Ok(Ok(true))) {
+        return true;
+    }
+    // Bound the entire transfer, not just wait(): helpers may never consume stdin.
+    // Reap before trying another helper, including after broken pipes or a timeout.
+    let _ = child.kill().await;
+    false
+}
+
+pub async fn copy_text_to_clipboard(text: &str) -> ClipboardStatus {
     use base64::Engine;
-    let mut copied = false;
-    if crate::term::stdout_is_tty() && text.chars().count() <= 100_000 {
-        // OSC 52 works over SSH and in most terminals, even without a clipboard helper.
-        stdout_write(&format!("\x1b]52;c;{}\x07", base64::engine::general_purpose::STANDARD.encode(text.as_bytes())));
-        copied = true;
-    }
     for (bin, args) in clipboard_candidates() {
-        let mut cmd = tokio::process::Command::new(&bin);
-        cmd.args(&args)
-            .env_clear()
-            .envs(crate::process::child_env(None))
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .kill_on_drop(true);
-        let Ok(mut child) = cmd.spawn() else { continue };
-        if let Some(mut stdin) = child.stdin.take() {
-            use tokio::io::AsyncWriteExt;
-            let _ = stdin.write_all(text.as_bytes()).await;
-        }
-        if let Ok(Ok(status)) = tokio::time::timeout(std::time::Duration::from_secs(3), child.wait()).await {
-            if status.success() {
-                return true;
-            }
+        if copy_with_helper(&bin, &args, text, std::time::Duration::from_secs(3)).await {
+            return ClipboardStatus::Confirmed;
         }
     }
-    copied
+    if crate::term::stdout_is_tty() && text.chars().count() <= 100_000 {
+        // OSC 52 has no delivery acknowledgement: unsupported terminals may ignore it.
+        stdout_write(&format!("\x1b]52;c;{}\x07", base64::engine::general_purpose::STANDARD.encode(text.as_bytes())));
+        return ClipboardStatus::Unconfirmed;
+    }
+    ClipboardStatus::Failed
 }
 
 /// API keys sent over plain HTTP are readable on the network path (except loopback).
@@ -803,6 +826,49 @@ async fn doctor_command(config: &Config, cwd: PathBuf) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn clipboard_helper_bounds_stdin_transfer_and_reaps_stalled_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("helper.pid");
+        let args = vec![
+            "-e".into(),
+            "require('node:fs').writeFileSync(process.argv[1], String(process.pid)); process.stdin.pause(); setInterval(() => {}, 1000);".into(),
+            pid_file.to_string_lossy().into_owned(),
+        ];
+        let large = "x".repeat(4 * 1024 * 1024);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), copy_with_helper("node", &args, &large, std::time::Duration::from_millis(500)))
+            .await
+            .expect("clipboard timeout must include a blocked stdin write");
+        assert!(!result);
+        let pid: u32 = std::fs::read_to_string(pid_file).expect("helper must actually start").parse().unwrap();
+        assert!(!crate::process::process_alive(pid), "timed-out clipboard helper must be reaped before returning");
+    }
+
+    #[tokio::test]
+    async fn clipboard_helper_checks_full_delivery_and_successful_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("copied.txt");
+        let args = vec![
+            "-e".into(),
+            "const chunks=[]; process.stdin.on('data',c=>chunks.push(c)); process.stdin.on('end',()=>require('node:fs').writeFileSync(process.argv[1],Buffer.concat(chunks)));".into(),
+            output.to_string_lossy().into_owned(),
+        ];
+        let payload = "café 界 👩‍💻\nsecond line\n";
+        assert!(copy_with_helper("node", &args, payload, std::time::Duration::from_secs(3)).await);
+        assert_eq!(std::fs::read_to_string(output).unwrap(), payload);
+        let args = vec!["-e".into(), "process.exit(0)".into()];
+        assert!(!copy_with_helper("node", &args, &"x".repeat(4 * 1024 * 1024), std::time::Duration::from_secs(3)).await, "a zero exit cannot hide an incomplete stdin write");
+        let args = vec!["-e".into(), "process.stdin.resume(); process.stdin.on('end',()=>process.exit(1));".into()];
+        assert!(!copy_with_helper("node", &args, payload, std::time::Duration::from_secs(3)).await);
+    }
+
+    #[test]
+    fn clipboard_feedback_distinguishes_failed_unconfirmed_and_confirmed_delivery() {
+        assert_eq!(ClipboardStatus::Confirmed.message("selection"), "Copied selection to clipboard");
+        assert_eq!(ClipboardStatus::Unconfirmed.message("selection"), "Sent selection to terminal clipboard; delivery not confirmed");
+        assert_eq!(ClipboardStatus::Failed.message("selection"), "Failed to copy selection to system clipboard");
+    }
 
     #[test]
     fn helpers_match_ts() {

@@ -60,6 +60,334 @@ impl Tty {
     }
 }
 
+#[tokio::test]
+async fn selection_arrow_keys_move_endpoint_and_reveal_it_without_touching_composer() {
+    let tty = Tty::new(40, 16);
+    tty.ui.write(&format!("a👩‍💻b\n{}", (0..35).map(|i| format!("line {i:02} content\n")).collect::<String>()));
+    tty.ui.set_input("unsent draft", false);
+    tty.ui.set_status("Running");
+    tty.frame();
+    let mut st = tty.ui.state.lock().unwrap();
+    let mut selected = selection::Selection::new(selection::Point { line: 0, offset: 0 }, &st.transcript, &st.body_layout);
+    selected.end = selection::Point { line: 0, offset: 1 };
+    st.selection = Some(selected);
+    let cursor = st.cursor;
+    let mut actions = vec![];
+    tty.ui.keypress_inner(&mut st, None, &Key::named("right"), &mut actions);
+    assert!(actions.is_empty());
+    assert_eq!(st.selection.as_ref().unwrap().end.offset, 12);
+    assert_eq!(st.cursor, cursor);
+    assert_eq!(st.input.iter().collect::<String>(), "unsent draft");
+    assert!(st.scroll > 0, "offscreen endpoint is revealed rather than moving draft caret");
+    for _ in 0..30 {
+        tty.ui.keypress_inner(&mut st, None, &Key { shift: true, ..Key::named("down") }, &mut actions);
+    }
+    assert!(st.selection.as_ref().unwrap().end.line >= 30);
+    tty.ui.render(&mut st);
+    let end_row = st.body_layout.row_for(st.selection.as_ref().unwrap().end).unwrap();
+    assert!((st.transcript_top_row..st.transcript_top_row + st.transcript_view_rows.len()).contains(&end_row));
+    assert_eq!(st.cursor, cursor);
+    assert_eq!(st.input.iter().collect::<String>(), "unsent draft");
+    assert!(st.queued_prompts.is_empty());
+    assert_eq!(tty.cancelled.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn repeated_mouse_clicks_select_unicode_words_and_whole_wrapped_logical_lines() {
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    let tty = Tty::new(36, 24);
+    let line = "café 👩‍💻 words repeated enough to wrap onto several screen rows";
+    tty.ui.write(&format!("{line}\nnext line\n"));
+    tty.frame();
+    let row = {
+        let st = tty.ui.state.lock().unwrap();
+        st.transcript_screen_row + st.transcript_view_rows.iter().position(|r| r.contains("café")).unwrap()
+    };
+    let mouse = |kind, column| tty.ui.handle_mouse(MouseEvent { kind, column, row: row as u16, modifiers: KeyModifiers::NONE });
+    let click = |column| {
+        mouse(MouseEventKind::Down(MouseButton::Left), column);
+        mouse(MouseEventKind::Up(MouseButton::Left), column);
+    };
+    click(1);
+    assert!(tty.ui.selected_transcript_text().is_none());
+    click(1);
+    assert_eq!(tty.ui.selected_transcript_text().as_deref(), Some("café"));
+    click(1);
+    assert_eq!(tty.ui.selected_transcript_text(), Some(format!("{line}\n")), "triple click selects logical line, not a visual wrap");
+    *tty.size.lock().unwrap() = (70, 24);
+    tty.ui.resize();
+    tty.frame();
+    assert_eq!(tty.ui.selected_transcript_text(), Some(format!("{line}\n")));
+    // Keyboard action breaks the multi-click chain before another word gesture.
+    tty.key("escape");
+    click(5);
+    click(5);
+    assert_eq!(tty.ui.selected_transcript_text().as_deref(), Some("👩‍💻"), "ZWJ emoji remains an atomic word-bound segment");
+}
+
+#[tokio::test]
+async fn shift_click_extends_original_character_and_word_anchors_in_both_directions() {
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    let tty = Tty::new(80, 24);
+    tty.ui.write("one café three four\n");
+    tty.ui.set_input("keep draft", false);
+    tty.frame();
+    let row = {
+        let st = tty.ui.state.lock().unwrap();
+        st.transcript_screen_row + st.transcript_view_rows.iter().position(|r| r.contains("one café")).unwrap()
+    };
+    let click = |column, modifiers| {
+        for kind in [MouseEventKind::Down(MouseButton::Left), MouseEventKind::Up(MouseButton::Left)] {
+            tty.ui.handle_mouse(MouseEvent { kind, column, row: row as u16, modifiers });
+        }
+    };
+    let mouse = |kind, column| tty.ui.handle_mouse(MouseEvent { kind, column, row: row as u16, modifiers: KeyModifiers::NONE });
+    mouse(MouseEventKind::Down(MouseButton::Left), 4);
+    mouse(MouseEventKind::Up(MouseButton::Left), 8);
+    assert_eq!(tty.ui.selected_transcript_text().as_deref(), Some("café"));
+    click(14, KeyModifiers::SHIFT);
+    assert_eq!(tty.ui.selected_transcript_text().as_deref(), Some("café three"));
+    click(0, KeyModifiers::SHIFT);
+    assert_eq!(tty.ui.selected_transcript_text().as_deref(), Some("one "), "character anchor remains at original caret");
+    tty.key("escape");
+    click(5, KeyModifiers::NONE);
+    click(5, KeyModifiers::NONE);
+    assert_eq!(tty.ui.selected_transcript_text().as_deref(), Some("café"));
+    click(11, KeyModifiers::SHIFT);
+    assert_eq!(tty.ui.selected_transcript_text().as_deref(), Some("café three"));
+    click(1, KeyModifiers::SHIFT);
+    assert_eq!(tty.ui.selected_transcript_text().as_deref(), Some("one café"), "word anchor retains entire initial word on reversal");
+    assert_eq!(draft(&tty), "keep draft");
+    assert_eq!(tty.cancelled.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn windows_copy_shortcuts_decode_without_altgr_becoming_copy() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let tty = Tty::new(80, 24);
+    tty.ui.write("selected text\n");
+    tty.ui.set_input("draft", false);
+    tty.frame();
+    let mut st = tty.ui.state.lock().unwrap();
+    let mut selected = selection::Selection::new(selection::Point { line: 0, offset: 0 }, &st.transcript, &st.body_layout);
+    selected.end = selection::Point { line: 0, offset: 8 };
+    st.selection = Some(selected);
+    for event in [
+        KeyEvent::new(KeyCode::Insert, KeyModifiers::CONTROL),
+        KeyEvent::new(KeyCode::Char('C'), KeyModifiers::CONTROL),
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+    ] {
+        let (text, key) = key_from_event(&event).unwrap();
+        let mut actions = vec![];
+        tty.ui.keypress_inner(&mut st, text.as_deref(), &key, &mut actions);
+        assert!(matches!(actions.as_slice(), [Action::CopySelection(_)]), "{event:?}");
+    }
+    let event = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL | KeyModifiers::ALT);
+    let (text, key) = key_from_event(&event).unwrap();
+    assert!(!key.ctrl && !key.meta, "AltGr remains text");
+    assert_eq!(text.as_deref(), Some("c"));
+    assert_eq!(st.input.iter().collect::<String>(), "draft");
+    assert_eq!(tty.cancelled.load(Ordering::SeqCst), 0);
+    st.selection = None;
+    st.status = "Running".into();
+    for event in [KeyEvent::new(KeyCode::Char('C'), KeyModifiers::CONTROL), KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL | KeyModifiers::SHIFT)] {
+        let (text, key) = key_from_event(&event).unwrap();
+        let mut actions = vec![];
+        tty.ui.keypress_inner(&mut st, text.as_deref(), &key, &mut actions);
+        assert!(actions.is_empty(), "copy-only chord without selection cannot interrupt");
+        assert_eq!(st.input.iter().collect::<String>(), "draft");
+    }
+}
+
+#[tokio::test]
+async fn selection_copy_acknowledgment_preserves_retry_and_rejects_stale_results() {
+    use crate::cli::ClipboardStatus;
+    let tty = Tty::new(80, 24);
+    tty.ui.write("selected text\nnext line\n");
+    tty.ui.set_input("unsent draft", false);
+    tty.frame();
+    let install = || {
+        let mut st = tty.ui.state.lock().unwrap();
+        let mut selected = selection::Selection::new(selection::Point { line: 0, offset: 0 }, &st.transcript, &st.body_layout);
+        selected.end = selection::Point { line: 0, offset: 8 };
+        st.selection = Some(selected);
+        st.scroll = 3;
+    };
+    install();
+    let request = tty.ui.state.lock().unwrap().selection.as_ref().unwrap().copy_request(true).unwrap();
+    for status in [ClipboardStatus::Failed, ClipboardStatus::Unconfirmed] {
+        tty.ui.finish_selection_copy(&request, status);
+        assert_eq!(tty.ui.selected_transcript_text().as_deref(), Some("selected"));
+        assert_eq!(tty.ui.state.lock().unwrap().scroll, 3);
+    }
+    {
+        let mut st = tty.ui.state.lock().unwrap();
+        let selected = st.selection.as_mut().unwrap();
+        selected.extend(selection::Point { line: 0, offset: 9 });
+        selected.extend(selection::Point { line: 0, offset: 8 });
+    }
+    tty.ui.finish_selection_copy(&request, ClipboardStatus::Confirmed);
+    assert!(tty.ui.state.lock().unwrap().selection.is_some(), "changing away and back is not the original pending copy range");
+    tty.ui.state.lock().unwrap().selection.as_mut().unwrap().end.offset = 9;
+    tty.ui.finish_selection_copy(&request, ClipboardStatus::Confirmed);
+    assert_eq!(tty.ui.selected_transcript_text().as_deref(), Some("selected "), "extension cannot be cleared by old delivery");
+    install(); // Same content/anchors, but a new gesture identity.
+    tty.ui.finish_selection_copy(&request, ClipboardStatus::Confirmed);
+    assert!(tty.ui.state.lock().unwrap().selection.is_some());
+    let request = tty.ui.state.lock().unwrap().selection.as_ref().unwrap().copy_request(false).unwrap();
+    tty.ui.finish_selection_copy(&request, ClipboardStatus::Confirmed);
+    assert!(tty.ui.selected_transcript_text().is_none());
+    assert_eq!(tty.ui.state.lock().unwrap().scroll, 3, "ordinary copy keeps reading position");
+    install();
+    let request = tty.ui.state.lock().unwrap().selection.as_ref().unwrap().copy_request(true).unwrap();
+    tty.ui.finish_selection_copy(&request, ClipboardStatus::Confirmed);
+    assert_eq!(tty.ui.state.lock().unwrap().scroll, 0, "Enter copy follows after confirmed delivery");
+    assert_eq!(draft(&tty), "unsent draft");
+    assert_eq!(tty.cancelled.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn selection_copy_ack_cannot_undo_scrolling_even_after_returning_to_the_same_position() {
+    use crate::cli::ClipboardStatus;
+    for follow in [false, true] {
+        for return_to_start in [false, true] {
+            let tty = Tty::new(80, 16);
+            tty.ui.write(&format!("selected text\n{}", "another line\n".repeat(40)));
+            tty.ui.set_input("unsent draft", false);
+            tty.frame();
+            let request = {
+                let mut st = tty.ui.state.lock().unwrap();
+                let mut selected = selection::Selection::new(selection::Point { line: 0, offset: 0 }, &st.transcript, &st.body_layout);
+                selected.end = selection::Point { line: 0, offset: 8 };
+                st.selection = Some(selected);
+                st.scroll = 3;
+                st.status_notice = Some("newer notice".into());
+                let request = st.selection.as_ref().unwrap().copy_request(follow).unwrap();
+                tty.ui.scroll_by(&mut st, 2);
+                if return_to_start {
+                    tty.ui.scroll_by(&mut st, -2);
+                }
+                request
+            };
+            tty.ui.finish_selection_copy(&request, ClipboardStatus::Confirmed);
+            let st = tty.ui.state.lock().unwrap();
+            assert!(st.selection.is_some(), "reading navigation invalidates pending copy ownership");
+            assert_eq!(st.scroll, if return_to_start { 3 } else { 5 });
+            assert_eq!(st.status_notice.as_deref(), Some("newer notice"));
+            assert_eq!(st.input.iter().collect::<String>(), "unsent draft");
+            assert!(st.queued_prompts.is_empty());
+            assert_eq!(tty.cancelled.load(Ordering::SeqCst), 0);
+        }
+    }
+}
+
+#[tokio::test]
+async fn selection_copy_ack_cannot_undo_home_or_unchanged_endpoint_reveal() {
+    for home in [false, true] {
+        let tty = Tty::new(80, 16);
+        tty.ui.set_transcript_overlay(true);
+        tty.ui.write(&format!("selected text\n{}", "another line\n".repeat(40)));
+        tty.frame();
+        let (request, scroll) = {
+            let mut st = tty.ui.state.lock().unwrap();
+            let mut selected = selection::Selection::new(selection::Point { line: 0, offset: 8 }, &st.transcript, &st.body_layout);
+            selected.end = selection::Point { line: 0, offset: 0 };
+            st.selection = Some(selected);
+            let request = st.selection.as_ref().unwrap().copy_request(true).unwrap();
+            let mut actions = vec![];
+            tty.ui.keypress_inner(&mut st, None, &Key::named(if home { "home" } else { "left" }), &mut actions);
+            assert!(actions.is_empty());
+            assert_eq!(st.selection.as_ref().unwrap().end.offset, 0, "logical endpoint did not move");
+            assert!(st.scroll > 0, "navigation revealed earlier history");
+            (request, st.scroll)
+        };
+        tty.ui.finish_selection_copy(&request, crate::cli::ClipboardStatus::Confirmed);
+        assert_eq!(tty.ui.selected_transcript_text().as_deref(), Some("selected"));
+        assert_eq!(tty.ui.state.lock().unwrap().scroll, scroll);
+    }
+}
+
+#[tokio::test]
+async fn selection_copy_ack_survives_noop_scroll_but_not_actual_resize() {
+    use crate::cli::ClipboardStatus;
+    for resize in [false, true] {
+        let tty = Tty::new(80, 24);
+        tty.ui.write("selected text\n");
+        tty.frame();
+        let request = {
+            let mut st = tty.ui.state.lock().unwrap();
+            let mut selected = selection::Selection::new(selection::Point { line: 0, offset: 0 }, &st.transcript, &st.body_layout);
+            selected.end = selection::Point { line: 0, offset: 8 };
+            st.selection = Some(selected);
+            let request = st.selection.as_ref().unwrap().copy_request(true).unwrap();
+            tty.ui.scroll_by(&mut st, -2); // Already at Latest; no reading-position change.
+            request
+        };
+        if resize {
+            *tty.size.lock().unwrap() = (60, 20);
+        }
+        tty.ui.resize();
+        tty.ui.finish_selection_copy(&request, ClipboardStatus::Confirmed);
+        assert_eq!(tty.ui.selected_transcript_text().as_deref(), resize.then_some("selected"), "only actual geometry changes invalidate the pending acknowledgment");
+    }
+}
+
+#[tokio::test]
+async fn enter_and_control_copy_capture_selection_without_submitting_draft_or_cancelling() {
+    let tty = Tty::new(80, 24);
+    tty.ui.write("selected text\n");
+    tty.ui.set_input("unsent draft", false);
+    tty.ui.set_status("Running");
+    tty.frame();
+    let mut st = tty.ui.state.lock().unwrap();
+    let mut selected = selection::Selection::new(selection::Point { line: 0, offset: 0 }, &st.transcript, &st.body_layout);
+    selected.end = selection::Point { line: 0, offset: 8 };
+    st.selection = Some(selected);
+    for (key, follow) in [(Key::named("return"), true), (Key { ctrl: true, ..Key::named("c") }, false), (Key { ctrl: true, ..Key::named("o") }, false)] {
+        st.scroll = 3;
+        let mut actions = vec![];
+        tty.ui.keypress_inner(&mut st, None, &key, &mut actions);
+        assert_eq!(actions.len(), 1);
+        let Action::CopySelection(request) = actions.remove(0) else { panic!("selection owns copy key") };
+        assert_eq!(request.text, "selected");
+        // Completion is exercised separately; no real clipboard writes in these tests.
+        drop(st);
+        tty.ui.finish_selection_copy(&request, crate::cli::ClipboardStatus::Confirmed);
+        st = tty.ui.state.lock().unwrap();
+        assert!(st.selection.is_none());
+        assert_eq!(st.scroll, if follow { 0 } else { 3 });
+        assert_eq!(st.input.iter().collect::<String>(), "unsent draft");
+        assert!(st.queued_prompts.is_empty());
+        assert_eq!(tty.cancelled.load(Ordering::SeqCst), 0);
+        let mut selected = selection::Selection::new(selection::Point { line: 0, offset: 0 }, &st.transcript, &st.body_layout);
+        selected.end = selection::Point { line: 0, offset: 8 };
+        st.selection = Some(selected);
+    }
+}
+
+#[tokio::test]
+async fn clipboard_ack_does_not_follow_behind_a_new_modal_prompt() {
+    let tty = Tty::new(80, 24);
+    tty.ui.write("selected text\n");
+    tty.frame();
+    let request = {
+        let mut st = tty.ui.state.lock().unwrap();
+        let mut selected = selection::Selection::new(selection::Point { line: 0, offset: 0 }, &st.transcript, &st.body_layout);
+        selected.end = selection::Point { line: 0, offset: 8 };
+        st.selection = Some(selected);
+        st.scroll = 3;
+        st.selection.as_ref().unwrap().copy_request(true).unwrap()
+    };
+    let ui = tty.ui.clone();
+    let prompt = tokio::spawn(async move { ui.question("Approval: ", None, false, QuestionOpts { esc_cancels: true, ..Default::default() }).await });
+    tokio::task::yield_now().await;
+    assert!(tty.ui.state.lock().unwrap().pending.is_some());
+    tty.ui.finish_selection_copy(&request, crate::cli::ClipboardStatus::Confirmed);
+    assert_eq!(tty.ui.state.lock().unwrap().scroll, 3, "late completion cannot navigate a modal");
+    tty.key("escape");
+    assert!(prompt.await.unwrap().unwrap_err().is::<InputCancelled>());
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn suspend_yields_rendering_and_restores_both_modes_even_on_failure() {
@@ -501,8 +829,8 @@ async fn no_row_exceeds_width_and_tables_align() {
         }
         if cols >= 60 {
             let frame = tty.frame();
-            assert!(frame.contains("│ a   │ bb │"), "{frame}");
-            assert!(frame.contains("│ ccc │ d  │"), "{frame}");
+            assert!(frame.contains("│ a   │ bb  │"), "{frame}");
+            assert!(frame.contains("│ ccc │ d   │"), "{frame}");
         }
     }
 }
@@ -1046,6 +1374,267 @@ async fn markdown_tables_align_columns_across_rows() {
     for row in &table {
         assert_eq!(bars(row), expected, "misaligned row: {row}");
     }
+}
+
+#[tokio::test]
+async fn narrow_tables_show_all_values_instead_of_clipping_the_right_columns() {
+    let tty = Tty::new(32, 60);
+    tty.ui.write("[answer]\n| Task | Status | Next step |\n|---|---|---|\n| Task 1 | Complete | Review results |\n| Task 2 | In progress | Finish implementation |\n");
+    let frame = tty.frame();
+    for word in ["Task 1", "Complete", "Review", "results", "Task 2", "In progress", "Finish", "implementation"] {
+        assert!(frame.contains(word), "narrow table loses {word:?}:\n{frame}");
+    }
+}
+
+#[tokio::test]
+async fn record_label_drag_never_copies_cells_outside_the_visible_gesture() {
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    for (columns, reverse, shift_click) in [(24, false, false), (24, true, false), (32, false, false), (32, true, false), (24, false, true), (32, true, true)] {
+        let tty = Tty::new(columns, 60);
+        tty.ui.write("[answer]\n| Task | Status | Next step |\n|---|---|---|\n| Task 1 | SECRET_HIDDEN_VALUE | Review results |\n| Task 2 | Planned_long_status | Finish implementation |\n");
+        tty.frame();
+        let (start, end) = {
+            let st = tty.ui.state.lock().unwrap();
+            let row = st.transcript_view_rows.iter().position(|line| line.contains("Review results")).unwrap();
+            let label = st.transcript_view_rows[..=row].iter().rposition(|line| line.contains("Next step")).unwrap();
+            if columns == 32 {
+                assert_eq!(label, row, "aligned records place label and value on the same row");
+            }
+            let at = |index: usize, text: &str, end: bool| {
+                let plain = crate::term::strip_vt(&st.transcript_view_rows[index]);
+                let col = visible_length(plain.split(text).next().unwrap()) + if end { visible_length(text) } else { 0 };
+                (col as u16, (st.transcript_screen_row + index) as u16)
+            };
+            (at(label, "Next step", false), at(row, "Review results", true))
+        };
+        let (start, end) = if reverse { (end, start) } else { (start, end) };
+        if shift_click {
+            for (kind, (column, row), modifiers) in [
+                (MouseEventKind::Down(MouseButton::Left), start, KeyModifiers::NONE),
+                (MouseEventKind::Up(MouseButton::Left), end, KeyModifiers::NONE),
+                (MouseEventKind::Down(MouseButton::Left), end, KeyModifiers::SHIFT),
+            ] {
+                tty.ui.handle_mouse(MouseEvent { kind, column, row, modifiers });
+            }
+        } else {
+            for (kind, (column, row)) in [(MouseEventKind::Down(MouseButton::Left), start), (MouseEventKind::Up(MouseButton::Left), end)] {
+                tty.ui.handle_mouse(MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE });
+            }
+        }
+        let expected = "|  |  | Next step |\n|---|---|---|\n|  |  | Review results |";
+        assert_eq!(tty.ui.selected_transcript_text().as_deref(), Some(expected));
+        tty.frame();
+        assert!(!tty.ui.rendered_frame().contains("\x1b[7mSECRET"), "unselected values cannot be highlighted");
+        *tty.size.lock().unwrap() = (100, 60);
+        tty.ui.resize();
+        tty.frame();
+        assert_eq!(tty.ui.selected_transcript_text().as_deref(), Some(expected));
+    }
+}
+
+#[tokio::test]
+async fn record_word_and_line_gestures_expand_visual_units_without_hidden_cells() {
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    for clicks in [2, 3] {
+        let tty = Tty::new(24, 60);
+        tty.ui.write("[answer]\n| Task | Status | Next step |\n|---|---|---|\n| Task 1 | SECRET_HIDDEN_VALUE | Review results |\n| Task 2 | Planned_long_status | Finish implementation |\n");
+        tty.frame();
+        let (label, value) = {
+            let st = tty.ui.state.lock().unwrap();
+            let value = st.transcript_view_rows.iter().position(|line| line.contains("Review results")).unwrap();
+            let label = st.transcript_view_rows[..value].iter().rposition(|line| line.contains("Next step")).unwrap();
+            let position = |index: usize, text: &str| {
+                let plain = crate::term::strip_vt(&st.transcript_view_rows[index]);
+                (visible_length(plain.split(text).next().unwrap()) as u16 + 1, (st.transcript_screen_row + index) as u16)
+            };
+            (position(label, "Next"), position(value, "Review"))
+        };
+        let mouse = |kind, (column, row), modifiers| tty.ui.handle_mouse(MouseEvent { kind, column, row, modifiers });
+        for _ in 0..clicks {
+            mouse(MouseEventKind::Down(MouseButton::Left), label, KeyModifiers::NONE);
+            mouse(MouseEventKind::Up(MouseButton::Left), label, KeyModifiers::NONE);
+        }
+        assert_eq!(tty.ui.selected_transcript_text().as_deref(), Some(if clicks == 2 { "Next" } else { "Next step" }));
+        mouse(MouseEventKind::Down(MouseButton::Left), value, KeyModifiers::SHIFT);
+        let expected = if clicks == 2 { "|  |  | Next step |\n|---|---|---|\n|  |  | Review |" } else { "|  |  | Next step |\n|---|---|---|\n|  |  | Review results |" };
+        assert_eq!(tty.ui.selected_transcript_text().as_deref(), Some(expected));
+        mouse(MouseEventKind::Up(MouseButton::Left), value, KeyModifiers::SHIFT);
+        *tty.size.lock().unwrap() = (100, 60);
+        tty.ui.resize();
+        tty.frame();
+        assert_eq!(tty.ui.selected_transcript_text().as_deref(), Some(expected));
+    }
+}
+
+#[tokio::test]
+async fn adaptive_table_value_selection_keeps_logical_bytes_across_grid_and_records() {
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    let tty = Tty::new(32, 60);
+    tty.ui.write("[answer]\n| Task | Status | Next step |\n|---|---|---|\n| Task 1 | Complete | Review results |\n| Task 2 | In progress | Finish implementation |\n");
+    tty.frame();
+    let (row, column) = {
+        let st = tty.ui.state.lock().unwrap();
+        let row = st.transcript_view_rows.iter().position(|line| line.contains("Review results")).unwrap();
+        let plain = crate::term::strip_vt(&st.transcript_view_rows[row]);
+        (st.transcript_screen_row + row, visible_length(plain.split("Review").next().unwrap()))
+    };
+    for (kind, column) in [(MouseEventKind::Down(MouseButton::Left), column), (MouseEventKind::Up(MouseButton::Left), column + 6)] {
+        tty.ui.handle_mouse(MouseEvent { kind, column: column as u16, row: row as u16, modifiers: KeyModifiers::NONE });
+    }
+    assert_eq!(tty.ui.selected_transcript_text().as_deref(), Some("Review"));
+    for columns in [100, 24, 80, 32] {
+        *tty.size.lock().unwrap() = (columns, 60);
+        tty.ui.resize();
+        tty.frame();
+        assert_eq!(tty.ui.selected_transcript_text().as_deref(), Some("Review"), "width {columns}");
+    }
+    assert_eq!(tty.cancelled.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn adaptive_table_full_copy_and_native_source_boundaries_survive_layout_changes() {
+    let source = "[answer]\n| Task | Status | Next step |\n|---|---|---|\n| Task 1 | Complete | Review results |\n| Task 2 | In progress | Finish implementation |\n";
+    let expected = "| Task | Status | Next step |\n|---|---|---|\n| Task 1 | Complete | Review results |\n| Task 2 | In progress | Finish implementation |";
+    for columns in [12, 24, 32, 80, 120] {
+        let tty = Tty::new(columns, 60);
+        tty.ui.write(source);
+        tty.frame();
+        let mut st = tty.ui.state.lock().unwrap();
+        let first = st.body_layout.text.iter().position(|line| line.contains("│ Task ")).unwrap();
+        let last = st.body_layout.text.iter().position(|line| line.contains("Finish implementation")).unwrap();
+        let mut selected = selection::Selection::new(selection::Point { line: first, offset: 0 }, &st.transcript, &st.body_layout);
+        selected.end = selection::Point { line: last, offset: st.body_layout.text[last].len() };
+        assert_eq!(selected.copy_request(false).unwrap().text, expected, "width {columns}");
+        assert!(
+            st.body_source_ends.iter().all(|end| *end >= st.transcript.find("| Task 2 | In progress | Finish implementation |").unwrap() + "| Task 2 | In progress | Finish implementation |".len()),
+            "native commit cannot consume a table before all source rows, width {columns}: {:?}",
+            st.body_source_ends
+        );
+        st.selection = Some(selected);
+        drop(st);
+        *tty.size.lock().unwrap() = (100, 60);
+        tty.ui.resize();
+        tty.frame();
+        assert_eq!(tty.ui.selected_transcript_text().as_deref(), Some(expected));
+    }
+}
+
+#[tokio::test]
+async fn whole_table_copy_preserves_markdown_structure_alignment_and_empty_cells() {
+    for columns in [24, 80, 120] {
+        let tty = Tty::new(columns, 30);
+        tty.ui.write("[answer]\n| A | B |\n|:---|---:|\n| left | right |\n|  |  |\n");
+        tty.frame();
+        let request = {
+            let st = tty.ui.state.lock().unwrap();
+            let first = st.body_layout.text.iter().position(|line| line.contains("│ A")).unwrap();
+            let last = st.body_layout.text.iter().rposition(|line| line.contains('│')).unwrap();
+            let mut selected = selection::Selection::new(selection::Point { line: first, offset: 0 }, &st.transcript, &st.body_layout);
+            selected.end = selection::Point { line: last, offset: st.body_layout.text[last].len() };
+            selected.copy_request(false).unwrap()
+        };
+        assert_eq!(request.text, "| A | B |\n|:---|---:|\n| left | right |\n|  |  |", "width {columns}");
+    }
+}
+
+#[tokio::test]
+async fn table_copy_only_serializes_selected_cell_fragments_and_survives_reflow() {
+    let tty = Tty::new(100, 30);
+    tty.ui.write("[answer]\n| Label | Value |\n|---|---|\n| **alpha** | beta |\n| gamma | delta |\n");
+    tty.frame();
+    let install = |first: &str, from: usize, last: &str, to: usize| {
+        let mut st = tty.ui.state.lock().unwrap();
+        let line = st.body_layout.text.iter().position(|line| line.contains(first)).unwrap();
+        let offset = st.body_layout.text[line].find(first).unwrap() + from;
+        let mut selected = selection::Selection::new(selection::Point { line, offset }, &st.transcript, &st.body_layout);
+        let line = st.body_layout.text.iter().position(|line| line.contains(last)).unwrap();
+        selected.end = selection::Point { line, offset: st.body_layout.text[line].find(last).unwrap() + to };
+        st.selection = Some(selected);
+    };
+    install("alpha", 1, "alpha", 4);
+    assert_eq!(tty.ui.selected_transcript_text().as_deref(), Some("**lph**"));
+    install("alpha", 0, "delta", 5);
+    let expected = "|  |  |\n|---|---|\n| **alpha** | beta |\n| gamma | delta |";
+    assert_eq!(tty.ui.selected_transcript_text().as_deref(), Some(expected));
+    *tty.size.lock().unwrap() = (24, 24);
+    tty.ui.resize();
+    tty.frame();
+    assert_eq!(tty.ui.selected_transcript_text().as_deref(), Some(expected));
+    tty.ui.write("streaming updates must not change a pending selected table\n");
+    tty.frame();
+    assert_eq!(tty.ui.selected_transcript_text().as_deref(), Some(expected));
+}
+
+#[tokio::test]
+async fn table_copy_keeps_literal_cells_plain_and_mixed_code_cells_formatted() {
+    let tty = Tty::new(100, 30);
+    tty.ui.write("[answer]\nBefore\n\n| `a\\|b` | B |\n|---|---|\n| **literal │ divider** | value |\n");
+    tty.frame();
+    let request = |start_text: &str, start_offset: usize, end_text: &str, end_offset: usize| {
+        let st = tty.ui.state.lock().unwrap();
+        let line = st.body_layout.text.iter().position(|line| line.contains(start_text)).unwrap();
+        let offset = st.body_layout.text[line].find(start_text).unwrap() + start_offset;
+        let mut selected = selection::Selection::new(selection::Point { line, offset }, &st.transcript, &st.body_layout);
+        let line = st.body_layout.text.iter().position(|line| line.contains(end_text)).unwrap();
+        selected.end = selection::Point { line, offset: st.body_layout.text[line].find(end_text).unwrap() + end_offset };
+        selected.copy_request(false).unwrap().text
+    };
+    assert_eq!(request("a|b", 0, "a|b", 3), "a|b");
+    assert_eq!(request("a|b", 1, "a|b", 3), "|b");
+    assert_eq!(request("Before", 0, "a|b", 3), "Before\n\n`a|b`");
+    assert_eq!(request("literal │ divider", 0, "literal │ divider", "literal │ divider".len()), "**literal │ divider**");
+    let separator = {
+        let st = tty.ui.state.lock().unwrap();
+        let line = st.body_layout.text.iter().position(|line| line.contains('├')).unwrap();
+        st.body_layout.text[line].to_string()
+    };
+    assert_eq!(request(&separator, 0, &separator, separator.len()), separator, "separator-only copy retains visible text");
+}
+
+#[tokio::test]
+async fn table_copy_keeps_separate_tables_and_fenced_pipe_text_separate() {
+    let tty = Tty::new(100, 40);
+    tty.ui.write("[answer]\nBefore\n\n| A | B |\n|---|---|\n| one | two |\n\n```text\n| literal | code |\n```\n\n| C | D |\n|---|---|\n| three | four |\n\nAfter\n");
+    tty.frame();
+    let request = {
+        let st = tty.ui.state.lock().unwrap();
+        let first = st.body_layout.text.iter().position(|line| line.contains("Before")).unwrap();
+        let last = st.body_layout.text.iter().position(|line| line.contains("After")).unwrap();
+        let mut selected = selection::Selection::new(selection::Point { line: first, offset: 0 }, &st.transcript, &st.body_layout);
+        selected.end = selection::Point { line: last, offset: st.body_layout.text[last].len() };
+        selected.copy_request(false).unwrap()
+    };
+    assert!(request.text.contains("| A | B |\n|---|---|\n| one | two |"), "{}", request.text);
+    assert!(request.text.contains("| C | D |\n|---|---|\n| three | four |"), "{}", request.text);
+    assert!(request.text.contains("| literal | code |"));
+    assert_eq!(request.text.matches("|---|---|").count(), 2, "fenced pipe text must not gain a table separator");
+}
+
+#[tokio::test]
+async fn escaped_table_pipes_remain_cell_content_and_copy_as_literal_text() {
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    let tty = Tty::new(100, 24);
+    tty.ui.write("[answer]\n| Code | Value |\n|---|---|\n| `a\\|b` | right |\n| left\\|middle | tail |\n| : | -- |\n");
+    tty.frame();
+    let (row, column) = {
+        let st = tty.ui.state.lock().unwrap();
+        let row = st.transcript_view_rows.iter().position(|r| r.contains("a|b")).expect("escaped pipe must display literally inside code");
+        for marker in ["a|b", "left|middle", ":"] {
+            let row = st.transcript_view_rows.iter().find(|r| r.contains(marker)).expect("table cell content must remain visible");
+            assert_eq!(crate::term::strip_vt(row).matches('│').count(), 3, "escaped content must not create an extra column: {row}");
+            assert!(!row.contains("\\|"), "escape syntax is not displayed");
+        }
+        let column = visible_length(crate::term::strip_vt(&st.transcript_view_rows[row]).split("a|b").next().unwrap());
+        (st.transcript_screen_row + row, column)
+    };
+    for (kind, column) in [(MouseEventKind::Down(MouseButton::Left), column), (MouseEventKind::Up(MouseButton::Left), column + 3)] {
+        tty.ui.handle_mouse(MouseEvent { kind, column: column as u16, row: row as u16, modifiers: KeyModifiers::NONE });
+    }
+    assert_eq!(tty.ui.selected_transcript_text().as_deref(), Some("a|b"));
+    *tty.size.lock().unwrap() = (60, 24);
+    tty.ui.resize();
+    tty.frame();
+    assert_eq!(tty.ui.selected_transcript_text().as_deref(), Some("a|b"));
 }
 
 #[tokio::test]
@@ -2501,6 +3090,37 @@ async fn logical_copy_excludes_gutters_and_synthetic_fences_but_keeps_hard_blank
 }
 
 #[tokio::test]
+async fn mouse_selection_paints_hard_newline_without_copying_padding() {
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    for overlay in [false, true] {
+        let tty = Tty::new(40, 20);
+        tty.ui.write("code\nnext\n");
+        if overlay {
+            tty.key("ctrl+t");
+        }
+        tty.frame();
+        let (first, next) = {
+            let st = tty.ui.state.lock().unwrap();
+            (
+                st.transcript_screen_row + st.transcript_view_rows.iter().position(|r| crate::term::strip_vt(r) == "code").unwrap(),
+                st.transcript_screen_row + st.transcript_view_rows.iter().position(|r| crate::term::strip_vt(r) == "next").unwrap(),
+            )
+        };
+        let mouse = |kind, column, row| tty.ui.handle_mouse(MouseEvent { kind, column, row: row as u16, modifiers: KeyModifiers::NONE });
+        mouse(MouseEventKind::Down(MouseButton::Left), 0, first);
+        mouse(MouseEventKind::Up(MouseButton::Left), 10, first);
+        tty.frame();
+        assert_eq!(tty.ui.selected_transcript_text().as_deref(), Some("code"));
+        assert!(!tty.ui.rendered_frame().contains("code \x1b[0m"), "unselected newline has no padding highlight");
+        mouse(MouseEventKind::Down(MouseButton::Left), 0, first);
+        mouse(MouseEventKind::Up(MouseButton::Left), 0, next);
+        tty.frame();
+        assert_eq!(tty.ui.selected_transcript_text().as_deref(), Some("code\n"));
+        assert!(tty.ui.rendered_frame().contains("code \x1b[0m"), "selected hard newline is visibly marked");
+    }
+}
+
+#[tokio::test]
 async fn clipped_table_projection_and_synthetic_mouse_release_keep_valid_anchors() {
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     let tty = Tty::new(40, 20);
@@ -2521,15 +3141,17 @@ async fn clipped_table_projection_and_synthetic_mouse_release_keep_valid_anchors
     };
     mouse(MouseEventKind::Down(MouseButton::Left), col as u16, table);
     mouse(MouseEventKind::Up(MouseButton::Left), (col + 1) as u16, table);
-    assert_eq!(tty.ui.selected_transcript_text().as_deref(), Some("é"));
+    assert_eq!(tty.ui.selected_transcript_text().as_deref(), Some("[é](<http://x>)"), "semantic copy preserves selected link styling without adding its unselected visible URL");
     tty.frame(); // highlight cannot slice a multibyte glyph at a raw-markup byte.
     mouse(MouseEventKind::Down(MouseButton::Left), 0, table);
     mouse(MouseEventKind::Up(MouseButton::Left), 39, table);
-    assert!(tty.ui.selected_transcript_text().unwrap().contains("clipped tail marker"));
+    let selected = tty.ui.selected_transcript_text().unwrap();
+    assert!(selected.contains("é"));
+    assert!(!selected.contains("clipped tail marker"), "narrow-table labels do not copy an unselected value offscreen");
     *tty.size.lock().unwrap() = (80, 24);
     tty.ui.resize();
     tty.frame();
-    assert!(tty.ui.selected_transcript_text().unwrap().contains("clipped tail marker"));
+    assert_eq!(tty.ui.selected_transcript_text().as_deref(), Some(selected.as_str()), "grid/record transition retains selected logical bytes");
     tty.key("escape");
     // Re-establish small geometry so previously captured screen rows are valid.
     *tty.size.lock().unwrap() = (40, 20);

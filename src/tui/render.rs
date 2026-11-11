@@ -20,18 +20,33 @@ fn is_table_row(line: &str) -> bool {
 
 fn split_table_cells(trimmed: &str) -> Vec<String> {
     let inner = &trimmed[1..trimmed.len() - 1];
-    inner.split('|').map(|c| c.trim().to_string()).collect()
+    let mut cells = Vec::new();
+    let mut cell = String::new();
+    let mut backslashes = 0;
+    for ch in inner.chars() {
+        if ch == '|' {
+            if backslashes % 2 == 1 {
+                cell.pop(); // Markdown's escaped pipe is literal content, including in code spans.
+                cell.push('|');
+            } else {
+                cells.push(cell.trim().to_string());
+                cell.clear();
+            }
+        } else {
+            cell.push(ch);
+        }
+        backslashes = if ch == '\\' { backslashes + 1 } else { 0 };
+    }
+    cells.push(cell.trim().to_string());
+    cells
 }
 
 fn displayed_cell(cell: &str) -> String {
-    let c = re!(r"\*\*([^*]+)\*\*").replace_all(cell, "${1}");
-    let c = re!(r"`([^`\n]+)`").replace_all(&c, "${1}");
-    let c = re!(r"~~([^~]+)~~").replace_all(&c, "${1}");
-    re!(r"\[([^\]]+)\]\(([^)]+)\)").replace_all(&c, "${1} (${2})").to_string()
+    crate::term::strip_vt(&format_inline_markdown_default(cell)).into_owned()
 }
 
 fn table_separator(trimmed: &str) -> bool {
-    re!(r"^\|[\s:|-]+\|$").is_match(trimmed)
+    split_table_cells(trimmed).iter().all(|cell| re!(r"^:?-+:?$").is_match(cell))
 }
 
 fn plain_row(row: &Row, cols: usize) -> String {
@@ -39,7 +54,7 @@ fn plain_row(row: &Row, cols: usize) -> String {
         RowKind::Blank => String::new(),
         RowKind::CodeHead => slice_visible(&format!("  ─ {}", row.text), cols),
         RowKind::Cell | RowKind::Child => slice_visible(&crate::term::strip_vt(&Tui::style_row(row, cols)), cols),
-        RowKind::Table => slice_visible(&format!("{}{}", row.pre, crate::term::strip_vt(&format_inline_markdown_default(&row.text))), cols),
+        RowKind::Table => slice_visible(&format!("{}{}", row.pre, crate::term::strip_vt(&row.text)), cols),
         _ => slice_visible(&format!("{}{}", row.pre, crate::term::strip_vt(&row.text)), cols),
     }
 }
@@ -88,6 +103,9 @@ impl Tui {
 
         // Pre-scan contiguous Markdown table blocks so all rows of a table share column widths.
         let mut table_widths: std::collections::HashMap<usize, Vec<usize>> = Default::default();
+        let mut table_rows: std::collections::HashMap<usize, (std::sync::Arc<super::table_copy::Table>, usize)> = Default::default();
+        let mut table_sources: std::collections::HashMap<usize, std::sync::Arc<Vec<Vec<String>>>> = Default::default();
+        let mut table_ends = std::collections::HashMap::new();
         let mut i = 0;
         while i < raw_lines.len() {
             if !is_table_row(raw_lines[i]) {
@@ -109,8 +127,27 @@ impl Tui {
                 }
                 j += 1;
             }
-            for k in i..j {
+            let mut alignments = vec!["---".to_string(); widths.len()];
+            for line in &raw_lines[i..j] {
+                if table_separator(line.trim()) {
+                    for (column, cell) in split_table_cells(line.trim()).iter().enumerate().take(alignments.len()) {
+                        alignments[column] = format!("{}---{}", if cell.starts_with(':') { ":" } else { "" }, if cell.ends_with(':') { ":" } else { "" });
+                    }
+                    break;
+                }
+            }
+            let table = std::sync::Arc::new(super::table_copy::Table { alignments });
+            let sources: Vec<Vec<String>> = raw_lines[i..j].iter().filter(|line| !table_separator(line.trim())).map(|line| split_table_cells(line.trim())).collect();
+            let sources = std::sync::Arc::new(sources);
+            let mut row = 0;
+            for (k, line) in raw_lines.iter().enumerate().take(j).skip(i) {
                 table_widths.insert(k, widths.clone());
+                table_rows.insert(k, (table.clone(), row));
+                table_sources.insert(k, sources.clone());
+                table_ends.insert(k, j - 1);
+                if !table_separator(line.trim()) {
+                    row += 1;
+                }
             }
             i = j;
         }
@@ -137,7 +174,7 @@ impl Tui {
                     glyph: glyph.clone(),
                     sign,
                     level,
-                    origin: Some(super::selection::Origin { text: logical.clone(), range, projected: markdown }),
+                    origin: Some(super::selection::Origin { text: logical.clone(), range, projected: markdown, table: None, fragments: None }),
                 });
             }
         };
@@ -173,18 +210,10 @@ impl Tui {
                 return;
             }
             if is_table_row(raw_line) {
-                let trimmed = raw_line.trim();
                 let widths = table_widths.get(&line_index).cloned().unwrap_or_default();
-                if table_separator(trimmed) {
-                    let grid = format!("├{}┤", widths.iter().map(|w| "─".repeat(w + 2)).collect::<Vec<_>>().join("┼"));
-                    rows.push(Row { kind: RowKind::Table, pre: first_pre(base), text: grid, glyph: None, sign: None, level: 0, origin: None });
-                } else {
-                    let cells: Vec<String> = split_table_cells(trimmed)
-                        .iter()
-                        .enumerate()
-                        .map(|(i, c)| format!("{c}{}", " ".repeat(widths.get(i).copied().unwrap_or(0).saturating_sub(visible_length(&displayed_cell(c))))))
-                        .collect();
-                    rows.push(Row { kind: RowKind::Table, pre: first_pre(base), text: format!("│ {} │", cells.join(" │ ")), glyph: None, sign: None, level: 0, origin: None });
+                let (table, _) = table_rows.get(&line_index).expect("pre-scanned table row");
+                if table_ends[&line_index] == line_index {
+                    rows.extend(super::table_view::render(&table_sources[&line_index], table, &widths, cols, base, &first_pre(base)));
                 }
                 return;
             }
@@ -291,7 +320,7 @@ impl Tui {
                     glyph: None,
                     sign: None,
                     level: 0,
-                    origin: Some(super::selection::Origin { text: std::sync::Arc::from(""), range: 0..0, projected: false }),
+                    origin: Some(super::selection::Origin { text: std::sync::Arc::from(""), range: 0..0, projected: false, table: None, fragments: None }),
                 });
                 continue;
             }
@@ -300,6 +329,11 @@ impl Tui {
                 continue;
             }
             if state.block == Block::Answer {
+                // A table is emitted at its final source line so native scrollback
+                // cannot commit cells whose source rows have not been consumed yet.
+                if table_ends.get(&line_index).is_some_and(|last| *last > line_index) {
+                    continue;
+                }
                 let lead = if state.answer_first { Some(format!("{} ", glyph::ANSWER)) } else { None };
                 state.answer_first = false;
                 push_markdown(&mut rows, raw_line.trim_end(), "  ", lead.as_deref(), RowKind::Answer, line_index);
@@ -434,7 +468,7 @@ impl Tui {
                 if row.text.starts_with('├') {
                     return format!("{}{DIM}{}{RESET}", answer_pre(&row.pre), row.text);
                 }
-                format!("{}{}", answer_pre(&row.pre), row.text.split('│').map(format_inline_markdown_default).collect::<Vec<_>>().join(&format!("{DIM}│{RESET}")))
+                format!("{}{}", answer_pre(&row.pre), row.text)
             }
             RowKind::ReasoningHead => format!("{DIM}\x1b[3m{}{RESET}", row.text),
             RowKind::Reasoning => format!("{}{}", row.pre, md(&row.text, &format!("{DIM}\x1b[3m"))),
@@ -893,7 +927,7 @@ impl Tui {
             st.scroll = st.scroll.min(st.max_scroll);
             let end = all.len() - st.scroll;
             let mut body: Vec<String> = all[end.saturating_sub(height)..end].to_vec();
-            Self::select_body(st, &mut body, end.saturating_sub(height), 1);
+            Self::select_body(st, &mut body, end.saturating_sub(height), 1, safe_cols);
             while body.len() < height {
                 body.push(String::new());
             }
@@ -974,7 +1008,7 @@ impl Tui {
             st.scroll = st.scroll.min(st.max_scroll);
             let end = all.len() - st.scroll;
             let mut body: Vec<String> = all[end.saturating_sub(height)..end].to_vec();
-            Self::select_body(st, &mut body, end.saturating_sub(height), 0);
+            Self::select_body(st, &mut body, end.saturating_sub(height), 0, safe_cols);
             while body.len() < height {
                 body.push(String::new());
             }
@@ -1053,7 +1087,7 @@ impl Tui {
         st.scroll = st.scroll.min(st.max_scroll);
         let end = all.len() - st.scroll;
         let mut body: Vec<String> = all[end.saturating_sub(height)..end].to_vec();
-        Self::select_body(st, &mut body, end.saturating_sub(height), 0);
+        Self::select_body(st, &mut body, end.saturating_sub(height), 0, safe_cols);
         while st.native.is_none() && body.len() < height {
             body.push(String::new());
         }
@@ -1150,5 +1184,24 @@ impl Tui {
         }
         let start = (cursor_row + 1).saturating_sub(max_rows);
         (lines.into_iter().skip(start).take(max_rows).collect(), cursor_row - start, cursor_col)
+    }
+}
+
+#[cfg(test)]
+mod table_tests {
+    use super::*;
+
+    #[test]
+    fn escaped_pipe_parsing_respects_backslash_parity_and_empty_cells() {
+        assert_eq!(split_table_cells(r"| `a\|b` | café |"), ["`a|b`", "café"]);
+        assert_eq!(split_table_cells(r"| a\\| b |"), [r"a\\", "b"]);
+        assert_eq!(split_table_cells(r"| a\\\|b |"), [r"a\\|b"]);
+        assert_eq!(split_table_cells("| | value | |"), ["", "value", ""]);
+        assert_eq!(split_table_cells("||"), [""]);
+        assert!(table_separator("|:--|--:|:--:|"));
+        assert!(table_separator("| - | - |"));
+        assert!(!table_separator("| : | -- |"), "a colon alone is content, not a delimiter cell");
+        assert!(!table_separator("| | -- |"), "empty delimiter cell is invalid");
+        assert!(!table_separator(r"| --\|-- | -- |"), "literal pipes cannot join delimiter columns");
     }
 }

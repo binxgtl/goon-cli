@@ -78,10 +78,71 @@ child work when the user stops the parent. Incomplete rows below remain required
   endpoint; streaming replacement and canonical history trimming do not retarget selected text.
   Logical copy excludes soft-wrap newlines and user/answer/code/list/quote/diff gutters while
   preserving hard blank lines. Markup projects before wrapping so links/emphasis retain stable
-  offsets across rich/compact widths. Required next work: table-cell semantic/rich Markdown copy,
-  per-entry rather than whole-transcript snapshot updates and hard-line selection highlighting.
+  offsets across rich/compact widths. Required next work: complete rich Markdown copy beyond the
+  current inline dialect, complete record-field/selection fidelity, rich clipboard formats and
+  per-entry rather than whole-transcript snapshot updates. Nonempty hard-line breaks now paint
+  one selected cell when crossed, matching Codex `transcript_view/text.rs:454-480`; soft wraps,
+  empty source rows and a same-line end selection do not paint a newline. Viewport-edge clipping
+  prevents the marker from wrapping, and copying still returns the logical newline without padding.
+  Highlighting preserves original SGR colors/emphasis instead of stripping whole-row styles,
+  reapplies selection after resets (including within a grapheme), and restores existing reverse
+  style beyond the selection. Extended RGB/indexed color values do not change reverse state.
+  Escaped table pipes are literal cell content (also inside code spans), with backslash parity
+  respected; delimiter rows validate each cell instead of swallowing colon-only data rows.
+  Partial mouse copy of `a\|b` returns `a|b` before/after resize, matching the reference
+  `transcript_view/table_copy_tests.rs:37-51`. Grid rows now carry shared table identity, original
+  column alignment and selected cell-byte provenance (`src/tui/table_copy.rs`). Whole/multicell copy
+  serializes Markdown rather than box borders/padding, emits blank unselected headers and cells,
+  retains selected empty rows, and never inserts unselected cell text. Partial bold/strike/link
+  slices keep balanced supported markup; standalone plain/code slices stay literal. Mixed prose
+  into code preserves the code wrapper; table pipes and link destinations escape contextually.
+  Separator-only selections retain their visible text. Reflow and streaming preserve the frozen
+  table metadata. Literal `│` inside formatted cells no longer splits/reformats a cell. This is
+  semantic copy for the renderer's existing regex inline dialect, not full CommonMark/HTML parity.
+  Adaptive width allocation now follows Codex's compact/narrative/token-heavy priorities, minimum
+  widths, bulk shrinking and degraded-row thresholds (`table_layout.rs`). Grid cells word-wrap;
+  narrow/unreadable grids become key/value records rather than clipping right-hand values.
+  Logical table rows remain width-independent, with explicit visual-fragment hit/highlight mapping;
+  mouse-selected value bytes and full-table Markdown survive record/grid transitions. Whole table
+  rendering is attributed to its last consumed source line before native scrollback commitment.
+  Aligned record labels/values now share the first physical row, with value continuation indent.
+  Header label fragments explicitly retain their own source row when sharing a body row. Character
+  mouse drags involving tables own selected visual fragments, not a bounding canonical interval;
+  forward/reverse label-to-value copies exclude unselected preceding cells and retain those slices
+  after grid/record reflow. Wrapped fragment gaps merge only when their source is whitespace.
+   Shift-click now uses the same visual-fragment extension path on press (not only release), and
+   word/line gestures expand table visual units rather than pulling in hidden canonical cells.
+   Pointer anchors are recovered after reflow instead of falling through to unsafe source intervals.
+   Remaining fidelity gaps: repeated-label instance identity after reflow and duplicate highlight
+   suppression, full keyboard fragment navigation, mixed-block spacing, header-only ultra-narrow
+   fallback and border-only reflow need broader review.
   Wheel clears stale drag hit coordinates without changing selected text; a subsequent actual drag
   reactivates hit testing. Navigation/presentation changes reset fractional momentum.
+  Clipboard helpers bound both stdin delivery and process exit, reject incomplete writes even
+  after a zero exit, and reap stalled helpers. `/copy`, Ctrl+O and selected-copy feedback distinguish
+   confirmed native-helper delivery, unconfirmed OSC-52 fallback and failure. Failure/unconfirmed
+   delivery retains selection for retry. Confirmed delivery clears only the original gesture and
+   unchanged anchors; stale completions cannot clear a replacement/extended selection. Enter
+   copies and follows only after confirmation, while ordinary copy preserves scroll/draft. Modal
+    input retains precedence, and late completion cannot follow behind a newly opened modal.
+  Repeated same-position clicks within 400 ms select a Unicode word (double) or whole logical
+  line including its following newline (triple), following `text_selection.rs:19-65`. Word/line
+  drags expand whole units in either direction; reflow retains selected source. Drag releases,
+  wheel, keyboard input, capture transitions and geometry changes reset the click chain.
+  Shift-click retains the original character/word/line anchor and extends whole units in either
+  direction. Ctrl+Insert and Ctrl+Shift+C copy selected text through the same confirmation path;
+  Ctrl+Alt (AltGr) remains text rather than copy. Any range mutation invalidates pending clipboard
+  completion, even when a later extension returns to identical offsets.
+  Ctrl+Shift+C without a selection is a no-op, not a composer clear/turn interrupt; uppercase C
+  with Control alone is normalized to that copy-only chord as reported by some terminals.
+  Active selection owns plain/Shift arrow keys (reference `transcript_view/input.rs:171-181`),
+  moving its endpoint by grapheme or visual row without changing composer/draft. Vertical motion
+  preserves a preferred display column across short rows, skips synthetic rows, and reveals the
+  endpoint when it leaves the viewport. Resize drops visual-row navigation state, not logical anchors.
+   Pending copy acknowledgments lose selection ownership after actual reading navigation (including
+   scrolling away and back, Home, visual-only wrap-boundary endpoint motion) or geometry changes.
+   Late delivery cannot clear that selection, overwrite newer notices or jump to latest; the same
+   immutable selected text remains available for retry. No-op scroll/resize preserves copy ownership.
 - Native viewport cursor-origin resize/reflow without scrolling live rows, active-cell commit tracking, overlay isolation,
   launch-time transcript ownership config, and balanced behavior under Windows Terminal/Zellij/tmux.
 - Complete startup input handoff/acknowledgment and asynchronous question delivery/countdowns.
@@ -117,10 +178,42 @@ child work when the user stops the parent. Incomplete rows below remain required
 
 ## Checks at this stage
 
-- Latest Windows Rust run: 204 library + 1 parity + 327 integration = 532 passed.
-- Latest Linux/WSL Ubuntu 24.04 Rust run: 208 library + 1 parity + 339 integration = 548 passed.
-- Node contracts/E2E against rebuilt binaries: Windows 81 passed, 7 POSIX/Linux-only tests skipped;
-  Linux 88 passed, 0 skipped. Both suites have 0 failures.
+- Post-release Windows-only selection check: 118 TUI tests passed, including new hard-newline,
+  escaped-table-pipe, delimiter validation, reverse-range, SGR/reset/emoji and mouse regressions.
+  A regression reproduced original color loss before the style-preservation fix. No WSL was used for
+  this change; Linux/macOS evidence below is historical, not validation of uncommitted changes.
+- Current post-release Windows Rust run: **256 library + 1 parity + 330 integration = 587 passed**,
+  0 failed (`CARGO_PROFILE_DEV_DEBUG=0 cargo test --locked -j 2`). Includes helper/status,
+  identity-checked completion, copy-key, late-modal, Unicode/soft-wrap, Shift-click, Ctrl+Insert,
+  AltGr, unit-drag, grapheme/visual-row arrow navigation and draft-preservation regressions.
+  New pre-fix regressions reproduced stale selection consumption after scrolling and actual resize;
+  passing coverage includes scroll-away-and-back, ordinary/Enter copy, no-op controls, Home,
+  offscreen unchanged-endpoint reveal and visual-only wrap-boundary navigation.
+  Fake Node helpers cover Unicode round-trip, nonzero exit, early zero exit with incomplete stdin,
+  and a helper that never reads a 4 MiB input. No system clipboard writes are used by these tests.
+- Current Windows all-target Clippy, debug build, fmt and diff checks pass. Rebuilt-binary Node
+  contracts/E2E: **81 passed, 7 POSIX/Linux-only tests skipped**, 0 failed (concurrency 2).
+  Oxlint exits 0 with the existing unnecessary-escape warning in `tests/parity/synth.mjs`.
+  Table regression reproduced terminal-grid output before the structural copy fix. New serializer
+  and renderer tests cover alignment, blank/unselected cells, partial formatting, literal pipes,
+  links, Unicode, disjoint selected ranges, separators, distinct tables, code fences and reflow.
+  Narrow-table regression reproduced right-column clipping at 32 columns. New adaptive tests cover
+  width policy, huge-token bulk shrinking, Unicode, value-selection reflow, full-table copy across
+  12–120 columns and source consumption before scrollback commit.
+  Record-label regression reproduced unselected SECRET cell overcopy. Passing cases cover stacked
+  and same-line aligned records in both directions and copy stability after width changes.
+  Latest logs: `/tmp/goon-record-fragments-{before,after,full-rust,clippy,build,node}.log`.
+  Previous adaptive logs: `/tmp/goon-adaptive-{before,full-rust,clippy,build,node}.log`.
+  Previous logs: `/tmp/goon-table-{before,full-rust,clippy,build,node}.log`; earlier clipboard/race evidence
+  remains in `/tmp/goon-copy-navigation-{full-rust,clippy,build,node,oxlint}.log`.
+  Windows-native checks only; no WSL used. Changes remain local/uncommitted and unpublished.
+
+### Historical cross-platform evidence (not current-change verification)
+
+- Earlier Windows Rust run: 204 library + 1 parity + 327 integration = 532 passed.
+- Earlier Linux/WSL Ubuntu 24.04 Rust run: 208 library + 1 parity + 339 integration = 548 passed.
+- Earlier Node contracts/E2E against rebuilt binaries: Windows 81 passed, 7 POSIX/Linux-only tests
+  skipped; Linux 88 passed, 0 skipped. Both suites had 0 failures.
 - Regression reproduced before fix: Escape while reading scrolled history dispatched Cancel before
   returning to latest during Running/Compacting/Stopping. Navigation now consumes that Escape first;
   a distinct Escape at the live tail still stops the turn. Escape/Ctrl+T closing Transcript resets

@@ -13,6 +13,9 @@ mod pointer;
 mod questions;
 mod render;
 mod selection;
+mod table_copy;
+mod table_layout;
+mod table_view;
 pub mod text;
 #[cfg(windows)]
 mod windows_console;
@@ -438,6 +441,7 @@ pub(crate) struct State {
     selection_pointer_valid: bool,
     mouse_scroll_speed: f64,
     mouse_wheel: pointer::Wheel,
+    selection_clicks: pointer::Clicks,
     follow_control: pointer::Follow,
 }
 
@@ -466,6 +470,7 @@ enum Action {
     Immediate(String),
     Steer { expanded: String, queued: composer::QueuedPrompt },
     Copy,
+    CopySelection(selection::CopyRequest),
     Ended,
     Quit,
     ClipboardPaste,
@@ -636,6 +641,7 @@ impl Tui {
             selection_pointer_valid: false,
             mouse_scroll_speed: 1.0,
             mouse_wheel: pointer::Wheel::default(),
+            selection_clicks: pointer::Clicks::default(),
             follow_control: pointer::Follow::default(),
         };
         let tui = Arc::new_cyclic(|me| Tui {
@@ -742,12 +748,17 @@ impl Tui {
                         self.schedule(&mut st, 0);
                     }
                 }
+                Action::CopySelection(request) => {
+                    let me = self.me.clone();
+                    self.handle.spawn(async move {
+                        let status = crate::cli::copy_text_to_clipboard(&request.text).await;
+                        if let Some(tui) = me.upgrade() {
+                            tui.finish_selection_copy(&request, status);
+                        }
+                    });
+                }
                 Action::Copy => {
-                    if let Some(text) = self.selected_transcript_text() {
-                        self.handle.spawn(async move {
-                            crate::cli::copy_text_to_clipboard(&text).await;
-                        });
-                    } else if let Some(f) = &callbacks.on_copy {
+                    if let Some(f) = &callbacks.on_copy {
                         self.handle.spawn(f());
                     }
                 }
@@ -2235,7 +2246,13 @@ impl Tui {
         if delta == 0 {
             return;
         }
-        st.scroll = (st.scroll as i64).saturating_add(delta).clamp(0, st.max_scroll as i64) as usize;
+        let scroll = (st.scroll as i64).saturating_add(delta).clamp(0, st.max_scroll as i64) as usize;
+        if scroll != st.scroll {
+            if let Some(selection) = st.selection.as_mut() {
+                selection.invalidate_copy();
+            }
+            st.scroll = scroll;
+        }
         self.schedule(st, 0);
     }
 
@@ -2268,6 +2285,7 @@ impl Tui {
         }
         match event.kind {
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                st.selection_clicks = pointer::Clicks::default();
                 let row = event.row as usize;
                 let inside = row >= st.transcript_screen_row && row < st.transcript_screen_row + st.transcript_view_rows.len() && (event.column as usize) < self.size().0;
                 if inside || st.selection_dragging {
@@ -2283,12 +2301,25 @@ impl Tui {
                 if row >= st.transcript_screen_row && row < st.transcript_screen_row + st.transcript_view_rows.len() {
                     let local = row - st.transcript_screen_row;
                     let Some(point) = st.body_layout.hit(st.transcript_top_row + local, event.column as usize) else { return };
-                    let source = st.selection.as_ref().map(|s| s.source.as_ref()).unwrap_or(&st.transcript);
-                    st.selection = Some(selection::Selection::new(point, source, &st.body_layout));
+                    if event.modifiers.contains(crossterm::event::KeyModifiers::SHIFT) && st.selection.is_some() {
+                        st.selection_clicks = pointer::Clicks::default();
+                        if let Some(mut selection) = st.selection.take() {
+                            selection.extend_pointer(point, &st.body_layout, st.transcript_top_row + local, event.column as usize);
+                            st.selection = Some(selection);
+                        }
+                    } else {
+                        let clicks = st.selection_clicks.press(event.column, event.row, std::time::Instant::now());
+                        let source = st.selection.as_ref().map(|s| s.source.as_ref()).unwrap_or(&st.transcript);
+                        let mut selected = selection::Selection::begin(point, source, &st.body_layout, clicks);
+                        selected.begin_pointer(st.transcript_top_row + local, event.column as usize);
+                        selected.extend_pointer(point, &st.body_layout, st.transcript_top_row + local, event.column as usize);
+                        st.selection = Some(selected);
+                    }
                     st.selection_dragging = true;
                     st.selection_pointer_valid = true;
                     self.schedule(&mut st, 0);
                 } else if st.selection.take().is_some() {
+                    st.selection_clicks = pointer::Clicks::default();
                     st.selection_dragging = false;
                     self.schedule(&mut st, 0);
                 }
@@ -2298,20 +2329,23 @@ impl Tui {
                     return;
                 }
                 if matches!(event.kind, MouseEventKind::Drag(_)) {
+                    st.selection_clicks = pointer::Clicks::default();
                     st.selection_pointer_valid = true;
                 }
                 let row = (event.row as usize).clamp(st.transcript_screen_row, st.transcript_screen_row + st.transcript_view_rows.len().saturating_sub(1));
                 let local = row - st.transcript_screen_row;
                 if st.selection_pointer_valid {
                     if let Some(point) = st.body_layout.hit(st.transcript_top_row + local, event.column as usize) {
-                        if let Some(selection) = st.selection.as_mut() {
-                            selection.end = point;
+                        if let Some(mut selection) = st.selection.take() {
+                            selection.extend_pointer(point, &st.body_layout, st.transcript_top_row + local, event.column as usize);
+                            st.selection = Some(selection);
                         }
                     }
                 }
                 if matches!(event.kind, MouseEventKind::Up(_)) {
+                    st.selection_clicks.release(event.column, event.row);
                     st.selection_dragging = false;
-                    if st.selection.as_ref().is_some_and(|s| s.anchor == s.end) {
+                    if st.selection.as_ref().is_some_and(selection::Selection::is_empty) {
                         st.selection = None;
                     }
                 }
@@ -2327,6 +2361,7 @@ impl Tui {
             return;
         }
         st.mouse_capture = capture;
+        st.selection_clicks = pointer::Clicks::default();
         st.mouse_wheel = pointer::Wheel::default();
         st.follow_control = pointer::Follow::default();
         if capture {
@@ -2384,6 +2419,10 @@ impl Tui {
         }
         if geometry_changed {
             // Logical anchors survive reflow; only the old pointer gesture ends.
+            if let Some(selection) = st.selection.as_mut() {
+                selection.reset_navigation();
+            }
+            st.selection_clicks = pointer::Clicks::default();
             st.selection_dragging = false;
             st.mouse_wheel = pointer::Wheel::default();
             st.follow_control = pointer::Follow::default();
@@ -2473,6 +2512,7 @@ impl Tui {
     }
 
     fn keypress_inner(&self, st: &mut State, text: Option<&str>, key: &Key, actions: &mut Vec<Action>) {
+        st.selection_clicks = pointer::Clicks::default();
         if st.closed || st.editor_active || st.editor_requested || st.input_yielded || st.suspend_requested {
             return;
         }
@@ -2566,11 +2606,55 @@ impl Tui {
         if st.status_notice.is_some() && !key.is("escape") {
             st.status_notice = None;
         }
-        if key.ctrl && key.is("c") {
-            if st.selection.as_ref().map(|s| s.anchor != s.end).unwrap_or(false) {
-                actions.push(Action::Copy);
+        let copy_shortcut = key.ctrl && !key.meta && (key.is("c") || key.is("C") || key.is("o") || (key.is("insert") && !key.shift));
+        let copy_and_follow = !key.ctrl
+            && !key.meta
+            && !key.shift
+            && (key.is("return") || key.is("enter"))
+            && (st.pending.is_none() || st.remember)
+            && Self::mention_popup(st).is_none()
+            && Self::slash_popup(st).0.is_empty();
+        if (copy_shortcut || copy_and_follow) && (st.pending.is_none() || st.remember) {
+            if let Some(request) = st.selection.as_ref().and_then(|s| s.copy_request(copy_and_follow)) {
+                actions.push(Action::CopySelection(request));
                 return;
             }
+        }
+        if key.ctrl && !key.meta && key.shift && (key.is("c") || key.is("C")) {
+            return; // Copy-only chord without a selection must never fall through to interrupt.
+        }
+        if !key.ctrl
+            && !key.meta
+            && matches!(key.name.as_str(), "left" | "right" | "up" | "down")
+            && st.selection.is_some()
+            && (st.pending.is_none() || st.remember)
+            && !st.shortcuts_open
+            && Self::mention_popup(st).is_none()
+            && Self::slash_popup(st).0.is_empty()
+        {
+            self.render(st); // Refresh wrapped row geometry before moving the logical endpoint.
+            if let Some(mut selection) = st.selection.take() {
+                if let Some(row) = selection.move_endpoint(&st.body_layout, &key.name) {
+                    let height = st.transcript_view_rows.len().max(1);
+                    let previous_scroll = st.scroll;
+                    if row < st.transcript_top_row {
+                        st.scroll = st.body_layout.row_count().saturating_sub(row + height);
+                    } else if row >= st.transcript_top_row + height {
+                        st.scroll = st.body_layout.row_count().saturating_sub(row + 1);
+                    }
+                    if previous_scroll != st.scroll {
+                        selection.invalidate_copy();
+                    }
+                }
+                st.selection = Some(selection);
+            }
+            st.selection_dragging = false;
+            st.selection_pointer_valid = false;
+            st.mouse_wheel = pointer::Wheel::default();
+            self.schedule(st, 0);
+            return;
+        }
+        if key.ctrl && key.is("c") {
             if st.pending.is_some() && !st.remember {
                 let pending = st.pending.take().unwrap();
                 let _ = pending.tx.send(if st.esc_cancels { Err(QErr::Esc) } else { Ok(String::new()) });
@@ -2649,7 +2733,7 @@ impl Tui {
                 return;
             }
             if key.is("home") || (plain && text == Some("g") && st.input.is_empty()) {
-                st.scroll = st.max_scroll;
+                self.scroll_by(st, st.max_scroll as i64);
                 self.schedule(st, 0);
                 return;
             }
@@ -3353,6 +3437,9 @@ fn key_from_event(ev: &crossterm::event::KeyEvent) -> Option<(Option<String>, Ke
         KeyCode::Char(c) if ctrl || meta => {
             let lower = c.to_ascii_lowercase();
             let mut k = named(&lower.to_string());
+            if ctrl && !meta && c == 'C' {
+                k.shift = true; // Some terminals omit SHIFT on Ctrl+Shift+C.
+            }
             if meta && !ctrl {
                 k.sequence = format!("\x1b{c}");
             }
@@ -3367,6 +3454,7 @@ fn key_from_event(ev: &crossterm::event::KeyEvent) -> Option<(Option<String>, Ke
         KeyCode::BackTab => (None, Key { name: "tab".into(), shift: true, sequence: "\x1b[Z".into(), ..Default::default() }),
         KeyCode::Backspace => (None, named("backspace")),
         KeyCode::Delete => (None, named("delete")),
+        KeyCode::Insert => (None, named("insert")),
         KeyCode::Esc => (None, named("escape")),
         KeyCode::Left => (None, named("left")),
         KeyCode::Right => (None, named("right")),

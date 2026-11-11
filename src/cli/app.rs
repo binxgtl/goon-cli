@@ -1528,10 +1528,10 @@ impl App {
                         app.notice("Nothing to copy yet (no assistant output in this session).");
                         return;
                     };
-                    let ok = super::copy_text_to_clipboard(&text).await;
+                    let status = super::copy_text_to_clipboard(&text).await;
                     let lines = regex::Regex::new(r"\r?\n").unwrap().split(&text).count();
                     let chars = jsutil::utf16_len(&text);
-                    app.notice(&if ok { format!("Copied {label} ({chars} chars · {lines} lines) to clipboard") } else { format!("Failed to copy {label} to system clipboard") });
+                    app.notice(&status.message(&format!("{label} ({chars} chars · {lines} lines)")));
                 })
             }));
             let me = self.me.clone();

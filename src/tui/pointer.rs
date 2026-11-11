@@ -3,6 +3,26 @@
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 
 #[derive(Default)]
+pub(super) struct Clicks {
+    last: Option<(std::time::Instant, u16, u16, u8)>,
+}
+
+impl Clicks {
+    pub fn release(&mut self, column: u16, row: u16) {
+        if self.last.is_some_and(|(_, x, y, _)| x != column || y != row) {
+            self.last = None;
+        }
+    }
+
+    pub fn press(&mut self, column: u16, row: u16, now: std::time::Instant) -> u8 {
+        let count =
+            self.last.filter(|(at, x, y, _)| now.saturating_duration_since(*at) < std::time::Duration::from_millis(400) && *x == column && *y == row).map_or(1, |(_, _, _, count)| count % 3 + 1);
+        self.last = Some((now, column, row, count));
+        count
+    }
+}
+
+#[derive(Default)]
 pub(super) struct Wheel {
     pending: f64,
 }
@@ -83,6 +103,20 @@ impl Follow {
 mod tests {
     use super::*;
     use crossterm::event::KeyModifiers;
+
+    #[test]
+    fn repeated_clicks_cycle_units_only_at_same_position_within_window() {
+        let mut clicks = Clicks::default();
+        let now = std::time::Instant::now();
+        for count in [1, 2, 3, 1] {
+            assert_eq!(clicks.press(4, 5, now), count);
+        }
+        assert_eq!(clicks.press(5, 5, now), 1);
+        assert_eq!(clicks.press(5, 6, now), 1);
+        assert_eq!(clicks.press(5, 6, now + std::time::Duration::from_millis(400)), 1);
+        clicks.release(6, 6);
+        assert_eq!(clicks.press(5, 6, now + std::time::Duration::from_millis(401)), 1, "drag release resets the click sequence");
+    }
 
     #[test]
     fn fractions_accumulate_exactly_and_reverse_without_old_remainder() {

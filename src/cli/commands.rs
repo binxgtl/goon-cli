@@ -675,10 +675,10 @@ impl App {
                 }
                 return Ok(true);
             };
-            let ok = super::copy_text_to_clipboard(&text).await;
+            let status = super::copy_text_to_clipboard(&text).await;
             let lines = line_count(&text);
             let chars = jsutil::utf16_len(&text);
-            let msg = if ok { format!("Copied {label} ({chars} chars · {lines} lines) to clipboard.") } else { format!("Copied {label} ({chars} chars · {lines} lines).") };
+            let msg = format!("{}.", status.message(&format!("{label} ({chars} chars · {lines} lines)")));
             self.notice(&msg);
             self.display(&format!("{msg}\n"));
             return Ok(true);

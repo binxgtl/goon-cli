@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Transcript selection, tables and clipboard delivery
+- Preserve source colors and emphasis while highlighting selected text, and mark selected hard
+  line breaks without adding padding to copied text. Add word/line multi-click selection,
+  Shift-click extension, grapheme-safe endpoint arrows and Windows copy shortcuts.
+- Copy selected table cells as Markdown with column alignment, empty cells and supported inline
+  formatting; wrap grids or switch to key/value records on narrow terminals instead of clipping
+  right-hand values. Preserve selected cell text across layout changes and exclude unselected
+  cells from record-label drags, Shift-click and word/line gestures.
+- Bound clipboard helper stdin delivery and process completion, reject incomplete transfers, and
+  distinguish confirmed native delivery from unconfirmed OSC-52 fallback. Keep selections for
+  retry on failure and ignore stale confirmations after selection, navigation or resize changes.
+- Full Codex parity remains unfinished; known selection and presentation gaps are tracked in
+  `docs/CODEX-UX-PARITY.md`.
+
 ### Terminal and interruption hotfix
 - Escape while reading scrolled output returns to the current response without cancelling the
   running agent; closing Transcript and Ctrl+End navigation preserve the turn and unsent draft.
