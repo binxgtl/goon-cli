@@ -1,6 +1,6 @@
 {
   "name": "@binxgodteli/goon-cli",
-  "version": "0.3.15",
+  "version": "0.3.16",
   "description": "A small independent coding harness for Termux and external model APIs",
   "type": "module",
   "license": "MIT",
