@@ -113,9 +113,12 @@ child work when the user stops the parent. Incomplete rows below remain required
    Shift-click now uses the same visual-fragment extension path on press (not only release), and
    word/line gestures expand table visual units rather than pulling in hidden canonical cells.
    Pointer anchors are recovered after reflow instead of falling through to unsafe source intervals.
-   Remaining fidelity gaps: repeated-label instance identity after reflow and duplicate highlight
-   suppression, full keyboard fragment navigation, mixed-block spacing, header-only ultra-narrow
-   fallback and border-only reflow need broader review.
+    Record-label selections now retain the displaying body-record identity separately from canonical
+    source bytes, preventing duplicate highlights across repeated labels after grid/record reflow.
+    Regression covers stacked/aligned records and widths 24/32/100 while preserving Markdown copy.
+    Remaining fidelity gaps: pointer-anchor occurrence recovery after reflow, full keyboard fragment
+    navigation, mixed-block spacing, header-only ultra-narrow fallback and border-only reflow need
+    broader review.
   Wheel clears stale drag hit coordinates without changing selected text; a subsequent actual drag
   reactivates hit testing. Navigation/presentation changes reset fractional momentum.
   Clipboard helpers bound both stdin delivery and process exit, reject incomplete writes even

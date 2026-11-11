@@ -44,14 +44,14 @@ fn push(rows: &mut Vec<Row>, text: String, pre: &str, logical: &Arc<TableRow>, f
     });
 }
 
-fn field(rows: &mut Vec<Row>, logical: &Logical, column: usize, width: usize, first: &str, cont: &str, pre: &str) {
+fn field(rows: &mut Vec<Row>, logical: &Logical, column: usize, width: usize, first: &str, cont: &str, pre: &str, occurrence: Option<usize>) {
     let cell = &logical.row.cells[column];
     let plain = &logical.row.text[cell.range.clone()];
     for (index, range) in wrap_ranges(plain, width, width, true).into_iter().enumerate() {
         let prefix = if index == 0 { first } else { cont };
         let start = visible_length(prefix);
         let end = start + visible_length(&plain[range.clone()]);
-        let fragment = Fragment { columns: start..end, range: cell.range.start + range.start..cell.range.start + range.end, table: None };
+        let fragment = Fragment { columns: start..end, range: cell.range.start + range.start..cell.range.start + range.end, table: None, occurrence };
         push(rows, format!("{prefix}{}", styled_range(&logical.painted[column], range)), pre, &logical.row, vec![fragment]);
     }
 }
@@ -92,7 +92,7 @@ pub(super) fn render(sources: &[Vec<String>], table: &Arc<Table>, natural: &[usi
                             let start = cell.range.start + range.start;
                             let end = cell.range.start + range.end;
                             let used = visible_length(&row.row.text[start..end]);
-                            fragments.push(Fragment { columns: col..col + used, range: start..end, table: None });
+                            fragments.push(Fragment { columns: col..col + used, range: start..end, table: None, occurrence: None });
                             text.push_str(&styled_range(&row.painted[column], range.clone()));
                             used
                         } else {
@@ -127,20 +127,20 @@ pub(super) fn render(sources: &[Vec<String>], table: &Arc<Table>, natural: &[usi
                         for (index, range) in wrap_ranges(value, width, width, true).into_iter().enumerate() {
                             let mut fragments = vec![];
                             let prefix = if index == 0 {
-                                fragments.push(Fragment { columns: 1..1 + visible_length(label_text), range: label.range.clone(), table: Some(header.row.clone()) });
+                                fragments.push(Fragment { columns: 1..1 + visible_length(label_text), range: label.range.clone(), table: Some(header.row.clone()), occurrence: Some(number) });
                                 format!(" {BOLD}{}{RESET}{}", header.painted[column], " ".repeat(indent - 1 - visible_length(label_text)))
                             } else {
                                 " ".repeat(indent)
                             };
                             let used = visible_length(&value[range.clone()]);
-                            fragments.push(Fragment { columns: indent..indent + used, range: cell.range.start + range.start..cell.range.start + range.end, table: None });
+                            fragments.push(Fragment { columns: indent..indent + used, range: cell.range.start + range.start..cell.range.start + range.end, table: None, occurrence: None });
                             push(&mut rows, format!("{prefix}{}", styled_range(&row.painted[column], range)), pre, &row.row, fragments);
                         }
                     } else {
                         let label_indent = if available > 1 { " " } else { "" };
-                        field(&mut rows, &logical[0], column, available.saturating_sub(label_indent.len()).max(1), label_indent, label_indent, pre);
+                        field(&mut rows, &logical[0], column, available.saturating_sub(label_indent.len()).max(1), label_indent, label_indent, pre, Some(number));
                         let indent = " ".repeat(available.min(2).saturating_sub(usize::from(available <= 2)));
-                        field(&mut rows, row, column, available.saturating_sub(indent.len()).max(1), &indent, &indent, pre);
+                        field(&mut rows, row, column, available.saturating_sub(indent.len()).max(1), &indent, &indent, pre, None);
                     }
                 }
             }

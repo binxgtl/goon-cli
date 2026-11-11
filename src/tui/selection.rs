@@ -19,6 +19,8 @@ pub(super) struct Fragment {
     pub range: Range<usize>,
     /// Aligned record labels belong to the header, not the value's logical row.
     pub table: Option<Arc<super::table_copy::TableRow>>,
+    /// Body record displaying this header label; absent in the canonical grid.
+    pub occurrence: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -171,7 +173,7 @@ impl Layout {
                 .flat_map(|fragment| {
                     let line = self.fragment_line(layout_row, fragment);
                     let text = &self.text[line];
-                    selection.ranges_on(line).into_iter().filter_map(move |range| {
+                    selection.ranges_on_occurrence(line, fragment.occurrence).into_iter().filter_map(move |range| {
                         let from = range.start.max(fragment.range.start);
                         let to = range.end.min(fragment.range.end);
                         (from < to).then(|| {
@@ -251,7 +253,7 @@ pub(super) struct Selection {
     preferred_column: Option<usize>,
     pointer_anchor: Option<(usize, usize)>,
     pointer_unit_origin: Option<((usize, usize), (usize, usize))>,
-    selected_fragments: Option<Vec<(usize, Range<usize>)>>,
+    selected_fragments: Option<Vec<(usize, Range<usize>, Option<usize>)>>,
 }
 
 #[derive(Clone, Copy)]
@@ -377,16 +379,16 @@ impl Selection {
                         col = next;
                     }
                     if from < to || fragment.range.is_empty() && left <= col && col < right {
-                        selected.push((line, from..to));
+                        selected.push((line, from..to, fragment.occurrence));
                     }
                 }
             } else if visual.line != usize::MAX {
                 if let (Some(from), Some(to)) = (layout.hit(index, left), layout.hit(index, right)) {
-                    selected.push((visual.line, from.offset..to.offset));
+                    selected.push((visual.line, from.offset..to.offset, None));
                 }
             }
         }
-        selected.sort_by_key(|(line, range)| (*line, range.start, range.end));
+        selected.sort_by_key(|(line, range, occurrence)| (*line, range.start, range.end, *occurrence));
         if previous.as_ref() != Some(&selected) {
             self.invalidate_copy();
         }
@@ -503,9 +505,20 @@ impl Selection {
         Some(CopyRequest { text: self.copy()?, identity: self.identity.clone(), anchor: self.anchor, end: self.end, follow })
     }
 
+    fn ranges_on_occurrence(&self, line: usize, occurrence: Option<usize>) -> Vec<Range<usize>> {
+        if let Some(selected) = &self.selected_fragments {
+            return selected
+                .iter()
+                .filter(|(selected_line, _, selected_occurrence)| *selected_line == line && (occurrence.is_none() || selected_occurrence.is_none() || *selected_occurrence == occurrence))
+                .map(|(_, range, _)| range.clone())
+                .collect();
+        }
+        self.ranges_on(line)
+    }
+
     fn ranges_on(&self, line: usize) -> Vec<Range<usize>> {
         if let Some(selected) = &self.selected_fragments {
-            return selected.iter().filter(|(selected_line, _)| *selected_line == line).map(|(_, range)| range.clone()).collect();
+            return selected.iter().filter(|(selected_line, _, _)| *selected_line == line).map(|(_, range, _)| range.clone()).collect();
         }
         let (start, end) = self.range();
         if line < start.line || line > end.line || start == end {
@@ -527,12 +540,12 @@ impl Selection {
             let mut output = Vec::new();
             let mut index = 0;
             while index < selected.len() {
-                let (line, range) = &selected[index];
+                let (line, range, _) = &selected[index];
                 if let Some(table) = self.tables.get(*line).and_then(Option::as_ref) {
                     let mut rows = Vec::new();
                     let first = index;
                     while index < selected.len() {
-                        let (line, range) = &selected[index];
+                        let (line, range, _) = &selected[index];
                         let Some(row) = self.tables.get(*line).and_then(Option::as_ref).filter(|row| Arc::ptr_eq(&row.table, &table.table)) else { break };
                         rows.push((row.clone(), range.clone()));
                         index += 1;

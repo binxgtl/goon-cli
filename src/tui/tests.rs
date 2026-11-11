@@ -1387,6 +1387,41 @@ async fn narrow_tables_show_all_values_instead_of_clipping_the_right_columns() {
 }
 
 #[tokio::test]
+async fn selecting_a_record_label_highlights_only_its_visual_occurrence_after_reflow() {
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    for width in [24, 32] {
+        let tty = Tty::new(width, 60);
+        tty.ui.write("[answer]\n| Task | Status | Next step |\n|---|---|---|\n| Task 1 | SECRET_HIDDEN_VALUE | Review results |\n| Task 2 | Planned_long_status | Finish implementation |\n");
+        tty.frame();
+        let (column, row) = {
+            let st = tty.ui.state.lock().unwrap();
+            let index = st.transcript_view_rows.iter().rposition(|line| line.contains("Next step")).unwrap();
+            let plain = crate::term::strip_vt(&st.transcript_view_rows[index]);
+            (visible_length(plain.split("Next step").next().unwrap()) as u16, (st.transcript_screen_row + index) as u16)
+        };
+        for (kind, column) in [(MouseEventKind::Down(MouseButton::Left), column), (MouseEventKind::Up(MouseButton::Left), column + 9)] {
+            tty.ui.handle_mouse(MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE });
+        }
+        let copy = tty.ui.selected_transcript_text().unwrap();
+        assert!(copy.contains("Next step"));
+        assert!(!copy.contains("Finish"));
+        for columns in [width, 100, 24, 32, width] {
+            *tty.size.lock().unwrap() = (columns, 60);
+            tty.ui.resize();
+            tty.frame();
+            assert_eq!(tty.ui.selected_transcript_text().as_deref(), Some(copy.as_str()));
+            let st = tty.ui.state.lock().unwrap();
+            let labels: Vec<_> = st.last_frame_rows.iter().filter(|line| crate::term::strip_vt(line).contains("Next step")).collect();
+            let highlighted = labels.iter().filter(|line| line.contains("\x1b[7m")).count();
+            assert_eq!(highlighted, 1, "only the selected label occurrence may highlight at width {columns}: {labels:?}");
+            if columns != 100 {
+                assert!(labels.last().unwrap().contains("\x1b[7m"), "second record retains label ownership");
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn record_label_drag_never_copies_cells_outside_the_visible_gesture() {
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     for (columns, reverse, shift_click) in [(24, false, false), (24, true, false), (32, false, false), (32, true, false), (24, false, true), (32, true, true)] {

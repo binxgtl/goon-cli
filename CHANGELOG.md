@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Repeated table labels
+- Keep mouse-selected record labels associated with their visual record instead of highlighting
+  every repeated header label. Preserve selected Markdown across stacked/aligned/grid layouts.
+
 ### Resilient Ubuntu build dependencies
 - Bound runner APT requests and fail on partial index errors, then try isolated HTTPS Ubuntu
   mirrors with the installed archive keyring for amd64 and arm64 musl builds.
