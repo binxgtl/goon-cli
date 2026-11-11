@@ -249,7 +249,11 @@ impl ClipboardStatus {
 async fn copy_with_helper(bin: &str, args: &[String], text: &str, timeout: std::time::Duration) -> bool {
     let mut cmd = tokio::process::Command::new(bin);
     cmd.args(args).env_clear().envs(crate::process::child_env(None)).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).kill_on_drop(true);
-    let Ok(mut child) = cmd.spawn() else { return false };
+    let Ok(child) = cmd.spawn() else { return false };
+    copy_to_helper_child(child, text, timeout).await
+}
+
+async fn copy_to_helper_child(mut child: tokio::process::Child, text: &str, timeout: std::time::Duration) -> bool {
     let delivered = tokio::time::timeout(timeout, async {
         use tokio::io::AsyncWriteExt;
         let mut stdin = child.stdin.take().ok_or_else(|| std::io::Error::other("Missing clipboard input pipe"))?;
@@ -829,19 +833,36 @@ mod tests {
 
     #[tokio::test]
     async fn clipboard_helper_bounds_stdin_transfer_and_reaps_stalled_process() {
-        let dir = tempfile::tempdir().unwrap();
-        let pid_file = dir.path().join("helper.pid");
-        let args = vec![
-            "-e".into(),
-            "require('node:fs').writeFileSync(process.argv[1], String(process.pid)); process.stdin.pause(); setInterval(() => {}, 1000);".into(),
-            pid_file.to_string_lossy().into_owned(),
-        ];
+        // Wait for a readiness message before starting the short transfer deadline:
+        // loading Node on a busy CI host is not part of this blocked-write test.
+        // Delay readiness beyond that deadline to keep this distinction covered.
+        // The production caller still bounds delivery immediately after spawn.
+        let mut child = tokio::process::Command::new("node")
+            .args(["-e", "process.stdin.pause(); setInterval(() => {}, 1000); setTimeout(() => process.stdout.write('ready\\n'), 750);"])
+            .env_clear()
+            .envs(crate::process::child_env(None))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        let ready = {
+            use tokio::io::{AsyncBufReadExt, BufReader};
+            let mut stdout = BufReader::new(child.stdout.take().unwrap());
+            let mut line = String::new();
+            tokio::time::timeout(std::time::Duration::from_secs(15), stdout.read_line(&mut line)).await.map(|result| result.map(|_| line))
+        };
+        if !matches!(&ready, Ok(Ok(line)) if line == "ready\n") {
+            let _ = child.kill().await;
+            panic!("clipboard helper did not become ready: {ready:?}");
+        }
         let large = "x".repeat(4 * 1024 * 1024);
-        let result = tokio::time::timeout(std::time::Duration::from_secs(3), copy_with_helper("node", &args, &large, std::time::Duration::from_millis(500)))
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), copy_to_helper_child(child, &large, std::time::Duration::from_millis(500)))
             .await
             .expect("clipboard timeout must include a blocked stdin write");
         assert!(!result);
-        let pid: u32 = std::fs::read_to_string(pid_file).expect("helper must actually start").parse().unwrap();
         assert!(!crate::process::process_alive(pid), "timed-out clipboard helper must be reaped before returning");
     }
 

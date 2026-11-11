@@ -16,6 +16,10 @@
 - Full Codex parity remains unfinished; known selection and presentation gaps are tracked in
   `docs/CODEX-UX-PARITY.md`.
 
+### Clipboard helper validation
+- Synchronize the stalled-helper regression on process readiness before its short transfer
+  deadline, preserving blocked-write and reaping assertions on busy macOS CI hosts.
+
 ### Windows terminal validation
 - Deliver explicit Win32 input records in ConPTY end-to-end tests so paste delimiters and
   standalone Escape keys survive transport without timing-dependent sleeps. Require fresh
