@@ -16,6 +16,10 @@
 - Full Codex parity remains unfinished; known selection and presentation gaps are tracked in
   `docs/CODEX-UX-PARITY.md`.
 
+### macOS process liveness
+- Include zombie processes in the macOS BSD process-info query so terminated descendants and
+  stale session-lock owners are not falsely reported as live while awaiting system reaping.
+
 ### Terminal and interruption hotfix
 - Escape while reading scrolled output returns to the current response without cancelling the
   running agent; closing Transcript and Ctrl+End navigation preserve the turn and unsent draft.

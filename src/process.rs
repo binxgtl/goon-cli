@@ -345,7 +345,10 @@ pub fn process_alive(pid: u32) -> bool {
     unsafe {
         let mut info: libc::proc_bsdinfo = std::mem::zeroed();
         let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-        if libc::proc_pidinfo(pid as libc::c_int, libc::PROC_PIDTBSDINFO, 0, std::ptr::addr_of_mut!(info).cast::<libc::c_void>(), size) == size && info.pbi_status == libc::SZOMB {
+        // XNU only searches the zombie list for BSDINFO when arg is nonzero.
+        // With arg=0 a zombie returns ESRCH here but kill(pid, 0) still succeeds,
+        // falsely reporting a terminated descendant as live until launchd reaps it.
+        if libc::proc_pidinfo(pid as libc::c_int, libc::PROC_PIDTBSDINFO, 1, std::ptr::addr_of_mut!(info).cast::<libc::c_void>(), size) == size && info.pbi_status == libc::SZOMB {
             return false;
         }
     }

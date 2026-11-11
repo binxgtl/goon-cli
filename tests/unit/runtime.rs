@@ -48,6 +48,36 @@ setInterval(() => {}, 1000);
     assert!(!goon::process::process_alive(pid), "cancelled command left grandchild {pid} running");
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn unreaped_macos_zombie_is_not_a_live_process_or_lock_owner() {
+    let mut child = std::process::Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap();
+    let pid = child.id();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let zombie = loop {
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        // Nonzero arg is required to include zombie processes in this query.
+        let read = unsafe { libc::proc_pidinfo(pid as libc::c_int, libc::PROC_PIDTBSDINFO, 1, std::ptr::addr_of_mut!(info).cast(), size) };
+        if read == size && info.pbi_status == libc::SZOMB {
+            break true;
+        }
+        if std::time::Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    let alive = goon::process::process_alive(pid);
+    let dir = tempfile::tempdir().unwrap();
+    let lock = dir.path().join("session.lock");
+    std::fs::write(&lock, "").unwrap();
+    let lock_owner = goon::process::lock_owner_alive(pid, &lock);
+    child.wait().unwrap();
+    assert!(zombie, "fixture must remain an unreaped zombie until wait");
+    assert!(!alive, "macOS zombie cannot execute work");
+    assert!(!lock_owner, "macOS zombie cannot own a session lock");
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn unreaped_zombie_is_not_a_live_process_or_lock_owner() {
