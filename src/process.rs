@@ -484,18 +484,14 @@ pub async fn run_command(command: &str, args: &[String], options: RunOptions<'_>
     }
     let code = match status {
         Some(s) => {
-            if let Some(c) = s.code() {
-                c
-            } else {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::process::ExitStatusExt;
-                    s.signal().map(|sig| 128 + sig).unwrap_or(1)
-                }
-                #[cfg(not(unix))]
-                {
-                    1
-                }
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                s.code().unwrap_or_else(|| s.signal().map(|sig| 128 + sig).unwrap_or(1))
+            }
+            #[cfg(not(unix))]
+            {
+                s.code().unwrap_or(1)
             }
         }
         None => 1,
