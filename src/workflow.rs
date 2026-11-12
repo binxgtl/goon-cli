@@ -13,9 +13,11 @@ use futures_util::future::BoxFuture;
 use indexmap::IndexMap;
 use regex::Regex;
 use serde_json::{json, Map, Value};
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use tokio_util::sync::CancellationToken;
+use unicode_normalization::UnicodeNormalization;
 
 /// A workflow shell step that could not obtain an explicit approval.
 #[derive(Debug)]
@@ -30,10 +32,10 @@ impl std::fmt::Display for WorkflowApprovalError {
 impl std::error::Error for WorkflowApprovalError {}
 
 // ---------------------------------------------------------------------------------------------
-// Classifier (JS regex semantics: `\b` and `\w` are ASCII-only)
+// Classifier (Unicode-aware word boundaries + Vietnamese NFD / orthography normalization)
 // ---------------------------------------------------------------------------------------------
 
-const IMPERATIVE_VERBS: [&str; 37] = [
+const IMPERATIVE_VERBS: [&str; 38] = [
     "add",
     "implement",
     "fix",
@@ -61,6 +63,7 @@ const IMPERATIVE_VERBS: [&str; 37] = [
     "document",
     "clean",
     "extract",
+    "đọc",
     "thêm",
     "sửa",
     "xóa",
@@ -73,39 +76,151 @@ const IMPERATIVE_VERBS: [&str; 37] = [
     "triển khai",
 ];
 
+fn toned_vowel(base: char, upper: bool, tone: usize) -> char {
+    match (base, upper) {
+        ('o', false) => ['ò', 'ỏ', 'õ', 'ó', 'ọ'][tone],
+        ('o', true) => ['Ò', 'Ỏ', 'Õ', 'Ó', 'Ọ'][tone],
+        ('u', false) => ['ù', 'ủ', 'ũ', 'ú', 'ụ'][tone],
+        ('u', true) => ['Ù', 'Ủ', 'Ũ', 'Ú', 'Ụ'][tone],
+        _ => base,
+    }
+}
+
+fn split_toned_second_vowel(c: char) -> Option<(char, bool, usize)> {
+    match c {
+        'à' => Some(('a', false, 0)),
+        'ả' => Some(('a', false, 1)),
+        'ã' => Some(('a', false, 2)),
+        'á' => Some(('a', false, 3)),
+        'ạ' => Some(('a', false, 4)),
+        'À' => Some(('a', true, 0)),
+        'Ả' => Some(('a', true, 1)),
+        'Ã' => Some(('a', true, 2)),
+        'Á' => Some(('a', true, 3)),
+        'Ạ' => Some(('a', true, 4)),
+        'è' => Some(('e', false, 0)),
+        'ẻ' => Some(('e', false, 1)),
+        'ẽ' => Some(('e', false, 2)),
+        'é' => Some(('e', false, 3)),
+        'ẹ' => Some(('e', false, 4)),
+        'È' => Some(('e', true, 0)),
+        'Ẻ' => Some(('e', true, 1)),
+        'Ẽ' => Some(('e', true, 2)),
+        'É' => Some(('e', true, 3)),
+        'Ẹ' => Some(('e', true, 4)),
+        'ỳ' => Some(('y', false, 0)),
+        'ỷ' => Some(('y', false, 1)),
+        'ỹ' => Some(('y', false, 2)),
+        'ý' => Some(('y', false, 3)),
+        'ỵ' => Some(('y', false, 4)),
+        'Ỳ' => Some(('y', true, 0)),
+        'Ỷ' => Some(('y', true, 1)),
+        'Ỹ' => Some(('y', true, 2)),
+        'Ý' => Some(('y', true, 3)),
+        'Ỵ' => Some(('y', true, 4)),
+        _ => None,
+    }
+}
+
+/// Normalizes Vietnamese text across NFD, reverse-ordered combining marks (CCC=230), stroke-overlay
+/// `d`/`D`, and modern open-syllable diphthong tone placement (`xoá`->`xóa`, `hoà`->`hòa`, `huỷ`->`hủy`),
+/// while preserving closed syllables (`hoàn`, `toán`, `ngoài`, `huỳnh`) and `qu`-clusters (`quý`, `quỷ`).
+pub fn normalize_vietnamese(input: &str) -> String {
+    let nfd: Vec<char> = input.nfd().collect();
+    let mut reordered = String::with_capacity(input.len());
+    let mut i = 0;
+    while i < nfd.len() {
+        let mut base = nfd[i];
+        if unicode_normalization::char::canonical_combining_class(base) != 0 {
+            reordered.push(base);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        let mut marks = Vec::new();
+        while i < nfd.len() && unicode_normalization::char::canonical_combining_class(nfd[i]) != 0 {
+            marks.push(nfd[i]);
+            i += 1;
+        }
+        if matches!(base, 'd' | 'D') {
+            if let Some(pos) = marks.iter().position(|m| matches!(m, '\u{0335}' | '\u{0336}')) {
+                base = if base == 'd' { 'đ' } else { 'Đ' };
+                marks.remove(pos);
+            }
+        }
+        reordered.push(base);
+        if matches!(base.to_ascii_lowercase(), 'a' | 'e' | 'i' | 'o' | 'u' | 'y') && marks.len() > 1 {
+            for &m in &marks {
+                if matches!(m, '\u{0302}' | '\u{0306}' | '\u{031B}') {
+                    reordered.push(m);
+                }
+            }
+            for &m in &marks {
+                if matches!(m, '\u{0300}' | '\u{0309}' | '\u{0303}' | '\u{0301}' | '\u{0323}') {
+                    reordered.push(m);
+                }
+            }
+            for &m in &marks {
+                if !matches!(m, '\u{0302}' | '\u{0306}' | '\u{031B}' | '\u{0300}' | '\u{0309}' | '\u{0303}' | '\u{0301}' | '\u{0323}') {
+                    reordered.push(m);
+                }
+            }
+        } else {
+            for m in marks {
+                reordered.push(m);
+            }
+        }
+    }
+
+    let chars: Vec<char> = reordered.nfc().collect();
+    let mut out = String::with_capacity(reordered.len());
+    let mut idx = 0;
+    while idx < chars.len() {
+        let c1 = chars[idx];
+        if let Some(&c2) = chars.get(idx + 1) {
+            let after = chars.get(idx + 2).copied();
+            if !after.is_some_and(char::is_alphabetic) {
+                if let Some((v2, v2_upper, tone)) = split_toned_second_vowel(c2) {
+                    if matches!(c1, 'o' | 'O') && matches!(v2, 'a' | 'e') {
+                        out.push(toned_vowel('o', c1.is_uppercase(), tone));
+                        out.push(if v2_upper { v2.to_ascii_uppercase() } else { v2 });
+                        idx += 2;
+                        continue;
+                    }
+                    let prev_q = idx > 0 && matches!(chars[idx - 1], 'q' | 'Q');
+                    if matches!(c1, 'u' | 'U') && v2 == 'y' && !prev_q {
+                        out.push(toned_vowel('u', c1.is_uppercase(), tone));
+                        out.push(if v2_upper { 'Y' } else { 'y' });
+                        idx += 2;
+                        continue;
+                    }
+                }
+            }
+        }
+        out.push(c1);
+        idx += 1;
+    }
+    out
+}
+
 fn verb_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(&format!(r"(?i)(?-u:\b)(?:{})(?-u:\b)", IMPERATIVE_VERBS.iter().map(|v| regex::escape(v)).collect::<Vec<_>>().join("|"))).unwrap())
-}
-
-fn ascii_word(c: Option<char>) -> bool {
-    c.map(|c| c.is_ascii_alphanumeric() || c == '_').unwrap_or(false)
-}
-
-/// Counts matches of `base` (alternatives listed first) plus `tail` matches not followed by an
-/// ASCII word character (JS `(?![a-z0-9_])` under the `i` flag).
-fn count_with_tail(text: &str, re: &Regex, tail_group: usize) -> usize {
-    re.captures_iter(text)
-        .filter(|c| match c.get(tail_group) {
-            Some(m) => !ascii_word(text[m.end()..].chars().next()),
-            None => true,
-        })
-        .count()
+    RE.get_or_init(|| Regex::new(&format!(r"(?i)\b(?:{})\b", IMPERATIVE_VERBS.iter().map(|v| regex::escape(v)).collect::<Vec<_>>().join("|"))).unwrap())
 }
 
 fn sequence_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?i)(?-u:\b)(?:and then|then|after that|tiếp theo)(?-u:\b)|(?-u:\b)(sau[ -]?(?:đó|do))").unwrap())
+    RE.get_or_init(|| Regex::new(r"(?i)\b(?:and then|then|after that|tiếp theo|sau[ -]?(?:đó|do)|rồi)\b").unwrap())
 }
 
 fn weak_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?i)(?-u:\b)and(?-u:\b)|(?-u:\b)(và)").unwrap())
+    RE.get_or_init(|| Regex::new(r"(?i)\b(?:and|và)\b").unwrap())
 }
 
 fn keyword_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?i)(?-u:\b)(?:plan|workflow|multi[- ]?step|multi[- ]?agent|pipeline|roadmap|checklist|phase)(?-u:\b)").unwrap())
+    RE.get_or_init(|| Regex::new(r"(?i)\b(?:plan|workflow|multi[- ]?step|multi[- ]?agent|pipeline|roadmap|checklist|phase)\b").unwrap())
 }
 
 fn path_re() -> &'static Regex {
@@ -123,17 +238,18 @@ pub struct WorkflowClassification {
 
 /// Pure, conservative complexity classifier: `single` unless the signals clearly add up.
 pub fn classify_workflow_complexity(prompt: &str, file_count: usize) -> WorkflowClassification {
+    let normalized = normalize_vietnamese(prompt);
     let mut kinds = std::collections::HashSet::new();
     let mut hits = 0;
-    for m in verb_re().find_iter(prompt) {
+    for m in verb_re().find_iter(&normalized) {
         kinds.insert(m.as_str().to_lowercase());
         hits += 1;
     }
-    let connectors = count_with_tail(prompt, sequence_re(), 1);
-    let weak = count_with_tail(prompt, weak_re(), 1);
-    let paths: std::collections::HashSet<String> = path_re().find_iter(prompt).map(|m| m.as_str().to_lowercase()).collect();
+    let connectors = sequence_re().find_iter(&normalized).count();
+    let weak = weak_re().find_iter(&normalized).count();
+    let paths: std::collections::HashSet<String> = path_re().find_iter(&normalized).map(|m| m.as_str().to_lowercase()).collect();
     let path_count = paths.len() + file_count;
-    let keyword = keyword_re().is_match(prompt);
+    let keyword = keyword_re().is_match(&normalized);
     let verbs = kinds.len();
     let detail = format!(
         "{verbs} distinct imperative verb(s) in {hits} hit(s), {connectors} sequencing connector(s), {weak} conjunction(s), {path_count} path mention(s){}",
@@ -309,108 +425,911 @@ pub fn parse_workflow_args(raw: &str, defaults: Option<&IndexMap<String, String>
     ParsedArgs { full_input: if joined.is_empty() { raw.trim().to_string() } else { joined }, positional, named }
 }
 
-fn shell_quote_context(prefix: &str) -> u8 {
-    let chars: Vec<char> = prefix.chars().collect();
-    let mut stack: Vec<u8> = vec![];
-    let mut state = 0u8;
+#[derive(Clone, Debug)]
+enum HeredocInner {
+    DanglingBackslash,
+    AfterDollar,
+    Sub(Box<ShellCtx>),
+}
+
+#[derive(Clone, Debug)]
+enum ShellCtx {
+    Code(u8),
+    Backtick { outer_double_quoted: bool, dangling_bs: bool, inner: Box<ShellCtx> },
+    Heredoc { expand: bool, strip_tabs: bool, delim: String, inner: Option<HeredocInner> },
+}
+
+#[derive(Clone, Debug)]
+struct HeredocSpec {
+    expand: bool,
+    strip_tabs: bool,
+    delim: String,
+}
+
+#[derive(Clone, Debug)]
+enum CasePhase {
+    ExpectWord { saw_word_char: bool },
+    ExpectIn,
+    ExpectPat { started_token: bool, leading_paren: bool, after_pipe: bool, extglob: usize },
+    InBody,
+}
+
+impl CasePhase {
+    fn new_expect_pat() -> Self {
+        CasePhase::ExpectPat { started_token: false, leading_paren: false, after_pipe: false, extglob: 0 }
+    }
+
+    fn note_word_char(&mut self) {
+        match self {
+            CasePhase::ExpectWord { saw_word_char } => *saw_word_char = true,
+            CasePhase::ExpectPat { started_token, .. } => *started_token = true,
+            _ => {}
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CmdFrame {
+    outer: u8,
+    is_root: bool,
+    brace: usize,
+    paren: usize,
+    arith_cmd: usize,
+    cases: Vec<CasePhase>,
+    cmd_pos: bool,
+    in_assign_rhs: bool,
+    heredocs: VecDeque<HeredocSpec>,
+}
+
+impl CmdFrame {
+    fn new_root() -> Self {
+        Self { outer: 0, is_root: true, brace: 0, paren: 0, arith_cmd: 0, cases: Vec::new(), cmd_pos: true, in_assign_rhs: false, heredocs: VecDeque::new() }
+    }
+
+    fn new_sub(outer: u8) -> Self {
+        Self { outer, is_root: false, brace: 0, paren: 0, arith_cmd: 0, cases: Vec::new(), cmd_pos: true, in_assign_rhs: false, heredocs: VecDeque::new() }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum LexFrame {
+    Cmd(CmdFrame),
+    FuncSub(CmdFrame),
+    Param { outer: u8 },
+    Arith { outer: u8, paren: usize },
+}
+
+#[inline]
+fn is_shell_delim(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | ';' | '&' | '|' | '(' | ')' | '<' | '>')
+}
+
+fn scan_backtick(chars: &[char], mut i: usize, outer_dq: bool) -> (Option<usize>, String, bool) {
+    i += 1;
+    let mut inner = String::new();
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch == '\\' {
+            if i + 1 >= chars.len() {
+                inner.push('\\');
+                return (None, inner, true);
+            }
+            let nxt = chars[i + 1];
+            if nxt == '\n' {
+                i += 2;
+                continue;
+            }
+            if matches!(nxt, '$' | '`' | '\\') || (outer_dq && nxt == '"') {
+                inner.push(nxt);
+                i += 2;
+                continue;
+            }
+            inner.push('\\');
+            inner.push(nxt);
+            i += 2;
+            continue;
+        }
+        if ch == '`' {
+            return (Some(i + 1), inner, false);
+        }
+        inner.push(ch);
+        i += 1;
+    }
+    (None, inner, false)
+}
+
+fn escape_for_backtick(s: &str, outer_dq: bool) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        if matches!(c, '\\' | '$' | '`') || (outer_dq && c == '"') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+enum HeredocHeader {
+    Incomplete(ShellCtx),
+    None(usize),
+    Ok { next_i: usize, expand: bool, delim: String },
+}
+
+fn parse_heredoc_delim(chars: &[char], mut i: usize) -> HeredocHeader {
+    while i < chars.len() && matches!(chars[i], ' ' | '\t') {
+        i += 1;
+    }
+    let mut delim = String::new();
+    let mut quoted = false;
+    let mut started = false;
+    while i < chars.len() && !is_shell_delim(chars[i]) && chars[i] != '\r' {
+        started = true;
+        let ch = chars[i];
+        if ch == '\\' {
+            quoted = true;
+            if i + 1 >= chars.len() {
+                return HeredocHeader::Incomplete(ShellCtx::Code(4));
+            }
+            if chars[i + 1] == '\n' {
+                i += 2;
+                continue;
+            }
+            delim.push(chars[i + 1]);
+            i += 2;
+            continue;
+        }
+        if ch == '\'' {
+            quoted = true;
+            i += 1;
+            while i < chars.len() && chars[i] != '\'' {
+                delim.push(chars[i]);
+                i += 1;
+            }
+            if i >= chars.len() {
+                return HeredocHeader::Incomplete(ShellCtx::Code(1));
+            }
+            i += 1;
+            continue;
+        }
+        if ch == '$' && chars.get(i + 1) == Some(&'\'') {
+            quoted = true;
+            i += 2;
+            while i < chars.len() {
+                if chars[i] == '\\' {
+                    if i + 1 >= chars.len() {
+                        return HeredocHeader::Incomplete(ShellCtx::Code(8));
+                    }
+                    delim.push(chars[i + 1]);
+                    i += 2;
+                    continue;
+                }
+                if chars[i] == '\'' {
+                    break;
+                }
+                delim.push(chars[i]);
+                i += 1;
+            }
+            if i >= chars.len() {
+                return HeredocHeader::Incomplete(ShellCtx::Code(3));
+            }
+            i += 1;
+            continue;
+        }
+        if ch == '"' || (ch == '$' && chars.get(i + 1) == Some(&'"')) {
+            quoted = true;
+            i += if ch == '$' { 2 } else { 1 };
+            while i < chars.len() && chars[i] != '"' {
+                if chars[i] == '\\' {
+                    if i + 1 >= chars.len() {
+                        return HeredocHeader::Incomplete(ShellCtx::Code(5));
+                    }
+                    let nxt = chars[i + 1];
+                    if matches!(nxt, '\\' | '"' | '$' | '`') {
+                        delim.push(nxt);
+                    } else if nxt != '\n' {
+                        delim.push('\\');
+                        delim.push(nxt);
+                    }
+                    i += 2;
+                    continue;
+                }
+                delim.push(chars[i]);
+                i += 1;
+            }
+            if i >= chars.len() {
+                return HeredocHeader::Incomplete(ShellCtx::Code(2));
+            }
+            i += 1;
+            continue;
+        }
+        delim.push(ch);
+        i += 1;
+    }
+    if !started && !quoted {
+        return HeredocHeader::None(i);
+    }
+    HeredocHeader::Ok { next_i: i, expand: !quoted, delim }
+}
+
+fn is_heredoc_delim_line(line: &str, delim: &str, strip_tabs: bool) -> bool {
+    let check = |s: &str| {
+        let s = if strip_tabs { s.trim_start_matches('\t') } else { s };
+        s == delim
+    };
+    check(line) || line.strip_suffix('\r').is_some_and(check)
+}
+
+fn analyze_unquoted_heredoc_body(body: &[char]) -> Option<HeredocInner> {
     let mut i = 0;
+    while i < body.len() {
+        let ch = body[i];
+        if ch == '\\' {
+            if i + 1 >= body.len() {
+                return Some(HeredocInner::DanglingBackslash);
+            }
+            i += 2;
+            continue;
+        }
+        if ch == '`' {
+            let (end_i, inner_s, dangling_bs) = scan_backtick(body, i, false);
+            let Some(next_i) = end_i else {
+                return Some(HeredocInner::Sub(Box::new(ShellCtx::Backtick { outer_double_quoted: false, dangling_bs, inner: Box::new(analyze_shell_context(&inner_s)) })));
+            };
+            i = next_i;
+            continue;
+        }
+        if ch == '$' {
+            match body.get(i + 1) {
+                Some('(' | '{') => {
+                    let (end_i, sub_ctx) = run_shell_lexer(body, i, true, 2);
+                    if let Some(next_i) = end_i {
+                        i = next_i;
+                        continue;
+                    }
+                    return Some(HeredocInner::Sub(Box::new(sub_ctx)));
+                }
+                None => return Some(HeredocInner::AfterDollar),
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn analyze_shell_context(prefix: &str) -> ShellCtx {
+    let chars: Vec<char> = prefix.chars().collect();
+    run_shell_lexer(&chars, 0, false, 0).1
+}
+
+fn is_ident_assign_prefix(chars: &[char], start: usize) -> Option<usize> {
+    let first = *chars.get(start)?;
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return None;
+    }
+    let mut j = start + 1;
+    while j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '_') {
+        j += 1;
+    }
+    if chars.get(j) == Some(&'+') && chars.get(j + 1) == Some(&'=') {
+        return Some(j + 2);
+    }
+    if chars.get(j) == Some(&'=') {
+        return Some(j + 1);
+    }
+    None
+}
+
+fn run_shell_lexer(chars: &[char], start_i: usize, stop_when_sub_closes: bool, sub_outer: u8) -> (Option<usize>, ShellCtx) {
+    let mut stack: Vec<LexFrame> = if stop_when_sub_closes { Vec::new() } else { vec![LexFrame::Cmd(CmdFrame::new_root())] };
+    let mut state: u8 = 0;
+    let mut i = start_i;
+    let mut last_unescaped_dollar: Option<usize> = None;
+
     while i < chars.len() {
         let ch = chars[i];
         match state {
             0 => {
                 if ch == '\\' {
                     if i + 1 >= chars.len() {
-                        return 4;
+                        return (None, ShellCtx::Code(4));
+                    }
+                    if chars[i + 1] == '\n' {
+                        i += 2;
+                        continue;
+                    }
+                    if let Some(LexFrame::Cmd(cf) | LexFrame::FuncSub(cf)) = stack.last_mut() {
+                        if !cf.in_assign_rhs {
+                            cf.cmd_pos = false;
+                        }
+                        if let Some(c) = cf.cases.last_mut() {
+                            c.note_word_char();
+                        }
                     }
                     i += 2;
                     continue;
                 }
-                if ch == '#' && (i == 0 || matches!(chars[i - 1], ' ' | '\t' | '\n' | '\r' | ';' | '&' | '|' | '(' | ')')) {
+
+                if ch == '`' {
+                    if let Some(LexFrame::Cmd(cf) | LexFrame::FuncSub(cf)) = stack.last_mut() {
+                        if !cf.in_assign_rhs {
+                            cf.cmd_pos = false;
+                        }
+                        if let Some(c) = cf.cases.last_mut() {
+                            c.note_word_char();
+                        }
+                    }
+                    let (end_i, inner_s, dangling_bs) = scan_backtick(chars, i, false);
+                    let Some(next_i) = end_i else {
+                        return (None, ShellCtx::Backtick { outer_double_quoted: false, dangling_bs, inner: Box::new(analyze_shell_context(&inner_s)) });
+                    };
+                    i = next_i;
+                    continue;
+                }
+
+                let in_param = matches!(stack.last(), Some(LexFrame::Param { .. }));
+                let in_arith = matches!(stack.last(), Some(LexFrame::Arith { .. }));
+
+                if !in_param && !in_arith && ch == '#' && (i == start_i || is_shell_delim(chars[i - 1])) {
                     while i < chars.len() && chars[i] != '\n' {
                         i += 1;
                     }
+                    if i >= chars.len() {
+                        return (None, ShellCtx::Code(6));
+                    }
                     continue;
                 }
-                if ch == '$' && chars.get(i + 1) == Some(&'\'') {
-                    state = 3;
-                    i += 2;
-                    continue;
-                }
-                if ch == '$' && chars.get(i + 1) == Some(&'"') {
-                    state = 2;
-                    i += 2;
-                    continue;
-                }
-                if ch == '$' && chars.get(i + 1) == Some(&'(') && chars.get(i + 2) != Some(&'(') {
-                    stack.push(0);
-                    state = 0;
-                    i += 2;
-                    continue;
-                }
-                if ch == '(' && !stack.is_empty() {
-                    stack.push(0);
-                    i += 1;
-                    continue;
-                }
-                if ch == ')' {
-                    if let Some(prev) = stack.pop() {
-                        state = prev;
+
+                if ch == '\n' {
+                    if let Some(LexFrame::Cmd(cf) | LexFrame::FuncSub(cf)) = stack.last_mut() {
+                        cf.in_assign_rhs = false;
+                        match cf.cases.last_mut() {
+                            Some(CasePhase::ExpectWord { saw_word_char }) if *saw_word_char => {
+                                *cf.cases.last_mut().unwrap() = CasePhase::ExpectIn;
+                            }
+                            Some(CasePhase::ExpectWord { .. } | CasePhase::ExpectIn | CasePhase::ExpectPat { .. }) => {}
+                            _ => cf.cmd_pos = true,
+                        }
+                        if !cf.heredocs.is_empty() {
+                            i += 1;
+                            while let Some(spec) = cf.heredocs.front().cloned() {
+                                let body_start = i;
+                                let mut closed = false;
+                                while i < chars.len() {
+                                    let mut line = String::new();
+                                    while i < chars.len() {
+                                        if spec.expand && chars[i] == '\\' && chars.get(i + 1) == Some(&'\n') {
+                                            i += 2;
+                                            continue;
+                                        }
+                                        if chars[i] == '\n' {
+                                            break;
+                                        }
+                                        line.push(chars[i]);
+                                        i += 1;
+                                    }
+                                    if i < chars.len() && chars[i] == '\n' {
+                                        i += 1;
+                                        if is_heredoc_delim_line(&line, &spec.delim, spec.strip_tabs) {
+                                            cf.heredocs.pop_front();
+                                            closed = true;
+                                            break;
+                                        }
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                if !closed {
+                                    let inner = if spec.expand { analyze_unquoted_heredoc_body(&chars[body_start..]) } else { None };
+                                    return (None, ShellCtx::Heredoc { expand: spec.expand, strip_tabs: spec.strip_tabs, delim: spec.delim, inner });
+                                }
+                            }
+                            continue;
+                        }
                     }
                     i += 1;
                     continue;
                 }
-                if ch == '\'' {
-                    state = 1;
-                } else if ch == '"' {
-                    state = 2;
+
+                if ch == '$' {
+                    if let Some(LexFrame::Cmd(cf) | LexFrame::FuncSub(cf)) = stack.last_mut() {
+                        if !cf.in_assign_rhs {
+                            cf.cmd_pos = false;
+                        }
+                        if let Some(c) = cf.cases.last_mut() {
+                            c.note_word_char();
+                        }
+                    }
+                    let eff_outer = if stop_when_sub_closes && stack.is_empty() { sub_outer } else { 0 };
+                    match chars.get(i + 1) {
+                        Some('\'') => {
+                            state = 3;
+                            i += 2;
+                            continue;
+                        }
+                        Some('"') => {
+                            state = 2;
+                            i += 2;
+                            continue;
+                        }
+                        Some('(') if chars.get(i + 2) == Some(&'(') => {
+                            stack.push(LexFrame::Arith { outer: eff_outer, paren: 1 });
+                            state = 0;
+                            i += 3;
+                            continue;
+                        }
+                        Some('(') => {
+                            stack.push(LexFrame::Cmd(CmdFrame::new_sub(eff_outer)));
+                            state = 0;
+                            i += 2;
+                            continue;
+                        }
+                        Some('{') => {
+                            if matches!(chars.get(i + 2), Some(' ' | '\t' | '\n' | '|')) {
+                                stack.push(LexFrame::FuncSub(CmdFrame::new_sub(eff_outer)));
+                            } else {
+                                stack.push(LexFrame::Param { outer: eff_outer });
+                            }
+                            state = 0;
+                            i += 2;
+                            continue;
+                        }
+                        None => {
+                            last_unescaped_dollar = Some(i);
+                            i += 1;
+                            continue;
+                        }
+                        _ => {
+                            i += 1;
+                            continue;
+                        }
+                    }
                 }
+
+                if ch == '}' {
+                    if matches!(stack.last(), Some(LexFrame::Param { .. })) {
+                        let Some(LexFrame::Param { outer }) = stack.pop() else { unreachable!() };
+                        state = outer;
+                        i += 1;
+                        if stop_when_sub_closes && stack.is_empty() {
+                            return (Some(i), ShellCtx::Code(state));
+                        }
+                        continue;
+                    }
+                    if let Some(LexFrame::FuncSub(cf)) = stack.last_mut() {
+                        if cf.brace > 0 {
+                            cf.brace -= 1;
+                            cf.cmd_pos = true;
+                            cf.in_assign_rhs = false;
+                            i += 1;
+                            continue;
+                        }
+                        let outer = cf.outer;
+                        stack.pop();
+                        state = outer;
+                        i += 1;
+                        if stop_when_sub_closes && stack.is_empty() {
+                            return (Some(i), ShellCtx::Code(state));
+                        }
+                        continue;
+                    }
+                }
+
+                if let Some(LexFrame::Arith { outer, paren }) = stack.last_mut() {
+                    if ch == '(' {
+                        *paren += 1;
+                        i += 1;
+                        continue;
+                    }
+                    if ch == ')' {
+                        *paren = paren.saturating_sub(1);
+                        if *paren == 0 {
+                            let saved_outer = *outer;
+                            if chars.get(i + 1) == Some(&')') {
+                                stack.pop();
+                                state = saved_outer;
+                                i += 2;
+                                if stop_when_sub_closes && stack.is_empty() {
+                                    return (Some(i), ShellCtx::Code(state));
+                                }
+                                continue;
+                            }
+                            let mut sub = CmdFrame::new_sub(saved_outer);
+                            sub.cmd_pos = false;
+                            *stack.last_mut().unwrap() = LexFrame::Cmd(sub);
+                            i += 1;
+                            continue;
+                        }
+                        i += 1;
+                        continue;
+                    }
+                    if ch == '\'' {
+                        state = 1;
+                        i += 1;
+                        continue;
+                    }
+                    if ch == '"' {
+                        state = 2;
+                        i += 1;
+                        continue;
+                    }
+                    i += 1;
+                    continue;
+                }
+
+                if ch == '\'' || ch == '"' {
+                    if let Some(LexFrame::Cmd(cf) | LexFrame::FuncSub(cf)) = stack.last_mut() {
+                        if !cf.in_assign_rhs {
+                            cf.cmd_pos = false;
+                        }
+                        if let Some(c) = cf.cases.last_mut() {
+                            c.note_word_char();
+                        }
+                    }
+                    state = if ch == '\'' { 1 } else { 2 };
+                    i += 1;
+                    continue;
+                }
+
+                if in_param {
+                    i += 1;
+                    continue;
+                }
+
+                let is_funcsub = matches!(stack.last(), Some(LexFrame::FuncSub(_)));
+                let Some(LexFrame::Cmd(cf) | LexFrame::FuncSub(cf)) = stack.last_mut() else {
+                    i += 1;
+                    continue;
+                };
+
+                if matches!(ch, ' ' | '\t') {
+                    if cf.in_assign_rhs {
+                        cf.in_assign_rhs = false;
+                        cf.cmd_pos = true;
+                    }
+                    if matches!(cf.cases.last(), Some(CasePhase::ExpectWord { saw_word_char: true })) {
+                        *cf.cases.last_mut().unwrap() = CasePhase::ExpectIn;
+                    }
+                    i += 1;
+                    continue;
+                }
+
+                if ch == ';' && cf.paren == 0 && cf.arith_cmd == 0 && matches!(cf.cases.last(), Some(CasePhase::InBody)) {
+                    if chars.get(i + 1) == Some(&';') {
+                        i += if chars.get(i + 2) == Some(&'&') { 3 } else { 2 };
+                        *cf.cases.last_mut().unwrap() = CasePhase::new_expect_pat();
+                        cf.cmd_pos = false;
+                        cf.in_assign_rhs = false;
+                        continue;
+                    }
+                    if chars.get(i + 1) == Some(&'&') {
+                        i += 2;
+                        *cf.cases.last_mut().unwrap() = CasePhase::new_expect_pat();
+                        cf.cmd_pos = false;
+                        cf.in_assign_rhs = false;
+                        continue;
+                    }
+                }
+
+                if ch == '<' && chars.get(i + 1) == Some(&'<') && cf.arith_cmd == 0 {
+                    if chars.get(i + 2) == Some(&'<') {
+                        cf.cmd_pos = false;
+                        cf.in_assign_rhs = false;
+                        i += 3;
+                        continue;
+                    }
+                    let strip_tabs = chars.get(i + 2) == Some(&'-');
+                    let after_op = i + if strip_tabs { 3 } else { 2 };
+                    match parse_heredoc_delim(chars, after_op) {
+                        HeredocHeader::Incomplete(ctx) => return (None, ctx),
+                        HeredocHeader::Ok { next_i, expand, delim } => {
+                            cf.heredocs.push_back(HeredocSpec { expand, strip_tabs, delim });
+                            i = next_i;
+                            continue;
+                        }
+                        HeredocHeader::None(next_i) => {
+                            i = next_i;
+                            continue;
+                        }
+                    }
+                }
+
+                if ch == '(' {
+                    cf.in_assign_rhs = false;
+                    if let Some(CasePhase::ExpectPat { started_token, leading_paren, extglob, .. }) = cf.cases.last_mut() {
+                        if !*started_token && !*leading_paren {
+                            *leading_paren = true;
+                        } else {
+                            *extglob += 1;
+                        }
+                        i += 1;
+                        continue;
+                    }
+                    if cf.cmd_pos && chars.get(i + 1) == Some(&'(') {
+                        cf.arith_cmd += 1;
+                        cf.cmd_pos = false;
+                        i += 2;
+                        continue;
+                    }
+                    cf.paren += 1;
+                    cf.cmd_pos = true;
+                    i += 1;
+                    continue;
+                }
+
+                if ch == ')' {
+                    cf.in_assign_rhs = false;
+                    if cf.arith_cmd > 0 && chars.get(i + 1) == Some(&')') {
+                        cf.arith_cmd -= 1;
+                        cf.cmd_pos = false;
+                        i += 2;
+                        continue;
+                    }
+                    if cf.paren == 0 {
+                        if let Some(CasePhase::ExpectPat { extglob, .. }) = cf.cases.last_mut() {
+                            if *extglob > 0 {
+                                *extglob -= 1;
+                                i += 1;
+                                continue;
+                            }
+                            *cf.cases.last_mut().unwrap() = CasePhase::InBody;
+                            cf.cmd_pos = true;
+                            i += 1;
+                            continue;
+                        }
+                    }
+                    if cf.paren > 0 {
+                        cf.paren -= 1;
+                        cf.cmd_pos = false;
+                        i += 1;
+                        continue;
+                    }
+                    if !cf.is_root && !is_funcsub {
+                        let outer = cf.outer;
+                        stack.pop();
+                        state = outer;
+                        i += 1;
+                        if stop_when_sub_closes && stack.is_empty() {
+                            return (Some(i), ShellCtx::Code(state));
+                        }
+                        continue;
+                    }
+                    i += 1;
+                    continue;
+                }
+
+                if matches!(ch, ';' | '&' | '|') {
+                    cf.in_assign_rhs = false;
+                    if ch == '|' {
+                        if let Some(CasePhase::ExpectPat { started_token, after_pipe, .. }) = cf.cases.last_mut() {
+                            *started_token = false;
+                            *after_pipe = true;
+                            i += 1;
+                            continue;
+                        }
+                    }
+                    cf.cmd_pos = true;
+                    i += 1;
+                    continue;
+                }
+
+                if matches!(ch, '<' | '>') {
+                    i += 1;
+                    continue;
+                }
+
+                let prev_is_delim = i == start_i || is_shell_delim(chars[i - 1]);
+                if prev_is_delim {
+                    if cf.cmd_pos && matches!(cf.cases.last(), None | Some(CasePhase::InBody)) {
+                        if let Some(after_eq) = is_ident_assign_prefix(chars, i) {
+                            cf.in_assign_rhs = true;
+                            cf.cmd_pos = false;
+                            i = after_eq;
+                            continue;
+                        }
+                    }
+                    let mut j = i;
+                    while j < chars.len() && (chars[j].is_alphanumeric() || matches!(chars[j], '_' | '{' | '!')) {
+                        if matches!(chars[j], '{' | '!') && j > i {
+                            break;
+                        }
+                        j += 1;
+                        if matches!(chars[j - 1], '{' | '!') {
+                            break;
+                        }
+                    }
+                    let next_is_delim = j == chars.len() || is_shell_delim(chars[j]);
+                    if j > i && next_is_delim {
+                        let word: String = chars[i..j].iter().collect();
+                        if let Some(cphase) = cf.cases.last_mut() {
+                            match cphase {
+                                CasePhase::ExpectWord { saw_word_char } => {
+                                    *saw_word_char = true;
+                                    i = j;
+                                    continue;
+                                }
+                                CasePhase::ExpectIn => {
+                                    if word == "in" {
+                                        *cphase = CasePhase::new_expect_pat();
+                                    }
+                                    i = j;
+                                    continue;
+                                }
+                                CasePhase::ExpectPat { started_token, leading_paren, after_pipe, .. } => {
+                                    if word == "esac" && !*leading_paren && !*started_token && !*after_pipe {
+                                        cf.cases.pop();
+                                        cf.cmd_pos = false;
+                                        i = j;
+                                        continue;
+                                    }
+                                    *started_token = true;
+                                    i = j;
+                                    continue;
+                                }
+                                CasePhase::InBody => {}
+                            }
+                        }
+                        if cf.cmd_pos {
+                            if word == "case" {
+                                cf.cases.push(CasePhase::ExpectWord { saw_word_char: false });
+                                cf.cmd_pos = false;
+                                i = j;
+                                continue;
+                            }
+                            if word == "esac" && matches!(cf.cases.last(), Some(CasePhase::InBody)) {
+                                cf.cases.pop();
+                                cf.cmd_pos = false;
+                                i = j;
+                                continue;
+                            }
+                            if word == "{" && is_funcsub {
+                                cf.brace += 1;
+                                cf.cmd_pos = true;
+                                i = j;
+                                continue;
+                            }
+                            if matches!(word.as_str(), "do" | "then" | "else" | "elif" | "!" | "{") {
+                                cf.cmd_pos = true;
+                                i = j;
+                                continue;
+                            }
+                        }
+                        cf.cmd_pos = false;
+                        i = j;
+                        continue;
+                    }
+                }
+
+                if let Some(c) = cf.cases.last_mut() {
+                    c.note_word_char();
+                }
+                if !cf.in_assign_rhs {
+                    cf.cmd_pos = false;
+                }
+                i += 1;
+                continue;
             }
             1 => {
                 if ch == '\'' {
                     state = 0;
                 }
+                i += 1;
+                continue;
             }
             3 => {
                 if ch == '\\' {
-                    if i + 1 < chars.len() {
-                        i += 2;
-                        continue;
+                    if i + 1 >= chars.len() {
+                        return (None, ShellCtx::Code(8));
                     }
-                } else if ch == '\'' {
+                    i += 2;
+                    continue;
+                }
+                if ch == '\'' {
                     state = 0;
                 }
+                i += 1;
+                continue;
             }
             _ => {
                 if ch == '\\' {
                     if i + 1 >= chars.len() {
-                        return 5;
+                        return (None, ShellCtx::Code(5));
                     }
                     i += 2;
                     continue;
                 }
-                if ch == '$' && chars.get(i + 1) == Some(&'(') && chars.get(i + 2) != Some(&'(') {
-                    stack.push(2);
-                    state = 0;
-                    i += 2;
+                if ch == '`' {
+                    let (end_i, inner_s, dangling_bs) = scan_backtick(chars, i, true);
+                    let Some(next_i) = end_i else {
+                        return (None, ShellCtx::Backtick { outer_double_quoted: true, dangling_bs, inner: Box::new(analyze_shell_context(&inner_s)) });
+                    };
+                    i = next_i;
                     continue;
+                }
+                if ch == '$' {
+                    match chars.get(i + 1) {
+                        Some('(') if chars.get(i + 2) == Some(&'(') => {
+                            stack.push(LexFrame::Arith { outer: 2, paren: 1 });
+                            state = 0;
+                            i += 3;
+                            continue;
+                        }
+                        Some('(') => {
+                            stack.push(LexFrame::Cmd(CmdFrame::new_sub(2)));
+                            state = 0;
+                            i += 2;
+                            continue;
+                        }
+                        Some('{') => {
+                            if matches!(chars.get(i + 2), Some(' ' | '\t' | '\n' | '|')) {
+                                stack.push(LexFrame::FuncSub(CmdFrame::new_sub(2)));
+                            } else {
+                                stack.push(LexFrame::Param { outer: 2 });
+                            }
+                            state = 0;
+                            i += 2;
+                            continue;
+                        }
+                        None => {
+                            last_unescaped_dollar = Some(i);
+                            i += 1;
+                            continue;
+                        }
+                        _ => {
+                            i += 1;
+                            continue;
+                        }
+                    }
                 }
                 if ch == '"' {
                     state = 0;
                 }
+                i += 1;
+                continue;
             }
         }
-        i += 1;
     }
-    state
+
+    let trailing_dollar = last_unescaped_dollar.is_some_and(|idx| idx + 1 == chars.len());
+    if state == 0 {
+        match stack.last() {
+            Some(LexFrame::Arith { .. }) => return (None, ShellCtx::Code(10)),
+            Some(LexFrame::Param { outer: 2 }) => return (None, ShellCtx::Code(10)),
+            _ => {}
+        }
+        if trailing_dollar {
+            return (None, ShellCtx::Code(7));
+        }
+        return (None, ShellCtx::Code(0));
+    }
+    if state == 2 && trailing_dollar {
+        return (None, ShellCtx::Code(9));
+    }
+    (None, ShellCtx::Code(state))
+}
+
+#[allow(dead_code)]
+fn shell_quote_context(prefix: &str) -> u8 {
+    match analyze_shell_context(prefix) {
+        ShellCtx::Code(c) => c,
+        ShellCtx::Backtick { outer_double_quoted, .. } => {
+            if outer_double_quoted {
+                13
+            } else {
+                12
+            }
+        }
+        ShellCtx::Heredoc { .. } => 11,
+    }
 }
 
 pub fn shell_escape(value: &str, context: u8) -> String {
     match context {
         1 => value.replace('\'', "'\\''"),
         2 => {
-            let mut out = String::new();
+            let mut out = String::with_capacity(value.len());
             for c in value.chars() {
-                if matches!(c, '\\' | '"' | '$' | '`' | '!') {
+                if matches!(c, '\\' | '"' | '$' | '`') {
                     out.push('\\');
                 }
                 out.push(c);
@@ -418,7 +1337,7 @@ pub fn shell_escape(value: &str, context: u8) -> String {
             out
         }
         3 => {
-            let mut out = String::new();
+            let mut out = String::with_capacity(value.len());
             for c in value.chars() {
                 if matches!(c, '\\' | '\'') {
                     out.push('\\');
@@ -429,7 +1348,83 @@ pub fn shell_escape(value: &str, context: u8) -> String {
         }
         4 => format!("\\'{}'", value.replace('\'', "'\\''")),
         5 => format!("\\{}", shell_escape(value, 2)),
+        6 => value.chars().map(|c| if matches!(c, '\n' | '\r') { ' ' } else { c }).collect(),
+        7 => format!("\"\"'{}'", value.replace('\'', "'\\''")),
+        8 => format!("\\{}", shell_escape(value, 3)),
+        9 => format!("\"\"{}", shell_escape(value, 2)),
+        10 => format!("\"{}\"", shell_escape(value, 2)),
+        11 => {
+            let mut out = String::with_capacity(value.len());
+            for c in value.chars() {
+                if matches!(c, '\\' | '$' | '`') {
+                    out.push('\\');
+                }
+                out.push(c);
+            }
+            out
+        }
+        12 => escape_for_backtick(&shell_escape(value, 0), false),
+        13 => escape_for_backtick(&shell_escape(value, 0), true),
         _ => format!("'{}'", value.replace('\'', "'\\''")),
+    }
+}
+
+fn neutralize_heredoc_lines(rendered: &str, line_prefix: &str, line_suffix: &str, delim: &str, strip_tabs: bool) -> String {
+    let mut lines: Vec<String> = rendered.split('\n').map(str::to_string).collect();
+    let last_idx = lines.len().saturating_sub(1);
+    for (idx, seg) in lines.iter_mut().enumerate() {
+        let pre = if idx == 0 { line_prefix } else { "" };
+        let suf = if idx == last_idx { line_suffix } else { "" };
+        if idx == last_idx && !suf.is_empty() {
+            while is_heredoc_delim_line(&format!("{pre}{seg}{suf}"), delim, strip_tabs) {
+                seg.insert(0, ' ');
+            }
+        } else {
+            while is_heredoc_delim_line(&format!("{pre}{seg}"), delim, strip_tabs) {
+                if seg.ends_with('\r') {
+                    let cr_pos = seg.len() - 1;
+                    seg.insert(cr_pos, ' ');
+                } else {
+                    seg.push(' ');
+                }
+            }
+        }
+    }
+    lines.join("\n")
+}
+
+fn render_shell_ctx(value: &str, ctx: &ShellCtx, line_prefix: &str, line_suffix: &str) -> String {
+    match ctx {
+        ShellCtx::Code(code) => shell_escape(value, *code),
+        ShellCtx::Backtick { outer_double_quoted, dangling_bs, inner } => {
+            let inner_rendered = render_shell_ctx(value, inner, "", "");
+            let escaped = escape_for_backtick(&inner_rendered, *outer_double_quoted);
+            if *dangling_bs {
+                format!("\\{escaped}")
+            } else {
+                escaped
+            }
+        }
+        ShellCtx::Heredoc { expand, strip_tabs, delim, inner } => {
+            let raw = if !*expand {
+                value.to_string()
+            } else {
+                match inner {
+                    None => shell_escape(value, 11),
+                    Some(HeredocInner::DanglingBackslash) => format!("\\{}", shell_escape(value, 11)),
+                    Some(HeredocInner::AfterDollar) => {
+                        let esc = shell_escape(value, 11);
+                        if esc.starts_with('(') || esc.starts_with('{') {
+                            format!("\\{esc}")
+                        } else {
+                            esc
+                        }
+                    }
+                    Some(HeredocInner::Sub(sub)) => render_shell_ctx(value, sub, "", ""),
+                }
+            };
+            neutralize_heredoc_lines(&raw, line_prefix, line_suffix, delim, *strip_tabs)
+        }
     }
 }
 
@@ -441,13 +1436,14 @@ pub struct InterpContext<'a> {
     pub step_outputs: &'a IndexMap<String, String>,
 }
 
-fn replace_each(src: &str, re: &Regex, mut f: impl FnMut(&regex::Captures, usize, &str) -> String) -> String {
+fn replace_each(src: &str, re: &Regex, mut f: impl FnMut(&regex::Captures, usize, usize, &str, &str) -> String) -> String {
     let mut out = String::new();
     let mut last = 0;
     for c in re.captures_iter(src) {
         let m = c.get(0).unwrap();
         out.push_str(&src[last..m.start()]);
-        out.push_str(&f(&c, m.start(), src));
+        let replaced = f(&c, m.start(), m.end(), src, &out);
+        out.push_str(&replaced);
         last = m.end();
     }
     out.push_str(&src[last..]);
@@ -464,8 +1460,14 @@ pub fn interpolate_workflow_template(template: &str, ctx: &InterpContext, shell:
             )
             .unwrap()
         });
-        return replace_each(template, re, |c, offset, src| {
-            let fmt = |val: &str| shell_escape(val, shell_quote_context(&src[..offset]));
+        return replace_each(template, re, |c, start, end, src, out_so_far| {
+            let fmt = |val: &str| {
+                let sctx = analyze_shell_context(&src[..start]);
+                let line_prefix = out_so_far.rsplit('\n').next().unwrap_or(out_so_far);
+                let rem = &src[end..];
+                let line_suffix = rem.split('\n').next().unwrap_or(rem);
+                render_shell_ctx(val, &sctx, line_prefix, line_suffix)
+            };
             if let Some(step_id) = c.get(1) {
                 return fmt(ctx.step_outputs.get(step_id.as_str()).map(String::as_str).unwrap_or(""));
             }
@@ -497,7 +1499,7 @@ pub fn interpolate_workflow_template(template: &str, ctx: &InterpContext, shell:
         )
         .unwrap()
     });
-    replace_each(template, re, |c, _, _| {
+    replace_each(template, re, |c, _, _, _, _| {
         if let Some(step_id) = c.get(1) {
             return ctx.step_outputs.get(step_id.as_str()).cloned().unwrap_or_default();
         }
@@ -753,26 +1755,57 @@ fn read_contained_workflow_file(full: &Path, root_canon: &Path) -> Option<String
     String::from_utf8(buf).ok()
 }
 
+pub const BUILTIN_WORKFLOW_NAMES: [&str; 4] = ["feature-dev", "bug-hunt", "tdd-cycle", "security-audit"];
+
+fn strip_workflow_scope_prefixes(raw: &str) -> &str {
+    let mut cur = raw.trim();
+    loop {
+        let bytes = cur.as_bytes();
+        let advance = if bytes.get(..8).is_some_and(|p| p.eq_ignore_ascii_case(b"builtin:")) {
+            Some(8)
+        } else if bytes.get(..10).is_some_and(|p| p.eq_ignore_ascii_case(b"workspace:")) {
+            Some(10)
+        } else if bytes.get(..5).is_some_and(|p| p.eq_ignore_ascii_case(b"user:")) {
+            Some(5)
+        } else {
+            None
+        };
+        match advance {
+            Some(n) => cur = cur[n..].trim_start(),
+            None => return cur,
+        }
+    }
+}
+
+pub fn is_builtin_workflow_name(name: &str) -> bool {
+    let bare = strip_workflow_scope_prefixes(name);
+    BUILTIN_WORKFLOW_NAMES.iter().any(|b| b.eq_ignore_ascii_case(bare))
+}
+
 pub fn discover_workflows(cwd: &Path) -> Vec<WorkflowDefinition> {
     let workspace_canon = std::fs::canonicalize(cwd).ok();
-    let user_workflows_dir = config_dir().join("workflows");
-    let roots: [(PathBuf, Option<PathBuf>, &'static str); 3] = [
-        (cwd.join(".goon").join("workflows"), workspace_canon.clone(), "workspace"),
-        (cwd.join(".agents").join("workflows"), workspace_canon, "workspace"),
-        (user_workflows_dir.clone(), std::fs::canonicalize(&user_workflows_dir).ok(), "user"),
+    let cfg_dir = config_dir();
+    let user_workflows_dir = cfg_dir.join("workflows");
+    let roots: [(PathBuf, PathBuf, Option<PathBuf>, &'static str); 3] = [
+        (cwd.join(".goon"), cwd.join(".goon").join("workflows"), workspace_canon.clone(), "workspace"),
+        (cwd.join(".agents"), cwd.join(".agents").join("workflows"), workspace_canon, "workspace"),
+        (cfg_dir.clone(), user_workflows_dir, std::fs::canonicalize(&cfg_dir).ok(), "user"),
     ];
     let mut seen = std::collections::HashSet::new();
     let mut out = vec![];
-    for (dir, boundary_canon, scope) in roots {
+    for (parent_dir, dir, boundary_canon, scope) in roots {
+        let Some(boundary) = boundary_canon else { continue };
+        let Ok(pmeta) = std::fs::symlink_metadata(&parent_dir) else { continue };
+        if pmeta.file_type().is_symlink() || !pmeta.file_type().is_dir() {
+            continue;
+        }
         let Ok(lmeta) = std::fs::symlink_metadata(&dir) else { continue };
         if lmeta.file_type().is_symlink() || !lmeta.file_type().is_dir() {
             continue;
         }
         let Ok(dir_canon) = std::fs::canonicalize(&dir) else { continue };
-        if let Some(boundary) = &boundary_canon {
-            if !dir_canon.starts_with(boundary) {
-                continue;
-            }
+        if !dir_canon.starts_with(&boundary) {
+            continue;
         }
         let Ok(entries) = std::fs::read_dir(&dir) else { continue };
         let mut entries: Vec<_> = entries.flatten().collect();
@@ -784,7 +1817,7 @@ pub fn discover_workflows(cwd: &Path) -> Vec<WorkflowDefinition> {
             }
             let full = dir.join(&file_name);
             let Some(raw) = read_contained_workflow_file(&full, &dir_canon) else { continue };
-            let def = if file_name.ends_with(".json") {
+            let mut def = if file_name.ends_with(".json") {
                 let Ok(value) = serde_json::from_str::<Value>(&raw) else { continue };
                 let Ok((name, description, inputs, steps)) = parse_workflow_json(&value) else { continue };
                 let count = steps.len();
@@ -808,6 +1841,15 @@ pub fn discover_workflows(cwd: &Path) -> Vec<WorkflowDefinition> {
             } else {
                 parse_markdown_workflow(&file_name, &raw, scope, &full)
             };
+            let mut bare = strip_workflow_scope_prefixes(&def.name).to_string();
+            if bare.is_empty() {
+                let stem = file_name.strip_suffix(".json").or_else(|| file_name.strip_suffix(".md")).unwrap_or(&file_name);
+                bare = strip_workflow_scope_prefixes(stem).to_string();
+            }
+            if bare.is_empty() {
+                continue;
+            }
+            def.name = if BUILTIN_WORKFLOW_NAMES.iter().any(|b| b.eq_ignore_ascii_case(&bare)) { format!("{scope}:{}", bare.to_ascii_lowercase()) } else { bare };
             if seen.insert(def.name.to_lowercase()) {
                 out.push(def);
             }
@@ -821,19 +1863,99 @@ pub fn discover_workflows(cwd: &Path) -> Vec<WorkflowDefinition> {
     out
 }
 
+pub fn resolve_workflow(cwd: &Path, spec: &str) -> Option<WorkflowDefinition> {
+    let query = spec.trim();
+    if query.is_empty() {
+        return None;
+    }
+    let all = discover_workflows(cwd);
+    let bytes = query.as_bytes();
+    if bytes.get(..8).is_some_and(|p| p.eq_ignore_ascii_case(b"builtin:")) {
+        let target = query[8..].trim();
+        return all.into_iter().find(|w| w.scope == "builtin" && w.name.eq_ignore_ascii_case(target));
+    }
+    if bytes.get(..10).is_some_and(|p| p.eq_ignore_ascii_case(b"workspace:")) {
+        let target = query[10..].trim();
+        let qualified = format!("workspace:{target}");
+        return all.into_iter().find(|w| w.scope == "workspace" && (w.name.eq_ignore_ascii_case(&qualified) || w.name.eq_ignore_ascii_case(target)));
+    }
+    if bytes.get(..5).is_some_and(|p| p.eq_ignore_ascii_case(b"user:")) {
+        let target = query[5..].trim();
+        let qualified = format!("user:{target}");
+        return all.into_iter().find(|w| w.scope == "user" && (w.name.eq_ignore_ascii_case(&qualified) || w.name.eq_ignore_ascii_case(target)));
+    }
+    if BUILTIN_WORKFLOW_NAMES.iter().any(|b| b.eq_ignore_ascii_case(query)) {
+        return all.into_iter().find(|w| w.scope == "builtin" && w.name.eq_ignore_ascii_case(query));
+    }
+    all.into_iter().find(|w| w.name.to_lowercase() == query.to_lowercase())
+}
+
 pub fn create_workflow_scaffold(cwd: &Path, name: &str, description: Option<&str>, global: bool, overwrite: bool) -> Result<(PathBuf, WorkflowDefinition)> {
     static BAD: OnceLock<Regex> = OnceLock::new();
-    let clean = BAD.get_or_init(|| Regex::new(r"[^A-Za-z0-9_-]").unwrap()).replace_all(name.trim(), "-").trim_matches('-').to_string();
+    let stripped = strip_workflow_scope_prefixes(name);
+    if is_builtin_workflow_name(name) {
+        bail!("Workflow name \"{stripped}\" is reserved for a built-in workflow.");
+    }
+    let clean = BAD.get_or_init(|| Regex::new(r"[^A-Za-z0-9_-]").unwrap()).replace_all(stripped, "-").trim_matches('-').to_string();
     if clean.is_empty() {
         bail!("Workflow name cannot be empty.");
     }
-    let dir = if global { config_dir().join("workflows") } else { crate::files::resolve_lexical(&std::env::current_dir()?, &cwd.to_string_lossy()).join(".goon").join("workflows") };
-    std::fs::create_dir_all(&dir)?;
+    if is_builtin_workflow_name(&clean) {
+        bail!("Workflow name \"{clean}\" is reserved for a built-in workflow.");
+    }
+    let dir = if global {
+        let cfg = config_dir();
+        if let Ok(m) = std::fs::symlink_metadata(&cfg) {
+            if m.file_type().is_symlink() || !m.file_type().is_dir() {
+                bail!("Refusing to write workflow under symlink or non-directory config path: {}", cfg.display());
+            }
+        }
+        let wf_dir = cfg.join("workflows");
+        if let Ok(m) = std::fs::symlink_metadata(&wf_dir) {
+            if m.file_type().is_symlink() || !m.file_type().is_dir() {
+                bail!("Refusing to write workflow under symlink or non-directory path: {}", wf_dir.display());
+            }
+        }
+        std::fs::create_dir_all(&wf_dir)?;
+        let cfg_canon = std::fs::canonicalize(&cfg)?;
+        let dir_canon = std::fs::canonicalize(&wf_dir)?;
+        if !dir_canon.starts_with(&cfg_canon) {
+            bail!("Workflow directory escapes config boundary: {}", wf_dir.display());
+        }
+        wf_dir
+    } else {
+        let ws = if cwd.is_absolute() { cwd.to_path_buf() } else { crate::files::resolve_lexical(&std::env::current_dir()?, &cwd.to_string_lossy()) };
+        let ws_canon = std::fs::canonicalize(&ws).map_err(|e| anyhow!("Cannot resolve workspace directory {}: {e}", ws.display()))?;
+        let dot_goon = ws.join(".goon");
+        if let Ok(m) = std::fs::symlink_metadata(&dot_goon) {
+            if m.file_type().is_symlink() || !m.file_type().is_dir() {
+                bail!("Refusing to write workflow under symlink or non-directory .goon path: {}", dot_goon.display());
+            }
+        }
+        let wf_dir = dot_goon.join("workflows");
+        if let Ok(m) = std::fs::symlink_metadata(&wf_dir) {
+            if m.file_type().is_symlink() || !m.file_type().is_dir() {
+                bail!("Refusing to write workflow under symlink or non-directory workflows path: {}", wf_dir.display());
+            }
+        }
+        std::fs::create_dir_all(&wf_dir)?;
+        if std::fs::symlink_metadata(&dot_goon)?.file_type().is_symlink() || std::fs::symlink_metadata(&wf_dir)?.file_type().is_symlink() {
+            bail!("Refusing to write workflow through symlinked directory: {}", wf_dir.display());
+        }
+        let dir_canon = std::fs::canonicalize(&wf_dir)?;
+        if !dir_canon.starts_with(&ws_canon) {
+            bail!("Workflow directory escapes workspace boundary: {}", wf_dir.display());
+        }
+        wf_dir
+    };
     let file = dir.join(format!("{clean}.json"));
     let md = dir.join(format!("{clean}.md"));
-    if !overwrite {
-        for existing in [&file, &md] {
-            if existing.exists() {
+    for existing in [&file, &md] {
+        if let Ok(meta) = std::fs::symlink_metadata(existing) {
+            if meta.file_type().is_symlink() {
+                bail!("Refusing to overwrite symlinked workflow file: {}", existing.display());
+            }
+            if !overwrite {
                 bail!("Workflow \"{clean}\" already exists at {}. Remove it first with \"goon workflow rm {clean}\".", existing.display());
             }
         }
@@ -860,8 +1982,7 @@ pub fn create_workflow_scaffold(cwd: &Path, name: &str, description: Option<&str
 }
 
 pub fn remove_custom_workflow(cwd: &Path, name: &str) -> Result<PathBuf> {
-    let all = discover_workflows(cwd);
-    let Some(found) = all.into_iter().find(|w| w.name.to_lowercase() == name.trim().to_lowercase()) else { bail!("Workflow \"{name}\" not found.") };
+    let Some(found) = resolve_workflow(cwd, name) else { bail!("Workflow \"{name}\" not found.") };
     match (&found.path, found.scope) {
         (Some(p), s) if s != "builtin" => {
             let meta = std::fs::symlink_metadata(p)?;
@@ -999,7 +2120,8 @@ pub async fn execute_workflow(workflow: &WorkflowDefinition, raw_args: &str, hoo
                     }
                     progress(&format!("  $ {cmd}\n"));
                     let clean_env = |v: &str| v.replace('\0', "");
-                    let mut env: std::collections::BTreeMap<String, String> = std::env::vars().collect();
+                    let mut env = crate::process::child_env(None);
+                    env.retain(|k, _| !k.trim().to_ascii_uppercase().starts_with("GOON_WF_"));
                     env.insert("GOON_WF_INPUT".into(), clean_env(&parsed.full_input));
                     env.insert("GOON_WF_PREV".into(), clean_env(&prev));
                     for (idx, p) in parsed.positional.iter().enumerate() {

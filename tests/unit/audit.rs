@@ -216,7 +216,8 @@ fn bash_prefix_approvals_reject_flag_collapsing_launcher_flags_and_risky_extra_a
     assert!(!approved("awk 1 cmd=evil file.txt", &awk_set));
 
     let tar_set: BTreeSet<String> = [prefix("tar xzf archive.tgz").unwrap()].into_iter().collect();
-    assert!(approved("tar xzf other.tgz", &tar_set));
+    assert!(approved("tar xzf archive.tgz", &tar_set));
+    assert!(!approved("tar xzf other.tgz", &tar_set));
     assert!(!approved("tar xzf archive.tgz --checkpoint-action=exec=sh", &tar_set));
     assert!(!approved("tar xzf archive.tgz -P", &tar_set));
 }
@@ -428,4 +429,59 @@ async fn the_setup_wizard_always_offers_the_model_step_and_hides_the_api_key() {
     assert!(asked.iter().any(|l| l.to_lowercase().contains("model")));
     assert_eq!(secret.lock().unwrap().len(), 1);
     assert!(!asked.iter().any(|l| l.to_lowercase().contains("api key")));
+}
+
+#[test]
+fn bash_prefix_approval_blocks_nbsp_attached_paths_and_exact_only_commands_while_keeping_dev_flags() {
+    // Non-ASCII whitespace (NBSP) is never converted into a session prefix or matched as ASCII space.
+    assert_eq!(prefix("cargo\u{00A0}test"), None);
+    let cargo_set: BTreeSet<String> = [prefix("cargo test").unwrap()].into_iter().collect();
+    assert!(!approved("cargo\u{00A0}test", &cargo_set));
+    assert!(approved("cargo test -- --nocapture", &cargo_set));
+
+    // Attached short-value path escapes (`-r../evil.cjs`, `-f/etc/passwd`, `--output=/tmp/x`) are rejected.
+    let node_set: BTreeSet<String> = [prefix("node app.js").unwrap()].into_iter().collect();
+    assert!(!approved("node app.js -r../evil.cjs", &node_set));
+    let rg_set: BTreeSet<String> = [prefix("rg foo").unwrap()].into_iter().collect();
+    assert!(approved("rg foo -i src", &rg_set));
+    assert!(!approved("rg foo -f/etc/passwd", &rg_set));
+    let git_log_set: BTreeSet<String> = [prefix("git log").unwrap()].into_iter().collect();
+    assert!(approved("git log --oneline -n 5", &git_log_set));
+    assert!(!approved("git log --output=/tmp/leak", &git_log_set));
+
+    // ALWAYS_EXPLICIT commands (`find`, `env`) never yield a session prefix; EXACT_ONLY commands (`tar`, `git config`, `npm config`) never generalize.
+    for explicit in ["find . -name foo.rs", "env", "env ls"] {
+        assert_eq!(prefix(explicit), None, "{explicit} must require explicit exact approval");
+    }
+    for (seed, sibling) in [("tar xzf archive.tgz", "tar xzf other.tgz"), ("git config --get user.name", "git config core.sshCommand evil"), ("npm config list", "npm config set script-shell /bin/sh")]
+    {
+        let set: BTreeSet<String> = [prefix(seed).unwrap()].into_iter().collect();
+        assert!(approved(seed, &set), "exact command must match: {seed}");
+        assert!(!approved(sibling, &set), "sibling must not match exact-only prefix: {sibling}");
+    }
+}
+
+#[test]
+fn mcp_allowed_tools_match_raw_hyphenated_sanitized_and_hashed_names_without_prefix_collisions() {
+    let short_reg = mcp::mcp_tool_name("my-server", "run-query");
+    let hashed = mcp::mcp_tool_name("my-very-long-enterprise-server-name", "extremely-long-tool-action-identifier-name");
+    let other_server_hashed = mcp::mcp_tool_name("my-very-long-enterprise-other-team", "extremely-long-tool-action-identifier-name");
+    let scoped_fs = mcp::mcp_tool_name("@modelcontextprotocol/server-filesystem", "read_file");
+    let scoped_mem = mcp::mcp_tool_name("@modelcontextprotocol/server-memory", "read_file");
+
+    let raw_allow: std::collections::HashSet<String> = [
+        "mcp__my-server__run-query".to_string(),
+        "mcp__my-very-long-enterprise-server-name__extremely-long-tool-action-identifier-name".to_string(),
+        "mcp__@modelcontextprotocol/server-filesystem__read_file".to_string(),
+        "mcp__fs__read*".to_string(),
+    ]
+    .into_iter()
+    .collect();
+    assert!(tools::tool_allowed_by_set(&raw_allow, &short_reg));
+    assert!(tools::tool_allowed_by_set(&raw_allow, &hashed));
+    assert!(!tools::tool_allowed_by_set(&raw_allow, &other_server_hashed));
+    assert!(tools::tool_allowed_by_set(&raw_allow, &scoped_fs));
+    assert!(!tools::tool_allowed_by_set(&raw_allow, &scoped_mem));
+    assert!(tools::tool_allowed_by_set(&raw_allow, &mcp::mcp_tool_name("fs", "read_multiple_files")));
+    assert!(!tools::tool_allowed_by_set(&raw_allow, &mcp::mcp_tool_name("fs2", "read_file")));
 }

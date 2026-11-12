@@ -115,9 +115,6 @@ const INTERPRETERS: &[&str] = &[
     "sed",
     "gsed",
     "git",
-    "tar",
-    "gtar",
-    "bsdtar",
 ];
 const EXACT_ONLY: &[&str] = &[
     "rm",
@@ -142,6 +139,9 @@ const EXACT_ONLY: &[&str] = &[
     "unzip",
     "zip",
     "cpio",
+    "tar",
+    "gtar",
+    "bsdtar",
     "make",
     "gmake",
     "bmake",
@@ -149,6 +149,8 @@ const EXACT_ONLY: &[&str] = &[
     "npx",
     "pnpx",
     "bunx",
+    "uvx",
+    "pipx",
     "curl",
     "wget",
     "scp",
@@ -204,26 +206,105 @@ const INSTALL_SUBCOMMANDS: &[&str] = &[
     "dlx",
 ];
 
+fn is_multi_action_subcommand(cmd_name: &str, sub: &str) -> bool {
+    matches!((cmd_name, sub), ("git", "remote" | "stash" | "worktree" | "submodule") | ("npm" | "pnpm" | "yarn", "pkg" | "config") | ("uv", "tool" | "pip") | ("pip" | "pip3", "config"))
+}
+
+fn is_exact_only_invocation(cmd_name: &str, second: &str, third: &str) -> bool {
+    EXACT_ONLY.contains(&cmd_name)
+        || (PACKAGE_MANAGERS.contains(&cmd_name) && INSTALL_SUBCOMMANDS.contains(&second))
+        || (cmd_name == "uv" && matches!(second, "pip" | "tool") && (INSTALL_SUBCOMMANDS.contains(&third) || third == "run"))
+}
+
 fn risky_option_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r"(?i)^--?(?:o|output|out|outfile|out-file|outdir|out-dir|output-dir|exec|execdir|ok|okdir|delete|fprint|fprint0|fprintf|fls|exec-batch|ext-diff|upload-pack|receive-pack|exec-path|config-env|config|c|eval|eval-expression|e|print|p|command|shell|pager|editor|global|prefix|cwd|dir|target-dir|manifest-path|userconfig|globalconfig|registry|cache|script-shell|index-url|extra-index-url|find-links|trusted-host|git-dir|work-tree|namespace|super-prefix|repo|hard|force|init-file|rcfile|require|r|import|loader|experimental-loader|input-type|inspect|inspect-brk|prof|prof-process|cpu-prof|heap-prof|trace-event-file-pattern|diagnostic-dir|env-file|env-file-if-exists|pre|pre-glob|preprocessor|in-place|i|file|makefile|f|directory|checkpoint-action|to-command|use-compress-program|rmt-command|rsh-command|info-script|new-volume-script|absolute-names|extract|get|x|create|list|t|diff|compare|d|append|update|u|catenate|concatenate)(?:=|$)",
+            r"(?i)^(?:--(?:output|out|outfile|out-file|outdir|out-dir|output-dir|write|exec|execdir|ok|okdir|delete|delete-branch|fprint|fprint0|fprintf|fls|exec-batch|ext-diff|upload-pack|receive-pack|exec-path|config-env|config|eval|eval-expression|command|shell|script-shell|pager|editor|global|system|prefix|cwd|dir|directory|target-dir|manifest-path|userconfig|globalconfig|registry|cache|index-url|extra-index-url|find-links|trusted-host|git-dir|work-tree|namespace|super-prefix|repo|hard|force|force-with-lease|init-file|rcfile|require|import|loader|experimental-loader|input-type|inspect|inspect-brk|inspect-port|inspect-publish-uid|prof|prof-process|cpu-prof|heap-prof|trace-event-file-pattern|diagnostic-dir|env-file|env-file-if-exists|pre|pre-glob|preprocessor|hostname-bin|in-place|file|makefile|checkpoint-action|to-command|use-compress-program|rmt-command|rsh-command|info-script|new-volume-script|absolute-names|rootdir|confcutdir|basetemp|override-ini|allow-all|allow-run|allow-write|allow-net|allow-env|allow-ffi|allow-sys)|-(?:exec|execdir|toolexec|ok|okdir|delete|fprint|fprint0|fprintf|fls|outputdir|coverprofile|cpuprofile|memprofile|blockprofile|mutexprofile|trace|modfile|overlay))(?:=|$)",
         )
         .unwrap()
     })
 }
 
-fn has_risky_short_flag(token: &str) -> bool {
+fn is_compiler_cmd(cmd_name: &str) -> bool {
+    matches!(cmd_name, "gcc" | "cc" | "clang" | "g++" | "c++" | "clang++" | "rustc" | "ld")
+}
+
+fn short_cluster_has(flags: &str, needles: &[char]) -> bool {
+    flags.chars().take_while(|c| c.is_ascii_alphabetic()).any(|c| needles.contains(&c))
+}
+
+fn has_risky_short_flag(cmd_name: &str, second: &str, token: &str) -> bool {
     if !token.starts_with('-') || token.starts_with("--") || token.len() <= 1 {
         return false;
     }
     let head = token.split('=').next().unwrap_or(token);
-    head[1..].chars().any(|c| matches!(c, 'o' | 'O' | 'c' | 'C' | 'e' | 'E' | 'f' | 'F' | 'i' | 'I' | 'p' | 'P' | 'r' | 'R' | 'S' | 'u' | 'x' | 'X'))
+    let flags = &head[1..];
+
+    // Case-sensitive `-C` (directory change on git/cargo/npm/pnpm/go, but context lines on rg/grep and columns on ls).
+    if !matches!(cmd_name, "rg" | "ripgrep" | "grep" | "egrep" | "fgrep" | "ls") && !is_compiler_cmd(cmd_name) && token.starts_with("-C") {
+        return true;
+    }
+
+    // Case-sensitive `-o` (output file on compilers/go/git/sort/pytest, but --only-matching on grep/rg and format on ls/ps).
+    if !matches!(cmd_name, "grep" | "egrep" | "fgrep" | "rg" | "ripgrep" | "ls" | "ps")
+        && (token == "-o" || token.starts_with("-o=") || (is_compiler_cmd(cmd_name) && token.starts_with("-o")) || (cmd_name == "sort" && short_cluster_has(flags, &['o'])))
+    {
+        return true;
+    }
+
+    if is_compiler_cmd(cmd_name) {
+        return token.starts_with("-fplugin");
+    }
+    if cmd_name == "go" {
+        return false;
+    }
+    if cmd_name == "gofmt" || cmd_name == "prettier" {
+        return short_cluster_has(flags, &['w']);
+    }
+    if crate::risk::is_python_cmd(cmd_name) {
+        return short_cluster_has(flags, &['c', 'm', 'i']);
+    }
+    if matches!(cmd_name, "node" | "nodejs" | "bun") {
+        return matches!(head, "-e" | "-p" | "-r" | "-c") || token.starts_with("-e") || token.starts_with("-r");
+    }
+    if cmd_name == "deno" {
+        return short_cluster_has(flags, &['A', 'e']);
+    }
+    if matches!(cmd_name, "ruby" | "perl" | "php" | "lua" | "luajit" | "osascript" | "rscript" | "tclsh") {
+        return short_cluster_has(flags, &['e', 'r', 'i', 'I', 'M', 'c']);
+    }
+    if matches!(cmd_name, "sed" | "gsed") {
+        return short_cluster_has(flags, &['i', 'e', 'f']);
+    }
+    if matches!(cmd_name, "awk" | "gawk" | "mawk" | "nawk") {
+        return short_cluster_has(flags, &['f', 'e', 'i', 'l']);
+    }
+    if matches!(cmd_name, "pytest" | "py.test") {
+        return matches!(head, "-c" | "-o" | "-p") || token.starts_with("-p");
+    }
+    if cmd_name == "git" {
+        if head == "-c" || (token.starts_with("-c") && token.contains('=')) || head == "-f" || head == "-D" {
+            return true;
+        }
+        if matches!(second, "branch" | "tag" | "clean") && short_cluster_has(flags, &['d', 'D', 'f', 'm', 'M', 'x', 'X']) {
+            return true;
+        }
+        if matches!(second, "clone" | "fetch" | "pull" | "ls-remote") && token.starts_with("-u") {
+            return true;
+        }
+    }
+    if matches!(cmd_name, "npm" | "pnpm" | "yarn") && head == "-g" {
+        return true;
+    }
+    false
 }
 
-fn has_risky_extra_arg(cmd_name: &str, token: &str) -> bool {
-    if risky_option_re().is_match(token) || has_risky_short_flag(token) {
+fn has_risky_extra_arg(cmd_name: &str, second: &str, token: &str) -> bool {
+    if risky_option_re().is_match(token) || has_risky_short_flag(cmd_name, second, token) {
+        return true;
+    }
+    if is_compiler_cmd(cmd_name) && token.starts_with('@') {
         return true;
     }
     if matches!(cmd_name, "awk" | "gawk" | "mawk" | "nawk" | "make" | "gmake" | "bmake" | "nmake") && !token.starts_with('-') && token.contains('=') {
@@ -236,22 +317,47 @@ fn command_of(input: &Value) -> Option<&str> {
     input.get("command").and_then(Value::as_str)
 }
 
+fn has_non_ascii_whitespace(s: &str) -> bool {
+    s.chars().any(|c| c.is_whitespace() && !c.is_ascii_whitespace())
+}
+
 fn command_tokens(input: &Value) -> Option<Vec<String>> {
-    let trimmed = command_of(input)?.trim();
+    let raw = command_of(input)?;
+    if has_non_ascii_whitespace(raw) {
+        return None;
+    }
+    let trimmed = raw.trim();
     if trimmed.is_empty() || shell_meta_re().is_match(trimmed) || trimmed.contains('"') || trimmed.contains('\'') {
         return None;
     }
-    Some(trimmed.split_whitespace().map(str::to_string).collect())
+    Some(trimmed.split_ascii_whitespace().map(str::to_string).collect())
 }
 
-fn leaves_workspace(token: &str) -> bool {
-    let value = match token.find('=') {
-        Some(i) => &token[i + 1..],
-        None => token,
-    };
+fn value_leaves_workspace(value: &str) -> bool {
     static ABS: OnceLock<Regex> = OnceLock::new();
     static PARENT: OnceLock<Regex> = OnceLock::new();
     ABS.get_or_init(|| Regex::new(r"^(?:/|~|[A-Za-z]:[\\/]|\\\\)").unwrap()).is_match(value) || PARENT.get_or_init(|| Regex::new(r"(?:^|[\\/])\.\.(?:[\\/]|$)").unwrap()).is_match(value)
+}
+
+fn leaves_workspace(token: &str) -> bool {
+    if value_leaves_workspace(token) {
+        return true;
+    }
+    if let Some((_, rhs)) = token.split_once('=') {
+        return value_leaves_workspace(rhs);
+    }
+    if token.starts_with('-') && !token.starts_with("--") && token.len() > 2 {
+        let rest = &token[1..];
+        for (idx, ch) in rest.char_indices() {
+            if idx > 0 && value_leaves_workspace(&rest[idx..]) {
+                return true;
+            }
+            if !ch.is_ascii_alphanumeric() {
+                break;
+            }
+        }
+    }
+    false
 }
 
 fn command_name(token: &str) -> String {
@@ -275,10 +381,11 @@ pub fn bash_approval_prefix(input: &Value) -> Option<String> {
         return None;
     }
     let second = tokens.get(1).map(String::as_str).unwrap_or("");
-    if EXACT_ONLY.contains(&name.as_str()) || (PACKAGE_MANAGERS.contains(&name.as_str()) && INSTALL_SUBCOMMANDS.contains(&second)) {
+    let third = tokens.get(2).map(String::as_str).unwrap_or("");
+    if is_exact_only_invocation(&name, second, third) {
         return Some(tokens.join(" "));
     }
-    let take = if tokens.len() > 2 && LAUNCHER_SUBCOMMANDS.contains(&second) {
+    let take = if tokens.len() > 2 && (LAUNCHER_SUBCOMMANDS.contains(&second) || is_multi_action_subcommand(&name, second)) {
         if tokens[2].starts_with('-') {
             return None;
         }
@@ -299,11 +406,15 @@ pub fn can_auto_approve(mode: &str, _risk: RiskClass) -> bool {
 }
 
 pub fn bash_approval_exact(input: &Value) -> Option<String> {
-    let trimmed = command_of(input)?.trim();
+    let raw = command_of(input)?;
+    if has_non_ascii_whitespace(raw) {
+        return None;
+    }
+    let trimmed = raw.trim();
     if trimmed.is_empty() || shell_meta_re().is_match(trimmed) || trimmed.contains('"') || trimmed.contains('\'') {
         return None;
     }
-    Some(trimmed.split_whitespace().collect::<Vec<_>>().join(" "))
+    Some(trimmed.split_ascii_whitespace().collect::<Vec<_>>().join(" "))
 }
 
 pub fn is_approved_bash_exact(input: &Value, exact: &BTreeSet<String>) -> bool {
@@ -327,6 +438,9 @@ pub fn is_approved_bash_prefix(input: &Value, prefixes: &BTreeSet<String>) -> bo
         return false;
     }
     let second = tokens.get(1).map(String::as_str).unwrap_or("");
+    let third = tokens.get(2).map(String::as_str).unwrap_or("");
+    let exact_only = is_exact_only_invocation(&name, second, third);
+    let raw_risk = crate::risk::classify_bash_risk(raw);
     for prefix in prefixes {
         let wanted: Vec<&str> = prefix.split(' ').collect();
         if wanted.is_empty() || wanted.len() > tokens.len() || !wanted.iter().enumerate().all(|(i, t)| tokens[i] == *t) {
@@ -336,14 +450,16 @@ pub fn is_approved_bash_prefix(input: &Value, prefixes: &BTreeSet<String>) -> bo
             continue;
         }
         let extra = &tokens[wanted.len()..];
-        let exact_only = EXACT_ONLY.contains(&name.as_str()) || (PACKAGE_MANAGERS.contains(&name.as_str()) && INSTALL_SUBCOMMANDS.contains(&second));
         if exact_only && !extra.is_empty() {
             continue;
         }
-        if extra.iter().any(|t| leaves_workspace(t) || has_risky_extra_arg(&name, t)) {
+        if is_multi_action_subcommand(&name, second) && wanted.len() < 3 && !extra.is_empty() {
             continue;
         }
-        if !extra.is_empty() && crate::risk::classify_bash_risk(raw) >= RiskClass::High {
+        if extra.iter().any(|t| leaves_workspace(t) || has_risky_extra_arg(&name, second, t)) {
+            continue;
+        }
+        if !extra.is_empty() && (raw_risk >= RiskClass::High || raw_risk > crate::risk::classify_bash_risk(prefix)) {
             continue;
         }
         return true;

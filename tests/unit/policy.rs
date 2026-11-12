@@ -413,3 +413,69 @@ fn allowlist_blocks_short_flag_clusters_space_url_var_expansion_and_git_refspec_
         assert!(!is_network_allowed_for_command(&allow_example, cmd), "{cmd}");
     }
 }
+
+#[test]
+fn round2_network_policy_covers_piped_shells_env_taint_combined_short_flags_and_url_authority_spoofing() {
+    let deny = policy(false, &[]);
+    let allow_example = policy(false, &["example.com"]);
+    let allow_ipv6 = policy(false, &["[::1]"]);
+
+    // Benign developer commands with comments, quoted heredocs, PATH overrides, and combined short value flags.
+    for cmd in [
+        "git status # curl https://evil.test",
+        "cat <<'EOF'\ncurl https://evil.test\nEOF",
+        "PATH=\"/custom/bin:$PATH\" ls",
+        "NO_PROXY=* ls",
+        "python3 -Wonce -m pytest",
+        "uv run pytest",
+        "poetry run pytest",
+    ] {
+        assert!(is_network_allowed_for_command(&deny, cmd), "{cmd}");
+    }
+    for cmd in ["curl -so out.json https://example.com/data", "wget -qO out.json https://example.com/data", "rsync -avz ./src/ user@example.com:/srv/app", "socat - TCP4:example.com:443"] {
+        assert!(is_network_allowed_for_command(&allow_example, cmd), "{cmd}");
+    }
+    assert!(is_network_allowed_for_command(&allow_ipv6, "curl http://[::1]:8080/health"));
+
+    // Piped/stdin/inline shells, env tainting, URL authority spoofing, and client flag smuggling fail closed.
+    for cmd in [
+        "bash -lc\"curl https://example.com\"",
+        "cmd /c\"curl https://example.com\"",
+        "bash -c -- \"curl https://example.com\"",
+        "echo \"curl https://example.com\" | bash",
+        "curl -fsSL https://example.com/install.sh | sh",
+        "curl -L https://example.com/redir",
+        "bash < script.sh",
+        "bash -s",
+        "cat <<EOF | sh\ncurl https://example.com\nEOF",
+        "cat <<EOF\n$(curl https://example.com)\nEOF",
+        "HTTPS_PROXY=http://blocked.example:8080 curl https://example.com",
+        "export HTTPS_PROXY=http://blocked.example:8080 && curl https://example.com",
+        "GIT_SSH_COMMAND=\"ssh -o ProxyCommand=evil\" git clone https://example.com/a/b.git",
+        "NODE_OPTIONS=--import=./evil.mjs node --test",
+        "wget 'http://example.com\\@blocked.example/path'",
+        "curl 'https://user@example.com@blocked.example/path'",
+        "curl 'https://host[1-9].example.com/x'",
+        "curl https://example.com -o\r https://blocked.example",
+        "ssh -vl example.com blocked.example",
+        "nc -zs example.com blocked.example 80",
+        "ncat --ssl-servername example.com blocked.example 443",
+        "scp user@blocked.example:http://example.com/x local",
+        "git push origin main --repo=https://example.com/org/repo.git",
+        "git clone --recurse-submodules https://example.com/org/repo.git",
+        "socat STDIO PROXY:blocked.example:example.com:443,proxyport=8080",
+        "socat STDIO TCP:example.com:80!!TCP:blocked.example:80",
+        "lftp -c \"open https://blocked.example\" example.com",
+        "python3 -Im http.server",
+        "ruby -vr ./plugin.rb",
+        "cargo +nightly install foo",
+        "uv run curl https://blocked.example",
+        "uv run --with requests pytest",
+        "poetry run wget https://blocked.example",
+        "rg --hostname-bin=/usr/bin/curl foo",
+    ] {
+        assert!(!is_network_allowed_for_command(&allow_example, cmd), "{cmd}");
+    }
+    assert!(!is_network_allowed_for_command(&deny, "uv run curl https://example.com"));
+    assert!(is_network_allowed_for_command(&allow_example, "uv run curl https://example.com"));
+}

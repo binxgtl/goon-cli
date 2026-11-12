@@ -51,21 +51,82 @@ fn secret_names() -> &'static Mutex<HashSet<String>> {
 
 /// Environment variables holding goon's own credentials are removed from every child process.
 pub fn protect_secret_env(name: &str) {
-    if !name.is_empty() {
-        secret_names().lock().unwrap().insert(name.to_string());
+    let trimmed = name.trim();
+    if !trimmed.is_empty() {
+        secret_names().lock().unwrap_or_else(|e| e.into_inner()).insert(trimmed.to_ascii_uppercase());
     }
 }
 
-/// The current environment minus provider credentials (`childEnv`).
-pub fn child_env(base: Option<&BTreeMap<String, String>>) -> BTreeMap<String, String> {
-    let mut env: BTreeMap<String, String> = match base {
-        Some(base) => base.clone(),
-        None => std::env::vars_os().filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?))).collect(),
-    };
-    for name in secret_names().lock().unwrap().iter() {
-        env.remove(name);
+fn is_registered_secret_env(name: &str) -> bool {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return false;
     }
-    env
+    let upper = trimmed.to_ascii_uppercase();
+    secret_names().lock().unwrap_or_else(|e| e.into_inner()).contains(&upper)
+}
+
+const SECRET_ENV_SUFFIXES: &[&str] = &[
+    "API_KEY",
+    "APIKEY",
+    "TOKEN",
+    "SECRET",
+    "PASSWORD",
+    "PASSWD",
+    "PASSPHRASE",
+    "SECRET_KEY",
+    "ACCESS_KEY",
+    "ACCESS_KEY_ID",
+    "PRIVATE_KEY",
+    "CLIENT_SECRET",
+    "AUTH_TOKEN",
+    "BEARER_TOKEN",
+    "PGPASSWORD",
+    "MYSQL_PWD",
+];
+
+/// Case-insensitively identifies provider/cloud/database credential environment variable names.
+pub fn is_secret_env_name(name: &str) -> bool {
+    if is_registered_secret_env(name) {
+        return true;
+    }
+    let upper = name.trim().to_ascii_uppercase();
+    if upper.is_empty() {
+        return false;
+    }
+    if matches!(upper.as_str(), "PGPASSWORD" | "MYSQL_PWD" | "AWS_SECRET_ACCESS_KEY" | "AWS_ACCESS_KEY_ID") {
+        return true;
+    }
+    SECRET_ENV_SUFFIXES.iter().any(|suffix| upper == *suffix || (upper.len() > suffix.len() && upper.ends_with(suffix) && upper.as_bytes()[upper.len() - suffix.len() - 1] == b'_'))
+}
+
+/// Removes all credential-bearing environment variables in place.
+pub fn strip_secret_env_vars(env: &mut BTreeMap<String, String>) {
+    env.retain(|k, _| !is_secret_env_name(k));
+}
+
+/// The current environment minus provider and ambient credentials (`childEnv`).
+pub fn child_env(base: Option<&BTreeMap<String, String>>) -> BTreeMap<String, String> {
+    match base {
+        None => {
+            let mut env: BTreeMap<String, String> = std::env::vars_os().filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?))).collect();
+            strip_secret_env_vars(&mut env);
+            env
+        }
+        Some(base) => {
+            let mut env = base.clone();
+            env.retain(|k, _| {
+                if is_registered_secret_env(k) {
+                    return false;
+                }
+                if k.trim().to_ascii_uppercase().starts_with("GOON_WF_") {
+                    return true;
+                }
+                !is_secret_env_name(k)
+            });
+            env
+        }
+    }
 }
 
 /// `bash` on Windows resolves to Git Bash when it is installed.
@@ -175,23 +236,40 @@ fn trim_utf8_start(bytes: &[u8]) -> &[u8] {
     &bytes[start..]
 }
 
+#[inline]
+pub fn valid_posix_pid(pid: u32) -> bool {
+    (1..=i32::MAX as u32).contains(&pid)
+}
+
+#[inline]
+pub fn valid_posix_pgid(pgid: u32) -> bool {
+    (2..=i32::MAX as u32).contains(&pgid)
+}
+
 #[cfg(unix)]
 fn kill_group(pid: u32, signal: i32) {
+    if !valid_posix_pid(pid) || pid == std::process::id() {
+        return;
+    }
     unsafe {
-        if libc::kill(-(pid as i32), signal) != 0 {
-            libc::kill(pid as i32, signal);
+        let group_killed = valid_posix_pgid(pid) && libc::kill(-(pid as i32), signal) == 0;
+        if !group_killed {
+            let _ = libc::kill(pid as i32, signal);
         }
     }
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn for_each_session_proc(sid: u32, mut f: impl FnMut(u32, u32)) {
+    if !valid_posix_pgid(sid) {
+        return;
+    }
     let self_pid = std::process::id();
     let Ok(entries) = std::fs::read_dir("/proc") else { return };
     for entry in entries.flatten() {
         let Ok(name) = entry.file_name().into_string() else { continue };
         let Ok(entry_pid) = name.parse::<u32>() else { continue };
-        if entry_pid == 0 || entry_pid == self_pid {
+        if !valid_posix_pid(entry_pid) || entry_pid == self_pid {
             continue;
         }
         let Ok(stat) = std::fs::read_to_string(format!("/proc/{entry_pid}/stat")) else { continue };
@@ -212,16 +290,24 @@ fn for_each_session_proc(sid: u32, mut f: impl FnMut(u32, u32)) {
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn kill_session_procs(sid: u32, signal: i32) {
+    if !valid_posix_pgid(sid) {
+        return;
+    }
     for_each_session_proc(sid, |entry_pid, pgrp| unsafe {
-        if pgrp != sid && pgrp > 1 {
+        if pgrp != sid && valid_posix_pgid(pgrp) {
             let _ = libc::kill(-(pgrp as i32), signal);
         }
-        let _ = libc::kill(entry_pid as i32, signal);
+        if valid_posix_pid(entry_pid) {
+            let _ = libc::kill(entry_pid as i32, signal);
+        }
     });
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn group_or_session_alive(sid: u32) -> bool {
+    if !valid_posix_pgid(sid) {
+        return false;
+    }
     let mut alive = false;
     for_each_session_proc(sid, |_, _| {
         alive = true;
@@ -234,7 +320,15 @@ fn kill_session_procs(_sid: u32, _signal: i32) {}
 
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
 fn group_or_session_alive(pid: u32) -> bool {
-    unsafe { libc::kill(-(pid as i32), 0) == 0 }
+    if !valid_posix_pgid(pid) {
+        return false;
+    }
+    unsafe {
+        if libc::kill(-(pid as i32), 0) == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
 }
 
 #[cfg(windows)]
@@ -351,7 +445,7 @@ pub async fn run_command(command: &str, args: &[String], options: RunOptions<'_>
         rx.close();
         #[cfg(unix)]
         {
-            if pid > 0 {
+            if valid_posix_pid(pid) {
                 kill_group(pid, libc::SIGTERM);
                 kill_session_procs(pid, libc::SIGTERM);
                 let waited = tokio::time::timeout(Duration::from_millis(500), child.wait()).await;
@@ -411,6 +505,9 @@ pub async fn run_command(command: &str, args: &[String], options: RunOptions<'_>
 
 /// True when a process with this PID is alive. Unreaped zombies cannot execute or own locks.
 pub fn process_alive(pid: u32) -> bool {
+    if !valid_posix_pid(pid) {
+        return false;
+    }
     #[cfg(any(target_os = "linux", target_os = "android"))]
     if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
         if stat.rsplit_once(") ").is_some_and(|(_, fields)| matches!(fields.as_bytes().first(), Some(b'Z' | b'X'))) {
@@ -453,6 +550,9 @@ pub fn process_alive(pid: u32) -> bool {
 }
 
 fn process_start_time(pid: u32) -> Option<(std::time::SystemTime, Duration)> {
+    if !valid_posix_pid(pid) {
+        return None;
+    }
     #[cfg(windows)]
     {
         use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};

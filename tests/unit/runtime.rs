@@ -370,3 +370,42 @@ async fn transient_500s_are_retried_three_times_and_empty_sessions_are_ignored_o
     std::fs::write(f.config.join("goon").join("config.json"), json!({ "model": "gpt-5.4", "runTokenBudget": 120000 }).to_string()).unwrap();
     assert_eq!(config::load_config(&Map::new()).unwrap().run_token_budget, 0, "legacy 120000 runTokenBudget migrates to 0 (unlimited)");
 }
+
+#[test]
+fn child_env_strips_ambient_secrets_preserves_workflow_vars_and_guards_posix_pid_bounds() {
+    for secret in ["OPENAI_API_KEY", "anthropic_api_key", "GITHUB_TOKEN", "AWS_SECRET_ACCESS_KEY", "AWS_ACCESS_KEY_ID", "PGPASSWORD", "MYSQL_PWD", "STRIPE_CLIENT_SECRET", "SLACK_AUTH_TOKEN"] {
+        assert!(process::is_secret_env_name(secret), "{secret} must be recognized as secret");
+    }
+    for benign in ["PATH", "HOME", "PWD", "OLDPWD", "SSH_AUTH_SOCK", "DATABASE_URL", "TERM", "LANG"] {
+        assert!(!process::is_secret_env_name(benign), "{benign} must not be stripped as secret");
+    }
+
+    process::protect_secret_env("custom_gateway_cred");
+    assert!(process::is_secret_env_name("CUSTOM_GATEWAY_CRED"));
+
+    let mut wf_base = std::collections::BTreeMap::new();
+    wf_base.insert("PATH".into(), "/usr/bin".into());
+    wf_base.insert("PWD".into(), "/workspace".into());
+    wf_base.insert("GOON_WF_VAR_TOKEN".into(), "step-input-value".into());
+    wf_base.insert("OPENAI_API_KEY".into(), "sk-should-strip".into());
+    wf_base.insert("GOON_API_KEY".into(), "sk-goon-strip".into());
+    let cleaned = process::child_env(Some(&wf_base));
+    assert_eq!(cleaned.get("PATH").map(String::as_str), Some("/usr/bin"));
+    assert_eq!(cleaned.get("PWD").map(String::as_str), Some("/workspace"));
+    assert_eq!(cleaned.get("GOON_WF_VAR_TOKEN").map(String::as_str), Some("step-input-value"));
+    assert!(!cleaned.contains_key("OPENAI_API_KEY"));
+    assert!(!cleaned.contains_key("GOON_API_KEY"));
+
+    // BUG-02: out-of-range and zero/init PIDs/PGIDs never wrap i32 or signal init/self group.
+    assert!(!process::valid_posix_pid(0));
+    assert!(process::valid_posix_pid(1));
+    assert!(!process::valid_posix_pid(0x8000_0000));
+    assert!(!process::valid_posix_pid(u32::MAX));
+    assert!(!process::valid_posix_pgid(0));
+    assert!(!process::valid_posix_pgid(1));
+    assert!(process::valid_posix_pgid(2));
+    assert!(!process::valid_posix_pgid(0x8000_0000));
+    assert!(!process::process_alive(0));
+    assert!(!process::process_alive(0x8000_0000));
+    assert!(!process::process_alive(u32::MAX));
+}

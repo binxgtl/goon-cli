@@ -94,22 +94,28 @@ const GENERIC_RUNNERS: &[&str] = &[
 ];
 const MULTICALL_BINARIES: &[&str] = &["busybox", "toybox"];
 
-fn has_inline_code_flag(cmd: &str, rest: &[String]) -> bool {
+pub(crate) fn has_inline_code_flag(cmd: &str, rest: &[String]) -> bool {
     let args: Vec<&String> = rest.iter().take_while(|t| *t != "--").collect();
+    let has_short =
+        |chars: &[char]| args.iter().any(|t| t.starts_with('-') && !t.starts_with("--") && t.len() > 1 && t[1..].chars().take_while(|c| c.is_ascii_alphabetic()).any(|c| chars.contains(&c)));
     match cmd {
-        "perl" => args.iter().any(|t| {
-            t.as_str() == "-e"
-                || t.as_str() == "-E"
-                || (t.starts_with('-') && !t.starts_with("--") && (t.starts_with("-e") || t.starts_with("-E") || t[1..].chars().take_while(|c| c.is_ascii_alphabetic()).any(|c| c == 'e' || c == 'E')))
+        "perl" => has_short(&['e', 'E', 'M', 'm']),
+        "ruby" => has_short(&['e', 'r']),
+        "php" => args.iter().any(|t| {
+            matches!(t.as_str(), "-r" | "-B" | "-R" | "-F" | "-E" | "-S" | "--server" | "-a" | "-d") || (!t.starts_with("--") && (t.starts_with("-r") || t.starts_with("-S") || t.starts_with("-d")))
         }),
-        "ruby" => {
-            args.iter().any(|t| t.as_str() == "-e" || (t.starts_with('-') && !t.starts_with("--") && (t.starts_with("-e") || t[1..].chars().take_while(|c| c.is_ascii_alphabetic()).any(|c| c == 'e'))))
-        }
-        "php" => args.iter().any(|t| t.as_str() == "-r" || (!t.starts_with("--") && t.starts_with("-r"))),
-        "lua" | "luajit" | "osascript" | "rscript" => args.iter().any(|t| t.as_str() == "-e" || (!t.starts_with("--") && t.starts_with("-e"))),
+        "lua" | "luajit" => has_short(&['e', 'l']),
+        "osascript" | "rscript" => args.iter().any(|t| t.as_str() == "-e" || (!t.starts_with("--") && t.starts_with("-e"))),
         "tclsh" => args.iter().any(|t| t.as_str() == "-c" || (!t.starts_with("--") && t.starts_with("-c"))),
-        "deno" => args.iter().any(|t| t.as_str() == "eval"),
-        "bun" => args.iter().any(|t| t.as_str() == "-e" || t.as_str() == "--eval" || t.starts_with("--eval=") || (!t.starts_with("--") && t.starts_with("-e"))),
+        "deno" => args.iter().any(|t| matches!(t.as_str(), "eval" | "install" | "add" | "publish" | "upgrade" | "compile" | "serve" | "jupyter")),
+        "bun" => args.iter().any(|t| {
+            matches!(t.as_str(), "-e" | "--eval" | "-r" | "--preload" | "--inspect" | "--inspect-brk" | "--inspect-wait")
+                || t.starts_with("--eval=")
+                || t.starts_with("--preload=")
+                || t.starts_with("--inspect=")
+                || t.starts_with("--inspect-")
+                || (!t.starts_with("--") && (t.starts_with("-e") || t.starts_with("-r")))
+        }),
         _ => false,
     }
 }
@@ -242,8 +248,9 @@ const SAFE_READ_COMMANDS: &[&str] = &[
     "set",
 ];
 pub const SAFE_SCRIPT_NAMES: &[&str] = &["test", "tests", "build", "lint", "typecheck", "check", "test:unit", "test:ci", "ci"];
-const PACKAGE_MANAGERS: &[&str] =
-    &["npm", "pnpm", "yarn", "bun", "pip", "pip3", "uv", "poetry", "cargo", "go", "gem", "composer", "apt", "apt-get", "pkg", "brew", "dnf", "pacman", "apk", "yum", "npx", "pnpx", "bunx"];
+const PACKAGE_MANAGERS: &[&str] = &[
+    "npm", "pnpm", "yarn", "bun", "pip", "pip3", "uv", "poetry", "cargo", "go", "gem", "composer", "apt", "apt-get", "pkg", "brew", "dnf", "pacman", "apk", "yum", "npx", "pnpx", "bunx", "uvx", "pipx",
+];
 const INSTALL_SUBCOMMANDS: &[&str] = &[
     "install",
     "i",
@@ -268,10 +275,14 @@ const INSTALL_SUBCOMMANDS: &[&str] = &[
     "exec",
     "x",
     "dlx",
+    "search",
+    "login",
+    "owner",
+    "yank",
 ];
 const SAFE_GIT_SUBCOMMANDS: &[&str] =
     &["status", "diff", "log", "show", "blame", "shortlog", "describe", "rev-parse", "ls-files", "ls-tree", "grep", "whatchanged", "reflog", "cat-file", "hash-object", "version", "help"];
-const NETWORK_GIT_SUBCOMMANDS: &[&str] = &["push", "pull", "fetch", "clone", "ls-remote", "submodule", "request-pull", "archive"];
+const NETWORK_GIT_SUBCOMMANDS: &[&str] = &["push", "pull", "fetch", "clone", "ls-remote", "submodule", "request-pull", "archive", "lfs", "send-email", "imap-send", "svn", "p4"];
 const WRITE_GIT_SUBCOMMANDS: &[&str] = &[
     "add",
     "commit",
@@ -341,7 +352,7 @@ pub struct ShellScan {
 }
 
 fn is_word_boundary(ch: Option<char>) -> bool {
-    matches!(ch, None | Some(' ') | Some('\t') | Some('\n') | Some('\r') | Some(';') | Some('&') | Some('|'))
+    matches!(ch, None | Some(' ') | Some('\t') | Some('\n') | Some(';') | Some('&') | Some('|'))
 }
 
 const MAX_SCAN_DEPTH: usize = 32;
@@ -378,6 +389,7 @@ fn scan_dollar_brace(chars: &[char], mut i: usize, current: &mut String, in_doub
     let mut sq = false;
     let mut ansi_sq = false;
     let mut dq = false;
+    let mut in_double_unmatched_sq = false;
     while i < chars.len() {
         let ch = chars[i];
         if ansi_sq {
@@ -397,27 +409,6 @@ fn scan_dollar_brace(chars: &[char], mut i: usize, current: &mut String, in_doub
                 sq = false;
                 i += 1;
                 continue;
-            }
-            if in_double {
-                if ch == '\\' {
-                    i = consume_backslash(chars, i, current);
-                    continue;
-                }
-                if ch == '`' {
-                    *critical_escape = true;
-                } else if ch == '$' {
-                    if chars.get(i + 1) == Some(&'{') {
-                        i = scan_dollar_brace(chars, i, current, true, critical_escape, depth + 1);
-                        continue;
-                    }
-                    if chars.get(i + 1) == Some(&'(') && chars.get(i + 2) == Some(&'(') {
-                        i = scan_arith(chars, i, current, critical_escape, depth + 1);
-                        continue;
-                    }
-                    if chars.get(i + 1) == Some(&'(') {
-                        *critical_escape = true;
-                    }
-                }
             }
             current.push(ch);
             i += 1;
@@ -442,7 +433,7 @@ fn scan_dollar_brace(chars: &[char], mut i: usize, current: &mut String, in_doub
                     continue;
                 }
                 if chars.get(i + 1) == Some(&'(') && chars.get(i + 2) == Some(&'(') {
-                    i = scan_arith(chars, i, current, critical_escape, depth + 1);
+                    i = scan_arith(chars, i, current, true, critical_escape, depth + 1);
                     continue;
                 }
                 if chars.get(i + 1) == Some(&'(') {
@@ -454,6 +445,9 @@ fn scan_dollar_brace(chars: &[char], mut i: usize, current: &mut String, in_doub
             continue;
         }
         if ch == '}' {
+            if in_double && in_double_unmatched_sq {
+                *critical_escape = true;
+            }
             current.push(ch);
             return i + 1;
         }
@@ -470,12 +464,19 @@ fn scan_dollar_brace(chars: &[char], mut i: usize, current: &mut String, in_doub
             *critical_escape = true;
         }
         if ch == '\'' {
-            sq = true;
+            if in_double {
+                in_double_unmatched_sq = !in_double_unmatched_sq;
+            } else {
+                sq = true;
+            }
             current.push(ch);
             i += 1;
             continue;
         }
         if ch == '"' {
+            if in_double && in_double_unmatched_sq {
+                *critical_escape = true;
+            }
             dq = true;
             current.push(ch);
             i += 1;
@@ -501,7 +502,7 @@ fn scan_dollar_brace(chars: &[char], mut i: usize, current: &mut String, in_doub
                 continue;
             }
             if chars.get(i + 1) == Some(&'(') && chars.get(i + 2) == Some(&'(') {
-                i = scan_arith(chars, i, current, critical_escape, depth + 1);
+                i = scan_arith(chars, i, current, in_double, critical_escape, depth + 1);
                 continue;
             }
             if chars.get(i + 1) == Some(&'(') {
@@ -511,10 +512,13 @@ fn scan_dollar_brace(chars: &[char], mut i: usize, current: &mut String, in_doub
         current.push(ch);
         i += 1;
     }
+    if in_double_unmatched_sq {
+        *critical_escape = true;
+    }
     i
 }
 
-fn scan_arith(chars: &[char], mut i: usize, current: &mut String, critical_escape: &mut bool, depth: usize) -> usize {
+fn scan_arith(chars: &[char], mut i: usize, current: &mut String, in_double: bool, critical_escape: &mut bool, depth: usize) -> usize {
     if depth > MAX_SCAN_DEPTH {
         *critical_escape = true;
         current.push(chars[i]);
@@ -528,6 +532,7 @@ fn scan_arith(chars: &[char], mut i: usize, current: &mut String, critical_escap
     let mut sq = false;
     let mut ansi_sq = false;
     let mut dq = false;
+    let mut in_double_unmatched_sq = false;
     while i < chars.len() {
         let ch = chars[i];
         if ansi_sq {
@@ -568,7 +573,7 @@ fn scan_arith(chars: &[char], mut i: usize, current: &mut String, critical_escap
                     continue;
                 }
                 if chars.get(i + 1) == Some(&'(') && chars.get(i + 2) == Some(&'(') {
-                    i = scan_arith(chars, i, current, critical_escape, depth + 1);
+                    i = scan_arith(chars, i, current, true, critical_escape, depth + 1);
                     continue;
                 }
                 if chars.get(i + 1) == Some(&'(') {
@@ -580,12 +585,19 @@ fn scan_arith(chars: &[char], mut i: usize, current: &mut String, critical_escap
             continue;
         }
         if ch == '\'' {
-            sq = true;
+            if in_double {
+                in_double_unmatched_sq = !in_double_unmatched_sq;
+            } else {
+                sq = true;
+            }
             current.push(ch);
             i += 1;
             continue;
         }
         if ch == '"' {
+            if in_double {
+                *critical_escape = true;
+            }
             dq = true;
             current.push(ch);
             i += 1;
@@ -598,7 +610,7 @@ fn scan_arith(chars: &[char], mut i: usize, current: &mut String, critical_escap
             continue;
         }
         if ch == '$' {
-            if chars.get(i + 1) == Some(&'\'') {
+            if !in_double && chars.get(i + 1) == Some(&'\'') {
                 ansi_sq = true;
                 current.push('$');
                 current.push('\'');
@@ -606,6 +618,9 @@ fn scan_arith(chars: &[char], mut i: usize, current: &mut String, critical_escap
                 continue;
             }
             if chars.get(i + 1) == Some(&'"') {
+                if in_double {
+                    *critical_escape = true;
+                }
                 dq = true;
                 current.push('$');
                 current.push('"');
@@ -613,11 +628,11 @@ fn scan_arith(chars: &[char], mut i: usize, current: &mut String, critical_escap
                 continue;
             }
             if chars.get(i + 1) == Some(&'{') {
-                i = scan_dollar_brace(chars, i, current, false, critical_escape, depth + 1);
+                i = scan_dollar_brace(chars, i, current, in_double, critical_escape, depth + 1);
                 continue;
             }
             if chars.get(i + 1) == Some(&'(') && chars.get(i + 2) == Some(&'(') {
-                i = scan_arith(chars, i, current, critical_escape, depth + 1);
+                i = scan_arith(chars, i, current, in_double, critical_escape, depth + 1);
                 continue;
             }
             if chars.get(i + 1) == Some(&'(') {
@@ -633,6 +648,9 @@ fn scan_arith(chars: &[char], mut i: usize, current: &mut String, critical_escap
         if ch == ')' {
             inner_depth -= 1;
             if inner_depth == 0 {
+                if in_double && in_double_unmatched_sq {
+                    *critical_escape = true;
+                }
                 if chars.get(i + 1) == Some(&')') {
                     current.push(')');
                     current.push(')');
@@ -649,6 +667,220 @@ fn scan_arith(chars: &[char], mut i: usize, current: &mut String, critical_escap
         current.push(ch);
         i += 1;
     }
+    *critical_escape = true;
+    i
+}
+
+struct PendingHeredoc {
+    delimiter: String,
+    quoted: bool,
+    strip_tabs: bool,
+}
+
+fn parse_heredoc_delimiter(chars: &[char], mut i: usize, current: &mut String) -> (Option<PendingHeredoc>, usize) {
+    let strip_tabs = chars.get(i) == Some(&'-');
+    if strip_tabs {
+        current.push('-');
+        i += 1;
+    }
+    while i < chars.len() {
+        if chars[i] == ' ' || chars[i] == '\t' {
+            current.push(chars[i]);
+            i += 1;
+        } else if chars[i] == '\\' && chars.get(i + 1) == Some(&'\n') {
+            i += 2;
+        } else {
+            break;
+        }
+    }
+    let mut delim = String::new();
+    let mut quoted = false;
+    let mut has_delim = false;
+    let (mut sq, mut dq, mut ansi) = (false, false, false);
+    while i < chars.len() {
+        let ch = chars[i];
+        if ansi {
+            current.push(ch);
+            if ch == '\'' {
+                ansi = false;
+                i += 1;
+                continue;
+            }
+            if ch == '\\' {
+                let (decoded, consumed) = decode_ansi_escape(chars, i + 1);
+                for k in 0..consumed {
+                    current.push(chars[i + 1 + k]);
+                }
+                if let Some(c) = decoded {
+                    delim.push(c);
+                }
+                i += 1 + consumed;
+                continue;
+            }
+            delim.push(ch);
+            i += 1;
+            continue;
+        }
+        if sq {
+            current.push(ch);
+            if ch == '\'' {
+                sq = false;
+            } else {
+                delim.push(ch);
+            }
+            i += 1;
+            continue;
+        }
+        if dq {
+            current.push(ch);
+            if ch == '"' {
+                dq = false;
+            } else if ch == '\\' && chars.get(i + 1) == Some(&'\n') {
+                i += 2;
+                continue;
+            } else if ch == '\\' && matches!(chars.get(i + 1), Some('$' | '`' | '"' | '\\')) {
+                i += 1;
+                current.push(chars[i]);
+                delim.push(chars[i]);
+            } else {
+                delim.push(ch);
+            }
+            i += 1;
+            continue;
+        }
+        if matches!(ch, ' ' | '\t' | '\n' | ';' | '&' | '|' | '(' | ')' | '<' | '>') || (ch == '\r' && chars.get(i + 1) == Some(&'\n')) {
+            break;
+        }
+        if ch == '\\' {
+            if chars.get(i + 1) == Some(&'\n') {
+                i += 2;
+                continue;
+            }
+            quoted = true;
+            has_delim = true;
+            current.push('\\');
+            if i + 1 < chars.len() {
+                i += 1;
+                current.push(chars[i]);
+                delim.push(chars[i]);
+            }
+            i += 1;
+            continue;
+        }
+        if ch == '$' && chars.get(i + 1) == Some(&'\'') {
+            quoted = true;
+            has_delim = true;
+            ansi = true;
+            current.push('$');
+            current.push('\'');
+            i += 2;
+            continue;
+        }
+        if ch == '$' && chars.get(i + 1) == Some(&'"') {
+            quoted = true;
+            has_delim = true;
+            dq = true;
+            current.push('$');
+            current.push('"');
+            i += 2;
+            continue;
+        }
+        if ch == '\'' {
+            quoted = true;
+            has_delim = true;
+            sq = true;
+            current.push(ch);
+            i += 1;
+            continue;
+        }
+        if ch == '"' {
+            quoted = true;
+            has_delim = true;
+            dq = true;
+            current.push(ch);
+            i += 1;
+            continue;
+        }
+        has_delim = true;
+        current.push(ch);
+        delim.push(ch);
+        i += 1;
+    }
+    let doc = has_delim.then_some(PendingHeredoc { delimiter: delim, quoted, strip_tabs });
+    (doc, i)
+}
+
+fn consume_heredoc_body(chars: &[char], mut i: usize, doc: &PendingHeredoc, critical_escape: &mut bool) -> usize {
+    while i < chars.len() {
+        let mut line_end = i;
+        let mut folded = String::new();
+        let mut had_continuation = false;
+        if doc.quoted {
+            while line_end < chars.len() && chars[line_end] != '\n' {
+                folded.push(chars[line_end]);
+                line_end += 1;
+            }
+        } else {
+            while line_end < chars.len() && chars[line_end] != '\n' {
+                if chars[line_end] == '\\' && chars.get(line_end + 1) == Some(&'\n') {
+                    let mut bs = 0usize;
+                    let mut p = line_end;
+                    while p > i && chars[p - 1] == '\\' {
+                        bs += 1;
+                        p -= 1;
+                    }
+                    if bs.is_multiple_of(2) {
+                        had_continuation = true;
+                        line_end += 2;
+                        continue;
+                    }
+                }
+                folded.push(chars[line_end]);
+                line_end += 1;
+            }
+        }
+        let folded_no_cr = folded.strip_suffix('\r').unwrap_or(folded.as_str());
+        let check = if doc.strip_tabs { folded_no_cr.trim_start_matches('\t') } else { folded_no_cr };
+        if check == doc.delimiter {
+            if had_continuation {
+                // `EO\<newline>F` closes `<<EOF` in bash but not in dash (`/bin/sh`).
+                *critical_escape = true;
+            }
+            return if line_end < chars.len() { line_end + 1 } else { line_end };
+        }
+        if !doc.quoted {
+            let body_chars: Vec<char> = folded.chars().collect();
+            let mut k = 0;
+            let mut sink = String::new();
+            while k < body_chars.len() {
+                let bc = body_chars[k];
+                if bc == '\\' {
+                    k += if k + 1 < body_chars.len() { 2 } else { 1 };
+                    continue;
+                }
+                if bc == '`' {
+                    *critical_escape = true;
+                    k += 1;
+                    continue;
+                }
+                if bc == '$' {
+                    if body_chars.get(k + 1) == Some(&'{') {
+                        k = scan_dollar_brace(&body_chars, k, &mut sink, true, critical_escape, 0);
+                        continue;
+                    }
+                    if body_chars.get(k + 1) == Some(&'(') && body_chars.get(k + 2) == Some(&'(') {
+                        k = scan_arith(&body_chars, k, &mut sink, true, critical_escape, 0);
+                        continue;
+                    }
+                    if body_chars.get(k + 1) == Some(&'(') {
+                        *critical_escape = true;
+                    }
+                }
+                k += 1;
+            }
+        }
+        i = if line_end < chars.len() { line_end + 1 } else { line_end };
+    }
     i
 }
 
@@ -664,8 +896,10 @@ pub fn scan_shell(command: &str) -> ShellScan {
     let mut double = false;
     let mut critical_escape = false;
     let mut redirection = false;
+    let mut at_word_start = true;
+    let mut pending_heredocs: Vec<PendingHeredoc> = vec![];
     let push = |current: &mut String, segments: &mut Vec<String>| {
-        let trimmed = current.trim();
+        let trimmed = current.trim_matches(|c| matches!(c, ' ' | '\t' | '\n'));
         if !trimmed.is_empty() {
             segments.push(trimmed.to_string());
         }
@@ -693,11 +927,19 @@ pub fn scan_shell(command: &str) -> ShellScan {
             i += 1;
             continue;
         }
-        if ch == '\\' {
+        if ch == '\\' && !double {
+            let is_line_cont = chars.get(i + 1) == Some(&'\n') || (chars.get(i + 1) == Some(&'\r') && chars.get(i + 2) == Some(&'\n'));
             i = consume_backslash(&chars, i, &mut current);
+            if !is_line_cont {
+                at_word_start = false;
+            }
             continue;
         }
         if double {
+            if ch == '\\' {
+                i = consume_backslash(&chars, i, &mut current);
+                continue;
+            }
             if ch == '"' {
                 current.push(ch);
                 double = false;
@@ -716,7 +958,7 @@ pub fn scan_shell(command: &str) -> ShellScan {
                     continue;
                 }
                 if chars.get(i + 1) == Some(&'(') && chars.get(i + 2) == Some(&'(') {
-                    i = scan_arith(&chars, i, &mut current, &mut critical_escape, 0);
+                    i = scan_arith(&chars, i, &mut current, true, &mut critical_escape, 0);
                     continue;
                 }
                 if chars.get(i + 1) == Some(&'(') {
@@ -727,8 +969,31 @@ pub fn scan_shell(command: &str) -> ShellScan {
             i += 1;
             continue;
         }
+        if ch == '#' && at_word_start {
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if ch == ' ' || ch == '\t' {
+            current.push(ch);
+            at_word_start = true;
+            i += 1;
+            continue;
+        }
+        if ch == '\r' {
+            if chars.get(i + 1) == Some(&'\n') {
+                i += 1;
+            } else {
+                current.push('\r');
+                at_word_start = false;
+                i += 1;
+            }
+            continue;
+        }
         if ch == '$' && chars.get(i + 1) == Some(&'\'') {
             ansi_c = true;
+            at_word_start = false;
             current.push('$');
             current.push('\'');
             i += 2;
@@ -736,6 +1001,7 @@ pub fn scan_shell(command: &str) -> ShellScan {
         }
         if ch == '$' && chars.get(i + 1) == Some(&'"') {
             double = true;
+            at_word_start = false;
             current.push('$');
             current.push('"');
             i += 2;
@@ -743,45 +1009,90 @@ pub fn scan_shell(command: &str) -> ShellScan {
         }
         if ch == '\'' {
             single = true;
+            at_word_start = false;
             current.push(ch);
             i += 1;
             continue;
         }
         if ch == '"' {
             double = true;
+            at_word_start = false;
             current.push(ch);
             i += 1;
             continue;
         }
         if ch == '`' {
             critical_escape = true;
+            at_word_start = false;
             current.push(ch);
             i += 1;
             continue;
         }
         if ch == '$' && chars.get(i + 1) == Some(&'(') && chars.get(i + 2) == Some(&'(') {
-            i = scan_arith(&chars, i, &mut current, &mut critical_escape, 0);
+            at_word_start = false;
+            i = scan_arith(&chars, i, &mut current, false, &mut critical_escape, 0);
             continue;
         }
         if ch == '$' && chars.get(i + 1) == Some(&'{') {
+            at_word_start = false;
             i = scan_dollar_brace(&chars, i, &mut current, false, &mut critical_escape, 0);
             continue;
         }
         if ch == '$' && chars.get(i + 1) == Some(&'(') {
             critical_escape = true;
+            at_word_start = false;
             current.push(ch);
             i += 1;
             continue;
         }
         if (ch == '<' || ch == '>') && chars.get(i + 1) == Some(&'(') {
             critical_escape = true;
+            at_word_start = false;
             current.push(ch);
             i += 1;
+            continue;
+        }
+        if ch == '<' && chars.get(i + 1) == Some(&'<') {
+            redirection = true;
+            if chars.get(i + 2) == Some(&'<') {
+                current.push_str("<<<");
+                at_word_start = true;
+                i += 3;
+                continue;
+            }
+            current.push_str("<<");
+            let (doc, next_i) = parse_heredoc_delimiter(&chars, i + 2, &mut current);
+            if let Some(d) = doc {
+                pending_heredocs.push(d);
+            }
+            at_word_start = true;
+            i = next_i;
+            continue;
+        }
+        if ch == '&' && chars.get(i + 1) == Some(&'>') {
+            redirection = true;
+            current.push('&');
+            current.push('>');
+            i += 2;
+            if chars.get(i) == Some(&'>') {
+                current.push('>');
+                i += 1;
+            }
+            at_word_start = true;
             continue;
         }
         if ch == '>' || ch == '<' {
             redirection = true;
             current.push(ch);
+            if let Some(&nxt) = chars.get(i + 1) {
+                if nxt == '&' || nxt == '>' || (ch == '>' && nxt == '|') {
+                    current.push(nxt);
+                    i += 2;
+                    at_word_start = true;
+                    continue;
+                }
+            }
+            at_word_start = true;
             i += 1;
             continue;
         }
@@ -791,26 +1102,43 @@ pub fn scan_shell(command: &str) -> ShellScan {
             let standalone = is_word_boundary(prev) && (is_word_boundary(next) || ch == '}');
             if standalone {
                 push(&mut current, &mut segments);
+                at_word_start = true;
                 i += 1;
                 continue;
             }
+            at_word_start = false;
             current.push(ch);
             i += 1;
             continue;
         }
-        if ch == ';' || ch == '\n' || ch == '\r' || ch == '(' || ch == ')' {
+        if ch == '\n' {
             push(&mut current, &mut segments);
+            at_word_start = true;
+            i += 1;
+            if !pending_heredocs.is_empty() {
+                let docs = std::mem::take(&mut pending_heredocs);
+                for doc in docs {
+                    i = consume_heredoc_body(&chars, i, &doc, &mut critical_escape);
+                }
+            }
+            continue;
+        }
+        if ch == ';' || ch == '(' || ch == ')' {
+            push(&mut current, &mut segments);
+            at_word_start = true;
             i += 1;
             continue;
         }
         if ch == '&' || ch == '|' {
             push(&mut current, &mut segments);
+            at_word_start = true;
             if chars.get(i + 1) == Some(&ch) {
                 i += 1;
             }
             i += 1;
             continue;
         }
+        at_word_start = false;
         current.push(ch);
         i += 1;
     }
@@ -881,12 +1209,93 @@ fn decode_ansi_escape(segment: &[char], after_backslash: usize) -> (Option<char>
     (Some(mapped), 1)
 }
 
-/// Quote-aware word split. Quotes are removed; backslash escapes are kept as literal chars.
-pub fn tokenize(segment: &str) -> Vec<String> {
+fn consume_redirection_word(chars: &[char], mut i: usize) -> usize {
+    while i < chars.len() {
+        if chars[i] == ' ' || chars[i] == '\t' {
+            i += 1;
+        } else if chars[i] == '\\' && chars.get(i + 1) == Some(&'\n') {
+            i += 2;
+        } else {
+            break;
+        }
+    }
+    let (mut sq, mut dq, mut ansi) = (false, false, false);
+    let mut brace_depth = 0usize;
+    while i < chars.len() {
+        let ch = chars[i];
+        if ansi {
+            if ch == '\\' && i + 1 < chars.len() {
+                i += 2;
+                continue;
+            }
+            if ch == '\'' {
+                ansi = false;
+            }
+            i += 1;
+            continue;
+        }
+        if sq {
+            if ch == '\'' {
+                sq = false;
+            }
+            i += 1;
+            continue;
+        }
+        if ch == '\\' {
+            i += if i + 1 < chars.len() { 2 } else { 1 };
+            continue;
+        }
+        if dq {
+            if ch == '"' {
+                dq = false;
+            }
+            i += 1;
+            continue;
+        }
+        if brace_depth == 0 && matches!(ch, ' ' | '\t' | '\n' | '<' | '>' | ';' | '&' | '|' | '(' | ')') {
+            break;
+        }
+        if ch == '$' && chars.get(i + 1) == Some(&'\'') {
+            ansi = true;
+            i += 2;
+            continue;
+        }
+        if ch == '$' && chars.get(i + 1) == Some(&'"') {
+            dq = true;
+            i += 2;
+            continue;
+        }
+        if ch == '$' && chars.get(i + 1) == Some(&'{') {
+            brace_depth += 1;
+            i += 2;
+            continue;
+        }
+        if ch == '}' && brace_depth > 0 {
+            brace_depth -= 1;
+            i += 1;
+            continue;
+        }
+        if ch == '\'' {
+            sq = true;
+            i += 1;
+            continue;
+        }
+        if ch == '"' {
+            dq = true;
+            i += 1;
+            continue;
+        }
+        i += 1;
+    }
+    i
+}
+
+fn tokenize_inner(segment: &str, keep_empty: bool, posix_ifs_only: bool, strip_redirs: bool) -> Vec<String> {
     let chars: Vec<char> = segment.chars().collect();
     let mut tokens = vec![];
     let mut current = String::new();
     let mut has_token = false;
+    let mut has_quoted_part = false;
     let mut single = false;
     let mut double = false;
     let mut ansi_c = false;
@@ -923,6 +1332,12 @@ pub fn tokenize(segment: &str) -> Vec<String> {
         if double {
             if ch == '"' {
                 double = false;
+            } else if ch == '\\' && chars.get(i + 1) == Some(&'\n') {
+                i += 2;
+                continue;
+            } else if ch == '\\' && chars.get(i + 1) == Some(&'\r') && chars.get(i + 2) == Some(&'\n') {
+                i += 3;
+                continue;
             } else if ch == '\\' && i + 1 < chars.len() {
                 i += 1;
                 current.push(chars[i]);
@@ -932,27 +1347,73 @@ pub fn tokenize(segment: &str) -> Vec<String> {
             i += 1;
             continue;
         }
+        if ch == '#' && !has_token && current.is_empty() {
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if ch == '\\' && chars.get(i + 1) == Some(&'\n') {
+            i += 2;
+            continue;
+        }
+        if ch == '\\' && chars.get(i + 1) == Some(&'\r') && chars.get(i + 2) == Some(&'\n') {
+            i += 3;
+            continue;
+        }
+        if strip_redirs && (ch == '<' || ch == '>' || (ch == '&' && chars.get(i + 1) == Some(&'>'))) {
+            if !has_quoted_part && !current.is_empty() && current.chars().all(|c| c.is_ascii_digit()) {
+                current.clear();
+                has_token = false;
+            } else if !current.is_empty() || (keep_empty && has_token) {
+                tokens.push(std::mem::take(&mut current));
+                has_token = false;
+                has_quoted_part = false;
+            }
+            if ch == '&' {
+                i += 2;
+                if chars.get(i) == Some(&'>') {
+                    i += 1;
+                }
+            } else if ch == '<' && chars.get(i + 1) == Some(&'<') {
+                i += 2;
+                if matches!(chars.get(i), Some('<' | '-')) {
+                    i += 1;
+                }
+            } else {
+                i += 1;
+                if matches!(chars.get(i), Some('>' | '&' | '|')) {
+                    i += 1;
+                }
+            }
+            i = consume_redirection_word(&chars, i);
+            continue;
+        }
         if ch == '$' && chars.get(i + 1) == Some(&'\'') {
             ansi_c = true;
             has_token = true;
+            has_quoted_part = true;
             i += 2;
             continue;
         }
         if ch == '$' && chars.get(i + 1) == Some(&'"') {
             double = true;
             has_token = true;
+            has_quoted_part = true;
             i += 2;
             continue;
         }
         if ch == '\'' {
             single = true;
             has_token = true;
+            has_quoted_part = true;
             i += 1;
             continue;
         }
         if ch == '"' {
             double = true;
             has_token = true;
+            has_quoted_part = true;
             i += 1;
             continue;
         }
@@ -960,14 +1421,17 @@ pub fn tokenize(segment: &str) -> Vec<String> {
             i += 1;
             current.push(chars[i]);
             has_token = true;
+            has_quoted_part = true;
             i += 1;
             continue;
         }
-        if ch.is_whitespace() {
-            if !current.is_empty() {
+        let is_ws = if posix_ifs_only { matches!(ch, ' ' | '\t' | '\n') } else { ch.is_whitespace() };
+        if is_ws {
+            if !current.is_empty() || (keep_empty && has_token) {
                 tokens.push(std::mem::take(&mut current));
             }
             has_token = false;
+            has_quoted_part = false;
             i += 1;
             continue;
         }
@@ -975,11 +1439,64 @@ pub fn tokenize(segment: &str) -> Vec<String> {
         has_token = true;
         i += 1;
     }
-    let _ = has_token;
-    if !current.is_empty() {
+    if !current.is_empty() || (keep_empty && has_token) {
         tokens.push(current);
     }
     tokens
+}
+
+/// Quote-aware word split. Quotes are removed; backslash escapes are kept as literal chars.
+pub fn tokenize(segment: &str) -> Vec<String> {
+    tokenize_inner(segment, false, false, false)
+}
+
+/// POSIX shell `IFS` (`' \t\n'`) word split that preserves empty quoted words (`""` / `''`) and
+/// strips unquoted I/O redirections (`>/dev/null rm -rf /`, `2>&1`).
+pub(crate) fn tokenize_argv(segment: &str) -> Vec<String> {
+    tokenize_inner(segment, true, true, true)
+}
+
+fn tokenize_env_s(raw: &str) -> Vec<String> {
+    let chars: Vec<char> = raw.chars().collect();
+    let mut expanded = String::with_capacity(raw.len());
+    let (mut sq, mut dq) = (false, false);
+    let mut i = 0;
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch == '\\' && i + 1 < chars.len() && !sq {
+            let next = chars[i + 1];
+            if next == '_' && !dq {
+                expanded.push(' ');
+                i += 2;
+                continue;
+            }
+            if next == 'c' && !dq {
+                break;
+            }
+            if next == 't' {
+                expanded.push('\t');
+                i += 2;
+                continue;
+            }
+            if next == 'n' {
+                expanded.push('\n');
+                i += 2;
+                continue;
+            }
+            expanded.push('\\');
+            expanded.push(next);
+            i += 2;
+            continue;
+        }
+        if ch == '\'' && !dq {
+            sq = !sq;
+        } else if ch == '"' && !sq {
+            dq = !dq;
+        }
+        expanded.push(ch);
+        i += 1;
+    }
+    tokenize_inner(&expanded, true, true, false)
 }
 
 /// Executable name without directory or Windows executable suffix (`curl.exe` → `curl`).
@@ -1016,7 +1533,7 @@ fn strip_env_assignments(tokens: &[String]) -> Vec<String> {
     tokens[index..].to_vec()
 }
 
-fn skip_flags(tokens: &[String], value_flags: &[&str]) -> Vec<String> {
+fn skip_flags(tokens: &[String], value_flags: &[&str], short_value_chars: &[char]) -> Vec<String> {
     let mut index = 0;
     while index < tokens.len() {
         let token = &tokens[index];
@@ -1027,8 +1544,24 @@ fn skip_flags(tokens: &[String], value_flags: &[&str]) -> Vec<String> {
             return tokens[index..].to_vec();
         }
         index += 1;
-        if value_flags.contains(&token.as_str()) && index < tokens.len() {
-            index += 1;
+        if value_flags.contains(&token.as_str()) {
+            if index < tokens.len() {
+                index += 1;
+            }
+            continue;
+        }
+        if !token.starts_with("--") && token.len() > 2 && !short_value_chars.is_empty() {
+            for (byte_idx, ch) in token[1..].char_indices() {
+                if !ch.is_ascii_alphanumeric() {
+                    break;
+                }
+                if short_value_chars.contains(&ch) {
+                    if 1 + byte_idx + ch.len_utf8() == token.len() && index < tokens.len() {
+                        index += 1;
+                    }
+                    break;
+                }
+            }
         }
     }
     vec![]
@@ -1045,7 +1578,7 @@ fn split_env_s(rest: &[String]) -> Option<(String, usize)> {
             i += 1;
             continue;
         }
-        if t == "-u" || t == "--unset" || t == "-C" || t == "--chdir" {
+        if matches!(t.as_str(), "-u" | "--unset" | "-C" | "--chdir" | "-a" | "--argv0") {
             i += 2;
             continue;
         }
@@ -1057,7 +1590,7 @@ fn split_env_s(rest: &[String]) -> Option<(String, usize)> {
         }
         if !t.starts_with("--") && t.len() > 1 {
             for (byte_idx, ch) in t[1..].char_indices() {
-                if ch == 'u' || ch == 'C' {
+                if matches!(ch, 'u' | 'C' | 'a') {
                     if byte_idx + ch.len_utf8() >= t.len() - 1 {
                         i += 1;
                     }
@@ -1077,18 +1610,75 @@ fn split_env_s(rest: &[String]) -> Option<(String, usize)> {
     None
 }
 
-/// Peels environment assignments and command wrappers, returning the inner argv and a risk floor.
-pub fn peel_wrappers(input: &[String]) -> (Vec<String>, RiskClass) {
+pub(crate) fn is_dangerous_env_var(name: &str) -> bool {
+    let u = name.to_ascii_uppercase();
+    matches!(
+        u.as_str(),
+        "LD_PRELOAD"
+            | "LD_LIBRARY_PATH"
+            | "LD_AUDIT"
+            | "NODE_OPTIONS"
+            | "NODE_PATH"
+            | "PYTHONSTARTUP"
+            | "PYTHONPATH"
+            | "PYTHONHOME"
+            | "PERL5OPT"
+            | "PERL5LIB"
+            | "PERLLIB"
+            | "RUBYOPT"
+            | "RUBYLIB"
+            | "JAVA_TOOL_OPTIONS"
+            | "JDK_JAVA_OPTIONS"
+            | "_JAVA_OPTIONS"
+            | "RUSTC_WRAPPER"
+            | "RUSTC_WORKSPACE_WRAPPER"
+            | "CARGO_BUILD_RUSTC_WRAPPER"
+            | "BASH_ENV"
+            | "ENV"
+            | "PROMPT_COMMAND"
+            | "SHELLOPTS"
+            | "BASHOPTS"
+            | "IFS"
+            | "GIT_SSH"
+            | "GIT_SSH_COMMAND"
+            | "GIT_PROXY_COMMAND"
+            | "GIT_ASKPASS"
+            | "SSH_ASKPASS"
+            | "GIT_EXTERNAL_DIFF"
+            | "GIT_EDITOR"
+            | "GIT_SEQUENCE_EDITOR"
+            | "GIT_PAGER"
+            | "GIT_EXEC_PATH"
+            | "GIT_TEMPLATE_DIR"
+            | "CURL_HOME"
+            | "WGETRC"
+            | "NPM_CONFIG_SCRIPT_SHELL"
+    ) || u.starts_with("DYLD_")
+        || u.starts_with("GIT_CONFIG_")
+        || (u.starts_with("CARGO_TARGET_") && u.ends_with("_RUNNER"))
+}
+
+pub(crate) fn peel_wrappers_with_env(input: &[String]) -> (Vec<String>, RiskClass, Vec<String>, bool) {
     let mut tokens = input.to_vec();
     let mut floor = RiskClass::Low;
+    let mut env_names = Vec::new();
+    let mut used_env_s = false;
     for _ in 0..20 {
+        for tok in tokens.iter().take_while(|t| is_env_assignment(t)) {
+            if let Some((k, _)) = tok.split_once('=') {
+                if is_dangerous_env_var(k) {
+                    floor = max_risk(floor, RiskClass::High);
+                }
+                env_names.push(k.to_string());
+            }
+        }
         tokens = strip_env_assignments(&tokens);
         if tokens.is_empty() {
-            return (tokens, max_risk(floor, RiskClass::Medium));
+            return (tokens, max_risk(floor, RiskClass::Medium), env_names, used_env_s);
         }
         let wrapper = base_name(&tokens[0]);
         if !WRAPPERS.contains(&wrapper.as_str()) {
-            return (tokens, floor);
+            return (tokens, floor, env_names, used_env_s);
         }
         if HIGH_FLOOR_WRAPPERS.contains(&wrapper.as_str()) {
             floor = max_risk(floor, RiskClass::High);
@@ -1097,10 +1687,11 @@ pub fn peel_wrappers(input: &[String]) -> (Vec<String>, RiskClass) {
         match wrapper.as_str() {
             "env" => {
                 if let Some((raw, after)) = split_env_s(&rest) {
+                    used_env_s = true;
                     if raw.is_empty() {
-                        return (vec![], max_risk(floor, RiskClass::High));
+                        return (vec![], max_risk(floor, RiskClass::High), env_names, used_env_s);
                     }
-                    let mut split_tokens = tokenize(&raw);
+                    let mut split_tokens = tokenize_env_s(&raw);
                     if after < rest.len() {
                         split_tokens.extend_from_slice(&rest[after..]);
                     }
@@ -1108,22 +1699,97 @@ pub fn peel_wrappers(input: &[String]) -> (Vec<String>, RiskClass) {
                     floor = max_risk(floor, RiskClass::High);
                     continue;
                 }
-                tokens = skip_flags(&rest, &["-u", "--unset", "-C", "--chdir"]);
+                tokens = skip_flags(&rest, &["-u", "--unset", "-C", "--chdir", "-a", "--argv0"], &['u', 'C', 'a']);
             }
-            "sudo" | "doas" => tokens = skip_flags(&rest, &["-u", "-g", "-p", "-c", "-h", "-r", "-t", "-U", "--user", "--group"]),
+            "sudo" => {
+                tokens = skip_flags(
+                    &rest,
+                    &[
+                        "-u",
+                        "--user",
+                        "-g",
+                        "--group",
+                        "-p",
+                        "--prompt",
+                        "-c",
+                        "--class",
+                        "-h",
+                        "--host",
+                        "-r",
+                        "--role",
+                        "-t",
+                        "--type",
+                        "-U",
+                        "--other-user",
+                        "-D",
+                        "--chdir",
+                        "-R",
+                        "--chroot",
+                        "-T",
+                        "--command-timeout",
+                        "-C",
+                        "--close-from",
+                    ],
+                    &['u', 'g', 'p', 'c', 'h', 'r', 't', 'U', 'D', 'R', 'T', 'C'],
+                );
+            }
+            "doas" => tokens = skip_flags(&rest, &["-u", "-C"], &['u', 'C']),
             "timeout" => {
-                let after = skip_flags(&rest, &["-s", "--signal", "-k", "--kill-after"]);
+                let after = skip_flags(&rest, &["-s", "--signal", "-k", "--kill-after"], &['s', 'k']);
                 tokens = after.into_iter().skip(1).collect();
             }
-            "nice" => tokens = skip_flags(&rest, &["-n", "--adjustment"]),
-            "stdbuf" => tokens = skip_flags(&rest, &["-i", "--input", "-o", "--output", "-e", "--error"]),
-            "xargs" => tokens = skip_flags(&rest, &["-n", "-I", "-d", "-E", "-L", "-P", "-s", "-a"]),
-            "time" => tokens = skip_flags(&rest, &["-f", "--format", "-o", "--output"]),
-            "command" | "builtin" => tokens = rest.into_iter().enumerate().filter(|(i, t)| *i > 0 || !t.starts_with('-')).map(|(_, t)| t).collect(),
-            _ => tokens = skip_flags(&rest, &[]),
+            "nice" => tokens = skip_flags(&rest, &["-n", "--adjustment"], &['n']),
+            "stdbuf" => tokens = skip_flags(&rest, &["-i", "--input", "-o", "--output", "-e", "--error"], &['i', 'o', 'e']),
+            "xargs" => {
+                tokens = skip_flags(
+                    &rest,
+                    &[
+                        "-n",
+                        "--max-args",
+                        "-I",
+                        "-i",
+                        "--replace",
+                        "-d",
+                        "--delimiter",
+                        "-E",
+                        "-e",
+                        "--eof",
+                        "-L",
+                        "-l",
+                        "--max-lines",
+                        "-P",
+                        "--max-procs",
+                        "-s",
+                        "--max-chars",
+                        "-a",
+                        "--arg-file",
+                        "--process-slot-var",
+                    ],
+                    &['n', 'I', 'd', 'E', 'L', 'P', 's', 'a'],
+                );
+            }
+            "time" => tokens = skip_flags(&rest, &["-f", "--format", "-o", "--output"], &['f', 'o']),
+            "exec" => tokens = skip_flags(&rest, &["-a"], &['a']),
+            "command" => {
+                let pre_dd: Vec<&String> = rest.iter().take_while(|t| *t != "--" && t.starts_with('-') && t.as_str() != "-").collect();
+                let lookup_only = !pre_dd.is_empty()
+                    && pre_dd.iter().all(|t| !t.starts_with("--") && t[1..].chars().all(|c| matches!(c, 'p' | 'v' | 'V')))
+                    && pre_dd.iter().any(|t| t[1..].chars().any(|c| c == 'v' || c == 'V'));
+                if lookup_only {
+                    return (vec![], floor, env_names, used_env_s);
+                }
+                tokens = skip_flags(&rest, &[], &[]);
+            }
+            _ => tokens = skip_flags(&rest, &[], &[]),
         }
     }
-    (vec![], max_risk(floor, RiskClass::High))
+    (vec![], max_risk(floor, RiskClass::High), env_names, used_env_s)
+}
+
+/// Peels environment assignments and command wrappers, returning the inner argv and a risk floor.
+pub fn peel_wrappers(input: &[String]) -> (Vec<String>, RiskClass) {
+    let (tokens, floor, _, _) = peel_wrappers_with_env(input);
+    (tokens, floor)
 }
 
 fn has_flag(tokens: &[String], short: char, long: &str) -> bool {
@@ -1140,33 +1806,73 @@ fn has_flag(tokens: &[String], short: char, long: &str) -> bool {
 
 fn is_dangerous_path(target: &str) -> bool {
     let clean = target.trim().trim_matches(|c| c == '"' || c == '\'');
+    if clean.is_empty() {
+        return false;
+    }
     if DANGEROUS_RM_TARGETS.contains(&clean) {
         return true;
     }
-    // `//`, `/./`, `//*` and friends still point at the filesystem root; trailing slashes on a
-    // home/parent reference (`$HOME//`, `../`) do not change the target.
-    let mut normalized = clean.to_string();
-    while normalized.contains("//") {
-        normalized = normalized.replace("//", "/");
-    }
-    let normalized = regex_replace(&normalized, r"/\.(/|$)", "$1");
-    if normalized == "/" || normalized == "/*" || normalized.is_empty() && clean.starts_with('/') {
-        return true;
-    }
-    let trimmed = normalized.trim_end_matches('/');
-    !trimmed.is_empty() && DANGEROUS_RM_TARGETS.contains(&trimmed)
-}
-
-fn regex_replace(text: &str, pattern: &str, replacement: &str) -> String {
-    let mut current = text.to_string();
-    let re = regex::Regex::new(pattern).unwrap();
-    loop {
-        let next = re.replace_all(&current, replacement).to_string();
-        if next == current {
-            return next;
+    let slash = clean.replace('\\', "/");
+    let lower = slash.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        let rest_drive = slash[2..].trim_matches('/');
+        if rest_drive.is_empty() || rest_drive == "*" || rest_drive == "." {
+            return true;
         }
-        current = next;
     }
+    let is_abs = slash.starts_with('/');
+    let raw_parts: Vec<&str> = slash.split('/').filter(|p| !p.is_empty()).collect();
+    if !is_abs {
+        if let Some(&first) = raw_parts.first() {
+            if matches!(first, "~" | "$HOME" | "${HOME}") {
+                let mut tail: Vec<&str> = Vec::new();
+                for &part in &raw_parts[1..] {
+                    if part == "." {
+                        continue;
+                    }
+                    if part == ".." {
+                        if tail.pop().is_none() {
+                            return true;
+                        }
+                    } else {
+                        tail.push(part);
+                    }
+                }
+                return tail.is_empty() || (tail.len() == 1 && tail[0] == "*");
+            }
+        }
+    }
+    if is_abs {
+        let mut stack: Vec<&str> = Vec::new();
+        for part in raw_parts {
+            if part == "." {
+                continue;
+            }
+            if part == ".." {
+                stack.pop();
+            } else {
+                stack.push(part);
+            }
+        }
+        return stack.is_empty() || stack == ["*"] || matches!(stack.as_slice(), ["home"] | ["home", "*"] | ["root"] | ["root", "*"] | ["Users"] | ["Users", "*"]);
+    }
+    let mut stack: Vec<&str> = Vec::new();
+    for part in raw_parts {
+        if part == "." {
+            continue;
+        }
+        if part == ".." {
+            if stack.last().is_some_and(|last| *last != "..") {
+                stack.pop();
+            } else {
+                stack.push("..");
+            }
+        } else {
+            stack.push(part);
+        }
+    }
+    stack.is_empty() || stack == ["*"] || stack.first() == Some(&"..")
 }
 
 fn is_gnu_long_prefix(token: &str, full: &str) -> bool {
@@ -1209,7 +1915,7 @@ fn classify_git(rest: &[String]) -> RiskClass {
             index += 1;
             break;
         }
-        if token == "-C" || token == "--git-dir" || token == "--work-tree" {
+        if matches!(token.as_str(), "-C" | "--git-dir" | "--work-tree" | "--namespace" | "--super-prefix") {
             index += 2;
             continue;
         }
@@ -1255,9 +1961,36 @@ fn classify_git(rest: &[String]) -> RiskClass {
     if sub == "config"
         && sub_args.iter().any(|t| {
             let lower = t.to_lowercase();
-            ["core.hookspath", "core.pager", "core.editor", "core.sshcommand", "core.fsmonitor", "alias.", "http.proxy", "credential.helper", "diff.external", "sequence.editor"]
-                .iter()
-                .any(|key| lower.starts_with(key))
+            [
+                "core.hookspath",
+                "core.pager",
+                "core.editor",
+                "core.sshcommand",
+                "core.fsmonitor",
+                "core.gitproxy",
+                "core.askpass",
+                "alias.",
+                "http.",
+                "https.",
+                "ssh.",
+                "credential.",
+                "diff.external",
+                "difftool.",
+                "merge.",
+                "mergetool.",
+                "sequence.editor",
+                "filter.",
+                "protocol.",
+                "gpg.",
+                "fsck.",
+                "transfer.",
+                "receive.",
+                "uploadpack.",
+                "remote.",
+                "url.",
+            ]
+            .iter()
+            .any(|key| lower.starts_with(key))
         })
     {
         return RiskClass::High;
@@ -1271,34 +2004,273 @@ fn classify_git(rest: &[String]) -> RiskClass {
     max_risk(floor, RiskClass::Medium)
 }
 
-fn classify_package_manager(cmd: &str, rest: &[String]) -> RiskClass {
-    if cmd == "npx" || cmd == "pnpx" || cmd == "bunx" {
+const PKG_RISK_VALUE_FLAGS: &[&str] = &[
+    "--prefix",
+    "--registry",
+    "--cache",
+    "--userconfig",
+    "--globalconfig",
+    "--cwd",
+    "--dir",
+    "--directory",
+    "--project",
+    "--workspace",
+    "-w",
+    "--filter",
+    "--loglevel",
+    "--color",
+    "--target",
+    "--index-url",
+    "-i",
+    "--extra-index-url",
+    "--python",
+    "-p",
+    "--root",
+    "--manifest-path",
+    "--features",
+    "-F",
+    "--package",
+    "--toolchain",
+    "--config",
+    "--config-file",
+    "--repository",
+    "--source",
+    "--build-dir",
+    "-C",
+];
+
+fn skip_pkg_leading_flags<'a>(cmd: &str, tokens: &'a [String]) -> &'a [String] {
+    let mut i = 0;
+    while i < tokens.len() {
+        let t = &tokens[i];
+        if t == "--" {
+            return &tokens[i + 1..];
+        }
+        if cmd == "cargo" && t.starts_with('+') && t.len() > 1 {
+            i += 1;
+            continue;
+        }
+        if !t.starts_with('-') || t == "-" {
+            return &tokens[i..];
+        }
+        i += 1;
+        if PKG_RISK_VALUE_FLAGS.contains(&t.as_str()) {
+            if i < tokens.len() {
+                i += 1;
+            }
+            continue;
+        }
+        if !t.starts_with("--") && t.len() > 2 {
+            for (byte_idx, ch) in t[1..].char_indices() {
+                if !ch.is_ascii_alphanumeric() {
+                    break;
+                }
+                if matches!(ch, 'w' | 'i' | 'F' | 'p' | 'C') {
+                    if 1 + byte_idx + ch.len_utf8() == t.len() && i < tokens.len() {
+                        i += 1;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    &[]
+}
+
+fn classify_package_manager(cmd: &str, rest: &[String], depth: usize) -> RiskClass {
+    if matches!(cmd, "npx" | "pnpx" | "bunx" | "uvx" | "pipx") {
         return RiskClass::High;
     }
-    let sub = rest.first().map(|s| s.to_lowercase()).unwrap_or_default();
+    let mut floor = RiskClass::Low;
+    let pre_dd: Vec<&String> = rest.iter().take_while(|t| *t != "--").collect();
+    for (idx, tok) in pre_dd.iter().enumerate() {
+        let lower = tok.to_ascii_lowercase();
+        if matches!(lower.as_str(), "--script-shell" | "--onload-script")
+            || lower.starts_with("--script-shell=")
+            || lower.starts_with("--onload-script=")
+            || (cmd == "go"
+                && (matches!(lower.as_str(), "-exec" | "--exec" | "-toolexec" | "--toolexec")
+                    || lower.starts_with("-exec=")
+                    || lower.starts_with("--exec=")
+                    || lower.starts_with("-toolexec=")
+                    || lower.starts_with("--toolexec=")))
+        {
+            return RiskClass::High;
+        }
+        if cmd == "cargo" {
+            let cfg_val = if lower == "--config" { pre_dd.get(idx + 1).map(|s| s.to_ascii_lowercase()) } else { lower.strip_prefix("--config=").map(str::to_string) };
+            if cfg_val.is_some_and(|v| v.contains("wrapper") || v.contains("runner") || v.contains("linker")) {
+                return RiskClass::High;
+            }
+        }
+        if matches!(
+            lower.as_str(),
+            "--prefix" | "--cwd" | "--dir" | "--directory" | "--project" | "--userconfig" | "--globalconfig" | "--config" | "--config-file" | "--manifest-path" | "-modfile" | "-overlay"
+        ) || lower.starts_with("--prefix=")
+            || lower.starts_with("--cwd=")
+            || lower.starts_with("--dir=")
+            || lower.starts_with("--directory=")
+            || lower.starts_with("--project=")
+            || lower.starts_with("--userconfig=")
+            || lower.starts_with("--globalconfig=")
+            || lower.starts_with("--config=")
+            || lower.starts_with("--config-file=")
+            || lower.starts_with("--manifest-path=")
+            || lower.starts_with("-modfile=")
+            || lower.starts_with("-overlay=")
+            || (!tok.starts_with("--") && tok.starts_with("-C"))
+        {
+            floor = max_risk(floor, RiskClass::Medium);
+        }
+    }
+
+    let tail = skip_pkg_leading_flags(cmd, rest);
+    let sub = tail.first().map(|s| s.to_lowercase()).unwrap_or_default();
+    let after_sub = if tail.is_empty() { &[][..] } else { &tail[1..] };
     if sub.is_empty() {
-        return RiskClass::Medium;
+        return max_risk(floor, RiskClass::Medium);
     }
     if INSTALL_SUBCOMMANDS.contains(&sub.as_str()) {
         return RiskClass::High;
     }
-    if ["ls", "list", "help", "version", "why", "root", "config"].contains(&sub.as_str()) {
-        return RiskClass::Low;
+    if (cmd == "poetry" && sub == "run") || (cmd == "uv" && sub == "run") {
+        let mut idx = 0;
+        while idx < after_sub.len() {
+            let t = &after_sub[idx];
+            if t == "--" {
+                idx += 1;
+                break;
+            }
+            if !t.starts_with('-') || t == "-" {
+                break;
+            }
+            let lower = t.to_ascii_lowercase();
+            if lower.starts_with("--with")
+                || lower == "--refresh"
+                || lower == "--upgrade"
+                || t == "-U"
+                || lower.starts_with("--index")
+                || lower.starts_with("--default-index")
+                || lower.starts_with("--extra-index")
+            {
+                floor = max_risk(floor, RiskClass::High);
+            }
+            idx += 1;
+            if matches!(
+                lower.as_str(),
+                "--with"
+                    | "--with-editable"
+                    | "--with-requirements"
+                    | "--python"
+                    | "-p"
+                    | "--index"
+                    | "--default-index"
+                    | "--index-url"
+                    | "-i"
+                    | "--extra-index-url"
+                    | "--find-links"
+                    | "-f"
+                    | "--package"
+                    | "--group"
+                    | "--extra"
+                    | "--env-file"
+                    | "--cache-dir"
+                    | "--directory"
+                    | "-c"
+                    | "--project"
+                    | "--config-file"
+            ) && idx < after_sub.len()
+            {
+                idx += 1;
+            }
+        }
+        let inner = &after_sub[idx..];
+        if inner.is_empty() {
+            return max_risk(floor, RiskClass::Medium);
+        }
+        if inner[0].starts_with("http://") || inner[0].starts_with("https://") || depth > 4 {
+            return RiskClass::High;
+        }
+        let (peeled, inner_floor) = peel_wrappers(inner);
+        if peeled.is_empty() {
+            return max_risk(floor, inner_floor);
+        }
+        return max_risk(floor, max_risk(inner_floor, classify_base(&base_name(&peeled[0]), &peeled[1..], depth + 1)));
+    }
+    if cmd == "uv" {
+        if sub == "tool" {
+            let next = after_sub.iter().find(|t| !t.starts_with('-')).map(|s| s.to_ascii_lowercase());
+            return if matches!(next.as_deref(), Some("list" | "dir")) { max_risk(floor, RiskClass::Low) } else { RiskClass::High };
+        }
+        if sub == "pip" {
+            let next = after_sub.iter().find(|t| !t.starts_with('-')).map(|s| s.to_ascii_lowercase());
+            return if matches!(next.as_deref(), Some("list" | "show" | "freeze" | "check" | "tree")) { max_risk(floor, RiskClass::Low) } else { RiskClass::High };
+        }
+        if sub == "self" || (sub == "python" && after_sub.iter().any(|t| t == "install" || t == "upgrade")) {
+            return RiskClass::High;
+        }
+    }
+    if cmd == "go" {
+        if sub == "generate" {
+            return RiskClass::High;
+        }
+        if sub == "run" {
+            let remote = after_sub.iter().take_while(|t| *t != "--").filter(|t| !t.starts_with('-')).any(|a| {
+                a.contains('@')
+                    || (a.contains('/')
+                        && !a.starts_with("./")
+                        && !a.starts_with("../")
+                        && !a.starts_with('/')
+                        && a.split('/').next().is_some_and(|first| first.contains('.') && !first.ends_with(".go")))
+            });
+            return if remote { RiskClass::High } else { max_risk(floor, RiskClass::Medium) };
+        }
+    }
+    if sub == "config" {
+        let non_flags: Vec<&String> = after_sub.iter().take_while(|t| *t != "--").filter(|t| !t.starts_with('-')).collect();
+        let action = non_flags.first().map(|s| s.to_ascii_lowercase());
+        if matches!(action.as_deref(), Some("get" | "list" | "ls") | None) {
+            return max_risk(floor, RiskClass::Low);
+        }
+        if action.as_deref() == Some("set")
+            && after_sub.iter().any(|a| {
+                let l = a.to_ascii_lowercase();
+                l.contains("script-shell") || l.contains("onload-script") || l.contains("proxy") || l.contains("registry")
+            })
+        {
+            return RiskClass::High;
+        }
+        return max_risk(floor, RiskClass::Medium);
+    }
+    if sub == "pkg" {
+        let non_flags: Vec<&String> = after_sub.iter().take_while(|t| *t != "--").filter(|t| !t.starts_with('-')).collect();
+        let action = non_flags.first().map(|s| s.to_ascii_lowercase());
+        if action.as_deref() == Some("get") {
+            return max_risk(floor, RiskClass::Low);
+        }
+        if action.as_deref() == Some("set") && after_sub.iter().any(|a| a.starts_with("scripts.") || a == "scripts") {
+            return RiskClass::High;
+        }
+        return max_risk(floor, RiskClass::Medium);
+    }
+    if ["ls", "list", "help", "version", "why", "root"].contains(&sub.as_str()) {
+        return max_risk(floor, RiskClass::Low);
     }
     if sub == "run" || sub == "run-script" || sub == "workspace" {
-        let script = rest.get(1).map(|s| s.to_lowercase()).unwrap_or_default();
+        let rest_after = skip_pkg_leading_flags(cmd, after_sub);
+        let script = rest_after.first().map(|s| s.to_lowercase()).unwrap_or_default();
         if script.is_empty() {
-            return RiskClass::Medium;
+            return max_risk(floor, RiskClass::Medium);
         }
-        return if SAFE_SCRIPT_NAMES.contains(&script.as_str()) { RiskClass::Low } else { RiskClass::Medium };
+        return if SAFE_SCRIPT_NAMES.contains(&script.as_str()) { max_risk(floor, RiskClass::Low) } else { max_risk(floor, RiskClass::Medium) };
     }
     if ["test", "t", "exec"].contains(&sub.as_str()) {
-        return if sub == "exec" { RiskClass::High } else { RiskClass::Low };
+        return if sub == "exec" { RiskClass::High } else { max_risk(floor, RiskClass::Low) };
     }
     if ["pip", "pip3", "uv", "poetry", "gem", "composer"].contains(&cmd) && ["list", "show", "freeze", "check", "--version", "version"].contains(&sub.as_str()) {
-        return RiskClass::Low;
+        return max_risk(floor, RiskClass::Low);
     }
-    RiskClass::Medium
+    max_risk(floor, RiskClass::Medium)
 }
 
 fn classify_awk(rest: &[String]) -> RiskClass {
@@ -1361,8 +2333,8 @@ fn classify_generic_runner(rest: &[String], depth: usize) -> RiskClass {
 pub(crate) fn is_shell_inline_exec(cmd: &str, rest: &[String]) -> bool {
     if POSIX_SHELL_INTERPRETERS.contains(&cmd) {
         return rest.iter().take_while(|t| *t != "--").any(|t| {
-            (t.starts_with('-') && !t.starts_with("--") && t.len() > 1 && t[1..].chars().take_while(|c| c.is_ascii_alphabetic()).any(|c| c == 'c'))
-                || (cmd == "fish" && (t == "--command" || t.starts_with("--command=")))
+            (t.starts_with('-') && !t.starts_with("--") && t.len() > 1 && t[1..].chars().take_while(|c| c.is_ascii_alphabetic()).any(|c| c == 'c' || (cmd == "fish" && c == 'C')))
+                || (cmd == "fish" && (t == "--command" || t == "--init-command" || t.starts_with("--command=") || t.starts_with("--init-command=")))
         });
     }
     if cmd == "pwsh" || cmd == "powershell" {
@@ -1389,16 +2361,85 @@ pub(crate) fn is_python_cmd(cmd: &str) -> bool {
     matches!(cmd, "python" | "python2" | "python3" | "py" | "pypy" | "pypy3") || (cmd.starts_with("python") && cmd["python".len()..].chars().all(|c| c.is_ascii_digit() || c == '.'))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PythonInvocation {
+    InlineCode,
+    Module(String),
+    Stdin,
+    ScriptOrOther { has_script: bool, help_or_version: bool },
+}
+
+pub(crate) fn parse_python_args(rest: &[String]) -> PythonInvocation {
+    let mut i = 0;
+    let mut help_or_version = false;
+    while i < rest.len() {
+        let t = &rest[i];
+        if t == "--" {
+            let after = &rest[i + 1..];
+            if after.first().is_some_and(|s| s == "-" || s == "/dev/stdin" || s.starts_with("/dev/fd/") || s.starts_with("/proc/")) {
+                return PythonInvocation::Stdin;
+            }
+            return PythonInvocation::ScriptOrOther { has_script: !after.is_empty(), help_or_version };
+        }
+        if t == "-" || t == "/dev/stdin" || t.starts_with("/dev/fd/") || t.starts_with("/proc/") {
+            return PythonInvocation::Stdin;
+        }
+        if matches!(t.as_str(), "-V" | "--version" | "-h" | "--help") {
+            help_or_version = true;
+            i += 1;
+            continue;
+        }
+        if t == "--check-hash-based-pycs" {
+            i += 2;
+            continue;
+        }
+        if t.starts_with("--") {
+            i += 1;
+            continue;
+        }
+        if t.starts_with('-') && t.len() > 1 {
+            for (b_idx, ch) in t[1..].char_indices() {
+                if ch == 'c' {
+                    return PythonInvocation::InlineCode;
+                }
+                if ch == 'm' {
+                    let after_m = 1 + b_idx + ch.len_utf8();
+                    let module = if after_m < t.len() { t[after_m..].to_ascii_lowercase() } else { rest.get(i + 1).map(|s| s.to_ascii_lowercase()).unwrap_or_default() };
+                    return PythonInvocation::Module(module);
+                }
+                if matches!(ch, 'W' | 'X' | 'Q') {
+                    let after_opt = 1 + b_idx + ch.len_utf8();
+                    if after_opt == t.len() {
+                        i += 1;
+                    }
+                    break;
+                }
+                if matches!(ch, 'V' | 'h') {
+                    help_or_version = true;
+                }
+            }
+            i += 1;
+            continue;
+        }
+        return PythonInvocation::ScriptOrOther { has_script: true, help_or_version };
+    }
+    PythonInvocation::ScriptOrOther { has_script: false, help_or_version }
+}
+
 pub(crate) fn node_has_inline_or_loader(rest: &[String]) -> bool {
     rest.iter().take_while(|t| *t != "--").any(|t| {
-        matches!(t.as_str(), "-e" | "--eval" | "-p" | "--print" | "-r" | "--require" | "--import" | "--loader" | "--experimental-loader" | "--input-type")
-            || t.starts_with("--eval=")
+        matches!(
+            t.as_str(),
+            "-e" | "--eval" | "-p" | "--print" | "-r" | "--require" | "--import" | "--loader" | "--experimental-loader" | "--input-type" | "--inspect" | "--inspect-brk" | "--inspect-wait"
+        ) || t.starts_with("--eval=")
             || t.starts_with("--print=")
             || t.starts_with("--require=")
             || t.starts_with("--import=")
             || t.starts_with("--loader=")
             || t.starts_with("--experimental-loader=")
             || t.starts_with("--input-type=")
+            || t.starts_with("--inspect=")
+            || t.starts_with("--inspect-")
             || (t.starts_with('-')
                 && !t.starts_with("--")
                 && t.len() > 1
@@ -1445,6 +2486,12 @@ pub(crate) fn has_dev_net_redirection(segment: &str, _tokens: &[String]) -> bool
             i += 1;
             continue;
         }
+        if ch == '#' && (i == 0 || matches!(chars[i - 1], ' ' | '\t' | '\n' | ';' | '&' | '|')) {
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
         if ch == '$' && chars.get(i + 1) == Some(&'\'') {
             ansi_c = true;
             i += 2;
@@ -1466,14 +2513,23 @@ pub(crate) fn has_dev_net_redirection(segment: &str, _tokens: &[String]) -> bool
             continue;
         }
         if ch == '<' || ch == '>' {
-            while i < chars.len() && matches!(chars[i], '<' | '>' | '&' | '|') {
+            let op_start = i;
+            while i < chars.len() && matches!(chars[i], '<' | '>' | '&' | '|' | '-') {
+                if chars[i] == '-' && (i == op_start || chars[i - 1] != '<') {
+                    break;
+                }
                 i += 1;
             }
-            while i < chars.len() && chars[i].is_whitespace() {
+            let op: String = chars[op_start..i].iter().collect();
+            if matches!(op.as_str(), "<<" | "<<-" | "<<<") {
+                continue;
+            }
+            while i < chars.len() && matches!(chars[i], ' ' | '\t') {
                 i += 1;
             }
             let word_start = i;
             let (mut w_sq, mut w_dq, mut w_ansi) = (false, false, false);
+            let mut brace_depth = 0usize;
             while i < chars.len() {
                 let wc = chars[i];
                 if w_ansi {
@@ -1505,7 +2561,7 @@ pub(crate) fn has_dev_net_redirection(segment: &str, _tokens: &[String]) -> bool
                     i += 1;
                     continue;
                 }
-                if wc.is_whitespace() || matches!(wc, '<' | '>' | ';' | '&' | '|') {
+                if brace_depth == 0 && (matches!(wc, ' ' | '\t' | '\n' | '<' | '>' | ';' | '&' | '|')) {
                     break;
                 }
                 if wc == '$' && chars.get(i + 1) == Some(&'\'') {
@@ -1516,6 +2572,16 @@ pub(crate) fn has_dev_net_redirection(segment: &str, _tokens: &[String]) -> bool
                 if wc == '$' && chars.get(i + 1) == Some(&'"') {
                     w_dq = true;
                     i += 2;
+                    continue;
+                }
+                if wc == '$' && chars.get(i + 1) == Some(&'{') {
+                    brace_depth += 1;
+                    i += 2;
+                    continue;
+                }
+                if wc == '}' && brace_depth > 0 {
+                    brace_depth -= 1;
+                    i += 1;
                     continue;
                 }
                 if wc == '\'' {
@@ -1532,8 +2598,14 @@ pub(crate) fn has_dev_net_redirection(segment: &str, _tokens: &[String]) -> bool
             }
             if i > word_start {
                 let raw_word: String = chars[word_start..i].iter().collect();
-                if let Some(decoded) = tokenize(&raw_word).first() {
+                if let Some(decoded) = tokenize_inner(&raw_word, true, true, false).first() {
                     if is_dev_net_path(decoded) {
+                        return true;
+                    }
+                    if (decoded.starts_with("/dev/") || decoded.contains("/tcp/") || decoded.contains("/udp/")) && (decoded.contains('$') || decoded.contains('{')) {
+                        return true;
+                    }
+                    if decoded.starts_with('$') && (segment.contains("/dev/tcp") || segment.contains("/dev/udp")) {
                         return true;
                     }
                 }
@@ -1548,6 +2620,9 @@ pub(crate) fn has_dev_net_redirection(segment: &str, _tokens: &[String]) -> bool
 fn classify_base(cmd: &str, rest: &[String], depth: usize) -> RiskClass {
     if ["eval", "source", "."].contains(&cmd) {
         return RiskClass::Critical;
+    }
+    if cmd == "export" && rest.iter().any(|t| t.split_once('=').is_some_and(|(k, _)| is_dangerous_env_var(k))) {
+        return RiskClass::High;
     }
     if MULTICALL_BINARIES.contains(&cmd) {
         if rest.is_empty() || depth > 4 {
@@ -1583,15 +2658,11 @@ fn classify_base(cmd: &str, rest: &[String], depth: usize) -> RiskClass {
     if NETWORK_COMMANDS.contains(&cmd) || PROCESS_CONTROL_COMMANDS.contains(&cmd) || PRIVILEGED_COMMANDS.contains(&cmd) {
         return RiskClass::High;
     }
-    if cmd == "openssl" {
-        if let Some(sub) = rest.iter().find(|t| !t.starts_with('-')) {
-            if matches!(sub.to_ascii_lowercase().as_str(), "s_client" | "s_server" | "ocsp" | "s_time") {
-                return RiskClass::High;
-            }
-        }
+    if cmd == "openssl" && rest.iter().find(|t| !t.starts_with('-')).is_some_and(|sub| matches!(sub.to_ascii_lowercase().as_str(), "s_client" | "s_server" | "ocsp" | "s_time")) {
+        return RiskClass::High;
     }
     if PACKAGE_MANAGERS.contains(&cmd) {
-        return classify_package_manager(cmd, rest);
+        return classify_package_manager(cmd, rest, depth);
     }
     if cmd == "git" {
         return classify_git(rest);
@@ -1616,7 +2687,9 @@ fn classify_base(cmd: &str, rest: &[String], depth: usize) -> RiskClass {
         return if dangerous { RiskClass::High } else { RiskClass::Low };
     }
     if cmd == "rg" || cmd == "ripgrep" {
-        let dangerous = rest.iter().take_while(|t| *t != "--").any(|t| t == "--pre" || t == "--pre-glob" || t.starts_with("--pre=") || t.starts_with("--pre-glob=") || t.starts_with("--preprocessor"));
+        let dangerous = rest.iter().take_while(|t| *t != "--").any(|t| {
+            t == "--pre" || t == "--pre-glob" || t == "--hostname-bin" || t.starts_with("--pre=") || t.starts_with("--pre-glob=") || t.starts_with("--preprocessor") || t.starts_with("--hostname-bin=")
+        });
         return if dangerous { RiskClass::High } else { RiskClass::Low };
     }
     if matches!(cmd, "tar" | "gtar" | "bsdtar") {
@@ -1634,6 +2707,28 @@ fn classify_base(cmd: &str, rest: &[String], depth: usize) -> RiskClass {
         });
         return if dangerous { RiskClass::High } else { RiskClass::Medium };
     }
+    if cmd == "deno" {
+        let pre_dd: Vec<&String> = rest.iter().take_while(|t| *t != "--").collect();
+        let has_perm_or_inspect = pre_dd.iter().any(|t| {
+            t.as_str() == "-A"
+                || t.as_str() == "--allow-all"
+                || t.starts_with("--allow-")
+                || t.as_str() == "--unstable-ffi"
+                || t.as_str() == "--inspect"
+                || t.starts_with("--inspect=")
+                || t.starts_with("--inspect-")
+                || (t.starts_with('-') && !t.starts_with("--") && t.len() > 1 && t[1..].chars().any(|c| matches!(c, 'A' | 'N' | 'R' | 'W' | 'E' | 'S' | 'F')))
+        });
+        let has_remote_url = rest.iter().any(|t| t.starts_with("http://") || t.starts_with("https://"));
+        if has_perm_or_inspect || has_remote_url {
+            return RiskClass::High;
+        }
+        let sub = pre_dd.iter().find(|t| !t.starts_with('-')).map(|s| s.to_ascii_lowercase());
+        if matches!(sub.as_deref(), Some("lint" | "check" | "doc" | "types" | "completions" | "help")) {
+            return RiskClass::Low;
+        }
+        return RiskClass::Medium;
+    }
     if cmd == "node" || cmd == "nodejs" {
         if node_has_inline_or_loader(rest) {
             return RiskClass::High;
@@ -1644,34 +2739,22 @@ fn classify_base(cmd: &str, rest: &[String], depth: usize) -> RiskClass {
         return RiskClass::Medium;
     }
     if is_python_cmd(cmd) {
-        let pre_dd: Vec<&String> = rest.iter().take_while(|t| *t != "--").collect();
-        if pre_dd
-            .iter()
-            .any(|t| t.as_str() == "-c" || (!t.starts_with("--") && (t.starts_with("-c") || (t.starts_with('-') && t[1..].chars().take_while(|c| c.is_ascii_alphabetic()).any(|c| c == 'c')))))
-        {
-            return RiskClass::High;
-        }
-        for (idx, t) in pre_dd.iter().enumerate() {
-            let module = if t.as_str() == "-m" {
-                pre_dd.get(idx + 1).map(|s| s.to_lowercase())
-            } else if !t.starts_with("--") && t.starts_with("-m") && t.len() > 2 {
-                Some(t[2..].to_lowercase())
-            } else {
-                None
-            };
-            if let Some(module) = module {
+        return match parse_python_args(rest) {
+            PythonInvocation::InlineCode => RiskClass::High,
+            PythonInvocation::Module(module) => {
                 if ["pytest", "unittest", "mypy", "ruff"].contains(&module.as_str()) {
-                    return RiskClass::Low;
-                }
-                if ["pip", "pipx", "ensurepip", "uv", "poetry", "twine", "http.server", "http", "simplehttpserver", "urllib", "urllib.request", "smtpd", "webbrowser", "ftplib", "xmlrpc"]
+                    RiskClass::Low
+                } else if ["pip", "pipx", "ensurepip", "uv", "poetry", "twine", "http.server", "http", "simplehttpserver", "urllib", "urllib.request", "smtpd", "webbrowser", "ftplib", "xmlrpc"]
                     .contains(&module.as_str())
                 {
-                    return RiskClass::High;
+                    RiskClass::High
+                } else {
+                    RiskClass::Medium
                 }
-                return RiskClass::Medium;
             }
-        }
-        return RiskClass::Medium;
+            PythonInvocation::Stdin => RiskClass::High,
+            PythonInvocation::ScriptOrOther { .. } => RiskClass::Medium,
+        };
     }
     if ["pytest", "py.test", "mypy", "ruff", "oxlint", "eslint", "tsc"].contains(&cmd) {
         return RiskClass::Low;
@@ -1720,7 +2803,7 @@ fn classify_bash_risk_at(command: &str, depth: usize) -> RiskClass {
     }
     let mut risk = if scan.redirection { RiskClass::Medium } else { RiskClass::Low };
     for segment in &scan.segments {
-        let tokens = tokenize(segment);
+        let tokens = tokenize_argv(segment);
         if has_dev_net_redirection(segment, &tokens) {
             risk = max_risk(risk, RiskClass::High);
         }

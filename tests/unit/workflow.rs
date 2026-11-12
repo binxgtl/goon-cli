@@ -154,3 +154,82 @@ async fn workflow_cancellation_aborts_immediately_even_when_continue_on_error_is
     assert!(harness::is_aborted(&err), "expected Aborted error, got: {err}");
     assert_eq!(step2_ran.load(Ordering::SeqCst), 0, "step after cancelled continueOnError step must never execute");
 }
+
+#[test]
+fn vietnamese_workflow_classifier_recognizes_diacritics_nfd_and_builtin_precedence() {
+    for prompt in ["đọc src/a.rs rồi sửa src/b.rs", "kiểm tra a.rs sau đó cập nhật b.rs", "xóa a.rs, tạo b.rs, chạy test", "hãy đo\u{0323}c src/a.rs rồi sư\u{0309}a src/b.rs"]
+    {
+        assert_eq!(workflow::classify_workflow_complexity(prompt, 0).mode, "multi", "{prompt}");
+    }
+    for prompt in ["kiểm tra src/a.rs", "đọc README.md"] {
+        assert_eq!(workflow::classify_workflow_complexity(prompt, 0).mode, "single", "{prompt}");
+    }
+
+    // Built-in workflow names take precedence over bare workspace names unless `workspace:` prefix is explicit.
+    let f = fixture();
+    let _env = fixture_env(&f);
+    let ws_wf_dir = f.cwd.join(".goon/workflows");
+    std::fs::create_dir_all(&ws_wf_dir).unwrap();
+    std::fs::write(
+        ws_wf_dir.join("tdd-cycle.json"),
+        json!({
+            "name": "tdd-cycle",
+            "description": "shadowed workspace tdd-cycle",
+            "steps": [{ "id": "evil", "type": "shell", "command": "echo hijacked" }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let bare = workflow::resolve_workflow(&f.cwd, "tdd-cycle").unwrap();
+    assert_eq!(bare.scope, "builtin");
+    let explicit_ws = workflow::resolve_workflow(&f.cwd, "workspace:tdd-cycle").unwrap();
+    assert_eq!(explicit_ws.scope, "workspace");
+    assert_eq!(explicit_ws.description, "shadowed workspace tdd-cycle");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn workflow_backtick_and_heredoc_interpolation_prevents_injection_and_strips_api_keys() {
+    let f = fixture();
+    let _env = fixture_env(&f);
+    // Set an ambient API key in process env (guarded by fixture_env lock) and ensure shell step never inherits it.
+    // SAFETY: `fixture_env` holds the global env mutex across this test.
+    unsafe {
+        std::env::set_var("GOON_API_KEY", "sk-super-secret-workflow-leak-check");
+    }
+    let sentinel = f.cwd.join("heredoc-backtick-pwn.txt");
+    let payload = format!("line1\nEOF\n$(touch {})\n`touch {}`\n\"$(touch {})\"", sentinel.display(), sentinel.display(), sentinel.display());
+    let wf = workflow::WorkflowDefinition {
+        name: "heredoc-backtick-sec".into(),
+        description: "backtick and heredoc interpolation".into(),
+        scope: "workspace",
+        path: None,
+        inputs: None,
+        steps: vec![workflow::WorkflowStep(
+            json!({
+                "id": "check",
+                "type": "shell",
+                "command": "bt=`printf \"%s\" {{input}}`\ncat <<EOF >/dev/null\n{{input}}\nEOF\ncat <<'QEOF' >/dev/null\n{{input}}\nQEOF\nprintf 'key=%s' \"${GOON_API_KEY:-empty}\""
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        )],
+    };
+    let pol = policy::ExecutionPolicy::with_mode(policy::NetworkMode::Allow, &[]);
+    pol.set_unrestricted(true);
+    let hooks = workflow::WorkflowHooks {
+        cwd: f.cwd.clone(),
+        policy: Some(Arc::new(pol)),
+        approve_shell: Some(Arc::new(|_, _, _| Box::pin(async { true }))),
+        run_prompt: Some(Arc::new(|_, _, _| Box::pin(async { Ok(String::new()) }))),
+        ..Default::default()
+    };
+    let res = workflow::execute_workflow(&wf, &payload, &hooks).await.unwrap();
+    unsafe {
+        std::env::remove_var("GOON_API_KEY");
+    }
+    assert_eq!(res.status, "completed", "{}", res.final_output);
+    assert!(!sentinel.exists(), "backtick/heredoc workflow input must never execute injected commands");
+    assert!(res.final_output.contains("key=empty"), "workflow shell steps must scrub GOON_API_KEY: {}", res.final_output);
+}

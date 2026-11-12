@@ -7,14 +7,15 @@
 
 use crate::config::{VerifyConfig, VerifyPolicy};
 use crate::jsutil;
-use crate::policy::{is_network_allowed_for_command, ExecutionPolicy};
+use crate::policy::{is_network_allowed_for_command, ExecutionPolicy, NetworkMode};
 use crate::process::{run_command, CommandError, RunOptions};
 use crate::risk::{classify_bash_risk, RiskClass};
 use crate::syntax::validate_syntax;
 use futures_util::future::BoxFuture;
 use regex::Regex;
 use serde_json::{json, Map, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use tokio_util::sync::CancellationToken;
@@ -318,16 +319,7 @@ fn package_script(root: &Path, name: &str) -> Option<String> {
 }
 
 fn package_script_hooks(root: &Path, name: &str) -> Vec<(String, String)> {
-    let Ok(text) = std::fs::read_to_string(root.join("package.json")) else { return vec![] };
-    let Ok(parsed) = serde_json::from_str::<Value>(&text) else { return vec![] };
-    let Some(scripts) = parsed.get("scripts").and_then(Value::as_object) else { return vec![] };
-    let mut out = vec![];
-    for key in [format!("pre{name}"), name.to_string(), format!("post{name}")] {
-        if let Some(body) = scripts.get(&key).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) {
-            out.push((key, body.to_string()));
-        }
-    }
-    out
+    collect_transitive_script_hooks(root, &[name.to_string()])
 }
 
 fn npm_command(root: &Path, stage: &str, script: &str) -> VerifyCommand {
@@ -515,38 +507,333 @@ pub struct VerifyPlanAssessment {
     pub denied: Option<String>,
 }
 
-fn extract_npm_script_from_args(args: &[String]) -> Option<String> {
-    let first = args.first()?.as_str();
-    if first == "run" || first == "run-script" {
-        return args.get(1).filter(|s| !s.starts_with('-')).cloned();
+const PM_VALUE_FLAGS: &[&str] = &[
+    "-C",
+    "--prefix",
+    "--cwd",
+    "--dir",
+    "-w",
+    "--workspace",
+    "-F",
+    "--filter",
+    "--loglevel",
+    "--userconfig",
+    "--globalconfig",
+    "--cache",
+    "--registry",
+    "--script-shell",
+    "--config",
+    "-c",
+    "--modules-folder",
+    "--mutex",
+    "--network-timeout",
+    "--child-concurrency",
+];
+
+const PM_NON_SCRIPT_SUBCOMMANDS: &[&str] = &[
+    "install",
+    "i",
+    "add",
+    "ci",
+    "remove",
+    "rm",
+    "un",
+    "uninstall",
+    "update",
+    "up",
+    "upgrade",
+    "dlx",
+    "x",
+    "exec",
+    "init",
+    "create",
+    "link",
+    "unlink",
+    "publish",
+    "pack",
+    "login",
+    "logout",
+    "whoami",
+    "owner",
+    "tag",
+    "info",
+    "view",
+    "why",
+    "list",
+    "ls",
+    "outdated",
+    "audit",
+    "licenses",
+    "cache",
+    "config",
+    "set",
+    "get",
+    "global",
+    "workspaces",
+    "patch",
+    "patch-commit",
+    "dedupe",
+    "prune",
+    "store",
+    "fetch",
+    "env",
+    "pm",
+    "bin",
+    "root",
+    "help",
+    "version",
+    "versions",
+    "policies",
+    "node",
+    "rebuild",
+    "repl",
+];
+
+fn skip_pm_flags(args: &[String]) -> &[String] {
+    let mut idx = 0;
+    while idx < args.len() {
+        let tok = args[idx].as_str();
+        if tok == "--" || !tok.starts_with('-') || tok == "-" {
+            break;
+        }
+        idx += 1;
+        if PM_VALUE_FLAGS.contains(&tok) && idx < args.len() {
+            idx += 1;
+        }
     }
-    if first == "test" || first == "t" {
-        return Some("test".into());
+    &args[idx..]
+}
+
+fn pm_args_have_config_or_dir_override(args: &[String]) -> bool {
+    args.iter().take_while(|t| t.as_str() != "--").any(|t| {
+        let lower = t.to_ascii_lowercase();
+        matches!(lower.as_str(), "-c" | "--prefix" | "--cwd" | "--dir" | "--userconfig" | "--globalconfig" | "--script-shell")
+            || (!t.starts_with("--") && t.starts_with("-C"))
+            || lower.starts_with("--prefix=")
+            || lower.starts_with("--cwd=")
+            || lower.starts_with("--dir=")
+            || lower.starts_with("--userconfig=")
+            || lower.starts_with("--globalconfig=")
+            || lower.starts_with("--script-shell=")
+    })
+}
+
+fn extract_package_script(pm: &str, args: &[String]) -> Option<String> {
+    let rest = skip_pm_flags(args);
+    let first = rest.first()?.as_str();
+    if first == "--" {
+        return None;
+    }
+    if matches!(first, "run" | "run-script" | "rum" | "urn") {
+        let after_run = skip_pm_flags(&rest[1..]);
+        return after_run.first().filter(|s| !s.starts_with('-') && s.as_str() != "--").cloned();
+    }
+    if matches!(pm, "yarn" | "npm" | "pnpm") && first == "workspace" {
+        if rest.len() >= 3 && !rest[1].starts_with('-') {
+            return extract_package_script(pm, &rest[2..]);
+        }
+        return None;
+    }
+    if matches!(pm, "npm" | "pnpm" | "yarn") {
+        if matches!(first, "test" | "t" | "tst") {
+            return Some("test".into());
+        }
+        if matches!(first, "start" | "stop" | "restart") {
+            return Some(first.into());
+        }
+    }
+    if matches!(pm, "pnpm" | "yarn") && !PM_NON_SCRIPT_SUBCOMMANDS.contains(&first) {
+        return Some(first.into());
+    }
+    if pm == "bun" && first != "test" && first != "build" && !PM_NON_SCRIPT_SUBCOMMANDS.contains(&first) {
+        return Some(first.into());
     }
     None
 }
 
-fn referenced_npm_script(command: &VerifyCommand) -> Option<String> {
-    let base = crate::risk::base_name(&command.command);
-    if base == "npm" {
-        return extract_npm_script_from_args(&command.args);
-    }
-    if (base == "node" || base == "nodejs") && !command.args.is_empty() {
-        let first_norm = command.args[0].replace('\\', "/");
-        if first_norm.ends_with("/npm-cli.js") || first_norm == "npm-cli.js" {
-            return extract_npm_script_from_args(&command.args[1..]);
+#[derive(Default)]
+struct PmScan {
+    scripts: Vec<String>,
+    uses_node_pm: bool,
+    has_override_flag: bool,
+}
+
+impl PmScan {
+    fn push_script(&mut self, script: String) {
+        if !self.scripts.contains(&script) {
+            self.scripts.push(script);
         }
     }
-    if base == "cmd" && command.args.len() >= 5 && command.args[3].eq_ignore_ascii_case("npm") {
-        return extract_npm_script_from_args(&command.args[4..]);
-    }
-    if base == "bash" && command.args.len() == 2 && command.args[0] == "-c" {
-        let tokens = crate::risk::tokenize(&command.args[1]);
-        if tokens.first().is_some_and(|t| crate::risk::base_name(t) == "npm") {
-            return extract_npm_script_from_args(&tokens[1..]);
+}
+
+fn extract_shell_inline_script(rest: &[String]) -> Option<String> {
+    let mut i = 0;
+    while i < rest.len() {
+        let tok = rest[i].as_str();
+        if tok == "--" {
+            break;
         }
+        if tok == "-c" || tok.eq_ignore_ascii_case("-command") {
+            return rest.get(i + 1).cloned();
+        }
+        if tok.starts_with('-') && !tok.starts_with("--") && tok.len() > 1 {
+            let flags = &tok[1..];
+            if flags.chars().all(|c| c.is_ascii_alphabetic()) && flags.ends_with('c') {
+                return rest.get(i + 1).cloned();
+            }
+            if let Some(pos) = flags.find('c') {
+                if flags[..pos].chars().all(|c| c.is_ascii_alphabetic()) && pos + 1 < flags.len() {
+                    return Some(flags[pos + 1..].to_string());
+                }
+            }
+        }
+        i += 1;
     }
     None
+}
+
+fn scan_tokens_for_pm(tokens: &[String], depth: usize, scan: &mut PmScan) {
+    if tokens.is_empty() || depth > 4 {
+        return;
+    }
+    let (inner, _) = crate::risk::peel_wrappers(tokens);
+    if inner.is_empty() {
+        return;
+    }
+    let base = crate::risk::base_name(&inner[0]);
+    let rest = &inner[1..];
+    if matches!(base.as_str(), "npm" | "pnpm" | "yarn" | "bun") {
+        scan.uses_node_pm = true;
+        if pm_args_have_config_or_dir_override(rest) {
+            scan.has_override_flag = true;
+        }
+        if let Some(script) = extract_package_script(&base, rest) {
+            scan.push_script(script);
+        }
+        return;
+    }
+    if matches!(base.as_str(), "node" | "nodejs") && !rest.is_empty() {
+        let first_norm = rest[0].replace('\\', "/").to_ascii_lowercase();
+        let pm = if first_norm == "npm-cli.js" || first_norm.ends_with("/npm-cli.js") {
+            Some("npm")
+        } else if first_norm.ends_with("/pnpm.cjs") {
+            Some("pnpm")
+        } else if first_norm.ends_with("/yarn.js") {
+            Some("yarn")
+        } else {
+            None
+        };
+        if let Some(pm) = pm {
+            scan.uses_node_pm = true;
+            if pm_args_have_config_or_dir_override(&rest[1..]) {
+                scan.has_override_flag = true;
+            }
+            if let Some(script) = extract_package_script(pm, &rest[1..]) {
+                scan.push_script(script);
+            }
+        }
+        return;
+    }
+    if base == "cmd" {
+        if let Some(pos) = rest.iter().position(|a| a.eq_ignore_ascii_case("/c")) {
+            let after_c = &rest[pos + 1..];
+            if after_c.len() == 1 && after_c[0].chars().any(|c| c.is_whitespace() || matches!(c, '&' | '|' | ';')) {
+                scan_shell_for_pm(&after_c[0], depth + 1, scan);
+            } else {
+                scan_tokens_for_pm(after_c, depth + 1, scan);
+            }
+        }
+        return;
+    }
+    if matches!(base.as_str(), "bash" | "sh" | "zsh" | "dash" | "ksh" | "mksh" | "ash" | "pwsh" | "powershell") {
+        if let Some(inline) = extract_shell_inline_script(rest) {
+            scan_shell_for_pm(&inline, depth + 1, scan);
+        }
+    }
+}
+
+fn scan_shell_for_pm(script: &str, depth: usize, scan: &mut PmScan) {
+    if depth > 4 {
+        return;
+    }
+    let shell = crate::risk::scan_shell(script);
+    for segment in &shell.segments {
+        let tokens = crate::risk::tokenize_argv(segment);
+        scan_tokens_for_pm(&tokens, depth, scan);
+    }
+}
+
+fn scan_verify_command_pm(command: &VerifyCommand) -> PmScan {
+    let mut scan = PmScan::default();
+    let argv: Vec<String> = std::iter::once(command.command.clone()).chain(command.args.iter().cloned()).collect();
+    scan_tokens_for_pm(&argv, 0, &mut scan);
+    scan
+}
+
+fn collect_transitive_script_hooks(root: &Path, initial_scripts: &[String]) -> Vec<(String, String)> {
+    let Ok(text) = std::fs::read_to_string(root.join("package.json")) else {
+        return vec![];
+    };
+    let Ok(parsed) = serde_json::from_str::<Value>(&text) else {
+        return vec![];
+    };
+    let Some(scripts) = parsed.get("scripts").and_then(Value::as_object) else {
+        return vec![];
+    };
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut queue: VecDeque<String> = initial_scripts.iter().cloned().collect();
+    let mut out = vec![];
+    while let Some(name) = queue.pop_front() {
+        if !visited.insert(name.clone()) {
+            continue;
+        }
+        for key in [format!("pre{name}"), name.clone(), format!("post{name}")] {
+            if let Some(body) = scripts.get(&key).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) {
+                let body_owned = body.to_string();
+                let mut nested = PmScan::default();
+                scan_shell_for_pm(&body_owned, 0, &mut nested);
+                for sub_script in nested.scripts {
+                    if !visited.contains(&sub_script) {
+                        queue.push_back(sub_script);
+                    }
+                }
+                out.push((key, body_owned));
+            }
+        }
+    }
+    out
+}
+
+fn inspect_unsafe_npmrc(root: &Path) -> Option<RiskClass> {
+    let npmrc_path = root.join(".npmrc");
+    let meta = std::fs::symlink_metadata(&npmrc_path).ok()?;
+    if meta.file_type().is_symlink() {
+        return Some(RiskClass::High);
+    }
+    if !meta.file_type().is_file() {
+        return None;
+    }
+    let mut file = std::fs::File::open(&npmrc_path).ok()?;
+    let mut buf = Vec::new();
+    file.by_ref().take(65_536).read_to_end(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf);
+    let mut found: Option<RiskClass> = None;
+    for raw_line in text.trim_start_matches('\u{feff}').lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') || line.starts_with('[') {
+            continue;
+        }
+        let Some((raw_key, raw_val)) = line.split_once('=') else {
+            continue;
+        };
+        let key = raw_key.trim().trim_matches(|c| c == '"' || c == '\'').to_ascii_lowercase();
+        let val = raw_val.trim().trim_matches(|c| c == '"' || c == '\'').trim();
+        if matches!(key.as_str(), "script-shell" | "script_shell" | "onload-script" | "onload_script") && !val.is_empty() {
+            let r = RiskClass::High.max(classify_bash_risk(val));
+            found = Some(found.map_or(r, |prev| prev.max(r)));
+        }
+    }
+    found
 }
 
 fn is_workspace_node_modules_path(raw: &str, projects: &[VerifyProject], system_npm_execpath: Option<&Path>) -> bool {
@@ -583,13 +870,46 @@ pub fn assess_verify_plan(plan: &VerifyPlan, policy: Option<&ExecutionPolicy>) -
         if uses_workspace_node_modules(command, &plan.projects) {
             command_risk = command_risk.max(RiskClass::Medium);
         }
-        if let Some(script_name) = referenced_npm_script(command) {
+        let pm_scan = scan_verify_command_pm(command);
+        if pm_scan.has_override_flag {
+            command_risk = command_risk.max(RiskClass::High);
+            if !unrestricted {
+                if let Some(policy) = policy {
+                    if policy.effective_mode() != NetworkMode::Allow {
+                        return VerifyPlanAssessment {
+                            risk: risk.max(command_risk),
+                            denied: Some(format!("verification command needs network access blocked by the execution policy: {}", command.display)),
+                        };
+                    }
+                }
+            }
+        }
+        if pm_scan.uses_node_pm || !pm_scan.scripts.is_empty() {
             for project in &plan.projects {
-                if !project.root.join("package.json").exists() {
+                if let Some(npmrc_risk) = inspect_unsafe_npmrc(&project.root) {
+                    command_risk = command_risk.max(npmrc_risk);
+                    if command_risk == RiskClass::Critical && !unrestricted {
+                        return VerifyPlanAssessment { risk: RiskClass::Critical, denied: Some(format!("verification command is critical risk and cannot run: {}", command.display)) };
+                    }
+                    if !unrestricted {
+                        if let Some(policy) = policy {
+                            if policy.effective_mode() != NetworkMode::Allow {
+                                return VerifyPlanAssessment {
+                                    risk: risk.max(command_risk),
+                                    denied: Some(format!(
+                                        "verification command uses unsafe .npmrc (script-shell/onload-script) with network access blocked by the execution policy: {}",
+                                        command.display
+                                    )),
+                                };
+                            }
+                        }
+                    }
+                }
+                if pm_scan.scripts.is_empty() || !project.root.join("package.json").exists() {
                     continue;
                 }
                 command_risk = command_risk.max(RiskClass::Medium);
-                for (_, hook_body) in package_script_hooks(&project.root, &script_name) {
+                for (_, hook_body) in collect_transitive_script_hooks(&project.root, &pm_scan.scripts) {
                     let hook_risk = classify_bash_risk(&hook_body);
                     command_risk = command_risk.max(hook_risk);
                     if hook_risk == RiskClass::Critical && !unrestricted {
@@ -841,10 +1161,9 @@ fn run_syntax_stage(cwd: &Path, changed_files: &[String]) -> StageResult {
 }
 
 fn env_for_command(command: &VerifyCommand) -> Option<BTreeMap<String, String>> {
-    let name = command.command.trim_end_matches(".exe");
-    if name == "go" || name.ends_with("/go") {
+    if crate::risk::base_name(&command.command) == "go" {
         // Offline-by-default: never download modules while verifying.
-        let mut env: BTreeMap<String, String> = std::env::vars_os().filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?))).collect();
+        let mut env = crate::process::child_env(None);
         env.insert("GOPROXY".into(), "off".into());
         env.insert("GOFLAGS".into(), "-mod=readonly".into());
         return Some(env);
