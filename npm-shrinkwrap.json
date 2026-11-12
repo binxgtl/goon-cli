@@ -1,12 +1,12 @@
 {
   "name": "@binxgodteli/goon-cli",
-  "version": "0.3.17",
+  "version": "0.4.0",
   "lockfileVersion": 3,
   "requires": true,
   "packages": {
     "": {
       "name": "@binxgodteli/goon-cli",
-      "version": "0.3.17",
+      "version": "0.4.0",
       "hasInstallScript": true,
       "license": "MIT",
       "bin": {

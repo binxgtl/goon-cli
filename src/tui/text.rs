@@ -66,6 +66,15 @@ pub struct Palette {
     pub ok: &'static str,
     pub err: &'static str,
     pub warn: &'static str,
+    /// Background tint for user prompt bands and the compact composer (empty when unsupported).
+    pub surface: &'static str,
+    /// Background tints behind added / removed diff lines (empty when unsupported).
+    pub add_bg: &'static str,
+    pub del_bg: &'static str,
+    /// Resets only the background colour.
+    pub bg_off: &'static str,
+    /// Truecolor endpoints for the animated "working" shimmer: (base, highlight).
+    pub shimmer: Option<((u8, u8, u8), (u8, u8, u8))>,
 }
 
 impl Palette {
@@ -89,6 +98,11 @@ impl Palette {
         ok: OK,
         err: ERR,
         warn: WARN,
+        surface: "\x1b[48;2;46;46;58m",
+        add_bg: "\x1b[48;2;20;52;34m",
+        del_bg: "\x1b[48;2;68;26;32m",
+        bg_off: "\x1b[49m",
+        shimmer: Some(((112, 112, 128), (221, 214, 254))),
     };
 
     /// High-contrast WCAG AA (>= 4.5:1 on `#FFFFFF` and `#FDF6E3` Solarized Light) semantic tokens.
@@ -112,6 +126,11 @@ impl Palette {
         ok: "\x1b[38;2;21;128;61m",
         err: "\x1b[38;2;185;28;28m",
         warn: "\x1b[38;2;180;83;9m",
+        surface: "\x1b[48;2;236;236;242m",
+        add_bg: "\x1b[48;2;220;252;231m",
+        del_bg: "\x1b[48;2;254;226;226m",
+        bg_off: "\x1b[49m",
+        shimmer: Some(((120, 113, 108), (109, 40, 217))),
     };
 
     /// Standard 16-color SGR palette (`31`..`36` + `1`/`2`) without `38;2;R;G;B` sequences.
@@ -135,6 +154,11 @@ impl Palette {
         ok: "\x1b[32m",
         err: "\x1b[31m",
         warn: "\x1b[33m",
+        surface: "",
+        add_bg: "",
+        del_bg: "",
+        bg_off: "\x1b[49m",
+        shimmer: None,
     };
 
     /// Pure plain-text palette (`NO_COLOR`, `CLICOLOR=0`, `FORCE_COLOR=0`, `TERM=dumb`, `GOON_THEME=none`).
@@ -158,6 +182,11 @@ impl Palette {
         ok: "",
         err: "",
         warn: "",
+        surface: "",
+        add_bg: "",
+        del_bg: "",
+        bg_off: "",
+        shimmer: None,
     };
 
     pub const fn for_mode(mode: ThemeMode) -> Self {

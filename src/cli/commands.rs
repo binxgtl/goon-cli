@@ -82,6 +82,48 @@ fn starts_cmd(input: &str, cmd: &str) -> bool {
     input == cmd || input.starts_with(&format!("{cmd} "))
 }
 
+/// `/theme` (a slash word that no command handled) is almost always a typo, not a prompt.
+/// Paths such as `/etc/hosts …` still go to the model.
+fn unknown_slash_command(input: &str) -> Option<String> {
+    let name = crate::re!(r"^(/[A-Za-z][A-Za-z0-9_-]*)(?:\s|$)").captures(input)?.get(1)?.as_str().to_string();
+    if crate::tui::SLASH_COMMANDS.contains(&name.as_str()) {
+        return None;
+    }
+    Some(name)
+}
+
+/// The closest known command (edit distance ≤ 2, or a shared prefix), for "did you mean".
+fn closest_slash_command(name: &str) -> Option<&'static str> {
+    // Optimal string alignment distance: a swapped pair (`/modle`) costs one edit.
+    fn distance(a: &str, b: &str) -> usize {
+        let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+        let mut d = vec![vec![0usize; b.len() + 1]; a.len() + 1];
+        for (i, row) in d.iter_mut().enumerate() {
+            row[0] = i;
+        }
+        for (j, cell) in d[0].iter_mut().enumerate() {
+            *cell = j;
+        }
+        for i in 1..=a.len() {
+            for j in 1..=b.len() {
+                let cost = usize::from(a[i - 1] != b[j - 1]);
+                d[i][j] = (d[i - 1][j] + 1).min(d[i][j - 1] + 1).min(d[i - 1][j - 1] + cost);
+                if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                    d[i][j] = d[i][j].min(d[i - 2][j - 2] + 1);
+                }
+            }
+        }
+        d[a.len()][b.len()]
+    }
+    let lower = name.to_lowercase();
+    crate::tui::SLASH_COMMANDS
+        .iter()
+        .map(|c| (if c.starts_with(&lower) || lower.starts_with(c) { 0 } else { distance(&lower, c) }, *c))
+        .filter(|(d, _)| *d <= 2)
+        .min_by_key(|(d, c)| (*d, c.len().abs_diff(lower.len()), c.len()))
+        .map(|(_, c)| c)
+}
+
 fn line_count(text: &str) -> usize {
     Regex::new(r"\r?\n").unwrap().split(text).count()
 }
@@ -2052,6 +2094,11 @@ impl App {
                 self.run(&format!("Use a subagent (spawn_agent + wait_agent, or delegate_task / delegate_edit as appropriate) to execute the following task and report the result:\n\n{rest}")).await?;
                 continue;
             }
+            if let Some(name) = unknown_slash_command(&input) {
+                let hint = closest_slash_command(&name).map(|c| format!(" — did you mean {c}?")).unwrap_or_default();
+                self.display(&format!("\n[Unknown command {name}{hint} · /help lists all commands]\n"));
+                continue;
+            }
             self.run(&input).await?;
         }
         Ok(())
@@ -2852,4 +2899,23 @@ fn radix36(mut n: u64) -> String {
     }
     out.reverse();
     String::from_utf8(out).unwrap()
+}
+
+#[cfg(test)]
+mod slash_typo_tests {
+    use super::{closest_slash_command, unknown_slash_command};
+
+    #[test]
+    fn unknown_slash_words_are_caught_but_paths_and_known_commands_are_not() {
+        assert_eq!(unknown_slash_command("/theme").as_deref(), Some("/theme"));
+        assert_eq!(unknown_slash_command("/modle gpt-5").as_deref(), Some("/modle"));
+        assert_eq!(unknown_slash_command("/model gpt-5"), None);
+        assert_eq!(unknown_slash_command("/etc/hosts what is this?"), None);
+        assert_eq!(unknown_slash_command("/prompts:review src"), None);
+        assert_eq!(unknown_slash_command("explain /theme"), None);
+        assert_eq!(closest_slash_command("/modle"), Some("/model"));
+        assert!(matches!(closest_slash_command("/rev"), Some("/revert" | "/review")));
+        assert_eq!(closest_slash_command("/hepl"), Some("/help"));
+        assert_eq!(closest_slash_command("/zzzzzzzz"), None);
+    }
 }

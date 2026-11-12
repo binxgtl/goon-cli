@@ -115,10 +115,20 @@ Mã thoát: `0` thành công, `1` lỗi, `2` từ chối quyền, `130` Ctrl+C, 
 
 ## Giao diện TUI, Phím tắt & Slash Commands
 
-Khi chạy `goon` trong terminal, giao diện TUI toàn màn hình tối giản: không khung viền, không
-nền tô màu, dùng màu mặc định của terminal (đẹp trên cả theme sáng lẫn tối).
+Khi chạy `goon` trong terminal, giao diện TUI toàn màn hình lấy cảm hứng từ Claude Code và
+Codex: thẻ chào mừng bo góc, prompt nằm trên dải nền nhạt, ô nhập là một khung bo góc, dùng màu
+mặc định của terminal nên đẹp trên cả theme sáng lẫn tối (`GOON_THEME=light|ansi16|none`).
 
 ```
+╭──────────────────────────────────────────────────╮
+│ ◆ goon v0.4.0                                    │
+│                                                  │
+│ model      glm-5.3-flash · effort max · mode ask │
+│ gateway    api.yuristore.xyz/v1 · openai         │
+│ workspace  ~/shop-api · session 0f40f011         │
+╰──────────────────────────────────────────────────╯
+  /help commands · @ files · $ skills · ! shell · shift+tab mode
+
 › Sửa test checkout đang fail
 
 ○ Explored
@@ -126,16 +136,32 @@ nền tô màu, dùng màu mặc định của terminal (đẹp trên cả theme
 ● Ran npm test -- cart (2s)
 ± Edited src/cart.ts (+1 -1)
 ◆ Tổng tiền tính bằng số thực mà không làm tròn…
+✓ Worked for 14s ──────────────────────────────────────────────────────
 
-⠋ Working  4s   esc to interrupt
-──────────────────────────────────────────────────────────────
-› Ask anything   / commands   @ files   $ skills   ! shell
-ask   glm-5.3-flash   effort max        shop-api (main)   ctx 34%   69k tokens
+› Chạy lại toàn bộ test
+
+✻ Working… (4s · esc to interrupt)
+╭─────────────────────────────────────────────────────────────────────╮
+│ › Enter to steer · Tab to queue · Esc to interrupt                  │
+╰─────────────────────────────────────────────────────────────────────╯
+  enter steer · tab queue        glm-5.3-flash · max   66% context left
 ```
 
-- **Hội thoại**: Markdown, bảng căn cột, diff màu (`+` xanh, `-` đỏ), khối code có lề mờ, trạng thái tool/subagent theo thời gian thực.
-- **Dòng nhập**: một đường kẻ (chuyển màu hổ phách khi goon đang chờ bạn trả lời/duyệt quyền), dòng nhập `›` và popup gợi ý `/slash` kèm mô tả.
-- **Dòng trạng thái**: chế độ (`auto-approve` hiện màu hổ phách, `yolo (unrestricted)` hiện màu đỏ cảnh báo), model, effort, workspace (nhánh git), todo, % ngữ cảnh do provider báo và tổng token.
+- **Hội thoại**: Markdown, tiêu đề màu nhấn, bảng căn cột, khối code có nhãn `╭─ lang` và tô màu cú
+  pháp (Rust, JS/TS, Python, shell, Go, SQL, JSON/YAML/TOML…), diff có nền xanh/đỏ cho dòng
+  thêm/xoá, trạng thái tool/subagent theo thời gian thực, mỗi lượt kết thúc bằng vạch
+  `✓ Worked for …`.
+- **Ô nhập**: khung bo góc (viền hổ phách khi goon đang chờ bạn trả lời/duyệt quyền, xanh da trời
+  khi gõ lệnh `!shell`), gợi ý tự rút gọn theo bề ngang, popup `/slash` kèm mô tả. Gõ sai lệnh
+  (`/modle`) sẽ được báo `Unknown command … did you mean /model?` thay vì gửi cho model.
+- **Duyệt quyền & câu hỏi**: thẻ lựa chọn có khung ngay dưới yêu cầu; câu hỏi `request_user_input`
+  hiện thành thẻ ở cuối màn hình, hội thoại vẫn nhìn thấy phía trên.
+- **Dòng trạng thái**: ngôi sao "thở" + hiệu ứng shimmer, thời gian chạy và `esc to interrupt`.
+- **Footer**: `? for shortcuts` ở chế độ `ask`, hoặc huy hiệu chế độ (`» auto-approve on` màu hổ
+  phách, `◇ plan mode`, `◌ read-only`, `▲ yolo (unrestricted)` màu đỏ); bên phải là workspace
+  (nhánh git), todo, goal, token, `model · effort` và `% context left` do provider báo.
+- **Termux / màn hình hẹp** (< 48 cột hoặc < 12 dòng): bố cục gọn 3 dòng, prompt trên dải nền,
+  thẻ chào mừng tự bỏ khung khi hẹp hơn 32 cột.
 
 ### Phím tắt chính
 

@@ -180,7 +180,7 @@ try:
     wait_for("Select model", after=before)
     before = len(output)
     send("\x1b")
-    wait_for("shift+enter newline", after=before)
+    wait_for("? for shortcuts", after=before)
     before = len(output)
     send("\x1b[200~/status\x1b[201~")
     send("\r")

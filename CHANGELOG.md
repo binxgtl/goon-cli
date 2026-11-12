@@ -1,6 +1,45 @@
 # Changelog
 
-## Unreleased
+## 0.4.0
+
+### Redesigned terminal UI (Claude Code / Codex inspired)
+- Welcome card: the session banner is framed as a rounded card with aligned `model`, `gateway`
+  and `workspace` facts and a highlighted tips row. The banner text itself stays plain (no box
+  drawing), so piped and `NO_COLOR` output stay readable; terminals narrower than 32 columns keep
+  the unframed form.
+- Composer card: the prompt sits in a rounded `╭─╮ │ › … │ ╰─╯` frame that turns amber while goon
+  waits for an answer and sky-blue for `!` shell commands. Placeholder hints shrink to the longest
+  variant that fits instead of being cut mid-word. Compact layouts (< 48 columns or < 12 rows,
+  e.g. Termux with the keyboard open) keep three rows and put the prompt on a tinted band.
+- Quieter footer: `? for shortcuts` on the left in `ask` mode, or a mode badge with
+  `shift+tab to cycle` (`» auto-approve on`, `◇ plan mode`, `◌ read-only`, `▲ yolo`); on the
+  right workspace (branch), todo, goal, tokens, `model · effort` and `NN% context left`.
+- Working indicator: a breathing star spinner (braille on Windows) with a soft shimmer across the
+  status text and a single `(12s · esc to interrupt)` tail; a running tool shows only its own
+  timer instead of two competing clocks.
+- Prompts render as a tinted full-width band; `# H1`/`## H2` answer headings use the accent
+  colour; finished turns end with a `✓ Worked for 3.1s ────` separator rule.
+- Code blocks get a `╭─ lang` header and dependency-free syntax colouring (keywords, strings,
+  numbers, comments, types/calls) for common languages, plus `+`/`-` colouring inside
+  ```` ```diff ```` fences.
+- Diffs: added and removed lines sit on green/red background tints with syntax-coloured code
+  (truecolor themes); 16-colour and plain themes keep the previous foreground-only style.
+- Approval and choice prompts are framed cards above a dim hint line; `request_user_input`
+  questions are now a bottom-anchored card with the transcript still visible above it instead of
+  a bare form at the top of an otherwise empty screen.
+- The `?` shortcut sheet is a two-column key/action list that also documents `alt+.`/`alt+,`
+  effort cycling and the full `shift+tab` mode cycle.
+- Session notes such as `[Mode switched to: plan]` render as quiet `· Mode switched to: plan`
+  lines instead of raw bracketed text.
+
+### Fixes
+- Unknown slash commands (`/theme`, `/modle`) are no longer sent to the model as prompts; goon
+  answers `Unknown command /modle — did you mean /model?` and keeps the tokens. Paths such as
+  `/etc/hosts …` still go to the model.
+- Removed the doubled blank row after every prompt and after closed code fences; the gap is
+  now deferred so incremental and full re-renders stay identical.
+- The welcome banner omits `effort default` when no effort is configured.
+
 
 ### Repeated table labels
 - Keep mouse-selected record labels associated with their visual record instead of highlighting

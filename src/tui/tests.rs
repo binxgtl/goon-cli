@@ -765,8 +765,9 @@ async fn cells_markdown_and_diffs() {
     let lines: Vec<&str> = raw.split("\r\n").collect();
     let bullet = lines.iter().find(|l| l.contains("Todo list:")).unwrap();
     assert!(!bullet.contains(text::ERR));
-    let removed = lines.iter().find(|l| l.contains("const oldVal = 1;")).unwrap();
+    let removed = lines.iter().find(|l| crate::term::strip_vt(l).contains("const oldVal = 1;")).unwrap();
     assert!(removed.contains(text::ERR));
+    assert!(removed.contains(text::Palette::DARK.del_bg), "removed lines sit on a red tint: {removed:?}");
 }
 
 #[tokio::test]
@@ -816,7 +817,7 @@ async fn paste_collapses_and_expands_on_submit() {
 
 #[tokio::test]
 async fn no_row_exceeds_width_and_tables_align() {
-    for (cols, rows) in [(20, 10), (48, 12), (60, 20), (120, 40)] {
+    for (cols, rows) in [(20, 10), (48, 12), (60, 22), (120, 40)] {
         let tty = Tty::new(cols, rows);
         tty.ui.write("◆ goon v0.0.0\n  model m   effort default   mode ask\n  /help commands   @ files   $ skills   ! shell   shift+tab mode\n");
         tty.ui.write("\n> a fairly long user prompt that will need wrapping across multiple lines of the terminal\n");
@@ -1155,11 +1156,13 @@ async fn minimal_chrome_transient_cleanup_differential_rendering_and_queued_prom
     let lines = rows(&frame);
     let n = lines.len();
     assert!(!lines[0].contains("test-model"));
-    assert!(!frame.contains(['╭', '╮', '╰', '╯']));
-    assert!(regex::Regex::new(r"^─+$").unwrap().is_match(&lines[n - 3]), "{:?}", lines[n - 3]);
-    assert!(lines[n - 2].starts_with("› Ask anything   / commands"), "{:?}", lines[n - 2]);
-    assert!(lines[n - 1].starts_with("ask   test-model   effort default"), "{:?}", lines[n - 1]);
-    assert!(lines[n - 1].contains("ctrl+r history") && lines[n - 1].ends_with("0 tokens"));
+    // Composer card: rounded frame around the prompt, one quiet footer line below it.
+    assert!(regex::Regex::new(r"^╭─+╮$").unwrap().is_match(&lines[n - 4]), "{:?}", lines[n - 4]);
+    assert!(regex::Regex::new(r"^│ › Ask goon anything · / commands.*│$").unwrap().is_match(&lines[n - 3]), "{:?}", lines[n - 3]);
+    assert!(regex::Regex::new(r"^╰─+╯$").unwrap().is_match(&lines[n - 2]), "{:?}", lines[n - 2]);
+    assert!(lines[n - 1].starts_with("  ? for shortcuts"), "{:?}", lines[n - 1]);
+    assert!(lines[n - 1].ends_with("0 tokens   test-model"), "{:?}", lines[n - 1]);
+    assert_eq!(visible_length(&lines[n - 3]), visible_length(&lines[n - 4]), "frame edges line up");
     assert!(!frame.contains("Ready ·") && !frame.contains("Queue"));
 
     let before = tty.written().len();
@@ -1207,31 +1210,51 @@ async fn revert_removes_the_failed_turn_and_restores_its_prompt_into_the_compose
     assert!(!frame.contains("Upstream provider returned HTTP 500:"));
     assert!(frame.contains("› first prompt") && frame.contains("◆ First answer."));
     let lines = rows(&frame);
-    assert!(regex::Regex::new(r"^› can u play valorant\s*$").unwrap().is_match(&lines[lines.len() - 2]), "{:?}", lines[lines.len() - 2]);
+    assert!(regex::Regex::new(r"^│ › can u play valorant\s*│$").unwrap().is_match(&lines[lines.len() - 3]), "{:?}", lines[lines.len() - 3]);
     tty.key("escape");
     tty.key("escape");
     assert_eq!(q2.await.unwrap().unwrap(), "/revert");
 }
 
 #[tokio::test]
-async fn welcome_banner_is_short_and_unboxed_and_view_mode_toggles_thinking() {
+async fn welcome_banner_is_plain_text_framed_as_a_card_and_view_mode_toggles_thinking() {
     let workspace = std::path::PathBuf::from("D:\\Th\u{01B0} mu\u{0323}c m\u{01A1}\u{0301}i (2)");
     let banner = crate::cli::welcome_banner("gpt-5.4", "openai", "https://api.ezaiapi.com/v1", Some("max"), &workspace, "0f40f011-0000-4000-8000-000000000000", "ask");
     let lines: Vec<&str> = banner.trim().split('\n').collect();
     assert_eq!(lines.len(), 5, "{banner}");
     assert!(regex::Regex::new(r"^◆ goon v\d+\.\d+\.\d+").unwrap().is_match(lines[0]), "{}", lines[0]);
-    assert!(regex::Regex::new(r"model gpt-5\.4 {3}effort max {3}mode ask").unwrap().is_match(&banner));
-    assert!(banner.contains("gateway api.ezaiapi.com/v1 (openai)"));
+    assert!(regex::Regex::new(r"model +gpt-5\.4 · effort max · mode ask").unwrap().is_match(&banner), "{banner}");
+    assert!(banner.contains("gateway    api.ezaiapi.com/v1 · openai"));
     assert!(banner.contains("session 0f40f011"));
+    // The text stays plain (pipes, NO_COLOR); only the TUI frames it as a card.
     assert!(!banner.contains(['╭', '╮', '╰', '╯', '│']));
 
-    let tty = Tty::new(40, 20);
-    tty.ui.write(&banner);
-    let frame = tty.frame();
-    for row in rows(&frame) {
-        assert!(visible_length(&row) <= 40, "{row:?}");
+    for (cols, boxed) in [(40, true), (28, false), (100, true)] {
+        let tty = Tty::new(cols, 20);
+        tty.ui.write(&banner);
+        let frame = tty.frame();
+        for row in rows(&frame) {
+            assert!(visible_length(&row) <= cols, "{row:?}");
+        }
+        assert!(frame.contains("◆ goon v"));
+        assert!(frame.contains("/help commands"), "{frame}");
+        let lines = rows(&frame);
+        let top = lines.iter().position(|l| l.starts_with('╭'));
+        assert_eq!(top.is_some(), boxed, "{cols} cols:\n{frame}");
+        if let Some(top) = top {
+            assert!(lines[top + 1].starts_with("│ ◆ goon v"), "{frame}");
+            let bottom = lines.iter().skip(top).position(|l| l.starts_with('╰')).unwrap() + top;
+            let width = visible_length(&lines[top]);
+            assert!(lines[top..=bottom].iter().all(|l| visible_length(l) == width), "card edges align:\n{frame}");
+            // The card is decoration: selecting across it copies nothing from the frame.
+            let st = tty.ui.state.lock().unwrap();
+            assert!(st.body_layout.text.iter().all(|t| !t.contains('│') && !t.contains('╭')));
+        } else {
+            assert!(frame.contains("model gpt-5.4"), "narrow banner collapses label padding:\n{frame}");
+        }
+        tty.ui.close();
     }
-    assert!(frame.contains("◆ goon v"));
+    let tty = Tty::new(40, 20);
     tty.ui.clear();
     tty.size.lock().unwrap().0 = 90;
     tty.ui.set_view_mode("normal");
@@ -1294,8 +1317,8 @@ async fn blockquotes_never_render_as_user_turns_and_cells_after_unterminated_ans
     let raw = tty.ui.rendered_frame();
     let plain = crate::term::strip_vt(&raw).to_string();
     let all = rows(&raw);
-    let body = &all[..all.len() - 3];
-    let users: Vec<&String> = body.iter().filter(|l| l.starts_with(&format!("{}›", Theme::BRAND_BOLD))).collect();
+    let body = &all[..all.len() - 4];
+    let users: Vec<&String> = body.iter().filter(|l| l.starts_with(&format!("{}{}›", text::Palette::DARK.surface, Theme::BRAND_BOLD))).collect();
     assert_eq!(users.len(), 1, "{plain}");
     assert!(crate::term::strip_vt(users[0]).contains("› real user prompt"));
     assert!(plain.contains("▎ quoted model text"));
@@ -1316,19 +1339,19 @@ async fn footer_shows_workspace_branch_and_provider_reported_context() {
     };
     let plain = crate::term::strip_vt(&footer(&tty)).to_string();
     assert!(plain.contains("testcli (feature/redesign)"), "{plain}");
-    assert!(!plain.contains("ctx"));
+    assert!(!plain.contains("context left"));
     assert_eq!(plain.matches("test-model").count(), 1);
     tty.ui.event(&serde_json::json!({ "type": "usage", "input": 60000, "output": 8000, "total": 68000 }));
     tty.ui.event(&serde_json::json!({ "type": "subagent", "id": "kid", "state": "progress", "event": { "type": "usage", "input": 150000, "output": 1, "total": 150001 } }));
-    assert!(crate::term::strip_vt(&footer(&tty)).contains("ctx 34%"));
+    assert!(crate::term::strip_vt(&footer(&tty)).contains("66% context left"));
     assert!(tty.frame().contains("218k tokens"));
     tty.ui.event(&serde_json::json!({ "type": "compaction", "count": 1 }));
-    assert!(!crate::term::strip_vt(&footer(&tty)).contains("ctx"));
+    assert!(!crate::term::strip_vt(&footer(&tty)).contains("context left"));
     assert!(tty.frame().contains("◌ Context compacted #1"));
     tty.ui.event(&serde_json::json!({ "type": "usage", "input": 185000, "output": 0, "total": 185000 }));
     let raw = footer(&tty);
-    assert!(crate::term::strip_vt(&raw).contains("93%"));
-    assert!(raw.contains(&format!("{}ctx 93%", Theme::ERR)), "{raw:?}");
+    assert!(crate::term::strip_vt(&raw).contains("7% context left"));
+    assert!(raw.contains(&format!("{}7% context left", Theme::ERR)), "{raw:?}");
 }
 
 #[tokio::test]
@@ -1353,7 +1376,7 @@ async fn slash_popup_lists_matches_with_descriptions_and_arrows_keep_the_input()
     tty.key("down");
     let frame = tty.frame();
     let lines = rows(&frame);
-    assert!(regex::Regex::new(r"^› /rev\s*$").unwrap().is_match(&lines[lines.len() - 2]), "{:?}", lines[lines.len() - 2]);
+    assert!(regex::Regex::new(r"^│ › /rev\s*│$").unwrap().is_match(&lines[lines.len() - 3]), "{:?}", lines[lines.len() - 3]);
     assert!(regex::Regex::new(r"› /review\s+run code review").unwrap().is_match(&frame));
     tty.key("down");
     tty.key("up");
@@ -1717,7 +1740,7 @@ async fn question_hints_match_esc_behaviour_and_with_status_always_restores() {
     let ui = tty.ui.clone();
     let q = tokio::spawn(async move { ui.question("Base URL: ", None, false, QuestionOpts { esc_cancels: true, ..Default::default() }).await });
     tokio::time::sleep(Duration::from_millis(5)).await;
-    assert!(regex::Regex::new(r"enter submit {3}esc cancel").unwrap().is_match(&tty.frame()));
+    assert!(tty.frame().contains("enter submit · esc cancel"));
     tty.text("https://typed-but-cancelled");
     tty.key("escape");
     assert!(q.await.unwrap().unwrap_err().downcast_ref::<InputCancelled>().is_some());
@@ -1832,7 +1855,8 @@ async fn turn_completion_duration_flushes_explore_styles_cleanly_and_rewinds_wit
     assert!(explored_pos < answer_pos && answer_pos < worked_pos, "{plain}");
     let worked_row = rows(&raw).into_iter().find(|l| crate::term::strip_vt(l).starts_with("✓ Worked for 2m 14s")).unwrap();
     assert!(worked_row.contains(&format!("{}✓{}", Theme::OK, Theme::RESET)), "{worked_row:?}");
-    assert!(worked_row.contains(&format!("{}Worked for 2m 14s{}", Theme::FAINT, Theme::RESET)), "{worked_row:?}");
+    assert!(worked_row.contains(&format!("{}Worked for 2m 14s ─", Theme::FAINT)), "turn separator rule: {worked_row:?}");
+    assert!(visible_length(&worked_row) <= 89, "{worked_row:?}");
     assert!(tty.ui.rewind_turns(1));
     assert!(!tty.frame().contains("Worked for 2m 14s"));
 }
@@ -2525,7 +2549,7 @@ async fn shortcut_help_is_reversible_and_normal_question_marks_still_type() {
     let tty = Tty::new(100, 24);
     tty.text("?");
     assert_eq!(draft(&tty), "");
-    assert!(tty.frame().contains("ctrl+u/k cut line"));
+    assert!(tty.frame().contains("ctrl+u/k/w/y"));
     tty.key("escape");
     assert!(!tty.frame().contains("Shortcuts ·"));
     tty.text("why?");
@@ -3110,8 +3134,9 @@ async fn logical_copy_excludes_gutters_and_synthetic_fences_but_keeps_hard_blank
         tty.frame();
         let (first, last, last_col) = {
             let st = tty.ui.state.lock().unwrap();
-            let first = st.transcript_view_rows.iter().position(|row| row.contains(marker)).unwrap();
-            let last = st.transcript_view_rows.iter().rposition(|row| row.contains("content") || row.contains("second_code_line")).unwrap();
+            let plain: Vec<String> = st.transcript_view_rows.iter().map(|row| crate::term::strip_vt(row).into_owned()).collect();
+            let first = plain.iter().position(|row| row.contains(marker)).unwrap();
+            let last = plain.iter().rposition(|row| row.contains("content") || row.contains("second_code_line")).unwrap();
             (first, last, visible_length(&st.transcript_view_rows[last]))
         };
         tty.ui.handle_mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: 0, row: first as u16, modifiers: KeyModifiers::NONE });
