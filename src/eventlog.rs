@@ -103,7 +103,38 @@ impl StreamRedactor {
             return String::new();
         }
         let cut = len - self.tail_size;
-        let idx = self.carry.char_indices().nth(cut).map(|(i, _)| i).unwrap_or(self.carry.len());
+        let raw_idx = self.carry.char_indices().nth(cut).map(|(i, _)| i).unwrap_or(self.carry.len());
+        // Prefer cutting right after a newline within the last 512 bytes so multi-token patterns
+        // (`Bearer <tok>`, `"api_key": "<tok>"`, `token = <tok>`, known secrets) stay intact.
+        let mut search_start = raw_idx.saturating_sub(512);
+        while search_start < raw_idx && !self.carry.is_char_boundary(search_start) {
+            search_start += 1;
+        }
+        let mut idx = if let Some(rel_nl) = self.carry[search_start..raw_idx].rfind('\n') {
+            search_start + rel_nl + 1
+        } else {
+            let mut back = raw_idx;
+            while back > search_start {
+                let Some(prev) = self.carry[..back].chars().next_back() else { break };
+                if prev.is_whitespace() {
+                    let prefix_trim = self.carry[search_start..back].trim_end();
+                    let lower = prefix_trim.to_ascii_lowercase();
+                    if lower.ends_with("bearer") || lower.ends_with(':') || lower.ends_with('=') {
+                        back -= prev.len_utf8();
+                        continue;
+                    }
+                    break;
+                }
+                back -= prev.len_utf8();
+            }
+            back
+        };
+        if idx == 0 {
+            if len <= self.tail_size + 512 {
+                return String::new();
+            }
+            idx = raw_idx;
+        }
         let safe = self.carry[..idx].to_string();
         self.carry.drain(..idx);
         redact_secrets(&safe, &self.known)

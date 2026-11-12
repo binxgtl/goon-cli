@@ -80,7 +80,7 @@ test('e2e: --allow-net-hosts lifts the network gate in ask mode but the high-ris
   });
 });
 
-test('e2e: --yolo / --yes grants full unrestricted permissions (network, critical shell & outside-workspace files)', async t => {
+test('e2e: --yolo grants unrestricted permissions (network, high-risk shell & outside-workspace files) while still blocking critical commands', async t => {
   const server = http.createServer((_req, res) => {
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ repo: 'morluto/rea', ok: true }));
@@ -89,43 +89,78 @@ test('e2e: --yolo / --yes grants full unrestricted permissions (network, critica
   t.after(() => server.close());
   const { port } = server.address();
 
-  for (const modeFlag of ['--yolo', '--yes', '-y']) {
+  const f = await e2eFixture(t);
+  const outsideFile = join(f.root, 'outside-yolo.txt');
+  const fixture = await writeFixture(f, 'yolo-full.json', {
+    v: 1,
+    turns: [
+      {
+        match: 'install plugin',
+        toolCalls: [
+          {
+            id: 'call-net',
+            name: 'bash',
+            input: { command: `curl -sS http://127.0.0.1:${port}/repo && git --version` },
+          },
+          {
+            id: 'call-outside-write',
+            name: 'write_file',
+            input: { path: outsideFile, content: 'installed=true\n' },
+          },
+        ],
+        usage: { inputTokens: 12, outputTokens: 8, totalTokens: 20 },
+      },
+      {
+        text: ['all done'],
+        usage: { inputTokens: 10, outputTokens: 4, totalTokens: 14 },
+      },
+    ],
+  });
+
+  const run = await runGoon(t, f, [...BASE_FLAGS, '--yolo', '-p', 'install plugin', '--stub-fixture', fixture, '--json', '--no-verify']);
+  assert.equal(run.code, 0, `--yolo: stdout=${run.stdout} stderr=${run.stderr}`);
+  const events = jsonLines(run.stdout);
+  const errors = events.filter(event => event.type === 'tool' && event.state === 'error');
+  assert.deepEqual(errors, [], '--yolo should not fail high-risk/network/outside-workspace tool calls');
+  const done = events.find(event => event.type === 'done');
+  assert.equal(done.denied, false);
+  assert.equal(done.text, 'all done');
+  assert.equal(await readFile(outsideFile, 'utf8'), 'installed=true\n');
+
+  // Critical commands (rm -rf /) remain denied even under --yolo.
+  await expectBashDenial(t, {
+    command: 'rm -rf /',
+    flags: ['--yolo'],
+    denyMessage: 'Permission denied: bash is critical risk and cannot run. Stop this run.',
+  });
+});
+
+test('e2e: --yes / -y (auto mode) auto-approves workspace edits & safe commands while still blocking high-risk / outside-workspace mutations headless', async t => {
+  for (const modeFlag of ['--yes', '-y']) {
     const f = await e2eFixture(t);
-    const outsideFile = join(f.root, `outside-${modeFlag.replace(/^-+/, '')}.txt`);
-    const fixture = await writeFixture(f, 'yolo-full.json', {
+    const insideFile = join(f.workspace, 'inside-auto.txt');
+    const okFixture = await writeFixture(f, 'auto-ok.json', {
       v: 1,
       turns: [
         {
-          match: 'install plugin',
+          match: 'safe edit',
           toolCalls: [
-            {
-              id: 'call-net',
-              name: 'bash',
-              input: { command: `curl -sS http://127.0.0.1:${port}/repo && echo $(printf subshell-ok)` },
-            },
-            {
-              id: 'call-outside-write',
-              name: 'write_file',
-              input: { path: outsideFile, content: 'installed=true\n' },
-            },
+            { id: 'call-write', name: 'write_file', input: { path: 'inside-auto.txt', content: 'ok=1\n' } },
+            { id: 'call-ls', name: 'bash', input: { command: 'ls -la' } },
           ],
-          usage: { inputTokens: 12, outputTokens: 8, totalTokens: 20 },
+          usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
         },
-        {
-          text: ['all done'],
-          usage: { inputTokens: 10, outputTokens: 4, totalTokens: 14 },
-        },
+        { text: ['workspace updated'], usage: { inputTokens: 8, outputTokens: 3, totalTokens: 11 } },
       ],
     });
+    const okRun = await runGoon(t, f, [...BASE_FLAGS, modeFlag, '-p', 'safe edit', '--stub-fixture', okFixture, '--json', '--no-verify']);
+    assert.equal(okRun.code, 0, `${modeFlag}: stdout=${okRun.stdout} stderr=${okRun.stderr}`);
+    assert.equal(await readFile(insideFile, 'utf8'), 'ok=1\n');
 
-    const run = await runGoon(t, f, [...BASE_FLAGS, modeFlag, '-p', 'install plugin', '--stub-fixture', fixture, '--json', '--no-verify']);
-    assert.equal(run.code, 0, `${modeFlag}: stdout=${run.stdout} stderr=${run.stderr}`);
-    const events = jsonLines(run.stdout);
-    const errors = events.filter(event => event.type === 'tool' && event.state === 'error');
-    assert.deepEqual(errors, [], `${modeFlag} should not fail any tool call`);
-    const done = events.find(event => event.type === 'done');
-    assert.equal(done.denied, false);
-    assert.equal(done.text, 'all done');
-    assert.equal(await readFile(outsideFile, 'utf8'), 'installed=true\n');
+    await expectBashDenial(t, {
+      command: 'git reset --hard',
+      flags: [modeFlag],
+      denyMessage: 'Permission denied by the user. Stop this run.',
+    });
   }
 });

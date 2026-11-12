@@ -87,10 +87,12 @@ goon resume                                       # Chọn phiên để tiếp t
 goon --resume latest                              # Tương đương goon resume
 goon --resume SESSION_UUID -p 'Tiếp tục phần đang làm'
 goon -p 'Đọc repo, tìm nguyên nhân lỗi và sửa; chạy kiểm tra phù hợp'
-goon --effort max -p 'Phân tích sâu và tối ưu hiệu năng'
+goon -m 'YOUR_MODEL_ID' --effort max -p 'Phân tích sâu và tối ưu hiệu năng'
+goon --plan -p 'Lập kế hoạch chi tiết trước khi sửa code'
 goon --read-only -p 'Đọc và giải thích kiến trúc repo'
 goon --allow-net-hosts=api.github.com -p 'Gọi API đã được allowlist'
-goon --yes -p 'Tự động duyệt mọi thao tác ghi file và bash'
+goon --yes -p 'Tự động duyệt thao tác sửa file trong workspace và lệnh shell an toàn'
+goon --yolo -p 'Chế độ không giới hạn (mạng, shell rủi ro cao & ngoài workspace)'
 goon --verify-cmd 'npm test' --verify-cmd 'npm run typecheck' -p 'Sửa lỗi và kiểm chứng'
 goon --no-verify -p 'Chỉ sửa nhanh, không chạy kiểm chứng'
 goon --max-cost-usd 0.50 --max-time-ms 600000 -p 'Tác vụ có trần chi phí và thời gian'
@@ -108,8 +110,7 @@ goon sessions
 ```
 
 Mặc định ở chế độ `ask` (yêu cầu chấp thuận khi sửa/ghi file hoặc chạy shell).
-Không có TTY thì những yêu cầu này bị từ chối trừ khi truyền `--yes` (tương đương
-chế độ `auto`). `--read-only` loại bỏ các công cụ ghi/sửa/bash khỏi bộ tool.
+Không có TTY thì những yêu cầu này bị từ chối trừ khi truyền `--yes` (chế độ `auto` — tự duyệt sửa file trong workspace và lệnh rủi ro thấp/vừa) hoặc `--yolo` (không giới hạn mạng/ngoài workspace, vẫn chặn lệnh `critical`). `--read-only` (hoặc `--readonly`) loại bỏ các công cụ ghi/sửa/bash khỏi bộ tool.
 Mã thoát: `0` thành công, `1` lỗi, `2` từ chối quyền, `130` Ctrl+C, `143` SIGTERM.
 
 ## Giao diện TUI, Phím tắt & Slash Commands
@@ -134,7 +135,7 @@ ask   glm-5.3-flash   effort max        shop-api (main)   ctx 34%   69k tokens
 
 - **Hội thoại**: Markdown, bảng căn cột, diff màu (`+` xanh, `-` đỏ), khối code có lề mờ, trạng thái tool/subagent theo thời gian thực.
 - **Dòng nhập**: một đường kẻ (chuyển màu hổ phách khi goon đang chờ bạn trả lời/duyệt quyền), dòng nhập `›` và popup gợi ý `/slash` kèm mô tả.
-- **Dòng trạng thái**: chế độ (`auto-approve` hiện màu hổ phách vì là chế độ rủi ro), model, effort, workspace (nhánh git), todo, % ngữ cảnh do provider báo và tổng token.
+- **Dòng trạng thái**: chế độ (`auto-approve` hiện màu hổ phách, `yolo (unrestricted)` hiện màu đỏ cảnh báo), model, effort, workspace (nhánh git), todo, % ngữ cảnh do provider báo và tổng token.
 
 ### Phím tắt chính
 
@@ -210,7 +211,7 @@ Mặc định vẫn là giao diện fullscreen.
 
 Hộp duyệt quyền rủi ro thấp/vừa hỗ trợ `↑`/`↓`/`Tab`, `Enter`, phím chữ hoặc số của lựa chọn;
 `Esc` từ chối và trả lại bản nháp. Dán văn bản không tự duyệt quyền. Thao tác rủi ro cao
-vẫn yêu cầu gõ tên tool để xác nhận.
+yêu cầu gõ `allow` hoặc tên tool để xác nhận.
 
 Câu hỏi lựa chọn của agent dùng `↑`/`↓`/`Enter`; chọn **Other** để trả lời khác, `Tab` mở
 ghi chú cho lựa chọn. Với nhiều câu hỏi, `←`/`→` khi chọn phương án hoặc `PgUp`/`PgDn`
@@ -231,8 +232,9 @@ Khi model đang suy nghĩ hoặc chạy tool:
 
 ### Danh sách Slash Commands tiêu biểu
 
-- `/auto` (hoặc `/yolo [on|off]`): Bật/tắt chế độ **Auto-Approve** (tự động chấp thuận mọi thao tác sửa file, bash và subagent).
-- `/mode [ask|auto|plan|readonly]`: Xem hoặc đổi chế độ quyền thực thi.
+- `/auto [on|off]`: Bật/tắt chế độ **Auto-Approve** trong workspace (tự động duyệt thao tác rủi ro thấp/vừa; vẫn hỏi với lệnh rủi ro cao và giữ chính sách mạng).
+- `/yolo [on|off]`: Bật/tắt chế độ **YOLO (Unrestricted)** cho phiên hiện tại (tự động duyệt cả rủi ro cao, mạng và ngoài workspace; vẫn chặn `critical`).
+- `/mode [ask|auto|yolo|plan|readonly]`: Xem hoặc đổi chế độ quyền thực thi.
 - `/view [normal|verbose]`: Đổi chế độ hiển thị suy nghĩ (`normal` ẩn khối `Thinking` cho gọn; `verbose` hiện đầy đủ toàn bộ quá trình suy luận).
 - `/transcript`: Bật/tắt chế độ xem Transcript toàn màn hình (giống `Ctrl+T`).
 - `/model [tên_model]`: Đổi model hoặc quét trực tiếp danh sách model từ API.
@@ -290,7 +292,7 @@ tên lệnh, `$1`…`$9` là từng từ, `$$` là ký tự `$`.
   - **File & Shell**: `read_file`, `list_files`, `search`, `write_file`, `edit_file`, `apply_patch`, `bash`, `view_image`.
   - **Kế hoạch & Tương tác**: `todo_read`, `todo_write`, `update_plan`, `request_user_input`, `exit_plan_mode`.
   - **Subagents (7 công cụ)**: Vòng đời tương tác (`spawn_agent`, `wait_agent`, `send_input`, `close_agent`, `list_agents`) và uỷ thác theo lô (`delegate_task`, `delegate_edit`).
-  - **MCP Resources & Tools**: `list_mcp_resources`, `list_mcp_resource_templates`, `read_mcp_resource` cùng các tool động từ MCP server (`mcp__<server>__<tool>`).
+  - **MCP Resources & Tools**: `list_mcp_resources`, `list_mcp_resource_templates`, `read_mcp_resource` cùng các tool động từ MCP server (`mcp_<server>_<tool>_<hash>`; cấu hình allowlist hỗ trợ cả `mcp__<server>__<tool>` và `mcp__*`).
 - **Cơ chế Checkpoint & Rollback nhẹ, chính xác (`/rewind`, `/revert`, `/undo`)**:
   - Chỉ các file được sửa trực tiếp qua bộ công cụ chỉnh sửa (`write_file`, `edit_file`, `apply_patch` — bao gồm cả subagent worker được uỷ quyền sửa file) mới được ghi nhận bản sao lưu trước lượt chạy (trạng thái tồn tại, nội dung gốc và file mode) để rollback tức thì 100% và không tốn I/O quét toàn bộ workspace khi chạy lệnh shell (`bash`).
   - File bạn đã sửa tay **sau** lượt của agent sẽ không bị ghi đè khi revert: goon giữ nguyên và báo xung đột; dùng `/revert N --force` nếu thật sự muốn ghi đè.

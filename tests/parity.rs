@@ -11,7 +11,6 @@ use std::collections::{BTreeMap, BTreeSet};
 
 /// Intentional behaviour changes: `(module.fn, substring of the JSON-encoded args, reason)`.
 const DIVERGENCES: &[(&str, &str, &str)] = &[
-    ("approval.canAutoApprove", "\"auto\"", "auto/yolo mode grants full unrestricted permissions across all risk classes"),
     ("approval.bashApprovalPrefix", "npm --prefix x test", "flag-first package manager invocations must not collapse to a bare 'npm' wildcard prefix"),
     ("approval.bashApprovalPrefix", "yarn --cwd x test", "flag-first package manager invocations must not collapse to a bare 'yarn' wildcard prefix"),
     ("risk.classifyBashRisk", "core.hooksPath", "git config of keys that execute programs later (core.hooksPath, core.pager, …) is high risk; TS rated it medium"),

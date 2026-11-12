@@ -582,6 +582,62 @@ pub fn tool_approval_signature(tool: &str, input: &Value) -> String {
     format!("{tool}:{}", &digest[..32])
 }
 
+/// Workspace control/hook/instruction/secret files whose modification requires explicit High-risk confirmation.
+pub fn is_high_risk_mutation_path(raw: &str) -> bool {
+    let normalized = raw.trim().replace('\\', "/");
+    if normalized.is_empty() {
+        return false;
+    }
+    if crate::redact::is_sensitive_path(&normalized) {
+        return true;
+    }
+    let clean = normalized.trim_start_matches("./");
+    if clean.starts_with('/') || clean.starts_with("../") || clean == ".." {
+        return true;
+    }
+    let parts: Vec<String> = clean.split('/').filter(|s| !s.is_empty() && *s != ".").map(|s| s.to_ascii_lowercase()).collect();
+    if parts.is_empty() {
+        return false;
+    }
+    if parts.iter().any(|p| p == "..") {
+        return true;
+    }
+    for (idx, seg) in parts.iter().enumerate() {
+        if matches!(seg.as_str(), ".git" | ".goon" | ".agents" | ".codex" | ".husky" | ".claude") {
+            return true;
+        }
+        if seg == ".github" && parts.get(idx + 1).map(String::as_str) == Some("workflows") {
+            return true;
+        }
+        if seg == ".cargo" && matches!(parts.get(idx + 1).map(String::as_str), Some("config") | Some("config.toml")) {
+            return true;
+        }
+    }
+    matches!(parts.last().map(String::as_str), Some("agents.md" | "agents.override.md" | "claude.md" | ".npmrc" | ".yarnrc" | ".yarnrc.yml" | ".gitmodules"))
+}
+
+fn patch_touches_high_risk_path(patch: &str) -> bool {
+    for line in patch.lines() {
+        let trimmed = line.trim();
+        for prefix in ["*** Add File: ", "*** Update File: ", "*** Delete File: ", "*** Move to: "] {
+            if let Some(rest) = trimmed.strip_prefix(prefix) {
+                if is_high_risk_mutation_path(rest) {
+                    return true;
+                }
+            }
+        }
+        for prefix in ["+++ b/", "--- a/", "+++ ", "--- "] {
+            if let Some(rest) = trimmed.strip_prefix(prefix) {
+                let candidate = rest.split('\t').next().unwrap_or(rest).trim();
+                if candidate != "/dev/null" && !candidate.starts_with("a/") && !candidate.starts_with("b/") && is_high_risk_mutation_path(candidate) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 fn builtin_catalog() -> &'static Map<String, Value> {
     static CATALOG: OnceLock<Map<String, Value>> = OnceLock::new();
     CATALOG.get_or_init(|| serde_json::from_str::<Value>(include_str!("builtin_tools.json")).unwrap().as_object().unwrap().clone())
@@ -866,6 +922,19 @@ impl ToolRegistry {
                 return classify_bash_risk(command);
             }
         }
+        if matches!(canonical.as_str(), "write_file" | "edit_file") {
+            if let Some(path) = input.and_then(|i| i.get("path")).and_then(Value::as_str) {
+                if is_high_risk_mutation_path(path) {
+                    return RiskClass::High;
+                }
+            }
+        } else if canonical == "apply_patch" {
+            if let Some(patch) = input.and_then(|i| i.get("patch")).and_then(Value::as_str) {
+                if patch_touches_high_risk_path(patch) {
+                    return RiskClass::High;
+                }
+            }
+        }
         let defs = self.definitions.read().unwrap();
         match defs.get(&canonical) {
             Some(d) if d.risk.is_some() => d.risk.unwrap(),
@@ -903,7 +972,7 @@ impl ToolRegistry {
         let risk = self.risk_of(&canonical, Some(&input));
         let call_key = tool_approval_signature(&canonical, &normalized);
         let unrestricted = self.is_unrestricted();
-        if risk == RiskClass::Critical && !unrestricted {
+        if risk == RiskClass::Critical {
             return Ok(self.deny(&call_key, format!("Permission denied: {canonical} is critical risk and cannot run. Stop this run.")).await);
         }
         if !unrestricted {
@@ -1122,7 +1191,7 @@ impl ToolRegistry {
                         tool: "view_image".into(),
                         input: json!({ "path": resolved.to_string_lossy(), "outsideWorkspace": true }),
                         cancel: cancel.clone(),
-                        risk: None,
+                        risk: Some(RiskClass::High),
                         trusted: None,
                     })
                     .await;

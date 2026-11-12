@@ -62,13 +62,14 @@ async function download(root, triple, destination) {
   let packed;
   if (/^https?:\/\//i.test(base)) {
     const url = `${base.replace(/\/+$/, '')}/${asset.file}`;
+    if (process.stderr.isTTY) process.stderr.write(`goon: downloading ${asset.file} (v${manifest.version})...\n`);
     const response = await fetch(url, { redirect: 'follow', signal: AbortSignal.timeout(120_000) });
     if (!response.ok) throw new Error(`downloading ${url} failed: HTTP ${response.status}`);
     packed = Buffer.from(await response.arrayBuffer());
   } else {
     packed = readFileSync(join(base, asset.file));
   }
-  const bytes = asset.file.endsWith('.gz') ? gunzipSync(packed) : packed;
+  const bytes = asset.file.endsWith('.gz') ? gunzipSync(packed, { maxOutputLength: 128 * 1024 * 1024 }) : packed;
   const digest = createHash('sha256').update(bytes).digest('hex');
   if (digest !== asset.sha256) throw new Error(`checksum mismatch for ${asset.file} (expected ${asset.sha256}, got ${digest})`);
   mkdirSync(dirname(destination), { recursive: true });

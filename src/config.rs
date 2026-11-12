@@ -708,7 +708,34 @@ pub fn resolve_api_key(config: &Config) -> Option<String> {
         }
     }
     let stored = load_credentials();
-    stored.get(&config.key_env).and_then(Value::as_str).map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    if let Some(found) = stored.get(&config.key_env).and_then(Value::as_str).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+        return Some(found);
+    }
+    if config.key_env == "GOON_API_KEY" {
+        let fallback_env = if config.provider == "anthropic" {
+            Some("ANTHROPIC_API_KEY")
+        } else {
+            let host = config.base_url.as_deref().and_then(|u| url::Url::parse(u).ok()).and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase())).unwrap_or_default();
+            match host.as_str() {
+                "api.openai.com" => Some("OPENAI_API_KEY"),
+                "openrouter.ai" => Some("OPENROUTER_API_KEY"),
+                "api.deepseek.com" => Some("DEEPSEEK_API_KEY"),
+                "api.groq.com" => Some("GROQ_API_KEY"),
+                "api.anthropic.com" => Some("ANTHROPIC_API_KEY"),
+                _ => None,
+            }
+        };
+        if let Some(env_name) = fallback_env {
+            crate::process::protect_secret_env(env_name);
+            if let Ok(v) = std::env::var(env_name) {
+                let t = v.trim();
+                if !t.is_empty() {
+                    return Some(t.to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 pub fn normalize_gateway_url(raw: &str) -> String {

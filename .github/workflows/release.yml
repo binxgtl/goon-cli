@@ -237,7 +237,7 @@ jobs:
           ver=$(npm --version)
           echo "npm $ver"
           if ! node -e 'const [a,b,c]=process.argv[1].split(".").map(Number); process.exit(a>11||(a===11&&(b>5||(b===5&&c>=1)))?0:1)' "$ver"; then
-            npm install --prefix "$HOME/.npm-cli" npm@latest --no-audit --no-fund
+            npm install --prefix "$HOME/.npm-cli" npm@latest --ignore-scripts --no-audit --no-fund
             echo "$HOME/.npm-cli/bin" >> "$GITHUB_PATH"
           fi
       - name: Install the Rust toolchain

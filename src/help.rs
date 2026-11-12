@@ -22,43 +22,45 @@ Options:
   -C, --cwd DIRECTORY        Workspace (defaults to current directory)
       --provider NAME        openai-compatible | openai-responses | anthropic
       --base-url URL         Provider API root, usually ending in /v1
-      --model NAME           Exact model ID from your provider
+  -m, --model NAME           Exact model ID from your provider
       --effort LEVEL         Reasoning effort: low | medium | high | xhigh | max
       --key-env NAME         Credential variable (default GOON_API_KEY)
   -r, --resume [ID|latest]   Resume a saved session (opens picker when omitted)
       --pair                 Start Cloudflared tunnel + QR device pairing on launch
-  -y, --yes, --yolo         Full auto-approve (unrestricted tools, shell & network)
-      --read-only           Read tools and research agents; no writes or shell
-      --allow-net           Allow outbound network (bash/MCP) for this run (default: deny)
-      --allow-net-hosts H   Allow only these exact hosts (repeatable or comma-separated)
-      --json                Emit NDJSON events instead of terminal output
-      --no-tui              Use plain readline instead of the full-screen UI
-      --no-alt-screen       Inline TUI with native terminal scrollback (no alternate screen)
-      --no-mcp              Disable configured MCP servers for this run
-      --no-subagents        Disable delegation tools for this run
+  -y, --yes                  Auto-approve workspace edits & low/medium-risk shell commands
+      --yolo                 Unrestricted mode (high-risk shell, network & outside-workspace; dangerous)
+      --plan                 Start in read-only planning mode until exit_plan_mode
+      --read-only, --readonly  Read tools and research agents; no writes or shell
+      --allow-net            Allow outbound network (bash/MCP) for this run (default: deny)
+      --allow-net-hosts H    Allow only these exact hosts (repeatable or comma-separated)
+      --json                 Emit NDJSON events instead of terminal output
+      --no-tui               Use plain readline instead of the full-screen UI
+      --no-alt-screen        Inline TUI with native terminal scrollback (no alternate screen)
+      --no-mcp               Disable configured MCP servers for this run
+      --no-subagents         Disable delegation tools for this run
       --inline-reasoning MODE leading-think (default) | off
-      --show-reasoning      Separate reasoning events / labeled stderr output
-      --context-window N    Actual model context window (default 128000); input budget = N - max-output-tokens
+      --show-reasoning       Separate reasoning events / labeled stderr output
+      --context-window N     Actual model context window (default 128000); input budget = N - max-output-tokens
       --max-output-tokens N  Per-request output limit (default 16384)
       --run-token-budget N   Run token budget (default 0 = unlimited)
-      --timeout-ms N        Model stream idle timeout (default 300000)
-      --no-verify           Skip the post-edit verification hook
-      --verify-cmd CMD      Verification command (repeatable; replaces auto-detected commands)
-      --max-cost-usd N      Stop the run when estimated cost reaches N USD (0 = unlimited)
-      --max-time-ms N       Stop the run after N ms (0 = unlimited)
-      --event-log           Append every session event to an NDJSON log (GOON_EVENT_LOG)
-      --no-event-log        Disable the event log for this run
-      --stub                Use the deterministic stub provider (no network, no API key)
-      --stub-fixture FILE   JSON script for --stub (max 1 MiB; GOON_STUB_FIXTURE)
+      --timeout-ms N         Model stream idle timeout (default 300000)
+      --no-verify            Skip the post-edit verification hook
+      --verify-cmd CMD       Verification command (repeatable; replaces auto-detected commands)
+      --max-cost-usd N       Stop the run when estimated cost reaches N USD (0 = unlimited)
+      --max-time-ms N        Stop the run after N ms (0 = unlimited)
+      --event-log            Append every session event to an NDJSON log (GOON_EVENT_LOG)
+      --no-event-log         Disable the event log for this run
+      --stub                 Use the deterministic stub provider (no network, no API key)
+      --stub-fixture FILE    JSON script for --stub (max 1 MiB; GOON_STUB_FIXTURE)
   -o, --output-last-message FILE  Also write the final answer of a -p run to FILE
-  -h, --help                Show help
-  -v, --version             Show version
+  -h, --help                 Show help
+  -v, -V, --version          Show version
 
 Piping: with -p, text piped on stdin is attached as context, e.g.
   git diff | goon -p 'review this diff'      goon -p 'explain' < error.log
 
 Interactive commands:
-  /help, /setup, /key, /model, /effort, /mode, /auto, /view, /transcript, /copy, /btw,
+  /help, /setup, /key, /model, /effort, /mode, /auto, /yolo, /view, /transcript, /copy, /btw,
   /goal, /recap, /skills, /prompts, /memories, /memory, /presets, /mention, /pair, /workflow, /network, /dag,
   /cd, /pwd, /mcp, /subagents, /plan, /revert, /undo, /checkpoints, /todo, /resume, /new, /compact, /diff, /review, /fork, /rename,
   /delete, /export, /init, /status, /cost, /tools, /sessions, /debug-config, /warnings, /doctor, /clear, /exit, or !<cmd>.

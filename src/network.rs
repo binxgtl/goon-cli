@@ -603,7 +603,10 @@ impl AgentNetwork {
         store.session.lock().unwrap().title = Some(title);
         let before = store.session.lock().unwrap().cost();
         let outcome = match Harness::new(self.config.clone(), store.clone(), tools, noop_emit(), None, HarnessDeps { verify_enabled: Some(false), ..Default::default() }) {
-            Ok(h) => h.run(&prompt, cancel, Some(budget.clone())).await,
+            Ok(h) => {
+                h.set_untrusted_prompts(true);
+                h.run(&prompt, cancel, Some(budget.clone())).await
+            }
             Err(e) => Err(e),
         };
         self.aggregate_run_cost(&store, before);

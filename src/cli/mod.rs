@@ -87,9 +87,14 @@ pub fn welcome_banner(model: &str, provider: &str, base_url: &str, effort: Optio
         Ok(home) if !home.is_empty() && cwd_text.starts_with(&format!("{home}/")) => format!("~{}", &cwd_text[home.len()..]),
         _ => cwd_text,
     };
+    let mode_label = match mode {
+        "auto" => "auto-approve",
+        "yolo" => "yolo (unrestricted)",
+        other => other,
+    };
     [
         format!("◆ goon v{}", crate::version::VERSION),
-        format!("  model {model}   effort {}   mode {}", effort.unwrap_or("default"), if mode == "auto" { "auto-approve" } else { mode }),
+        format!("  model {model}   effort {}   mode {mode_label}", effort.unwrap_or("default")),
         format!("  gateway {host} ({provider})"),
         format!("  workspace {workspace}   session {}", jsutil::take_chars(session_id, 8)),
         "  /help commands   @ files   $ skills   ! shell   shift+tab mode".to_string(),
@@ -480,6 +485,10 @@ async fn mcp_add(argv: &[String]) -> Result<()> {
         None => (rest, vec![]),
     };
     let parsed = parse_args(flag_part, MCP_ADD_OPTIONS, false)?;
+    if parsed.flag("help") {
+        stdout_write("Usage: goon mcp add <name> (--url <URL> [--bearer-env ENV] | [--env KEY=VAL ...] -- <command> [args...]) [--trust] [--timeout-ms N]\n");
+        return Ok(());
+    }
     let Some(name) = parsed.positionals.first().cloned() else {
         bail!("Usage: goon mcp add <name> (--url <URL> [--bearer-env ENV] | -- <command> [args...])");
     };
@@ -712,7 +721,7 @@ fn workflow_command(sub: &str, positionals: &[String], ws: &Path, json_out: bool
 }
 
 pub fn pad_end(text: &str, width: usize) -> String {
-    let len = jsutil::utf16_len(text);
+    let len = crate::tui::visible_length(text);
     if len >= width {
         text.to_string()
     } else {
@@ -721,7 +730,7 @@ pub fn pad_end(text: &str, width: usize) -> String {
 }
 
 pub fn pad_start(text: &str, width: usize) -> String {
-    let len = jsutil::utf16_len(text);
+    let len = crate::tui::visible_length(text);
     if len >= width {
         text.to_string()
     } else {

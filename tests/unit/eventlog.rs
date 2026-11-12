@@ -55,6 +55,25 @@ fn env_credentials_are_redacted_without_explicit_secrets() {
 }
 
 #[test]
+fn stream_redactor_redacts_secrets_split_across_chunks() {
+    let known = "sk-known-secret-abcdefghijklmnopqrstuvwxyz123456";
+    let bearer_tok = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.payload.sig";
+    let json_tok = "ghp_splitJsonSecretToken9876543210";
+    let mut redactor = StreamRedactor::new(&[known.to_string()]);
+    let mut out = String::new();
+    // Split each secret pattern directly across chunk boundaries around the 256-char tail window.
+    out.push_str(&redactor.push(&format!("prefix {} sk-known-secret-abcdef", "x".repeat(120))));
+    out.push_str(&redactor.push(&format!("ghijklmnopqrstuvwxyz123456 {} Authorization: Bearer eyJhbGciOiJI", "y".repeat(240))));
+    out.push_str(&redactor.push(&format!("UzI1NiIsInR5cCI6IkpXVCJ9.payload.sig {} {{\"api_key\": \"ghp_splitJson", "z".repeat(240))));
+    out.push_str(&redactor.push(&format!("SecretToken9876543210\"}} {}", "w".repeat(260))));
+    out.push_str(&redactor.flush_all());
+    assert!(!out.contains(known), "split known secret leaked: {out}");
+    assert!(!out.contains(bearer_tok), "split bearer token leaked: {out}");
+    assert!(!out.contains(json_tok), "split JSON api_key leaked: {out}");
+    assert!(out.contains("[REDACTED]"), "expected redaction marker: {out}");
+}
+
+#[test]
 fn reopen_repairs_a_torn_tail_before_appending() {
     let f = fixture();
     let path = sessions(&f).join("torn.events.jsonl");

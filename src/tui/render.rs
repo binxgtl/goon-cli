@@ -1106,9 +1106,15 @@ impl Tui {
             status_line = if color_enabled && !text.is_empty() { format!("{}{text}{}", p.dim, p.reset) } else { text };
         }
 
-        let display_mode = if st.mode_label == "auto" { "auto-approve".to_string() } else { st.mode_label.clone() };
-        // Auto-approve is the one risky state, so it is the one mode shown in a warning colour.
-        let mode_tone = if display_mode == "auto-approve" {
+        let display_mode = match st.mode_label.as_str() {
+            "auto" => "auto-approve".to_string(),
+            "yolo" => "yolo (unrestricted)".to_string(),
+            _ => st.mode_label.clone(),
+        };
+        // Auto-approve uses warning tone; unrestricted yolo uses danger/error tone.
+        let mode_tone = if st.mode_label == "yolo" {
+            p.err
+        } else if display_mode == "auto-approve" {
             p.warn
         } else if display_mode == "plan" {
             p.brand

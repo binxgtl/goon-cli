@@ -596,7 +596,7 @@ impl SessionStore {
             let outcome = (|| -> Result<()> {
                 let pid = lock_pid(&lock)?.ok_or_else(|| anyhow!("Invalid session lock: {}", lock.display()))?;
                 if crate::process::lock_owner_alive(pid, &lock) {
-                    bail!("Session is already open in another process.");
+                    bail!("Session is already open in another process (pid {pid}).");
                 }
                 std::fs::remove_file(&lock)?;
                 acquire(&lock)?;
@@ -750,6 +750,24 @@ impl SessionStore {
         }
         let _ = std::fs::remove_file(&lock);
         remove_event_log_artifacts(root, &id);
+        if let Ok(entries) = std::fs::read_dir(root) {
+            let compact_prefix = format!("{id}.compact-");
+            let replayed_name = format!("{id}.replayed.json");
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let s = name.to_string_lossy();
+                if (s.starts_with(&compact_prefix) && s.ends_with(".json")) || s == replayed_name {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+        if is_uuid(&id) {
+            if let Some(data_dir) = root.parent() {
+                let _ = std::fs::remove_file(data_dir.join("history").join(format!("{id}.jsonl")));
+                let _ = std::fs::remove_dir_all(data_dir.join("subagents").join(&id));
+                let _ = std::fs::remove_dir_all(data_dir.join("workflows").join(&id));
+            }
+        }
         Ok(Some(id))
     }
 

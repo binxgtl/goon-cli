@@ -47,6 +47,7 @@ pub struct AllowSets {
     pub tools: HashSet<String>,
     pub prefixes: BTreeSet<String>,
     pub exact: BTreeSet<String>,
+    pub untrusted_next_prompt: bool,
 }
 
 pub enum Ui {
@@ -323,7 +324,7 @@ impl App {
             if st.view_mode == "normal" {
                 return;
             }
-            let source = s("source");
+            let source = terminal_text(&s("source"));
             if st.reasoning_source.as_deref() != Some(source.as_str()) {
                 stderr_write(&format!("\n[reasoning · {source}]\n"));
             }
@@ -341,8 +342,8 @@ impl App {
         let clean = |t: &str| terminal_text(t);
         match kind {
             "text" => stdout_write(&clean(&s("text"))),
-            "subagent" if s("state") != "progress" => stderr_write(&format!("\n[agent {}: {}]\n", take_chars(&s("id"), 8), s("state"))),
-            "tool" if s("state") == "start" => stderr_write(&format!("\n[{}]\n", s("name"))),
+            "subagent" if s("state") != "progress" => stderr_write(&clean(&format!("\n[agent {}: {}]\n", take_chars(&s("id"), 8), s("state")))),
+            "tool" if s("state") == "start" => stderr_write(&clean(&format!("\n[{}]\n", s("name")))),
             "todo" => {
                 let todos = event.get("todos").and_then(Value::as_array).cloned().unwrap_or_default();
                 let done = todos.iter().filter(|t| t.get("status").and_then(Value::as_str) == Some("completed")).count();
@@ -353,7 +354,7 @@ impl App {
                     Some(g) => format_goal_status_indicator(&g, 0.0),
                     None => "Goal cleared".into(),
                 };
-                stderr_write(&format!("\n[{label}]\n"));
+                stderr_write(&clean(&format!("\n[{label}]\n")));
             }
             "plan_exit" => stderr_write("\n[Plan approved — exited plan mode]\n"),
             "compaction" => stderr_write("\n[Context compacted; original history archived.]\n"),
@@ -382,7 +383,7 @@ impl App {
             "workflow_classified" => stderr_write(&clean(&format!("\n[workflow {}: {}]\n", s("mode"), s("reason")))),
             "scope_round" => stderr_write(&clean(&format!("\n[scope round {} {}: {}]\n", event.get("round").map(jsutil::js_string).unwrap_or_default(), s("action"), s("reason")))),
             "cost_degrade" => stderr_write(&clean(&format!("\n[cost degrade: {} — {} candidate(s)]\n", s("reason"), event.get("candidates").map(jsutil::js_string).unwrap_or_default()))),
-            "stopped" => stderr_write(&format!("\n{}\n", s("reason"))),
+            "stopped" => stderr_write(&clean(&format!("\n{}\n", s("reason")))),
             _ => {}
         }
     }
@@ -503,10 +504,10 @@ impl App {
             Some(e) if Some(e) != prefix.as_ref() => format!("\n  e = always allow exactly \"{e}\" in this session"),
             _ => String::new(),
         };
-        let high_hint = if high { format!("\n  High risk ({}): type the tool name \"{}\" to allow it once; it cannot be remembered.", risk.as_str(), request.tool) } else { String::new() };
+        let high_hint = if high { format!("\n  High risk ({}): type \"{}\" or \"allow\" to allow it once; it cannot be remembered.", risk.as_str(), request.tool) } else { String::new() };
         let block = format!("\n▲ Allow {}? [{}]\n{preview}{prefix_hint}{exact_hint}{high_hint}\n", request.tool, risk.as_str());
         let label = if high {
-            format!("[type \"{}\" to allow, N to deny] ", request.tool)
+            format!("[type \"{}\" or \"allow\", N to deny] ", request.tool)
         } else if exact.is_some() {
             "[y/N/p(refix)/e(xact)/a(lways)] ".into()
         } else if prefix.is_some() {
@@ -538,7 +539,7 @@ impl App {
                 let answer = self.ask_block(&block, &label, Some(&race), opts.clone()).await;
                 let clean = answer.unwrap_or_default().trim().to_lowercase();
                 if high {
-                    if clean == request.tool.to_lowercase() {
+                    if clean == request.tool.to_lowercase() || clean == "allow" {
                         "yes".into()
                     } else {
                         "no".into()
@@ -591,7 +592,7 @@ impl App {
         }
         let reply = self.ask_block(&block, &label, Some(&cancel), opts).await.unwrap_or_default().trim().to_lowercase();
         if high {
-            return reply == request.tool.to_lowercase();
+            return reply == request.tool.to_lowercase() || reply == "allow";
         }
         if reply == "a" || reply == "always" {
             self.allowed.lock().unwrap().tools.insert(request.tool.clone());
@@ -669,7 +670,7 @@ impl App {
         reg.set_plan_mode(current_mode == "plan");
         *reg.rejection_guard.lock().unwrap() = Some(Arc::new(SessionRejectionGuard { app: self.me.clone() }));
         reg.set_policy(Some(self.policy.clone()));
-        reg.set_unrestricted(current_mode == "auto");
+        reg.set_unrestricted(current_mode == "yolo");
         if !matches!(self.ui, Ui::None) {
             reg.callbacks.lock().unwrap().ask_user = Some(self.ask_user_fn());
         }
@@ -769,17 +770,22 @@ impl App {
         let tools = self.tools();
         tools.set_read_only(next == "readonly");
         tools.set_plan_mode(next == "plan");
-        self.policy.set_unrestricted(next == "auto");
-        tools.set_unrestricted(next == "auto");
+        self.policy.set_unrestricted(next == "yolo");
+        tools.set_unrestricted(next == "yolo");
         if let Some(t) = self.tui() {
             t.set_mode(next);
         }
-        {
+        // Session-ephemeral `yolo` is never persisted to config.json so future launches start safely.
+        if next != "yolo" {
             let mut config = self.config.lock().unwrap();
             config.approval_mode = Some(next.to_string());
             let _ = config::save_config(&config);
         }
-        let label = if next == "auto" { "auto-approve (full access — all tools, commands & network unrestricted)".to_string() } else { next.to_string() };
+        let label = match next {
+            "auto" => "auto-approve (workspace Low/Medium tools — High/Critical & network still gated)".to_string(),
+            "yolo" => "yolo (unrestricted session — High-risk, outside-workspace & network enabled; Critical still blocked)".to_string(),
+            _ => next.to_string(),
+        };
         self.notice(&format!("Mode: {label}"));
         self.display(&format!("\n[Mode switched to: {label}]\n"));
     }
@@ -788,8 +794,8 @@ impl App {
         let tools = self.tools();
         tools.set_plan_mode(mode == "plan");
         tools.set_read_only(mode == "readonly");
-        self.policy.set_unrestricted(mode == "auto");
-        tools.set_unrestricted(mode == "auto");
+        self.policy.set_unrestricted(mode == "yolo");
+        tools.set_unrestricted(mode == "yolo");
         if let Some(t) = self.tui() {
             t.set_mode(mode);
         }
@@ -876,8 +882,19 @@ impl App {
             p.notify_user_prompt(input);
         }
         self.publish_event(&json!({ "type": "user", "text": input }), true);
+        let untrusted_once = {
+            let mut allowed = self.allowed.lock().unwrap();
+            std::mem::replace(&mut allowed.untrusted_next_prompt, false)
+        };
         let harness = self.harness();
-        match harness.run(input, &controller, None).await {
+        if untrusted_once {
+            harness.set_untrusted_prompts(true);
+        }
+        let run_res = harness.run(input, &controller, None).await;
+        if untrusted_once {
+            harness.set_untrusted_prompts(false);
+        }
+        match run_res {
             Ok(text) => {
                 result.text = text.clone();
                 let mut ok = true;
@@ -1255,12 +1272,14 @@ pub async fn run_session(values: Parsed, mut config: Config, policy: ExecutionPo
         }
     }
     let stdin_tty = crate::term::stdin_is_tty();
+    let mut piped_only_prompt = false;
     if prompt.is_none() && !stdin_tty && initial_command.is_none() {
         let text = read_stdin_limited(1024 * 1024, "Piped prompt exceeds 1 MiB.").await?.trim().to_string();
         if text.is_empty() {
             bail!("Empty input. Supply --prompt or run in an interactive terminal.");
         }
         prompt = Some(text);
+        piped_only_prompt = true;
     }
     if !config.stub && prompt.is_none() && stdin_tty && !json_out && (config.model.is_none() || config::resolve_api_key(&config).is_none()) {
         config = crate::setup::run_setup_wizard(Some(config), Default::default()).await?;
@@ -1333,18 +1352,28 @@ pub async fn run_session(values: Parsed, mut config: Config, policy: ExecutionPo
         )
     });
     let memory_store = if runtime.memory_enabled { open_memory_store(&runtime).await } else { None };
-    let yes_flag = values.flag("yes") || values.flag("yolo");
+    let yolo_flag = values.flag("yolo");
+    let yes_flag = values.flag("yes");
     let mode = if values.flag("read-only") {
         "readonly".to_string()
     } else if values.flag("plan") {
         "plan".into()
+    } else if yolo_flag {
+        "yolo".into()
     } else if yes_flag {
         "auto".into()
     } else {
         config.approval_mode.clone().unwrap_or_else(|| "ask".into())
     };
-    policy.set_unrestricted(mode == "auto");
-    let pre_plan_mode = if yes_flag || config.approval_mode.as_deref() == Some("auto") { "auto" } else { "ask" }.to_string();
+    policy.set_unrestricted(mode == "yolo");
+    let pre_plan_mode = if yolo_flag {
+        "yolo"
+    } else if yes_flag || config.approval_mode.as_deref() == Some("auto") {
+        "auto"
+    } else {
+        "ask"
+    }
+    .to_string();
     let notify_enabled = !matches!(std::env::var("GOON_NOTIFY").as_deref(), Ok("0") | Ok("off"));
     let use_tui = interactive && stdin_tty && crate::term::stdout_is_tty() && !json_out && !values.flag("no-tui") && std::env::var("TERM").as_deref() != Ok("dumb");
     let app_slot: Arc<OnceLock<Weak<App>>> = Arc::new(OnceLock::new());
@@ -1413,7 +1442,7 @@ pub async fn run_session(values: Parsed, mut config: Config, policy: ExecutionPo
             rebuild_pending: false,
             reasoning_source: None,
         }),
-        allowed: Mutex::new(AllowSets::default()),
+        allowed: Mutex::new(AllowSets { untrusted_next_prompt: piped_only_prompt, ..Default::default() }),
         event_writer: Mutex::new(event_writer),
         history_writer: Mutex::new(None),
         input_cancel: Mutex::new(CancellationToken::new()),
@@ -1789,9 +1818,10 @@ impl App {
                 move |text: String| {
                     let Some(app) = me.upgrade() else { return };
                     if crate::pair::is_forbidden_remote_input(&text) {
-                        app.display("\n[Blocked remote attempt to run direct shell (!cmd) or escalate to auto-approve mode.]\n");
+                        app.display("\n[Blocked remote attempt to run direct shell (!cmd) or privileged slash command.]\n");
                         return;
                     }
+                    app.allowed.lock().unwrap().untrusted_next_prompt = true;
                     if let Some(t) = app.tui() {
                         t.submit_external_prompt(&text);
                     } else {
@@ -1810,8 +1840,8 @@ impl App {
                 let me = me.clone();
                 move |mode: String| {
                     let Some(app) = me.upgrade() else { return };
-                    if mode == "auto" {
-                        app.display("\n[Blocked remote attempt to switch to auto-approve mode.]\n");
+                    if mode == "auto" || mode == "yolo" {
+                        app.display("\n[Blocked remote attempt to switch to auto-approve/yolo mode.]\n");
                         return;
                     }
                     app.apply_permission_mode(&mode);

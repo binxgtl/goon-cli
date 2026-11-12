@@ -380,21 +380,26 @@ pub fn render_qr_terminal(url: &str, indent: &str) -> String {
         }
         !matrix[r - quiet][c - quiet]
     };
+    let theme_mode = crate::tui::text::resolve_theme_mode(|k| std::env::var(k).ok());
     let mut lines = vec![];
     let mut r = 0;
     while r < total {
-        let mut row = indent.to_string();
+        let mut blocks = String::with_capacity(total);
         for c in 0..total {
             let top = light(r, c);
             let bottom = if r + 1 < total { light(r + 1, c) } else { false };
-            row.push(match (top, bottom) {
+            blocks.push(match (top, bottom) {
                 (true, true) => '█',
                 (true, false) => '▀',
                 (false, true) => '▄',
                 _ => ' ',
             });
         }
-        lines.push(row);
+        match theme_mode {
+            crate::tui::text::ThemeMode::None => lines.push(format!("{indent}{blocks}")),
+            crate::tui::text::ThemeMode::Ansi16 => lines.push(format!("{indent}\x1b[97;40m{blocks}\x1b[0m")),
+            _ => lines.push(format!("{indent}\x1b[38;5;231;48;5;16m{blocks}\x1b[0m")),
+        }
         r += 2;
     }
     lines.join("\n")
@@ -412,21 +417,20 @@ pub fn is_forbidden_remote_input(raw: &str) -> bool {
     if trimmed.starts_with('!') {
         return true;
     }
+    if !trimmed.starts_with('/') {
+        return false;
+    }
     let lower = trimmed.to_lowercase();
-    if lower == "/yolo" || lower.starts_with("/yolo ") || lower == "/auto" {
-        return true;
+    let mut parts = lower.split_whitespace();
+    let cmd = parts.next().unwrap_or("");
+    let rest = lower[cmd.len()..].trim();
+    match cmd {
+        "/auto" | "/yolo" => !matches!(rest, "off" | "false" | "0" | "ask"),
+        "/mode" => !matches!(rest, "ask" | "plan" | "readonly" | "read-only"),
+        "/status" | "/cost" | "/help" | "/clear" | "/diff" | "/checkpoints" | "/warnings" | "/tools" | "/sessions" | "/pwd" | "/recap" => !rest.is_empty(),
+        "/compact" | "/todo" | "/view" | "/transcript" | "/btw" | "/subagents" | "/agents" => false,
+        _ => true,
     }
-    if let Some(arg) = lower.strip_prefix("/auto ") {
-        if ["", "on", "true", "1", "yes", "toggle"].contains(&arg.trim()) {
-            return true;
-        }
-    }
-    if let Some(arg) = lower.strip_prefix("/mode") {
-        if ["", "auto", "auto-approve", "yolo"].contains(&arg.trim()) {
-            return true;
-        }
-    }
-    false
 }
 
 /// The default-route IPv4 address (no packet is sent); loopback when offline.
@@ -663,6 +667,8 @@ impl PairManager {
         let binary = resolve_cloudflared_binary().await;
         let mut cmd = tokio::process::Command::new(&binary);
         cmd.args(["tunnel", "--no-autoupdate", "--url", &format!("http://127.0.0.1:{port}")])
+            .env_clear()
+            .envs(crate::process::child_env(None))
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -677,7 +683,7 @@ impl PairManager {
                 let mut st = self.state.lock().unwrap();
                 st.tunnel_status = "fallback_lan";
                 st.tunnel_error = Some(format!(
-                    "cloudflared not found or failed (spawn {binary} {}). Run \"/pair lan\" to pair over local Wi-Fi.",
+                    "cloudflared not found or failed (spawn {binary} {}). Install cloudflared or run \"/pair lan\" to pair over local Wi-Fi.",
                     if e.kind() == std::io::ErrorKind::NotFound { "ENOENT".to_string() } else { e.to_string() }
                 ));
                 return;
@@ -1026,29 +1032,92 @@ impl PairManager {
     }
 
     async fn handle_connection(&self, socket: tokio::net::TcpStream, stop: CancellationToken) -> Result<()> {
+        const SEC_HEADERS: &str = "X-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\n";
+        let respond = |status: &str, ctype: &str, body: String, extra: &str| {
+            format!("HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n{SEC_HEADERS}{extra}\r\n{body}", body.len())
+        };
         let mut reader = BufReader::new(socket);
-        let mut request_line = String::new();
-        reader.read_line(&mut request_line).await?;
-        let mut parts = request_line.split_whitespace();
-        let method = parts.next().unwrap_or("").to_string();
-        let target = parts.next().unwrap_or("/").to_string();
-        let mut headers = vec![];
-        loop {
-            let mut line = String::new();
-            if reader.read_line(&mut line).await? == 0 {
-                break;
+        let preamble = tokio::time::timeout(Duration::from_secs(15), async {
+            let mut request_line = String::new();
+            (&mut reader).take(8192).read_line(&mut request_line).await?;
+            if request_line.len() >= 8192 && !request_line.ends_with('\n') {
+                return Err(anyhow!("Request URI too long"));
             }
-            let line = line.trim_end();
-            if line.is_empty() {
-                break;
+            let mut parts = request_line.split_whitespace();
+            let method = parts.next().unwrap_or("").to_string();
+            let target = parts.next().unwrap_or("/").to_string();
+            let mut headers = vec![];
+            let mut header_bytes = 0usize;
+            loop {
+                let mut line = String::new();
+                let n = (&mut reader).take(8192).read_line(&mut line).await?;
+                if n == 0 {
+                    break;
+                }
+                header_bytes += n;
+                if (n >= 8192 && !line.ends_with('\n')) || header_bytes > 16 * 1024 || headers.len() >= 64 {
+                    return Err(anyhow!("Headers too large"));
+                }
+                let line = line.trim_end();
+                if line.is_empty() {
+                    break;
+                }
+                if let Some((k, v)) = line.split_once(':') {
+                    headers.push((k.trim().to_ascii_lowercase(), v.trim().to_string()));
+                }
             }
-            if let Some((k, v)) = line.split_once(':') {
-                headers.push((k.trim().to_ascii_lowercase(), v.trim().to_string()));
+            Ok::<_, anyhow::Error>((method, target, headers))
+        })
+        .await;
+        let (method, target, headers) = match preamble {
+            Ok(Ok(v)) => v,
+            Ok(Err(_)) => {
+                let mut socket = reader.into_inner();
+                let _ = socket
+                    .write_all(respond("431 Request Header Fields Too Large", "application/json; charset=utf-8", json!({ "error": "Request headers too large." }).to_string(), "").as_bytes())
+                    .await;
+                return Ok(());
             }
-        }
+            Err(_) => return Ok(()),
+        };
         let parsed = url::Url::parse(&format!("http://127.0.0.1{target}")).unwrap_or_else(|_| url::Url::parse("http://127.0.0.1/").unwrap());
         let path = parsed.path().to_string();
         let query: Vec<(String, String)> = parsed.query_pairs().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        if method == "GET" && path == "/favicon.ico" {
+            let mut socket = reader.into_inner();
+            socket.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await?;
+            return Ok(());
+        }
+        if !self.check_auth(&query, &headers) {
+            let mut socket = reader.into_inner();
+            socket.write_all(respond("401 Unauthorized", "application/json; charset=utf-8", json!({ "error": "Unauthorized: invalid or missing pairing token." }).to_string(), "").as_bytes()).await?;
+            return Ok(());
+        }
+        if method == "POST" {
+            if let Some((_, origin)) = headers.iter().find(|(k, _)| k == "origin") {
+                let host = headers.iter().find(|(k, _)| k == "host").map(|(_, v)| v.as_str()).unwrap_or("");
+                let origin_host = url::Url::parse(origin).ok().and_then(|u| {
+                    let h = u.host_str()?;
+                    Some(match u.port() {
+                        Some(p) => format!("{h}:{p}"),
+                        None => h.to_string(),
+                    })
+                });
+                if origin_host.as_deref().map(|oh| !oh.eq_ignore_ascii_case(host)).unwrap_or(true) {
+                    let mut socket = reader.into_inner();
+                    socket.write_all(respond("403 Forbidden", "application/json; charset=utf-8", json!({ "error": "Cross-origin POST rejected." }).to_string(), "").as_bytes()).await?;
+                    return Ok(());
+                }
+            }
+            let is_json = headers.iter().find(|(k, _)| k == "content-type").and_then(|(_, v)| v.split(';').next()).map(|ct| ct.trim().eq_ignore_ascii_case("application/json")).unwrap_or(false);
+            if !is_json {
+                let mut socket = reader.into_inner();
+                socket
+                    .write_all(respond("415 Unsupported Media Type", "application/json; charset=utf-8", json!({ "error": "Expected Content-Type: application/json." }).to_string(), "").as_bytes())
+                    .await?;
+                return Ok(());
+            }
+        }
         let length: usize = headers.iter().find(|(k, _)| k == "content-length").and_then(|(_, v)| v.parse().ok()).unwrap_or(0);
         // The body must be read through the buffered reader: it may already hold those bytes.
         let body: std::result::Result<Value, String> = if method == "POST" {
@@ -1056,8 +1125,8 @@ impl PairManager {
                 Err("Payload too large".into())
             } else {
                 let mut buf = vec![0u8; length];
-                match reader.read_exact(&mut buf).await {
-                    Ok(_) => {
+                match tokio::time::timeout(Duration::from_secs(15), reader.read_exact(&mut buf)).await {
+                    Ok(Ok(_)) => {
                         let raw = String::from_utf8_lossy(&buf).trim().to_string();
                         if raw.is_empty() {
                             Ok(json!({}))
@@ -1065,23 +1134,14 @@ impl PairManager {
                             crate::jsutil::parse_json(&raw)
                         }
                     }
-                    Err(e) => Err(e.to_string()),
+                    Ok(Err(e)) => Err(e.to_string()),
+                    Err(_) => Err("Request body read timed out".into()),
                 }
             }
         } else {
             Ok(json!({}))
         };
         let mut socket = reader.into_inner();
-        let respond =
-            |status: &str, ctype: &str, body: String, extra: &str| format!("HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n{extra}\r\n{body}", body.len());
-        if method == "GET" && path == "/favicon.ico" {
-            socket.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await?;
-            return Ok(());
-        }
-        if !self.check_auth(&query, &headers) {
-            socket.write_all(respond("401 Unauthorized", "application/json; charset=utf-8", json!({ "error": "Unauthorized: invalid or missing pairing token." }).to_string(), "").as_bytes()).await?;
-            return Ok(());
-        }
         let read_body = |socket: tokio::net::TcpStream| async move {
             match body {
                 Ok(v) => Ok((socket, v)),
@@ -1090,7 +1150,8 @@ impl PairManager {
         };
         match (method.as_str(), path.as_str()) {
             ("GET", "/") => {
-                socket.write_all(respond("200 OK", "text/html; charset=utf-8", MOBILE_HTML.to_string(), "Cache-Control: no-store, no-cache, must-revalidate\r\n").as_bytes()).await?;
+                let extra = "Cache-Control: no-store, no-cache, must-revalidate\r\nContent-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'none'\r\n";
+                socket.write_all(respond("200 OK", "text/html; charset=utf-8", MOBILE_HTML.to_string(), extra).as_bytes()).await?;
             }
             ("GET", "/api/state") => {
                 self.ensure_history_seeded();
@@ -1106,7 +1167,14 @@ impl PairManager {
             }
             ("GET", "/api/events") => {
                 self.ensure_history_seeded();
-                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nCache-Control: no-cache, no-store, no-transform\r\nConnection: keep-alive\r\nX-Accel-Buffering: no\r\n\r\n").await?;
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nCache-Control: no-cache, no-store, no-transform\r\nConnection: keep-alive\r\nX-Accel-Buffering: no\r\n{SEC_HEADERS}\r\n"
+                        )
+                        .as_bytes(),
+                    )
+                    .await?;
                 // 2 KB comment padding first so proxies flush the stream immediately.
                 let mut first = format!(": {}\n\n", " ".repeat(2048));
                 first.push_str(&format!("data: {}\n\n", stringify(&json!({ "type": "state", "state": (self.callbacks.get_state)() }))));
@@ -1146,7 +1214,7 @@ impl PairManager {
                             respond(
                                 "403 Forbidden",
                                 "application/json",
-                                json!({ "error": "Direct shell execution (!cmd) and auto-approve mode escalation are disabled for remote devices." }).to_string(),
+                                json!({ "error": "Direct shell execution (!cmd), privileged slash commands, and auto-approve escalation are disabled for remote devices." }).to_string(),
                                 "",
                             )
                             .as_bytes(),
@@ -1163,7 +1231,7 @@ impl PairManager {
                 Err((mut s, e)) => s.write_all(respond("500 Internal Server Error", "application/json", json!({ "error": e.to_string() }).to_string(), "").as_bytes()).await?,
                 Ok((mut s, body)) => {
                     let mode = body.get("mode").and_then(Value::as_str).unwrap_or("").to_string();
-                    if mode == "auto" {
+                    if mode == "auto" || mode == "yolo" {
                         s.write_all(respond("403 Forbidden", "application/json", json!({ "error": "Cannot enable auto-approve mode from a remote paired device." }).to_string(), "").as_bytes())
                             .await?;
                     } else if ["ask", "plan", "readonly"].contains(&mode.as_str()) {
@@ -1206,7 +1274,13 @@ impl PairManager {
 
 async fn can_spawn(bin: &str) -> bool {
     let mut cmd = tokio::process::Command::new(bin);
-    cmd.arg("--version").stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).kill_on_drop(true);
+    cmd.arg("--version")
+        .env_clear()
+        .envs(crate::process::child_env(None))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
     match cmd.spawn() {
         Ok(mut c) => matches!(tokio::time::timeout(Duration::from_secs(10), c.wait()).await, Ok(Ok(s)) if s.success()),
         Err(_) => false,
@@ -1222,32 +1296,6 @@ async fn resolve_cloudflared_binary() -> String {
     let local = dir.join(name);
     let local_text = local.to_string_lossy().to_string();
     if std::fs::metadata(&local).map(|m| m.is_file() && m.len() > 1024).unwrap_or(false) && can_spawn(&local_text).await {
-        return local_text;
-    }
-    let asset = match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("windows", "aarch64") => "cloudflared-windows-arm64.exe",
-        ("windows", _) => "cloudflared-windows-amd64.exe",
-        ("linux", "aarch64") => "cloudflared-linux-arm64",
-        ("linux", _) => "cloudflared-linux-amd64",
-        _ => return "cloudflared".into(),
-    };
-    let download = async {
-        std::fs::create_dir_all(&dir).ok()?;
-        let client = reqwest::Client::builder().timeout(Duration::from_secs(30)).build().ok()?;
-        let res = client.get(format!("https://github.com/cloudflare/cloudflared/releases/latest/download/{asset}")).send().await.ok()?;
-        if !res.status().is_success() {
-            return None;
-        }
-        let bytes = res.bytes().await.ok()?;
-        std::fs::write(&local, &bytes).ok()?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&local, std::fs::Permissions::from_mode(0o755));
-        }
-        Some(())
-    };
-    if download.await.is_some() && can_spawn(&local_text).await {
         return local_text;
     }
     "cloudflared".into()
@@ -1276,8 +1324,13 @@ mod tests {
         assert!(is_forbidden_remote_input("!rm -rf"));
         assert!(is_forbidden_remote_input("/auto on"));
         assert!(is_forbidden_remote_input("/mode"));
+        for blocked in ["/cd /tmp", "/export ../../pwn.md", "/mcp reload", "/workflow run deploy", "/delete 1234", "/key sk-123", "/setup", "/yolo on"] {
+            assert!(is_forbidden_remote_input(blocked), "expected remote slash block for {blocked}");
+        }
         assert!(!is_forbidden_remote_input("/auto off"));
         assert!(!is_forbidden_remote_input("/mode plan"));
+        assert!(!is_forbidden_remote_input("/status"));
+        assert!(!is_forbidden_remote_input("/compact focus on tests"));
         assert!(safe_token_equals(Some("abc"), "abc"));
         assert!(!safe_token_equals(Some("abd"), "abc"));
     }

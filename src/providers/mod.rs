@@ -34,12 +34,16 @@ pub struct SseEvent {
     pub data: String,
 }
 
+const MAX_SSE_EVENT_BYTES: usize = 16 * 1024 * 1024;
+
 /// Incremental `text/event-stream` parser (WHATWG semantics for the fields providers use).
 #[derive(Default)]
 pub struct SseParser {
     buffer: String,
     event: Option<String>,
     data: Vec<String>,
+    data_bytes: usize,
+    overflowed: bool,
 }
 
 impl SseParser {
@@ -52,16 +56,38 @@ impl SseParser {
             if line.ends_with('\r') {
                 line.pop();
             }
+            if line.len() > MAX_SSE_EVENT_BYTES {
+                self.overflowed = true;
+                self.event = None;
+                self.data.clear();
+                self.data_bytes = 0;
+                continue;
+            }
             self.line(&line, &mut out);
         }
+        if self.buffer.len() > MAX_SSE_EVENT_BYTES {
+            self.overflowed = true;
+            self.buffer.clear();
+            self.event = None;
+            self.data.clear();
+            self.data_bytes = 0;
+        }
         out
+    }
+
+    pub fn take_overflow(&mut self) -> bool {
+        std::mem::take(&mut self.overflowed)
     }
 
     pub fn finish(&mut self) -> Vec<SseEvent> {
         let mut out = vec![];
         if !self.buffer.is_empty() {
             let line = std::mem::take(&mut self.buffer);
-            self.line(line.trim_end_matches('\r'), &mut out);
+            if line.len() <= MAX_SSE_EVENT_BYTES {
+                self.line(line.trim_end_matches('\r'), &mut out);
+            } else {
+                self.overflowed = true;
+            }
         }
         self.dispatch(&mut out);
         out
@@ -84,7 +110,17 @@ impl SseParser {
         };
         match field {
             "event" => self.event = Some(value.to_string()),
-            "data" => self.data.push(value.to_string()),
+            "data" => {
+                if self.data_bytes.saturating_add(value.len()) > MAX_SSE_EVENT_BYTES {
+                    self.overflowed = true;
+                    self.event = None;
+                    self.data.clear();
+                    self.data_bytes = 0;
+                } else {
+                    self.data_bytes += value.len() + 1;
+                    self.data.push(value.to_string());
+                }
+            }
             _ => {}
         }
     }
@@ -92,10 +128,12 @@ impl SseParser {
     fn dispatch(&mut self, out: &mut Vec<SseEvent>) {
         if self.data.is_empty() {
             self.event = None;
+            self.data_bytes = 0;
             return;
         }
         out.push(SseEvent { event: self.event.take(), data: self.data.join("\n") });
         self.data.clear();
+        self.data_bytes = 0;
     }
 }
 
@@ -109,17 +147,23 @@ fn status_text(status: reqwest::StatusCode) -> String {
 
 /// Turns an error response body into an `ApiError` (provider `error.message` when present).
 fn error_from_body(status: reqwest::StatusCode, headers: BTreeMap<String, String>, body: &str) -> ApiError {
-    let message = if body.trim().is_empty() {
-        status_text(status)
+    let raw = if body.trim().is_empty() {
+        None
     } else {
-        match serde_json::from_str::<Value>(body) {
-            Ok(parsed) => parsed
+        serde_json::from_str::<Value>(body).ok().and_then(|parsed| {
+            parsed
                 .get("error")
                 .and_then(|e| e.get("message").and_then(Value::as_str).map(str::to_string).or_else(|| e.as_str().map(str::to_string)))
                 .or_else(|| parsed.get("message").and_then(Value::as_str).map(str::to_string))
-                .unwrap_or_else(|| status_text(status)),
-            Err(_) => status_text(status),
-        }
+        })
+    };
+    let base = raw.unwrap_or_else(|| status_text(status));
+    let message = match status.as_u16() {
+        401 => format!("{base} (HTTP 401 — check API key via /key or `goon setup`)"),
+        403 => format!("{base} (HTTP 403 — check API key permissions or model access)"),
+        404 => format!("{base} (HTTP 404 — check --base-url and --model; OpenAI-compatible URLs usually end in /v1)"),
+        429 => format!("{base} (HTTP 429 — rate limit or quota reached)"),
+        _ => base,
     };
     ApiError::http(status.as_u16(), message, headers)
 }
@@ -180,7 +224,12 @@ pub async fn post_sse(url: &str, headers: &[(String, String)], body: &Value, can
                     };
                     let text = String::from_utf8_lossy(&pending[..valid]).to_string();
                     pending.drain(..valid);
-                    for event in parser.push(&text) {
+                    let events = parser.push(&text);
+                    if parser.take_overflow() {
+                        let _ = tx.send(Err(ApiError::new("SSE event exceeded 16 MiB limit."))).await;
+                        return;
+                    }
+                    for event in events {
                         if tx.send(Ok(event)).await.is_err() {
                             return;
                         }

@@ -40,7 +40,7 @@ pub const MAIN_OPTIONS: &[OptSpec] = &[
     s("cwd", Some('C')),
     s("provider", None),
     s("base-url", None),
-    s("model", None),
+    s("model", Some('m')),
     s("effort", None),
     s("key-env", None),
     os("resume", Some('r')),
@@ -75,7 +75,7 @@ pub const MAIN_OPTIONS: &[OptSpec] = &[
     b("rebuild-session", None),
 ];
 
-pub const MCP_ADD_OPTIONS: &[OptSpec] = &[s("url", None), s("bearer-env", None), s("bearer-token-env-var", None), m("env"), b("trust", None), s("timeout-ms", None)];
+pub const MCP_ADD_OPTIONS: &[OptSpec] = &[b("help", Some('h')), s("url", None), s("bearer-env", None), s("bearer-token-env-var", None), m("env"), b("trust", None), s("timeout-ms", None)];
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum OptValue {
@@ -116,15 +116,41 @@ impl Parsed {
 }
 
 fn spec_by_name<'a>(specs: &'a [OptSpec], name: &str) -> Option<&'a OptSpec> {
-    specs.iter().find(|s| s.name == name)
+    let canonical = if name == "readonly" { "read-only" } else { name };
+    specs.iter().find(|s| s.name == canonical)
 }
 
 fn spec_by_short(specs: &[OptSpec], short: char) -> Option<&OptSpec> {
-    specs.iter().find(|s| s.short == Some(short))
+    let canonical = if short == 'V' { 'v' } else { short };
+    specs.iter().find(|s| s.short == Some(canonical))
 }
 
-fn unknown(token: &str) -> anyhow::Error {
-    anyhow::anyhow!("Unknown option '{token}'. To specify a positional argument starting with a '-', place it at the end of the command after '--', as in '-- \"{token}\"")
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b_chars: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b_chars.len()).collect();
+    let mut curr = vec![0usize; b_chars.len() + 1];
+    for (i, ca) in a.chars().enumerate() {
+        curr[0] = i + 1;
+        for (j, &cb) in b_chars.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[b_chars.len()]
+}
+
+fn suggest_option<'a>(specs: &'a [OptSpec], token: &str) -> Option<&'a str> {
+    let bare = token.strip_prefix("--")?;
+    if bare.len() < 2 {
+        return None;
+    }
+    specs.iter().map(|s| (s.name, edit_distance(bare, s.name))).filter(|(_, d)| *d <= 2).min_by_key(|(_, d)| *d).map(|(name, _)| name)
+}
+
+fn unknown(token: &str, specs: &[OptSpec]) -> anyhow::Error {
+    let hint = suggest_option(specs, token).map(|s| format!(" Did you mean '--{s}'?")).unwrap_or_default();
+    anyhow::anyhow!("Unknown option '{token}'.{hint} To specify a positional argument starting with a '-', place it at the end of the command after '--', as in '-- \"{token}\"'.")
 }
 
 fn option_label(spec: &OptSpec) -> String {
@@ -169,7 +195,7 @@ pub fn parse_args(args: &[String], specs: &[OptSpec], strict: bool) -> Result<Pa
             };
             let Some(spec) = spec_by_name(specs, name) else {
                 if strict {
-                    return Err(unknown(&format!("--{name}")));
+                    return Err(unknown(&format!("--{name}"), specs));
                 }
                 parsed.values.insert(name.to_string(), inline.map(OptValue::Str).unwrap_or(OptValue::Bool(true)));
                 i += 1;
@@ -228,7 +254,7 @@ pub fn parse_args(args: &[String], specs: &[OptSpec], strict: bool) -> Result<Pa
                 let c = chars[j];
                 let Some(spec) = spec_by_short(specs, c) else {
                     if strict {
-                        return Err(unknown(&format!("-{c}")));
+                        return Err(unknown(&format!("-{c}"), specs));
                     }
                     parsed.values.insert(c.to_string(), OptValue::Bool(true));
                     j += 1;
@@ -292,12 +318,16 @@ mod tests {
     #[test]
     fn mirrors_node_parse_args() {
         assert!(p(&["--nope"]).unwrap_err().to_string().starts_with("Unknown option '--nope'."));
+        assert!(p(&["--modle"]).unwrap_err().to_string().contains("Did you mean '--model'?"));
         assert_eq!(p(&["-p"]).unwrap_err().to_string(), "Option '-p, --prompt <value>' argument missing");
         assert!(p(&["-p", "-h"]).unwrap_err().to_string().starts_with("Option '-p' argument is ambiguous."));
         assert_eq!(p(&["--yes=1"]).unwrap_err().to_string(), "Option '--yes' does not take an argument");
         let r = p(&["-hp", "x"]).unwrap();
         assert!(r.flag("help"));
         assert_eq!(r.str("prompt").unwrap(), "x");
+        assert_eq!(p(&["-m", "gpt-5"]).unwrap().str("model").as_deref(), Some("gpt-5"));
+        assert!(p(&["-V"]).unwrap().flag("version"));
+        assert!(p(&["--readonly"]).unwrap().flag("read-only"));
         assert_eq!(p(&["-pabc"]).unwrap().str("prompt").unwrap(), "abc");
         assert_eq!(p(&["--prompt=-x"]).unwrap().str("prompt").unwrap(), "-x");
         assert_eq!(p(&["a", "--", "--yes"]).unwrap().positionals, vec!["a", "--yes"]);

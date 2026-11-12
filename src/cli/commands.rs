@@ -314,6 +314,7 @@ impl App {
             let before = child.session.lock().unwrap().cost();
             let deps = crate::harness::HarnessDeps { verify_enabled: Some(false), ..Default::default() };
             let harness = crate::harness::Harness::new(runtime.clone(), child.clone(), child_tools, Arc::new(|_| {}), None, deps)?;
+            harness.set_untrusted_prompts(true);
             harness.run(prompt, sig, reg.budget()).await?;
             // Per-child session counter: a shared-ledger snapshot double-counts overlapping runs.
             let delta = child.session.lock().unwrap().cost() - before;
@@ -912,18 +913,19 @@ impl App {
         }
         if starts_cmd(input, "/auto") || starts_cmd(input, "/yolo") {
             let is_yolo = starts_cmd(input, "/yolo");
+            let target_on = if is_yolo { "yolo" } else { "auto" };
             let raw_arg = input[5..].trim().to_lowercase();
             let arg = if is_yolo && raw_arg.is_empty() { "on".to_string() } else { raw_arg };
             let mode = self.mode();
             let next = match arg.as_str() {
                 "" | "toggle" => {
-                    if mode == "auto" {
+                    if mode == target_on {
                         "ask"
                     } else {
-                        "auto"
+                        target_on
                     }
                 }
-                "on" | "true" | "1" | "yes" => "auto",
+                "on" | "true" | "1" | "yes" => target_on,
                 "off" | "false" | "0" | "ask" => "ask",
                 _ => {
                     self.display("Usage: /auto [on | off] (or /yolo [on | off])\n");
@@ -943,10 +945,11 @@ impl App {
                 }
                 "ask" => "ask",
                 "plan" => "plan",
-                "auto" | "auto-approve" | "yolo" => "auto",
+                "auto" | "auto-approve" => "auto",
+                "yolo" => "yolo",
                 "readonly" | "read-only" => "readonly",
                 _ => {
-                    self.display("Usage: /mode [ask | auto | plan | readonly]\n");
+                    self.display("Usage: /mode [ask | auto | yolo | plan | readonly]\n");
                     return Ok(true);
                 }
             };
@@ -1198,7 +1201,11 @@ impl App {
                 runtime.base_url,
                 runtime.model,
                 runtime.effort.clone().unwrap_or_else(|| "default".into()),
-                if mode == "auto" { "auto-approve".to_string() } else { mode },
+                match mode.as_str() {
+                    "auto" => "auto-approve".to_string(),
+                    "yolo" => "yolo (unrestricted)".to_string(),
+                    _ => mode,
+                },
                 self.view_mode(),
                 runtime.cwd.display(),
                 s.checkpoints.as_ref().map(|c| c.len()).unwrap_or(0),
@@ -1246,8 +1253,21 @@ impl App {
             let s = store.session.lock().unwrap().clone();
             let out_name = input[7..].trim().to_string();
             let out_name = if out_name.is_empty() { format!("goon-session-{}.md", take_chars(&s.id, 8)) } else { out_name };
+            if crate::tools::is_high_risk_mutation_path(&out_name) {
+                bail!("Refusing to export to protected or sensitive path: {out_name}");
+            }
             let target = self.tools().files.path(&out_name)?;
+            if std::fs::symlink_metadata(&target).map(|m| m.file_type().is_symlink()).unwrap_or(false) {
+                bail!("Refusing to export through symlink: {out_name}");
+            }
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
             let runtime = self.runtime();
+            let mut secrets = crate::redact::collect_secrets();
+            if !runtime.api_key.is_empty() {
+                secrets.push(runtime.api_key.clone());
+            }
             let mut lines = vec![
                 format!("# Goon Session {}", s.title.clone().unwrap_or_else(|| s.id.clone())),
                 format!("- **Model**: {} ({})", runtime.model, runtime.provider),
@@ -1263,7 +1283,8 @@ impl App {
                 });
                 lines.push(String::new());
             }
-            std::fs::write(&target, lines.join("\n"))?;
+            let body = crate::redact::redact_secrets(&lines.join("\n"), &secrets);
+            crate::config::atomic_write(&target, body.as_bytes())?;
             self.display(&format!("Exported session transcript to {out_name}\n"));
             return Ok(true);
         }

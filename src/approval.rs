@@ -401,8 +401,12 @@ pub fn bash_approval_prefix(input: &Value) -> Option<String> {
     Some(tokens[..take].join(" "))
 }
 
-pub fn can_auto_approve(mode: &str, _risk: RiskClass) -> bool {
-    mode == "auto" || mode == "yolo"
+pub fn can_auto_approve(mode: &str, risk: RiskClass) -> bool {
+    match mode {
+        "auto" => matches!(risk, RiskClass::Low | RiskClass::Medium),
+        "yolo" => risk != RiskClass::Critical,
+        _ => false,
+    }
 }
 
 pub fn bash_approval_exact(input: &Value) -> Option<String> {
@@ -495,10 +499,12 @@ mod tests {
     fn exact_and_auto() {
         assert_eq!(bash_approval_exact(&cmd("  ls   -la ")), Some("ls -la".into()));
         assert_eq!(bash_approval_exact(&cmd("echo 'x'")), None);
+        assert!(can_auto_approve("auto", RiskClass::Low));
         assert!(can_auto_approve("auto", RiskClass::Medium));
-        assert!(can_auto_approve("auto", RiskClass::High));
-        assert!(can_auto_approve("auto", RiskClass::Critical));
-        assert!(can_auto_approve("yolo", RiskClass::Critical));
+        assert!(!can_auto_approve("auto", RiskClass::High));
+        assert!(!can_auto_approve("auto", RiskClass::Critical));
+        assert!(can_auto_approve("yolo", RiskClass::High));
+        assert!(!can_auto_approve("yolo", RiskClass::Critical));
         assert!(!can_auto_approve("ask", RiskClass::Low));
     }
 }

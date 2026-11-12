@@ -213,17 +213,23 @@ pub fn expand_skill_mentions(prompt: &str, cwd: &Path) -> (String, Vec<String>) 
 }
 
 fn find_dirs_root_to_cwd(cwd: &Path) -> Vec<PathBuf> {
+    let initial = crate::files::resolve_lexical(&std::env::current_dir().unwrap_or_default(), &cwd.to_string_lossy());
     let mut chain = vec![];
-    let mut cur = crate::files::resolve_lexical(&std::env::current_dir().unwrap_or_default(), &cwd.to_string_lossy());
+    let mut cur = initial.clone();
+    let mut found_git = false;
     for _ in 0..12 {
         chain.push(cur.clone());
         if cur.join(".git").exists() || std::fs::symlink_metadata(cur.join(".git")).is_ok() {
+            found_git = true;
             break;
         }
         match cur.parent() {
             Some(p) if p != cur => cur = p.to_path_buf(),
             _ => break,
         }
+    }
+    if !found_git {
+        return vec![initial];
     }
     chain.reverse();
     chain
@@ -337,8 +343,16 @@ impl Default for MentionOptions<'_> {
 
 pub fn expand_file_mentions(prompt: &str, files: &WorkspaceFiles, options: &MentionOptions) -> ExpandedMentions {
     use base64::Engine;
-    let (skill_text, used_skills) = expand_skill_mentions(prompt, &files.root);
-    let candidates = extract_candidate_paths(prompt);
+    let (scan_head, stdin_tail) = match prompt.find("\n\n<stdin>\n") {
+        Some(idx) if prompt[idx..].ends_with("\n</stdin>") => (&prompt[..idx], Some(&prompt[idx..])),
+        _ => (prompt, None),
+    };
+    let (skill_head, used_skills) = expand_skill_mentions(scan_head, &files.root);
+    let skill_text = match stdin_tail {
+        Some(tail) => format!("{skill_head}{tail}"),
+        None => skill_head,
+    };
+    let candidates = extract_candidate_paths(scan_head);
     let mut attached: Vec<String> = used_skills.iter().map(|s| format!("${s}")).collect();
     if candidates.is_empty() {
         return ExpandedMentions { expanded_prompt: skill_text, attached_paths: attached, image_parts: vec![] };
