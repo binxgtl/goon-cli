@@ -135,16 +135,19 @@ pub struct RevertResult {
 
 fn json_string_field(raw: &str, names: &str) -> Option<String> {
     let re = Regex::new(&format!(r#""(?:{names})"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)""#)).ok()?;
-    re.captures(raw).map(|c| c[1].to_string())
+    let body = &re.captures(raw)?[1];
+    if let Ok(decoded) = serde_json::from_str::<String>(&format!("\"{body}\"")) {
+        return Some(crate::term::terminal_text(&decoded));
+    }
+    static UNICODE_ESC: OnceLock<Regex> = OnceLock::new();
+    let unicode_re = UNICODE_ESC.get_or_init(|| Regex::new(r"\\u([0-9a-fA-F]{4})").unwrap());
+    let unescaped = unicode_re.replace_all(body, |caps: &regex::Captures| u32::from_str_radix(&caps[1], 16).ok().and_then(char::from_u32).map(|c| c.to_string()).unwrap_or_default());
+    let replaced = unescaped.replace("\\\"", "\"").replace("\\\\", "\\");
+    Some(crate::term::terminal_text(&replaced))
 }
 
 pub fn extract_stream_preview(raw: &str) -> String {
-    let target = json_string_field(raw, "path|filePath|file_path|directory")
-        .or_else(|| json_string_field(raw, "command|cmd"))
-        .or_else(|| json_string_field(raw, "query|pattern"))
-        .unwrap_or_default()
-        .replace("\\\"", "\"")
-        .replace("\\\\", "\\");
+    let target = json_string_field(raw, "path|filePath|file_path|directory").or_else(|| json_string_field(raw, "command|cmd")).or_else(|| json_string_field(raw, "query|pattern")).unwrap_or_default();
     static SPLIT: OnceLock<Regex> = OnceLock::new();
     let lines = SPLIT.get_or_init(|| Regex::new(r"\\n|\n").unwrap()).split(raw).count();
     let kb = crate::jsutil::to_fixed(raw.len() as f64 / 1024.0, 1);
@@ -246,7 +249,7 @@ pub fn build_tool_meta(tool_name: &str, raw_input: &Value) -> Map<String, Value>
 fn meta(kind: &str, summary: String) -> Map<String, Value> {
     let mut m = Map::new();
     m.insert("kind".into(), json!(kind));
-    m.insert("summary".into(), json!(summary));
+    m.insert("summary".into(), json!(crate::term::terminal_text(&summary)));
     m
 }
 
@@ -1674,6 +1677,7 @@ mod tests {
     #[test]
     fn previews_and_meta() {
         assert_eq!(extract_stream_preview(r#"{"path":"src/a.ts"}"#), "src/a.ts");
+        assert_eq!(extract_stream_preview(r#"{"path":"\u001b]52;c;cHduZWQ=\u0007/tmp/nonexistent-goon-osc-test"}"#), "/tmp/nonexistent-goon-osc-test");
         assert_eq!(extract_stream_preview(r#"{"pa"#), "");
         let m = build_tool_meta("bash", &json!({"command": "  echo   hi\n there"}));
         assert_eq!(Value::Object(m), json!({"kind": "exec", "summary": "echo hi there"}));
