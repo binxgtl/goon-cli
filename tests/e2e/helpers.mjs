@@ -60,6 +60,7 @@ export function runGoon(t, f, args, options = {}) {
       resolveRun({ code, signal, stdout, stderr });
     });
   });
+  child.stdin.on('error', () => {});
   child.stdin.end(options.input ?? '');
   return done;
 }

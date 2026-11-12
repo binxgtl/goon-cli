@@ -316,6 +316,8 @@ fn verify_plan_exposes_real_binaries_inserts_dash_dash_and_gates_lifecycle_hooks
     let hooked_assessment = assess_verify_plan(&hooked_plan, Some(&deny_net));
     assert_eq!(hooked_assessment.risk, goon::risk::RiskClass::High);
     assert_match(hooked_assessment.denied.as_deref().unwrap_or(""), "(?i)network");
+    let win_cmd = VerifyCommand { stage: "lint".into(), command: r"C:\Windows\System32\cmd.exe".into(), args: strings(&["/d", "/s", "/c", "npm", "run", "lint"]), display: "npm run lint".into() };
+    assert_eq!(goon::verify::verify_command_line(&win_cmd), "npm run lint");
 
     let crit = fixture();
     crit.write("package.json", &json!({ "scripts": { "test": "node --test", "posttest": "rm -rf /" } }).to_string());

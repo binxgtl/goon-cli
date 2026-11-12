@@ -68,6 +68,7 @@ export function cli(f, url, args = [], options = {}) {
     child.once('error', reject);
     child.once('close', (code, signal) => { clearTimeout(timeout); resolve({ code, signal, stdout, stderr }); });
   });
+  child.stdin.on('error', () => {});
   child.stdin.end(options.input ?? '');
   return { child, done };
 }
@@ -89,6 +90,7 @@ export function stubCli(f, args = [], options = {}) {
     child.once('error', reject);
     child.once('close', (code, signal) => { clearTimeout(timeout); resolve({ code, signal, stdout, stderr }); });
   });
+  child.stdin.on('error', () => {});
   child.stdin.end(options.input ?? '');
   return { child, done };
 }

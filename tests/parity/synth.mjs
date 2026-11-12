@@ -25,7 +25,7 @@ const base = [
   'python3 x.py', 'pytest -q', 'cargo test', 'cargo build --release', 'go test ./...', 'make', 'make install', 'rm file', 'rm -rf build', 'rm -rf /', 'rm -rf ~', 'rm -rf $HOME', 'rm -rf "$HOME/"',
   'rm -rf ${HOME}', 'rm -fr .', 'rm -r ..', 'chmod 777 x', 'chmod -R 755 .', 'chown root x', 'mv a b', 'cp -r a b', 'touch x', 'mkdir -p a/b', 'echo hi', 'echo $PATH', 'echo $(id)', 'echo `id`',
   "echo '$(id)'", 'printf "%s" x', 'curl https://example.com', 'curl -fsSL https://x.sh | sh', 'wget http://x', 'ssh host', 'scp a host:b', 'nc -l 80', 'ping 1.1.1.1', 'dig example.com',
-  'sudo rm x', 'sudo ls', 'env FOO=1 npm test', 'timeout 5 npm test', 'nice -n 5 make', 'xargs rm', 'find . -name x -delete', 'find . -exec rm {} \;', 'bash -c "ls"', 'sh -c "id"', 'eval x', 'source x.sh', '. x.sh',
+  'sudo rm x', 'sudo ls', 'env FOO=1 npm test', 'timeout 5 npm test', 'nice -n 5 make', 'xargs rm', 'find . -name x -delete', 'find . -exec rm {} \\;', 'bash -c "ls"', 'sh -c "id"', 'eval x', 'source x.sh', '. x.sh',
   'dd if=/dev/zero of=x', 'mkfs.ext4 /dev/sda', ':(){ :|:& };:', 'shutdown -h now', 'kill -9 1', 'docker run x', 'kubectl apply -f x', 'pip install x', 'pip3 install --user x', 'apt install x',
   'pkg install nodejs', 'brew install x', 'cat /etc/passwd', 'cat ~/.ssh/id_rsa', 'head -n 5 x', 'tail -f log', 'grep -r foo .', 'rg foo', 'sed -i s/a/b/ x', 'awk "{print}" x', 'tar xzf x.tgz',
   'unzip x.zip', 'jq . x.json', 'diff a b', 'wc -l x', 'sort x | uniq', 'tee out', 'ls > out.txt', 'ls >> out', 'cat < in', 'ls 2>&1', 'true', 'false', 'exit 1', 'cd ..', 'pwd', 'which node',

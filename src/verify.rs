@@ -491,6 +491,17 @@ pub fn verify_command_line(command: &VerifyCommand) -> String {
     if command.command == "bash" && command.args.len() == 2 && command.args[0] == "-c" {
         return command.args[1].clone();
     }
+    let slice: Vec<&str> = if crate::risk::base_name(&command.command) == "cmd"
+        && command.args.len() >= 4
+        && command.args[0].eq_ignore_ascii_case("/d")
+        && command.args[1].eq_ignore_ascii_case("/s")
+        && command.args[2].eq_ignore_ascii_case("/c")
+        && command.args[3] == "npm"
+    {
+        command.args[3..].iter().map(String::as_str).collect()
+    } else {
+        std::iter::once(command.command.as_str()).chain(command.args.iter().map(String::as_str)).collect()
+    };
     let quote = |part: &str| {
         if !part.is_empty() && part.chars().all(|c| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c)) {
             part.to_string()
@@ -498,7 +509,7 @@ pub fn verify_command_line(command: &VerifyCommand) -> String {
             format!("'{}'", part.replace('\'', "'\\''"))
         }
     };
-    std::iter::once(command.command.as_str()).chain(command.args.iter().map(String::as_str)).map(quote).collect::<Vec<_>>().join(" ")
+    slice.into_iter().map(quote).collect::<Vec<_>>().join(" ")
 }
 
 #[derive(Clone, Debug, PartialEq)]
