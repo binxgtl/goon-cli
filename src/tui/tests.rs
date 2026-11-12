@@ -3691,26 +3691,33 @@ async fn active_tool_elapsed_timer_renders_running_tool_seconds_and_clears_on_co
     let f2 = tty.frame();
     assert!(f2.contains("(+1 more)"), "expected concurrent tool count in:\n{f2}");
 
-    tty.ui.event(&serde_json::json!({ "type": "tool", "id": "call_bash_1", "name": "bash", "state": "ok", "meta": { "kind": "exec", "summary": "cargo test --locked" } }));
-    tty.ui.event(&serde_json::json!({ "type": "tool", "id": "call_read_2", "name": "read_file", "state": "ok", "meta": { "kind": "read", "summary": "src/main.rs" } }));
+    tty.ui.event(&serde_json::json!({ "type": "tool", "id": "call_bash_1", "name": "bash", "state": "done", "meta": { "kind": "exec", "summary": "cargo test --locked" } }));
+    tty.ui.event(&serde_json::json!({ "type": "tool", "id": "call_read_2", "name": "read_file", "state": "error", "meta": { "kind": "read", "summary": "src/main.rs" } }));
     assert!(tty.ui.state.lock().unwrap().active_tools.is_empty());
     let f3 = tty.frame();
     assert!(!f3.contains("Running bash ("), "{f3}");
 }
 
 #[tokio::test]
-async fn emergency_terminal_restore_resets_dec_modes_and_poisoned_mutex_still_restores() {
+async fn emergency_terminal_restore_resets_dec_modes_and_guards_never_undo_panic_recovery() {
+    let mut zero_buf = Vec::new();
+    emergency_restore_terminal_to(&mut zero_buf, 0);
+    assert!(zero_buf.is_empty(), "inactive terminal state must emit 0 bytes");
+
     let mut alt_buf = Vec::new();
     emergency_restore_terminal_to(&mut alt_buf, 0b111);
     let alt_seq = String::from_utf8(alt_buf).unwrap();
-    for expected in ["\x1b[?2026l", "\x1b[?2004l", "\x1b[?1004l", "\x1b[?1006l", "\x1b[?1000l", "\x1b[?25h", "\x1b[?1049l"] {
-        assert!(alt_seq.contains(expected), "missing {expected:?} in {alt_seq:?}");
-    }
+    assert!(
+        alt_seq.contains("\x1b[?1002l\x1b[?1004l\x1b[?2004l\x1b[?1007l\x1b[?1006l\x1b[?1000l\x1b[?25h\x1b[?1049l\r\n"),
+        "alt-screen emergency restore must match exact DEC reset suffix with trailing CRLF: {alt_seq:?}"
+    );
+    assert!(alt_seq.starts_with("\x1b[?2026l\x1b[0m"));
+    assert!(alt_seq.ends_with("\r\n"));
 
     let mut inline_buf = Vec::new();
     emergency_restore_terminal_to(&mut inline_buf, 0b101);
     let inline_seq = String::from_utf8(inline_buf).unwrap();
-    assert!(inline_seq.contains("\x1b[?2004l") && inline_seq.contains("\x1b[?25h"));
+    assert!(inline_seq.contains("\x1b[?1002l\x1b[?1004l\x1b[?2004l\x1b[?1007l\x1b[?1006l\x1b[?1000l\x1b[?25h\r\n"));
     assert!(!inline_seq.contains("\x1b[?1049l"), "inline mode must not emit ?1049l");
 
     let tty = Tty::new(80, 24);
@@ -3724,6 +3731,38 @@ async fn emergency_terminal_restore_resets_dec_modes_and_poisoned_mutex_still_re
     assert!(!tty.ui.is_closed());
     let raw_out = tty.written();
     assert!(raw_out.contains("\x1b[?2004l") && raw_out.contains("\x1b[?1049l"), "poisoned restore must still emit DEC reset sequences");
+
+    // EditorGuard dropped during panic stack unwinding must NOT re-enable ?2004h or hide cursor (?25l)
+    let ed_tty = Tty::new(80, 24);
+    ed_tty.ui.state.lock().unwrap().editor_active = true;
+    ed_tty.sink.0.lock().unwrap().clear();
+    let ed_ui = ed_tty.ui.clone();
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _guard = editor::EditorGuard(&ed_ui);
+        panic!("simulated panic inside external editor handoff");
+    }));
+    let ed_out = ed_tty.written();
+    assert!(ed_out.contains("\x1b[?25h\x1b[?1049l"), "EditorGuard panic unwind must restore terminal: {ed_out:?}");
+    assert!(!ed_out.contains("\x1b[?25l") && !ed_out.contains("\x1b[?2004h"), "EditorGuard panic unwind must never re-arm TUI modes: {ed_out:?}");
+
+    #[cfg(unix)]
+    {
+        let sus_tty = Tty::new(80, 24);
+        sus_tty.ui.request_suspend();
+        let sus_ui = sus_tty.ui.clone();
+        let sus_sink = sus_tty.sink.0.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            sus_ui.suspend_with(|| -> std::io::Result<()> {
+                sus_sink.lock().unwrap().clear();
+                panic!("simulated panic while suspended");
+            });
+        }));
+        let sus_out = sus_tty.written();
+        assert!(
+            !sus_out.contains("\x1b[?1049h") && !sus_out.contains("\x1b[?25l") && !sus_out.contains("\x1b[?2004h"),
+            "ResumeGuard panic unwind must never re-enter alt screen or hide cursor: {sus_out:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -3793,4 +3832,232 @@ async fn narrow_portrait_viewport_preserves_colors_clips_cleanly_and_shows_inlin
     tty.frame();
     let raw_no_color = tty.ui.rendered_frame();
     assert!(!sgr_re.is_match(&raw_no_color), "36-col viewport with ThemeMode::None must emit zero SGR:\n{raw_no_color:?}");
+}
+
+#[tokio::test]
+async fn windows_conpty_long_first_line_multiline_and_single_line_pastes_coalesce_without_premature_submit() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::time::Instant;
+
+    let tty = Tty::new(90, 24);
+    let ui1 = tty.ui.clone();
+    let ask1 = tokio::spawn(async move { ui1.question("goon> ", None, true, QuestionOpts::default()).await });
+    tokio::time::sleep(Duration::from_millis(5)).await;
+
+    let t0 = Instant::now();
+    // 1. Multi-line ConPTY paste where Line 1 (150 chars) spans 0..110ms across 3 chunks,
+    //    an async tick polls at t = 120ms, and \r\nLine 2\r\nLine 3\r\nLine 4 arrives at t = 122ms.
+    for chunk_idx in 0..3 {
+        let t_chunk = t0 + Duration::from_millis(chunk_idx * 55);
+        for _ in 0..50 {
+            tty.ui.handle_crossterm_key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::NONE), t_chunk, true);
+        }
+    }
+    assert!(!tty.ui.flush_paste_burst_at(t0 + Duration::from_millis(120), true), "ConPTY paste must not hit 120ms wall cap");
+    let t_rest = t0 + Duration::from_millis(122);
+    for ch in "\r\nLine 2\r\nLine 3\r\nLine 4".chars() {
+        let ev = match ch {
+            '\r' => KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            '\n' => KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+            c => KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+        };
+        tty.ui.handle_crossterm_key(ev, t_rest, true);
+    }
+    assert!(!ask1.is_finished(), "Line 1 \\r at 122ms must never auto-submit mid-paste");
+    assert!(tty.ui.flush_paste_burst_at(t_rest + Duration::from_millis(65), true));
+    let d1 = draft(&tty);
+    assert_eq!(d1, "[Pasted text #1 +4 lines] ", "entire payload must coalesce with zero inline prefix leak: {d1:?}");
+    ask1.abort();
+    let _ = ask1.await;
+
+    // 2. 200-char single-line ConPTY paste spanning > 120ms + late trailing Enter within 120ms window
+    tty.ui.set_input("", false);
+    let ui2 = tty.ui.clone();
+    let ask2 = tokio::spawn(async move { ui2.question("goon> ", None, true, QuestionOpts::default()).await });
+    tokio::time::sleep(Duration::from_millis(5)).await;
+
+    let s0 = t_rest + Duration::from_millis(300);
+    for (idx, ms) in [0u64, 50, 100, 150].into_iter().enumerate() {
+        let at = s0 + Duration::from_millis(ms);
+        let ch = char::from(b'a' + (idx as u8));
+        for _ in 0..50 {
+            tty.ui.handle_crossterm_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), at, true);
+        }
+    }
+    let last_at = s0 + Duration::from_millis(150);
+    assert!(tty.ui.flush_paste_burst_at(last_at + Duration::from_millis(65), true));
+    // Late trailing Enter at +70ms (< 120ms PASTE_ENTER_SUPPRESS_WINDOW) must NOT auto-submit!
+    tty.ui.handle_crossterm_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), last_at + Duration::from_millis(70), true);
+    assert!(!ask2.is_finished(), "late trailing Enter within 120ms of large single-line paste must not auto-submit");
+    assert!(draft(&tty).starts_with("[Pasted text #1"), "expected collapsed paste pill, got {:?}", draft(&tty));
+    ask2.abort();
+}
+
+#[tokio::test]
+async fn windows_human_rollover_enter_submits_tab_autocompletes_and_nfd_typing_normalizes_to_nfc() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::time::Instant;
+
+    let tty = Tty::new(80, 24);
+
+    // 1. Traditional Telex "tiếng" where final "ng" rolls over in 5ms followed by Enter 30ms later on Windows
+    let ui1 = tty.ui.clone();
+    let ask1 = tokio::spawn(async move { ui1.question("goon> ", None, true, QuestionOpts::default()).await });
+    tokio::time::sleep(Duration::from_millis(5)).await;
+
+    let mut t = Instant::now();
+    for ch in "tiế".chars() {
+        tty.ui.handle_crossterm_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), t, true);
+        t += Duration::from_millis(25);
+    }
+    tty.ui.flush_paste_burst_at(t + Duration::from_millis(65), true);
+    t += Duration::from_millis(70);
+    tty.ui.handle_crossterm_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE), t, true);
+    t += Duration::from_millis(5);
+    tty.ui.handle_crossterm_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE), t, true);
+    t += Duration::from_millis(30);
+    tty.ui.handle_crossterm_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), t, true);
+    assert_eq!(ask1.await.unwrap().unwrap(), "tiếng");
+
+    // 2. "/mo" with 5ms rollover + Tab at +25ms autocompletes "/model " on Windows instead of literal '\t'
+    t += Duration::from_millis(200);
+    tty.ui.handle_crossterm_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE), t, true);
+    t += Duration::from_millis(25);
+    tty.ui.flush_paste_burst_at(t, true);
+    tty.ui.handle_crossterm_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE), t, true);
+    t += Duration::from_millis(5);
+    tty.ui.handle_crossterm_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE), t, true);
+    t += Duration::from_millis(25);
+    tty.ui.handle_crossterm_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), t, true);
+    assert_eq!(draft(&tty), "/model ");
+    tty.ui.set_input("", false);
+
+    // 3. Decomposed NFD combining sequence typed via terminal keystrokes normalizes to canonical 5-char NFC "tiếng"
+    let ui2 = tty.ui.clone();
+    let ask2 = tokio::spawn(async move { ui2.question("goon> ", None, true, QuestionOpts::default()).await });
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    t += Duration::from_millis(200);
+    for ch in ['t', 'i', 'e', '\u{0302}', '\u{0301}', 'n', 'g'] {
+        tty.ui.handle_crossterm_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), t, true);
+        t += Duration::from_millis(20);
+    }
+    tty.ui.flush_paste_burst_at(t + Duration::from_millis(65), true);
+    assert_eq!(tty.ui.state.lock().unwrap().input.len(), 5, "composer input must be canonical 5-char NFC");
+    tty.ui.handle_crossterm_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), t + Duration::from_millis(70), true);
+    let submitted = ask2.await.unwrap().unwrap();
+    assert_eq!(submitted, "tiếng");
+    assert_eq!(submitted.chars().count(), 5);
+}
+
+#[tokio::test]
+async fn busy_status_row_strips_osc52_dcs_apc_csi_newlines_and_tabs_across_all_event_channels() {
+    let tty = Tty::new(96, 24);
+    tty.ui.set_status("Running");
+    tty.sink.0.lock().unwrap().clear();
+
+    // 1. Malicious tool_stream preview & name containing OSC-52, DCS, APC, 8-bit C1, private CSI, \n, \t
+    tty.ui.event(&serde_json::json!({
+        "type": "tool_stream",
+        "name": "read_file\n\t\x1b]52;c;bmFtZQ==\x07",
+        "preview": "{\"path\":\"\x1b]52;c;cHduZWQ=\x07\x1bP1$r\x1b\\\x1b_Gi=1\x1b\\\u{9d}52;c;eA==\u{9c}\x1b[>4;2m\x1b[38:2::255:0:0mline1\n\tline2\"}"
+    }));
+    tty.frame();
+
+    // 2. Malicious reasoning header/detail
+    tty.ui.event(&serde_json::json!({
+        "type": "reasoning",
+        "text": "**Analyzing \x1b]52;c;cmVhc29u\x07\tstep**\nDetail with \x1bPbad\x1b\\ and \t tabs\n"
+    }));
+    tty.frame();
+
+    // 3. Malicious active tool name/summary and multi-line HTTP 502 retry notice
+    tty.ui.event(&serde_json::json!({
+        "type": "tool",
+        "id": "call_1",
+        "name": "mcp_evil\n\t\x1b]52;c;dG9vbA==\x07",
+        "state": "start",
+        "meta": { "kind": "exec", "summary": "cmd\nwith\ttabs\x1b]52;c;c3Vt\x07" }
+    }));
+    tty.frame();
+
+    tty.ui.set_notice(Some("↻ HTTP 502:\n<html>\tBad Gateway\x1b]52;c;cmV0cnk=\x07\r\nretrying in 2s"));
+    tty.frame();
+    assert_eq!(tty.ui.state.lock().unwrap().last_frame_rows.len(), 24, "multi-line retry notice must never break frame row count");
+
+    let raw_pty = tty.written();
+    for forbidden in ["\x1b]52", "\x1bP", "\x1b_", "\u{9d}", "\u{9b}", "\x1b[>4", "\x1b[38:2::", "\t"] {
+        assert!(!raw_pty.contains(forbidden), "raw PTY output leaked {forbidden:?} in:\n{raw_pty:?}");
+    }
+}
+
+#[tokio::test]
+async fn busy_retry_notice_clears_immediately_on_esc_ctrl_c_and_stopped_and_notice_gen_bumps() {
+    let tty = Tty::new(90, 24);
+    tty.ui.set_status("Running");
+    tty.ui.set_notice(Some("↻ HTTP 429 — Retrying in 4.0s"));
+    assert!(tty.frame().contains("↻ HTTP 429"));
+
+    // Esc while Running cancels AND clears lingering retry notice immediately
+    tty.key("escape");
+    assert_eq!(tty.cancelled.load(Ordering::SeqCst), 1);
+    assert!(!tty.frame().contains("↻ HTTP 429"), "Esc cancel must clear retry notice immediately");
+
+    // Ctrl+C while Connecting MCP cancels AND clears retry notice immediately
+    tty.ui.set_status("Connecting MCP");
+    tty.ui.set_notice(Some("↻ MCP handshake retrying..."));
+    assert!(tty.frame().contains("↻ MCP handshake"));
+    tty.ui.key(None, modified("c", true, false, false));
+    assert_eq!(tty.cancelled.load(Ordering::SeqCst), 2);
+    assert!(!tty.frame().contains("↻ MCP handshake"), "Ctrl+C cancel must clear retry notice immediately");
+
+    // "stopped" event also clears retry notice and direct notice helpers bump notice_gen
+    tty.ui.set_status("Running");
+    tty.ui.set_notice(Some("↻ HTTP 503 — retrying"));
+    let gen_before = tty.ui.state.lock().unwrap().notice_gen;
+    tty.ui.event(&serde_json::json!({ "type": "stopped", "reason": "Interrupted" }));
+    let gen_after = tty.ui.state.lock().unwrap().notice_gen;
+    assert!(gen_after > gen_before);
+    assert!(tty.ui.state.lock().unwrap().status_notice.is_none());
+}
+
+#[tokio::test]
+async fn ultra_narrow_and_4_row_viewports_never_overflow_safe_cols_or_row_count_while_busy() {
+    for mode in [ThemeMode::Dark, ThemeMode::None] {
+        for (cols, rows) in [(6usize, 4usize), (8, 4), (4, 4), (36, 4)] {
+            let tty = Tty::new(cols, rows);
+            tty.ui.set_theme_mode(mode);
+            tty.ui.set_status("Running");
+            tty.ui.event(&serde_json::json!({
+                "type": "tool",
+                "id": "t1",
+                "name": "bash",
+                "state": "start",
+                "meta": { "kind": "exec", "summary": "cargo test --locked" }
+            }));
+            for elapsed_ms in [0i64, 10_500, 134_000] {
+                tty.ui.state.lock().unwrap().turn_started_at = Some(now() - elapsed_ms);
+                tty.ui.backdate_active_tool_for_test("t1", elapsed_ms);
+                tty.frame();
+                let safe_cols = cols.max(4).saturating_sub(1).max(3);
+                let frame_rows = tty.ui.state.lock().unwrap().last_frame_rows.clone();
+                assert_eq!(frame_rows.len(), rows, "cols={cols} rows={rows} mode={mode:?} emitted {} rows", frame_rows.len());
+                for (r, line) in frame_rows.iter().enumerate() {
+                    let vis = visible_length(line);
+                    assert!(vis <= safe_cols, "cols={cols} rows={rows} mode={mode:?} elapsed={elapsed_ms} row {r} vis={vis} > safe_cols={safe_cols}: {line:?}");
+                }
+            }
+            tty.ui.set_notice(Some("↻ HTTP 429 — retrying (1/3) in 2.0s"));
+            for overlay in [false, true] {
+                tty.ui.set_transcript_overlay(overlay);
+                tty.frame();
+                let safe_cols = cols.max(4).saturating_sub(1).max(3);
+                let frame_rows = tty.ui.state.lock().unwrap().last_frame_rows.clone();
+                assert_eq!(frame_rows.len(), rows, "overlay={overlay} cols={cols} rows={rows} emitted {} rows", frame_rows.len());
+                for (r, line) in frame_rows.iter().enumerate() {
+                    let vis = visible_length(line);
+                    assert!(vis <= safe_cols, "overlay={overlay} cols={cols} rows={rows} row {r} vis={vis} > safe_cols={safe_cols}: {line:?}");
+                }
+            }
+        }
+    }
 }

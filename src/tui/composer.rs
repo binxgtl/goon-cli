@@ -146,7 +146,7 @@ pub(super) struct QuestionGuard {
 impl Drop for QuestionGuard {
     fn drop(&mut self) {
         let Some(tui) = self.tui.upgrade() else { return };
-        let mut st = tui.state.lock().unwrap();
+        let mut st = tui.state.lock().unwrap_or_else(|e| e.into_inner());
         if st.pending.as_ref().map(|p| p.id != self.id).unwrap_or(false) {
             return;
         }
@@ -166,7 +166,9 @@ impl Drop for QuestionGuard {
             st.paste_archive = saved.paste_archive;
             st.recent_expanded = saved.recent_expanded;
         }
-        tui.schedule(&mut st, 0);
+        if !std::thread::panicking() {
+            tui.schedule(&mut st, 0);
+        }
     }
 }
 
@@ -178,12 +180,14 @@ pub(super) struct TransientGuard {
 impl Drop for TransientGuard {
     fn drop(&mut self) {
         let Some(tui) = self.tui.upgrade() else { return };
-        let mut st = tui.state.lock().unwrap();
+        let mut st = tui.state.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(pos) = st.transcript.rfind(&self.appended) {
             st.transcript.replace_range(pos..pos + self.appended.len(), "");
         }
         st.body_cache = None;
-        tui.schedule(&mut st, 0);
+        if !std::thread::panicking() {
+            tui.schedule(&mut st, 0);
+        }
     }
 }
 
@@ -297,6 +301,9 @@ impl Tui {
         }
         match st.paste_burst.flush_before_modified_input() {
             super::paste_burst::FlushResult::Typed(ch) => Self::insert_chars(&mut st, &[ch]),
+            super::paste_burst::FlushResult::Paste(text) if st.paste_burst.take_typed_burst_flag() => {
+                Self::insert_chars(&mut st, &super::chars_of(&crate::term::terminal_text(&text).replace('\n', " ")))
+            }
             super::paste_burst::FlushResult::Paste(text) => self.handle_paste(&mut st, &text, true),
             super::paste_burst::FlushResult::None => {}
         }
@@ -316,6 +323,9 @@ impl Tui {
         }
         match st.paste_burst.flush_before_modified_input() {
             super::paste_burst::FlushResult::Typed(ch) => Self::insert_chars(&mut st, &[ch]),
+            super::paste_burst::FlushResult::Paste(text) if st.paste_burst.take_typed_burst_flag() => {
+                Self::insert_chars(&mut st, &super::chars_of(&crate::term::terminal_text(&text).replace('\n', " ")))
+            }
             super::paste_burst::FlushResult::Paste(text) => self.handle_paste(&mut st, &text, true),
             super::paste_burst::FlushResult::None => {}
         }
@@ -371,6 +381,9 @@ impl Tui {
         }
         match st.paste_burst.flush_before_modified_input() {
             super::paste_burst::FlushResult::Typed(ch) => Self::insert_chars(&mut st, &[ch]),
+            super::paste_burst::FlushResult::Paste(text) if st.paste_burst.take_typed_burst_flag() => {
+                Self::insert_chars(&mut st, &super::chars_of(&crate::term::terminal_text(&text).replace('\n', " ")))
+            }
             super::paste_burst::FlushResult::Paste(text) => self.handle_paste(&mut st, &text, true),
             super::paste_burst::FlushResult::None => {}
         }
@@ -408,7 +421,7 @@ impl Tui {
         st.history_draft = None;
         st.history_search = None;
         st.history_index = st.history.len();
-        st.status_notice = Some("Queued messages restored — edit and press Enter to send".into());
+        st.set_raw_notice("Queued messages restored — edit and press Enter to send");
         self.schedule(&mut st, 0);
     }
 

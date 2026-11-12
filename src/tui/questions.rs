@@ -215,7 +215,7 @@ impl Tui {
                 let (columns, rows) = self.size();
                 let (_, options, _, room) = Self::form_layout(question, columns.saturating_sub(1).max(3), rows.max(8));
                 if options[question.selected].len() > room {
-                    st.status_notice = Some("Expand terminal to read the entire option before submitting".into());
+                    st.set_raw_notice("Expand terminal to read the entire option before submitting");
                     self.schedule(st, 0);
                     return true;
                 }

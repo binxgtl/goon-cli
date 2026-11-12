@@ -34,7 +34,7 @@ pub const PROVIDER_PRESETS: [ProviderPreset; 9] = [
     ProviderPreset { id: "openrouter", label: "OpenRouter Gateway", provider: "openai-compatible", base_url: "https://openrouter.ai/api/v1", key_env: "OPENROUTER_API_KEY" },
     ProviderPreset { id: "deepseek", label: "DeepSeek Official API", provider: "openai-compatible", base_url: "https://api.deepseek.com/v1", key_env: "DEEPSEEK_API_KEY" },
     ProviderPreset { id: "groq", label: "Groq Cloud API", provider: "openai-compatible", base_url: "https://api.groq.com/openai/v1", key_env: "GROQ_API_KEY" },
-    ProviderPreset { id: "ollama", label: "Ollama Local (http://127.0.0.1:11434/v1)", provider: "openai-compatible", base_url: "http://127.0.0.1:11434/v1", key_env: "GOON_API_KEY" },
+    ProviderPreset { id: "ollama", label: "Ollama Local (http://127.0.0.1:11434/v1)", provider: "openai-compatible", base_url: "http://127.0.0.1:11434/v1", key_env: "OLLAMA_API_KEY" },
     ProviderPreset {
         id: "yuristore",
         label: "YuriStore AI Gateway (https://api.yuristore.xyz/v1 · glm-5.3 / deepseek-v4.1 / space-bunny / beam)",
@@ -142,11 +142,25 @@ pub struct SetupIo {
 }
 
 fn default_ask() -> AskFn {
-    Arc::new(|label: String| Box::pin(async move { Ok(crate::term::read_line_cancelable(&label, None).await?.unwrap_or_default().trim().to_string()) }))
+    Arc::new(|label: String| {
+        Box::pin(async move {
+            let Some(line) = crate::term::read_line_cancelable(&label, None).await? else {
+                bail!(crate::term::InputCancelled);
+            };
+            Ok(line.trim().to_string())
+        })
+    })
 }
 
 fn default_secret() -> AskFn {
-    Arc::new(|label: String| Box::pin(async move { Ok(crate::term::read_hidden(&label).await?.unwrap_or_default().trim().to_string()) }))
+    Arc::new(|label: String| {
+        Box::pin(async move {
+            let Some(line) = crate::term::read_hidden(&label).await? else {
+                bail!(crate::term::InputCancelled);
+            };
+            Ok(line.trim().to_string())
+        })
+    })
 }
 
 pub async fn run_setup_wizard(initial: Option<Config>, io: SetupIo) -> Result<Config> {
@@ -219,16 +233,17 @@ pub(crate) async fn run_setup_wizard_in(initial: Option<Config>, io: SetupIo, co
         resolve_api_key(&probe_cfg)
     };
     let key_optional = preset.id == "ollama";
+    let existing_real_key = existing_key.clone().filter(|k| !(key_optional && k == "ollama"));
 
-    let key_hint = match (&existing_key, key_optional) {
+    let key_hint = match (&existing_real_key, key_optional) {
         (Some(k), _) => format!("saved ({}...{}) — press Enter to keep", crate::jsutil::take_chars(k, 4), crate::jsutil::tail_chars(k, 2)),
         (None, true) => "optional for local Ollama — press Enter to skip".to_string(),
         (None, false) => format!("stored in {}", creds_file.display()),
     };
     write(&format!("\nStep 3/5 · API Key ({target_key_env}, {key_hint}):\n"));
-    let secret_prompt = if key_optional && existing_key.is_none() { "API Key (optional, press Enter to skip): " } else { "API Key (input hidden): " };
+    let secret_prompt = if key_optional && existing_real_key.is_none() { "API Key (optional, press Enter to skip): " } else { "API Key (input hidden): " };
     let key_input = ask_secret(secret_prompt.into()).await?.trim().to_string();
-    let active_key = if key_input.is_empty() { existing_key.clone() } else { Some(key_input.clone()) };
+    let active_key = if key_input.is_empty() { existing_real_key.clone() } else { Some(key_input.clone()) };
 
     write(&format!("\nStep 4/5 · Model ID (probing {base_url}/models ...):\n"));
     let discovered = discover(base_url.clone(), active_key.clone(), preset.provider.to_string()).await;
@@ -312,6 +327,13 @@ pub(crate) async fn run_setup_wizard_in(initial: Option<Config>, io: SetupIo, co
     overrides.insert("contextWindow".into(), json!(next_context));
     overrides.insert("maxOutputTokens".into(), json!(next_max_out));
     overrides.insert("keyEnv".into(), json!(target_key_env));
+    let save_key_val: Option<&str> = if !key_input.is_empty() {
+        Some(key_input.as_str())
+    } else if key_optional && existing_key.is_none() {
+        Some("ollama")
+    } else {
+        None
+    };
     let (updated, final_key) = if let Some(dir) = &config_dir_override {
         mkdir_private(dir)?;
         let mut base_map = std::fs::read_to_string(&cfg_file).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()).and_then(|v| v.as_object().cloned()).unwrap_or_default();
@@ -323,9 +345,9 @@ pub(crate) async fn run_setup_wizard_in(initial: Option<Config>, io: SetupIo, co
             }
         }
         let updated = parse_config(&Value::Object(base_map))?;
-        if !key_input.is_empty() {
+        if let Some(val) = save_key_val {
             let mut creds = load_creds_map(&creds_file);
-            creds.insert(target_key_env.clone(), Value::String(key_input.clone()));
+            creds.insert(target_key_env.clone(), Value::String(val.to_string()));
             atomic_json(&creds_file, &Value::Object(creds), false)?;
         }
         atomic_json(&cfg_file, &updated.to_value(), false)?;
@@ -333,14 +355,15 @@ pub(crate) async fn run_setup_wizard_in(initial: Option<Config>, io: SetupIo, co
         (updated, resolved)
     } else {
         let updated = load_config(&overrides)?;
-        if !key_input.is_empty() {
-            save_credential(&target_key_env, &key_input)?;
+        if let Some(val) = save_key_val {
+            save_credential(&target_key_env, val)?;
         }
         save_config(&updated)?;
         let resolved = resolve_api_key(&updated);
         (updated, resolved)
     };
-    let key_status = if final_key.is_some() {
+    let has_real_key = final_key.as_deref().is_some_and(|k| !(key_optional && k == "ollama"));
+    let key_status = if has_real_key {
         "configured".into()
     } else if key_optional {
         "optional (local Ollama)".into()
@@ -397,6 +420,7 @@ mod tests {
         assert_eq!(PROVIDER_PRESETS[5].key_env, "GROQ_API_KEY");
         assert_eq!(PROVIDER_PRESETS[6].id, "ollama");
         assert_eq!(PROVIDER_PRESETS[6].base_url, "http://127.0.0.1:11434/v1");
+        assert_eq!(PROVIDER_PRESETS[6].key_env, "OLLAMA_API_KEY");
         assert_eq!(PROVIDER_PRESETS[7].id, "yuristore");
         assert_eq!(PROVIDER_PRESETS[7].base_url, DEFAULT_GATEWAY_URL);
         assert_eq!(PROVIDER_PRESETS[8].id, "local-proxy");
@@ -502,18 +526,45 @@ mod tests {
         assert_eq!(creds["ANTHROPIC_API_KEY"], "sk-ant-secret-111");
         assert_eq!(creds["OPENROUTER_API_KEY"], "sk-or-secret-222");
 
-        let out3 = Arc::new(Mutex::new(String::new()));
-        let cfg3 = run_setup_wizard_in(
+        // Fresh Config::default() highlights [8] YuriStore (not Ollama)
+        assert!(out1.lock().unwrap().contains("● [8] YuriStore AI Gateway"), "fresh install should default to YuriStore:\n{}", out1.lock().unwrap());
+
+        // Save a GOON_API_KEY under YuriStore first to verify Ollama never exfiltrates GOON_API_KEY
+        let out_yuri = Arc::new(Mutex::new(String::new()));
+        let cfg_yuri = run_setup_wizard_in(
             Some(cfg2),
-            scripted_io(vec!["ollama", "", "qwen2.5-coder:7b", "default"], "", out3.clone(), Arc::new(Mutex::new(vec![])), Arc::new(Mutex::new(vec![]))),
+            scripted_io(vec!["yuristore", "", "glm-5.3", "default"], "sk-yuri-paid-secret-9999", out_yuri, Arc::new(Mutex::new(vec![])), Arc::new(Mutex::new(vec![]))),
             Some(dir.clone()),
         )
         .await
         .unwrap();
+        assert_eq!(cfg_yuri.key_env, "GOON_API_KEY");
+
+        // Keyless Ollama setup isolates OLLAMA_API_KEY, sends None to /models, and persists "ollama" sentinel
+        let out3 = Arc::new(Mutex::new(String::new()));
+        let probed3 = Arc::new(Mutex::new(vec![]));
+        let cfg3 =
+            run_setup_wizard_in(Some(cfg_yuri), scripted_io(vec!["ollama", "", "qwen2.5-coder:7b", "default"], "", out3.clone(), Arc::new(Mutex::new(vec![])), probed3.clone()), Some(dir.clone()))
+                .await
+                .unwrap();
         assert_eq!(cfg3.base_url.as_deref(), Some("http://127.0.0.1:11434/v1"));
+        assert_eq!(cfg3.key_env, "OLLAMA_API_KEY");
+        assert_eq!(probed3.lock().unwrap().as_slice(), &[None], "Ollama /models probe must never leak GOON_API_KEY");
         assert!(out3.lock().unwrap().contains("optional (local Ollama)"));
         let creds_after: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("credentials.json")).unwrap()).unwrap();
-        assert!(creds_after.get("GOON_API_KEY").is_none());
+        assert_eq!(creds_after["OLLAMA_API_KEY"], "ollama");
+        assert_eq!(creds_after["GOON_API_KEY"], "sk-yuri-paid-secret-9999");
+
+        // Re-running Ollama setup with stored "ollama" sentinel still treats key as optional and probes with None
+        let out4 = Arc::new(Mutex::new(String::new()));
+        let probed4 = Arc::new(Mutex::new(vec![]));
+        let cfg4 = run_setup_wizard_in(Some(cfg3), scripted_io(vec!["", "", "qwen2.5-coder:14b", "default"], "", out4.clone(), Arc::new(Mutex::new(vec![])), probed4.clone()), Some(dir.clone()))
+            .await
+            .unwrap();
+        assert_eq!(cfg4.model.as_deref(), Some("qwen2.5-coder:14b"));
+        assert!(out4.lock().unwrap().contains("optional for local Ollama — press Enter to skip"));
+        assert!(out4.lock().unwrap().contains("optional (local Ollama)"));
+        assert_eq!(probed4.lock().unwrap().as_slice(), &[None]);
 
         let err = run_setup_wizard_in(
             Some(Config::default()),

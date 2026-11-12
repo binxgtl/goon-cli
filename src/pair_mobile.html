@@ -216,10 +216,24 @@
     }
   }
 
+  let errSeq = 0;
+
+  function showActionError(err, fallback) {
+    errSeq += 1;
+    upsertEntry({
+      id: 'local-err-' + errSeq,
+      kind: 'system',
+      text: '✗ ' + ((err && err.message) || fallback),
+    });
+  }
+
   function updateHeader(state) {
     if (!state) return;
-    metaEl.textContent = state.model + ' · ' + state.cwd.split(/[\\/]/).pop();
-    statusEl.textContent = '● ' + state.status + ' · ' + state.mode;
+    const rawCwd = String(state.cwd || '');
+    const folder = rawCwd.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || rawCwd;
+    const model = String(state.model || '');
+    metaEl.textContent = folder ? (model ? model + ' · ' + folder : folder) : model;
+    statusEl.textContent = '● ' + (state.status || 'Ready') + ' · ' + (state.mode || 'ask');
     document.querySelectorAll('.mode-btn[data-mode]').forEach(btn => {
       btn.classList.toggle('active', btn.dataset.mode === state.mode);
     });
@@ -244,8 +258,19 @@
       b.className = 'btn ' + cls;
       b.textContent = label;
       b.onclick = async () => {
-        await apiPost('/api/approve', { id: msg.id, decision: dec });
-        box.textContent = '✓ Decision sent: ' + label;
+        b.disabled = true;
+        try {
+          await apiPost('/api/approve', { id: msg.id, decision: dec });
+          box.textContent = '✓ Decision sent: ' + label;
+        } catch (err) {
+          b.disabled = false;
+          let errEl = box.children[2];
+          if (!errEl) {
+            errEl = document.createElement('div');
+            box.appendChild(errEl);
+          }
+          errEl.textContent = '✗ ' + ((err && err.message) || 'Approval failed');
+        }
       };
       actions.appendChild(b);
     });
@@ -264,7 +289,11 @@
       },
       body: JSON.stringify(body || {}),
     });
-    return res.json();
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data.error || ('HTTP ' + res.status));
+    }
+    return data;
   }
 
   async function pollState(force) {
@@ -311,23 +340,40 @@
 
   document.querySelectorAll('.mode-btn[data-mode]').forEach(btn => {
     btn.onclick = async () => {
-      await apiPost('/api/mode', { mode: btn.dataset.mode });
-      pollState(true);
+      try {
+        await apiPost('/api/mode', { mode: btn.dataset.mode });
+        pollState(true);
+      } catch (err) {
+        showActionError(err, 'Mode change failed');
+      }
     };
   });
   document.getElementById('stopBtn').onclick = async () => {
-    await apiPost('/api/stop', {});
-    pollState(true);
+    try {
+      await apiPost('/api/stop', {});
+      pollState(true);
+    } catch (err) {
+      showActionError(err, 'Stop request failed');
+    }
   };
 
   async function submitPrompt() {
     if (!promptEl) return;
-    const text = promptEl.value.trim();
+    const rawValue = promptEl.value;
+    const text = rawValue.trim();
     if (!text) return;
     promptEl.value = '';
     resizePromptInput();
-    await apiPost('/api/prompt', { prompt: text });
-    pollState(true);
+    try {
+      await apiPost('/api/prompt', { prompt: text });
+      pollState(true);
+    } catch (err) {
+      if (!promptEl.value) {
+        promptEl.value = rawValue;
+        resizePromptInput();
+      }
+      showActionError(err, 'Send failed');
+    }
   }
 
   if (promptEl) {

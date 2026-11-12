@@ -196,7 +196,7 @@ impl Tui {
             let command = match command {
                 Ok(command) => command,
                 Err(error) => {
-                    st.status_notice = Some(error.to_string());
+                    st.set_raw_notice(&error.to_string());
                     self.schedule(&mut st, 0);
                     return;
                 }
@@ -209,7 +209,7 @@ impl Tui {
             for (token, payload) in &st.pasted_texts {
                 seed = seed.replace(token, payload);
             }
-            st.status_notice = Some("Save and close external editor to continue.".into());
+            st.set_raw_notice("Save and close external editor to continue.");
             self.render(&mut st);
             st.editor_active = true;
             st.mouse_capture = false;
@@ -230,9 +230,9 @@ impl Tui {
             match result {
                 Ok(text) => {
                     Self::apply_external_edit(&mut st, &text);
-                    st.status_notice = Some("External edit applied · Enter to submit".into());
+                    st.set_raw_notice("External edit applied · Enter to submit");
                 }
-                Err(error) => st.status_notice = Some(format!("Failed to open editor: {}", terminal_text(&error.to_string()))),
+                Err(error) => st.set_raw_notice(&format!("Failed to open editor: {error}")),
             }
         }
     }
@@ -244,7 +244,10 @@ impl Drop for EditorGuard<'_> {
         let tui = self.0;
         let mut st = tui.state.lock().unwrap_or_else(|e| e.into_inner());
         st.editor_active = false;
-        if st.closed {
+        if st.closed || std::thread::panicking() {
+            st.closed = true;
+            st.spinning = false;
+            st.spin_gen = st.spin_gen.wrapping_add(1);
             drop(st);
             tui.restore_terminal();
             return;
@@ -255,7 +258,7 @@ impl Drop for EditorGuard<'_> {
             // cached raw-mode flag before reapplying the actual terminal mode.
             let _ = crossterm::terminal::disable_raw_mode();
             if let Err(error) = crossterm::terminal::enable_raw_mode() {
-                st.status_notice = Some(format!("Failed to restore raw input: {error}"));
+                st.set_raw_notice(&format!("Failed to restore raw input: {error}"));
             } else {
                 super::set_panic_terminal_state(true, st.native.is_none());
             }

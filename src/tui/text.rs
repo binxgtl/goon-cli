@@ -268,6 +268,91 @@ pub fn visible_length(text: &str) -> usize {
     UnicodeWidthStr::width(strip_vt(text).as_ref())
 }
 
+fn skip_csi(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> bool {
+    while chars.peek().is_some_and(|c| ('\x30'..='\x3f').contains(c)) {
+        chars.next();
+    }
+    while chars.peek().is_some_and(|c| ('\x20'..='\x2f').contains(c)) {
+        chars.next();
+    }
+    match chars.peek().copied() {
+        Some(c) if ('\x40'..='\x7e').contains(&c) => {
+            chars.next();
+            false
+        }
+        Some('\x1b') => {
+            chars.next();
+            true
+        }
+        _ => false,
+    }
+}
+
+fn skip_control_string(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> bool {
+    while let Some(c) = chars.next() {
+        match c {
+            '\x07' | '\u{9c}' => return false,
+            '\x1b' => {
+                if chars.peek() == Some(&'\\') {
+                    chars.next();
+                    return false;
+                }
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Strips all 7-bit and 8-bit VT/ECMA-48/xterm control sequences (OSC, DCS, SOS, PM, APC,
+/// CSI with private/colon/intermediate bytes, nF/Fp/Fe escapes, and unterminated trailing
+/// control strings) in O(N) time and O(1) stack space.
+pub(crate) fn strip_vt_complete(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    let mut pending_esc = false;
+    while pending_esc || chars.peek().is_some() {
+        let ch = if pending_esc {
+            pending_esc = false;
+            '\x1b'
+        } else {
+            chars.next().unwrap()
+        };
+        match ch {
+            '\x1b' => match chars.next() {
+                None => break,
+                Some('\x1b') => pending_esc = true,
+                Some('[') => pending_esc = skip_csi(&mut chars),
+                Some(']' | 'P' | 'X' | '^' | '_') => pending_esc = skip_control_string(&mut chars),
+                Some(c) if ('\x20'..='\x2f').contains(&c) => {
+                    while chars.peek().is_some_and(|n| ('\x20'..='\x2f').contains(n)) {
+                        chars.next();
+                    }
+                    if chars.peek().is_some_and(|fin| ('\x30'..='\x7e').contains(fin)) {
+                        chars.next();
+                    } else if chars.peek() == Some(&'\x1b') {
+                        chars.next();
+                        pending_esc = true;
+                    }
+                }
+                Some(_) => {}
+            },
+            '\u{9b}' => pending_esc = skip_csi(&mut chars),
+            '\u{90}' | '\u{98}' | '\u{9d}' | '\u{9e}' | '\u{9f}' => pending_esc = skip_control_string(&mut chars),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Sanitizes dynamic/untrusted text for single-line TUI chrome: strips all VT/OSC/DCS/APC/CSI
+/// sequences and C0/C1 controls, normalizes to NFC, and collapses all whitespace (`\n`, `\r`, `\t`) to `' '`.
+pub fn sanitize_single_line(s: &str) -> String {
+    let stripped = strip_vt_complete(s);
+    terminal_text(&stripped).split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 pub fn slice_visible(text: &str, max_cols: usize) -> String {
     let mut out = String::new();
     let mut used = 0;
@@ -499,7 +584,8 @@ pub fn format_turn_duration(ms: i64) -> String {
 }
 
 pub fn extract_reasoning_summary(buffer: &str) -> (Option<String>, Option<String>) {
-    let lines: Vec<&str> = re!(r"\r?\n").split(buffer).map(str::trim).filter(|l| !l.is_empty()).collect();
+    let clean_buf = strip_vt_complete(buffer);
+    let lines: Vec<&str> = re!(r"\r?\n").split(&clean_buf).map(str::trim).filter(|l| !l.is_empty()).collect();
     let mut header = None;
     let mut detail = None;
     for line in lines.iter().rev() {
@@ -508,12 +594,20 @@ pub fn extract_reasoning_summary(buffer: &str) -> (Option<String>, Option<String
         }
         let bold = re!(r"^\*\*([^*]{3,80})\*\*").captures(line).or_else(|| re!(r"^#{1,3}\s+(.{3,80})$").captures(line));
         match bold {
-            Some(c) if header.is_none() => header = Some(c[1].trim().to_string()),
+            Some(c) if header.is_none() => {
+                let h = sanitize_single_line(&c[1]);
+                if !h.is_empty() {
+                    header = Some(h);
+                }
+            }
             _ => {
                 if detail.is_none() {
                     let d = re!(r"\*\*([^*]+)\*\*").replace_all(line, "${1}");
                     let d = re!(r"`([^`]+)`").replace_all(&d, "${1}");
-                    detail = Some(crate::jsutil::slice_chars(&d, 0, 120).to_string());
+                    let clean_d = sanitize_single_line(crate::jsutil::slice_chars(&d, 0, 120));
+                    if !clean_d.is_empty() {
+                        detail = Some(clean_d);
+                    }
                 }
             }
         }

@@ -816,7 +816,7 @@ impl Tui {
         }
         let (columns, rows) = self.size();
         let columns = columns.max(4);
-        let rows = rows.max(8);
+        let rows = rows.max(4);
         let safe_cols = columns.saturating_sub(1).max(3);
         let clip = |s: &str| wrap_terminal(s, safe_cols).into_iter().next().unwrap_or_default();
         let current_input: String = st.input.iter().collect();
@@ -977,7 +977,7 @@ impl Tui {
                 safe_cols,
                 &p,
             );
-            let height = rows.saturating_sub(2).max(2);
+            let height = rows.saturating_sub(2).max(1);
             st.max_scroll = all.len().saturating_sub(height);
             st.scroll = st.scroll.min(st.max_scroll);
             let end = all.len() - st.scroll;
@@ -989,8 +989,9 @@ impl Tui {
             let mut live: Vec<Seg> = vec![];
             if busy {
                 if let Some(notice) = &st.status_notice {
-                    let tone = notice_tone(notice, &p);
-                    live = vec![seg(format!("{indicator} "), p.brand), seg(slice_visible(notice, safe_cols.saturating_sub(24).max(8)), tone), seg(format!("  {elapsed}   "), p.dim)];
+                    let clean_notice = super::text::sanitize_single_line(notice);
+                    let tone = notice_tone(&clean_notice, &p);
+                    live = vec![seg(format!("{indicator} "), p.brand), seg(slice_visible(&clean_notice, safe_cols.saturating_sub(24).max(8)), tone), seg(format!("  {elapsed}   "), p.dim)];
                 } else if let Some(active_tool) = Self::format_active_tool_status(st, safe_cols.saturating_sub(24).max(12), now_ms) {
                     live = vec![seg(format!("{indicator} "), p.brand), seg(active_tool, p.default_fg), seg(format!("  {elapsed}   "), p.dim)];
                 } else {
@@ -1042,34 +1043,54 @@ impl Tui {
             status_line = if color_enabled { format!("{}{text}{}", p.warn, p.reset) } else { text };
         } else if busy {
             if let Some(notice) = &st.status_notice {
+                let clean_notice = super::text::sanitize_single_line(notice);
                 let full_tail = format!("  {elapsed}   esc to interrupt");
                 let short_tail = format!("  {elapsed}");
-                let tail = if 2 + visible_length(notice) + visible_length(&full_tail) <= safe_cols {
+                let tail = if 2 + visible_length(&clean_notice) + visible_length(&full_tail) <= safe_cols {
                     full_tail
-                } else if 2 + visible_length(notice) + visible_length(&short_tail) <= safe_cols {
+                } else if 2 + visible_length(&clean_notice) + visible_length(&short_tail) <= safe_cols {
                     short_tail
                 } else {
                     String::new()
                 };
-                let shown_notice = slice_visible(notice, safe_cols.saturating_sub(2 + visible_length(&tail)).max(1));
-                let tone = notice_tone(notice, &p);
-                status_line = if color_enabled {
-                    format!("{}{indicator}{} {tone}{shown_notice}{}{}{tail}{}", p.brand, p.reset, p.reset, p.dim, p.reset)
-                } else {
-                    clip(&format!("{indicator} {shown_notice}{tail}"))
-                };
+                let shown_notice = slice_visible(&clean_notice, safe_cols.saturating_sub(2 + visible_length(&tail)).max(1));
+                let tone = notice_tone(&clean_notice, &p);
+                let raw_status =
+                    if color_enabled { format!("{}{indicator}{} {tone}{shown_notice}{}{}{tail}{}", p.brand, p.reset, p.reset, p.dim, p.reset) } else { format!("{indicator} {shown_notice}{tail}") };
+                status_line = clip_line(&raw_status, safe_cols, color_enabled);
             } else {
-                let tail = if safe_cols >= 48 { format!("  {elapsed}   esc to interrupt") } else { format!("  {elapsed}") };
-                let avail_working = safe_cols.saturating_sub(visible_length(&tail) + 2).max(1);
-                let working = Self::format_active_tool_status(st, avail_working, now_ms).unwrap_or_else(|| {
-                    let raw = if st.status == "Running" { st.reasoning_header.clone().unwrap_or_else(|| "Working".to_string()) } else { st.status.clone() };
-                    slice_visible(&raw, avail_working)
-                });
-                status_line = if color_enabled { format!("{}{indicator}{} {working}{}{}{}", p.brand, p.reset, p.dim, clip(&tail), p.reset) } else { clip(&format!("{indicator} {working}{tail}")) };
+                let candidate_tail = if safe_cols >= 48 {
+                    format!("  {elapsed}   esc to interrupt")
+                } else if elapsed.is_empty() {
+                    String::new()
+                } else {
+                    format!("  {elapsed}")
+                };
+                let candidate_avail = safe_cols.saturating_sub(2 + visible_length(&candidate_tail)).max(1);
+                let resolve_working = |avail: usize| -> String {
+                    Self::format_active_tool_status(st, avail, now_ms).unwrap_or_else(|| {
+                        let raw = if st.status == "Running" {
+                            st.reasoning_header.as_deref().map(super::text::sanitize_single_line).filter(|h| !h.is_empty()).unwrap_or_else(|| "Working".to_string())
+                        } else {
+                            super::text::sanitize_single_line(&st.status)
+                        };
+                        slice_visible(&raw, avail)
+                    })
+                };
+                let mut working = resolve_working(candidate_avail);
+                let tail = if 2 + visible_length(&working) + visible_length(&candidate_tail) <= safe_cols {
+                    candidate_tail
+                } else {
+                    working = resolve_working(safe_cols.saturating_sub(2).max(1));
+                    String::new()
+                };
+                let raw_status = if color_enabled { format!("{}{indicator}{} {working}{}{tail}{}", p.brand, p.reset, p.dim, p.reset) } else { format!("{indicator} {working}{tail}") };
+                status_line = clip_line(&raw_status, safe_cols, color_enabled);
             }
         } else if let Some(notice) = &st.status_notice {
-            let text = clip(notice);
-            let tone = notice_tone(notice, &p);
+            let clean_notice = super::text::sanitize_single_line(notice);
+            let text = clip(&clean_notice);
+            let tone = notice_tone(&clean_notice, &p);
             status_line = if color_enabled { format!("{tone}{text}{}", p.reset) } else { text };
         } else if !st.attached_images.is_empty() || !st.pasted_texts.is_empty() {
             let mut items: Vec<String> = st.attached_images.iter().map(|(k, path)| format!("{k} {}", super::text::basename(path))).collect();
@@ -1112,7 +1133,7 @@ impl Tui {
             let status_tone = if busy { p.brand } else { p.dim };
             let left_compact = vec![seg(display_mode, mode_tone), seg(format!("  {}", st.status), status_tone)];
             let footer = Self::band(&left_compact, vec![Self::context_group(st, &p), token_group], safe_cols, &p);
-            let height = rows.saturating_sub(3).max(2);
+            let height = rows.saturating_sub(3).max(1);
             st.max_scroll = all.len().saturating_sub(height);
             st.scroll = st.scroll.min(st.max_scroll);
             let end = all.len() - st.scroll;

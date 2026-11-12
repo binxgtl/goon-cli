@@ -18,6 +18,7 @@ impl Tui {
         // Hold any burst text in the draft; suspend must never submit it.
         match st.paste_burst.flush_before_modified_input() {
             paste_burst::FlushResult::Typed(ch) => Self::insert_chars(&mut st, &[ch]),
+            paste_burst::FlushResult::Paste(text) if st.paste_burst.take_typed_burst_flag() => Self::insert_chars(&mut st, &chars_of(&terminal_text(&text).replace('\n', " "))),
             paste_burst::FlushResult::Paste(text) => self.handle_paste(&mut st, &text, true),
             paste_burst::FlushResult::None => {}
         }
@@ -64,10 +65,13 @@ impl Drop for ResumeGuard<'_> {
     fn drop(&mut self) {
         let tui = self.tui;
         let mut st = tui.state.lock().unwrap_or_else(|e| e.into_inner());
-        if st.closed {
+        if st.closed || std::thread::panicking() {
             // Modes/screen were already yielded. The shell may have written or
             // moved its cursor since then; a second native.finish() would touch
             // output that is no longer ours. Only restore the raw-mode cache.
+            st.closed = true;
+            st.spinning = false;
+            st.spin_gen = st.spin_gen.wrapping_add(1);
             if tui.real_terminal {
                 let _ = crossterm::terminal::disable_raw_mode();
                 super::set_panic_terminal_state(false, false);
@@ -97,7 +101,7 @@ impl Drop for ResumeGuard<'_> {
         tui.write_raw("\x1b[?1004h\x1b[?2004h\x1b[?1007h\x1b[?25l");
         st.input_yielded = false;
         if let Some(error) = &self.error {
-            st.status_notice = Some(format!("Suspend/resume failed: {}", terminal_text(&error.to_string())));
+            st.set_raw_notice(&format!("Suspend/resume failed: {error}"));
         }
         st.last_frame_rows.clear();
         st.needs_full_clear = true;

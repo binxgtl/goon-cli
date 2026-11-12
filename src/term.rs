@@ -135,14 +135,28 @@ pub fn delete_prev_word(buf: &mut String) {
     }
 }
 
+fn pop_last_grapheme(buf: &mut String) {
+    use unicode_segmentation::UnicodeSegmentation;
+    if let Some((idx, _)) = buf.grapheme_indices(true).next_back() {
+        buf.truncate(idx);
+    }
+}
+
 /// Pure single-line TTY event reducer shared by `read_hidden` and `read_line_cancelable`.
 pub fn step_tty_input(buf: &mut String, event: &crossterm::event::Event) -> TtyReadStep {
+    step_tty_input_with(buf, event, cfg!(windows))
+}
+
+/// Platform-parameterized single-line TTY event reducer (preserves Windows `AltGr` `CONTROL | ALT`).
+pub fn step_tty_input_with(buf: &mut String, event: &crossterm::event::Event, is_windows: bool) -> TtyReadStep {
     use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
     match event {
         Event::Key(key) if key.kind != KeyEventKind::Release => {
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
             let alt = key.modifiers.contains(KeyModifiers::ALT);
             let super_meta = key.modifiers.intersects(KeyModifiers::SUPER | KeyModifiers::HYPER | KeyModifiers::META);
+            let is_altgr = is_windows && ctrl && alt;
+            let has_non_text_modifier = ((ctrl || alt) && !is_altgr) || super_meta;
             match key.code {
                 KeyCode::Esc => TtyReadStep::Cancel,
                 KeyCode::Enter => TtyReadStep::Submit(std::mem::take(buf)),
@@ -153,11 +167,11 @@ pub fn step_tty_input(buf: &mut String, event: &crossterm::event::Event) -> TtyR
                 KeyCode::Char('d' | 'D') if ctrl && !alt && !super_meta && buf.is_empty() => TtyReadStep::Eof,
                 KeyCode::Char('\x04') if buf.is_empty() => TtyReadStep::Eof,
                 KeyCode::Backspace | KeyCode::Delete | KeyCode::Char('\x08' | '\x7f') => {
-                    buf.pop();
+                    pop_last_grapheme(buf);
                     TtyReadStep::Continue
                 }
                 KeyCode::Char('h' | 'H') if ctrl && !alt && !super_meta => {
-                    buf.pop();
+                    pop_last_grapheme(buf);
                     TtyReadStep::Continue
                 }
                 KeyCode::Char('u' | 'U') if ctrl && !alt && !super_meta => {
@@ -176,7 +190,7 @@ pub fn step_tty_input(buf: &mut String, event: &crossterm::event::Event) -> TtyR
                     delete_prev_word(buf);
                     TtyReadStep::Continue
                 }
-                KeyCode::Char(c) if !ctrl && !alt && !super_meta && !c.is_control() => {
+                KeyCode::Char(c) if !has_non_text_modifier && !c.is_control() => {
                     buf.push(c);
                     TtyReadStep::Continue
                 }
@@ -227,11 +241,35 @@ fn stderr_supports_line_redraw() -> bool {
     stderr_is_tty() && std::env::var("TERM").map(|v| !v.eq_ignore_ascii_case("dumb")).unwrap_or(true)
 }
 
-fn split_prompt_prefix(label: &str) -> (&str, &str) {
+fn split_prompt_prefix(label: &str) -> (Option<&str>, &str) {
     match label.rsplit_once('\n') {
-        Some((prefix, tail)) => (prefix, tail),
-        None => ("", label),
+        Some((prefix, tail)) => (Some(prefix), tail),
+        None => (None, label),
     }
+}
+
+fn is_bare_esc_press(event: &crossterm::event::Event) -> bool {
+    matches!(
+        event,
+        crossterm::event::Event::Key(k)
+            if k.code == crossterm::event::KeyCode::Esc
+                && k.modifiers.is_empty()
+                && k.kind != crossterm::event::KeyEventKind::Release
+    )
+}
+
+fn drain_split_escape_sequence() -> Result<bool> {
+    if !crossterm::event::poll(std::time::Duration::from_millis(15))? {
+        return Ok(false);
+    }
+    let _ = crossterm::event::read()?;
+    for _ in 0..8 {
+        if !crossterm::event::poll(std::time::Duration::from_millis(2))? {
+            break;
+        }
+        let _ = crossterm::event::read()?;
+    }
+    Ok(true)
 }
 
 /// Reads one line on a TTY with live `Esc` / `Ctrl+C` cancellation; falls back to `read_line` when non-TTY or `TERM=dumb`.
@@ -240,7 +278,7 @@ pub async fn read_line_cancelable(label: &str, cancel: Option<&CancellationToken
         return read_line(label, cancel).await;
     }
     let (prefix, line_label_ref) = split_prompt_prefix(label);
-    if !prefix.is_empty() {
+    if let Some(prefix) = prefix {
         eprintln!("{prefix}");
     }
     eprint!("{line_label_ref}");
@@ -262,6 +300,9 @@ pub async fn read_line_cancelable(label: &str, cancel: Option<&CancellationToken
                 continue;
             }
             let event = crossterm::event::read()?;
+            if is_bare_esc_press(&event) && drain_split_escape_sequence()? {
+                continue;
+            }
             match step_tty_input(&mut buf, &event) {
                 TtyReadStep::Continue => {
                     if redraw && buf != shown {
@@ -301,7 +342,7 @@ pub async fn read_hidden(label: &str) -> Result<Option<String>> {
         return read_line(label, None).await;
     }
     let (prefix, line_label_ref) = split_prompt_prefix(label);
-    if !prefix.is_empty() {
+    if let Some(prefix) = prefix {
         eprintln!("{prefix}");
     }
     eprint!("{line_label_ref}");
@@ -309,49 +350,55 @@ pub async fn read_hidden(label: &str) -> Result<Option<String>> {
     let line_label = line_label_ref.to_string();
     let redraw = stderr_supports_line_redraw();
     tokio::task::spawn_blocking(move || -> Result<Option<String>> {
+        use unicode_segmentation::UnicodeSegmentation;
         let _guard = RawModeGuard::enter(redraw)?;
         let mut out = String::new();
         let mut last_count = 0usize;
         loop {
             match crossterm::event::read() {
-                Ok(event) => match step_tty_input(&mut out, &event) {
-                    TtyReadStep::Continue => {
-                        let count = out.chars().count();
-                        if redraw && count != last_count {
-                            last_count = count;
-                            let mask = format_hidden_mask(count);
-                            eprint!("\r\x1b[2K{line_label}{mask}");
+                Ok(event) => {
+                    if is_bare_esc_press(&event) && drain_split_escape_sequence()? {
+                        continue;
+                    }
+                    match step_tty_input(&mut out, &event) {
+                        TtyReadStep::Continue => {
+                            let count = out.graphemes(true).count();
+                            if redraw && count != last_count {
+                                last_count = count;
+                                let mask = format_hidden_mask(count);
+                                eprint!("\r\x1b[2K{line_label}{mask}");
+                                let _ = std::io::stderr().flush();
+                            }
+                        }
+                        TtyReadStep::Submit(secret) => {
+                            if redraw {
+                                eprint!("\r\x1b[2K{line_label}\r\n");
+                            } else {
+                                eprint!("\r\n");
+                            }
                             let _ = std::io::stderr().flush();
+                            break Ok(Some(secret));
+                        }
+                        TtyReadStep::Eof => {
+                            if redraw {
+                                eprint!("\r\x1b[2K{line_label}\r\n");
+                            } else {
+                                eprint!("\r\n");
+                            }
+                            let _ = std::io::stderr().flush();
+                            break Ok(None);
+                        }
+                        TtyReadStep::Cancel => {
+                            if redraw {
+                                eprint!("\r\x1b[2K{line_label}\r\n");
+                            } else {
+                                eprint!("\r\n");
+                            }
+                            let _ = std::io::stderr().flush();
+                            break Err(InputCancelled.into());
                         }
                     }
-                    TtyReadStep::Submit(secret) => {
-                        if redraw {
-                            eprint!("\r\x1b[2K{line_label}\r\n");
-                        } else {
-                            eprint!("\r\n");
-                        }
-                        let _ = std::io::stderr().flush();
-                        break Ok(Some(secret));
-                    }
-                    TtyReadStep::Eof => {
-                        if redraw {
-                            eprint!("\r\x1b[2K{line_label}\r\n");
-                        } else {
-                            eprint!("\r\n");
-                        }
-                        let _ = std::io::stderr().flush();
-                        break Ok(None);
-                    }
-                    TtyReadStep::Cancel => {
-                        if redraw {
-                            eprint!("\r\x1b[2K{line_label}\r\n");
-                        } else {
-                            eprint!("\r\n");
-                        }
-                        let _ = std::io::stderr().flush();
-                        break Err(InputCancelled.into());
-                    }
-                },
+                }
                 Err(e) => {
                     eprint!("\r\n");
                     let _ = std::io::stderr().flush();
@@ -434,5 +481,40 @@ mod tests {
         assert_eq!(format_hidden_mask(4), "•••• (4 chars)");
         assert_eq!(format_hidden_mask(8), "•••••••• (8 chars)");
         assert_eq!(format_hidden_mask(24), "•••••••• (24 chars)");
+    }
+
+    #[test]
+    fn split_prompt_prefix_distinguishes_leading_newline_from_no_newline() {
+        assert_eq!(split_prompt_prefix("API Key: "), (None, "API Key: "));
+        assert_eq!(split_prompt_prefix("\nSelect provider: "), (Some(""), "Select provider: "));
+        assert_eq!(split_prompt_prefix("Header\nPrompt: "), (Some("Header"), "Prompt: "));
+    }
+
+    #[test]
+    fn windows_altgr_inserts_printable_symbols_and_backspace_deletes_full_graphemes() {
+        let mut buf = String::from("http://");
+        for ch in ['[', ':', ':', '1', ']', '@', '~'] {
+            let ev = Event::Key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL | KeyModifiers::ALT));
+            assert_eq!(step_tty_input_with(&mut buf, &ev, true), TtyReadStep::Continue);
+        }
+        assert_eq!(buf, "http://[::1]@~");
+
+        // On Unix (is_windows == false), CONTROL | ALT is not AltGr and must be ignored
+        let ev_unix = Event::Key(KeyEvent::new(KeyCode::Char('@'), KeyModifiers::CONTROL | KeyModifiers::ALT));
+        assert_eq!(step_tty_input_with(&mut buf, &ev_unix, false), TtyReadStep::Continue);
+        assert_eq!(buf, "http://[::1]@~");
+
+        // Ctrl+V, Alt+V, and Super+V remain ignored even when is_windows == true
+        for mods in [KeyModifiers::CONTROL, KeyModifiers::ALT, KeyModifiers::SUPER] {
+            assert_eq!(step_tty_input_with(&mut buf, &Event::Key(KeyEvent::new(KeyCode::Char('v'), mods)), true), TtyReadStep::Continue);
+        }
+        assert_eq!(buf, "http://[::1]@~");
+
+        // NFD combining sequence ("ae\u{0301}") and ZWJ emoji delete atomically on Backspace / Ctrl+H
+        let mut gbuf = String::from("ae\u{0301}👩‍💻");
+        assert_eq!(step_tty_input_with(&mut gbuf, &Event::Key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)), true), TtyReadStep::Continue);
+        assert_eq!(gbuf, "ae\u{0301}");
+        assert_eq!(step_tty_input_with(&mut gbuf, &Event::Key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL)), true), TtyReadStep::Continue);
+        assert_eq!(gbuf, "a");
     }
 }
