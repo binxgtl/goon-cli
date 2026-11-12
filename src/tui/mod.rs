@@ -5,6 +5,7 @@
 mod completion;
 mod composer;
 mod editor;
+mod highlight;
 #[cfg(unix)]
 mod job_control;
 mod native;
@@ -105,6 +106,11 @@ pub fn install_panic_hook() {
     });
 }
 
+/// A "breathing" star (Claude Code style); every frame is a single-width, text-presentation glyph.
+#[cfg(not(windows))]
+pub const SPINNER: [&str; 10] = ["·", "✢", "✶", "✻", "✽", "✽", "✻", "✶", "✢", "·"];
+/// Legacy Windows console fonts lack the dingbat stars; braille is covered everywhere.
+#[cfg(windows)]
 pub const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 pub const USER_MARK: char = '\u{E000}';
 const TRANSCRIPT_MAX_CHARS: usize = 160_000;
@@ -345,11 +351,13 @@ pub(crate) struct ParseState {
     pub answer_first: bool,
     pub last_was_user: bool,
     pub in_banner: bool,
+    /// A closed code fence wants one blank row before the next content.
+    pub pending_gap: bool,
 }
 
 impl Default for ParseState {
     fn default() -> Self {
-        ParseState { block: Block::Normal, in_code: false, in_diff: false, answer_first: false, last_was_user: false, in_banner: false }
+        ParseState { block: Block::Normal, in_code: false, in_diff: false, answer_first: false, last_was_user: false, in_banner: false, pending_gap: false }
     }
 }
 
@@ -375,6 +383,8 @@ pub(crate) enum RowKind {
     Hint,
     BannerTitle,
     Banner,
+    /// Decorative frame line (welcome card border or padded card content); never selectable.
+    Frame,
 }
 
 #[derive(Clone, Debug)]
@@ -1717,7 +1727,7 @@ impl Tui {
                         if st.spin_gen != gen || st.closed {
                             return;
                         }
-                        st.spin_tick = (st.spin_tick + 1) % SPINNER.len();
+                        st.spin_tick = st.spin_tick.wrapping_add(1);
                         t.schedule(&mut st, 16);
                     }
                 });

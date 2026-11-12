@@ -72,7 +72,9 @@ impl Layout {
                     }
                 }
             }
-            if (row.origin.is_none() && row.kind == RowKind::Blank) || matches!(row.kind, RowKind::Rule | RowKind::CodeHead | RowKind::ReasoningHead | RowKind::BannerTitle | RowKind::Banner) {
+            if (row.origin.is_none() && row.kind == RowKind::Blank)
+                || matches!(row.kind, RowKind::Rule | RowKind::CodeHead | RowKind::ReasoningHead | RowKind::BannerTitle | RowKind::Banner | RowKind::Frame)
+            {
                 layout.rows.push(LayoutRow { line: usize::MAX, range: 0..0, prefix: 0, visible: String::new(), fragments: None });
                 previous = None;
                 continue;

@@ -49,6 +49,80 @@ fn table_separator(trimmed: &str) -> bool {
     split_table_cells(trimmed).iter().all(|cell| re!(r"^:?-+:?$").is_match(cell))
 }
 
+/// Narrower terminals keep the unframed banner (a card would wrap every line).
+const CARD_MIN_COLS: usize = 32;
+
+fn is_banner_title(line: &str) -> bool {
+    re!(r"^◆ goon v\S+\s*$").is_match(line)
+}
+
+/// `model      x · effort y` → `model x · effort y` for the unframed, narrow banner.
+fn compact_banner_detail(detail: &str) -> String {
+    re!(r"^(\S+)\s{2,}").replace(detail, "$1 ").into_owned()
+}
+
+fn frame_row(text: String, level: usize) -> Row {
+    Row { kind: RowKind::Frame, pre: String::new(), text, glyph: None, sign: None, level, origin: None }
+}
+
+/// The welcome card (Claude Code / Codex style): a rounded frame around the title and the
+/// session facts. Rows are decorative (`Frame`), so selection and copy skip them.
+fn welcome_card(title: &str, details: &[&str], cols: usize) -> Vec<Row> {
+    let infos: Vec<&str> = details.iter().copied().filter(|d| !d.starts_with("/help")).collect();
+    let natural = infos.iter().map(|d| visible_length(d)).chain([visible_length(title)]).max().unwrap_or(0) + 4;
+    let width = natural.max(48).min(cols).max(8);
+    let inner = width - 4;
+    let pad = |text: &str| format!("│ {text}{} │", " ".repeat(inner.saturating_sub(visible_length(text))));
+    let mut rows = vec![frame_row(format!("╭{}╮", "─".repeat(width - 2)), 0), frame_row(pad(&slice_visible(title, inner)), 1)];
+    if !infos.is_empty() {
+        rows.push(frame_row(pad(""), 3));
+    }
+    for info in infos {
+        let label = re!(r"^\S+\s{2,}").find(info).map(|m| visible_length(m.as_str())).filter(|w| *w <= inner / 2).unwrap_or(0);
+        for (i, range) in super::text::wrap_ranges(info, inner, inner.saturating_sub(label).max(1), true).into_iter().enumerate() {
+            let piece = if i == 0 { info[range].to_string() } else { format!("{}{}", " ".repeat(label), info[range].trim_start()) };
+            rows.push(frame_row(pad(&slice_visible(&piece, inner)), 2));
+        }
+    }
+    rows.push(frame_row(format!("╰{}╯", "─".repeat(width - 2)), 0));
+    rows
+}
+
+/// `a · b · c` with dim separators and dim sub-labels (`effort`, `mode`, `session`).
+fn paint_facts(text: &str, p: &Palette) -> String {
+    let painted = re!(r"(^|· )(effort|mode|session|branch) ").replace_all(text, |c: &regex::Captures| format!("{}{}{}{} ", &c[1], p.dim, &c[2], p.reset));
+    painted.replace(" · ", &format!(" {}·{} ", p.dim, p.reset))
+}
+
+fn style_frame(row: &Row, p: &Palette) -> String {
+    let (Some(inner), true) = (row.text.strip_prefix("│ ").and_then(|t| t.strip_suffix(" │")), row.level > 0) else {
+        return format!("{}{}{}", p.dim, row.text, p.reset);
+    };
+    let content = match row.level {
+        1 => match re!(r"^◆ goon (v\S+)(\s*)$").captures(inner) {
+            Some(c) => format!("{}{}{} {}goon{} {}{}{}{}", p.brand_bold, glyph::BRAND, p.reset, p.bold, p.reset, p.dim, &c[1], p.reset, &c[2]),
+            None => inner.to_string(),
+        },
+        2 => match re!(r"^(\S+)(\s{2,})(.*)$").captures(inner) {
+            Some(c) => format!("{}{}{}{}{}", p.dim, &c[1], p.reset, &c[2], paint_facts(&c[3], p)),
+            None => paint_facts(inner, p),
+        },
+        _ => inner.to_string(),
+    };
+    format!("{}│{} {content} {}│{}", p.dim, p.reset, p.dim, p.reset)
+}
+
+/// Tip rows: the key of each `key description` item stays bright, the rest is dim.
+fn style_tips(text: &str, p: &Palette) -> String {
+    text.split(" · ")
+        .map(|item| match item.split_once(' ') {
+            Some((key, rest)) => format!("{}{key}{} {}{rest}{}", p.default_fg, p.reset, p.dim, p.reset),
+            None => format!("{}{item}{}", p.dim, p.reset),
+        })
+        .collect::<Vec<_>>()
+        .join(&format!(" {}·{} ", p.dim, p.reset))
+}
+
 fn plain_row(row: &Row, cols: usize) -> String {
     match row.kind {
         RowKind::Blank => String::new(),
@@ -131,11 +205,27 @@ impl Tui {
         let mut previous_source_end = base_len;
         let raw_lines: Vec<&str> = transcript[base_len..].split('\n').collect();
 
+        // Welcome cards: the title line plus its indented detail lines, framed together.
+        let mut banner_ends: std::collections::HashMap<usize, usize> = Default::default();
+        for (i, line) in raw_lines.iter().enumerate() {
+            if is_banner_title(line) {
+                let mut j = i + 1;
+                while j < raw_lines.len() && raw_lines[j].starts_with("  ") && !raw_lines[j].trim().is_empty() {
+                    j += 1;
+                }
+                banner_ends.insert(i, j - 1);
+            }
+        }
+
         // Checkpoint for the next frame: the last (possibly streaming) line, moved back past any
         // table rows because a growing table changes the widths of earlier rows.
         let mut checkpoint = raw_lines.len() - 1;
         while checkpoint > 0 && is_table_row(raw_lines[checkpoint - 1]) {
             checkpoint -= 1;
+        }
+        // A card still being written is re-framed from its title next frame.
+        if let Some((start, _)) = banner_ends.iter().find(|(start, end)| **start < checkpoint && **end >= checkpoint) {
+            checkpoint = *start;
         }
         let mut checkpoint_rows = rows.len();
         let mut checkpoint_state = state;
@@ -274,6 +364,10 @@ impl Tui {
                 checkpoint_state = state;
             }
             let trimmed = raw_line.trim();
+            if state.pending_gap && !trimmed.is_empty() {
+                state.pending_gap = false;
+                blank(&mut rows);
+            }
             if raw_line == "[normal]" {
                 state.block = Block::Normal;
                 state.in_code = false;
@@ -314,7 +408,10 @@ impl Tui {
             }
             if state.last_was_user {
                 state.last_was_user = false;
-                blank(&mut rows);
+                // An empty source line right after the prompt is the gap itself.
+                if !trimmed.is_empty() {
+                    blank(&mut rows);
+                }
             }
             if state.block == Block::Reasoning && !show_reasoning {
                 continue;
@@ -322,7 +419,8 @@ impl Tui {
             if let Some(fence_label) = trimmed.strip_prefix("```") {
                 if state.in_code {
                     state.in_code = false;
-                    blank(&mut rows);
+                    // Deferred: a following source blank line provides the gap instead.
+                    state.pending_gap = true;
                 } else {
                     state.in_code = true;
                     state.in_diff = false;
@@ -341,7 +439,11 @@ impl Tui {
                 continue;
             }
             if state.in_code {
-                wrap_into(&mut rows, RowKind::Code, raw_line.replace('\t', "  ").trim_end(), "    ", "    ", None, None, 0, false);
+                let lang = match rows.last() {
+                    Some(r) if r.kind == RowKind::Code => r.glyph.clone(),
+                    _ => rows.iter().rev().find(|r| r.kind == RowKind::CodeHead).map(|r| r.text.clone()),
+                };
+                wrap_into(&mut rows, RowKind::Code, raw_line.replace('\t', "  ").trim_end(), "    ", "    ", lang, None, 0, false);
                 continue;
             }
             if trimmed.is_empty() {
@@ -352,6 +454,8 @@ impl Tui {
                 if state.block == Block::Answer && state.answer_first {
                     continue;
                 }
+                // This source blank is the gap a closed fence asked for; don't stack a second.
+                state.pending_gap = false;
                 rows.push(Row {
                     kind: RowKind::Blank,
                     pre: String::new(),
@@ -379,15 +483,26 @@ impl Tui {
                 continue;
             }
             // Normal block: tool cells, diffs, CLI output, banner.
-            if re!(r"^◆ goon v\S+\s*$").is_match(raw_line) {
+            if is_banner_title(raw_line) {
                 blank(&mut rows);
-                rows.push(Row { kind: RowKind::BannerTitle, pre: String::new(), text: trimmed.to_string(), glyph: None, sign: None, level: 0, origin: None });
+                let end = banner_ends.get(&line_index).copied().unwrap_or(line_index);
+                let details: Vec<&str> = raw_lines[line_index + 1..=end].iter().map(|l| l.trim()).collect();
+                if cols >= CARD_MIN_COLS {
+                    rows.extend(welcome_card(trimmed, &details, cols));
+                } else {
+                    rows.push(Row { kind: RowKind::BannerTitle, pre: String::new(), text: trimmed.to_string(), glyph: None, sign: None, level: 0, origin: None });
+                    for detail in details.iter().filter(|d| !d.starts_with("/help")) {
+                        wrap_into(&mut rows, RowKind::Banner, &compact_banner_detail(detail), "  ", "    ", None, None, 0, true);
+                    }
+                }
+                if let Some(tips) = details.iter().find(|d| d.starts_with("/help")) {
+                    wrap_into(&mut rows, RowKind::Banner, tips, "  ", "  ", None, None, 0, true);
+                }
                 state.in_banner = true;
                 continue;
             }
             if state.in_banner {
                 if raw_line.starts_with("  ") {
-                    wrap_into(&mut rows, RowKind::Banner, trimmed, "  ", "    ", None, None, 0, true);
                     continue;
                 }
                 state.in_banner = false;
@@ -413,7 +528,15 @@ impl Tui {
                         _ => unreachable!(),
                     };
                     let cont = " ".repeat(visible_length(&pre));
-                    wrap_into(&mut rows, RowKind::Diff, &code, &pre, &cont, None, Some(sign), 0, false);
+                    let path = match rows.last() {
+                        Some(r) if r.kind == RowKind::Diff => r.glyph.clone(),
+                        _ => rows
+                            .iter()
+                            .rev()
+                            .find(|r| r.kind == RowKind::Cell || (r.kind == RowKind::DiffMeta && r.text.starts_with("+++ ")))
+                            .and_then(|r| r.text.split_whitespace().nth(1).map(str::to_string)),
+                    };
+                    wrap_into(&mut rows, RowKind::Diff, &code, &pre, &cont, path, Some(sign), 0, false);
                     continue;
                 }
                 if re!(r"^\s*(?:⋮|… \+\d+ more|\.\.\. \(\+\d+ more)").is_match(raw_line) || raw_line.starts_with("\\ No newline") {
@@ -437,6 +560,12 @@ impl Tui {
             }
             if raw_line.starts_with(['╭', '│', '╰']) {
                 rows.push(Row { kind: RowKind::Box, pre: String::new(), text: raw_line.trim_end().to_string(), glyph: None, sign: None, level: 0, origin: None });
+                continue;
+            }
+            // `[Mode switched to: plan]`-style session notes read as quiet system lines.
+            if let Some(note) = re!(r"^\[([A-Z◆][^\[\]]*)\]\s*$").captures(raw_line).filter(|c| !re!(r"^(?:Pasted text|Image) #").is_match(&c[1])) {
+                blank(&mut rows);
+                wrap_into(&mut rows, RowKind::Hint, note[1].trim(), "· ", "  ", None, None, 0, true);
                 continue;
             }
             if raw_line.starts_with("Type /help") {
@@ -491,12 +620,23 @@ impl Tui {
             RowKind::Blank => String::new(),
             RowKind::User => {
                 let pre = if row.pre.trim().is_empty() { row.pre.clone() } else { format!("{}{}{}", p.brand_bold, row.pre, p.reset) };
-                format!("{pre}{}{}{}", p.bold, inline(&row.text, p.bold), p.reset)
+                if p.surface.is_empty() {
+                    return format!("{pre}{}{}{}", p.bold, inline(&row.text, p.bold), p.reset);
+                }
+                // Codex-style prompt band: the tint survives inline styles and fills the row.
+                let body = format!("{pre}{}{}", p.default_fg, inline(&row.text, p.default_fg));
+                let used = visible_length(&row.pre) + visible_length(&row.text);
+                let tinted = body.replace(p.reset, &format!("{}{}", p.reset, p.surface));
+                format!("{}{tinted}{}{}", p.surface, " ".repeat(cols.saturating_sub(used)), p.reset)
             }
             RowKind::Answer => format!("{}{}", answer_pre(&row.pre), md(&row.text, p.default_fg)),
             RowKind::Normal => format!("{}{}", prefix(&row.pre, p.dim), inline(&row.text, p.reset)),
             RowKind::Heading => {
-                let tone = if row.level == 1 { format!("{}{}", p.bold, p.underline) } else { p.bold.to_string() };
+                let tone = match row.level {
+                    1 => format!("{}{}", p.brand_bold, p.underline),
+                    2 => p.brand_bold.to_string(),
+                    _ => p.bold.to_string(),
+                };
                 format!("{}{}", answer_pre(&row.pre), md(&row.text, &tone))
             }
             RowKind::Quote => {
@@ -516,9 +656,9 @@ impl Tui {
             }
             RowKind::ReasoningHead => format!("{}{}{}{}", p.dim, p.italic, row.text, p.reset),
             RowKind::Reasoning => format!("{}{}", row.pre, md(&row.text, &format!("{}{}", p.dim, p.italic))),
-            RowKind::CodeHead => format!("  {}{}{}", p.dim, slice_visible(&row.text, cols.saturating_sub(2).max(1)), p.reset),
-            RowKind::Code => format!("  {}│{} {}", p.dim, p.reset, row.text),
-            RowKind::Cell => Self::style_cell(row, p),
+            RowKind::CodeHead => format!("  {}╭─ {}{}{}{}", p.dim, p.reset, p.info, slice_visible(&row.text, cols.saturating_sub(5).max(1)), p.reset),
+            RowKind::Code => format!("  {}│{} {}{}", p.dim, p.reset, super::highlight::code(&row.text, row.glyph.as_deref().unwrap_or(""), p), p.reset),
+            RowKind::Cell => Self::style_cell(row, cols, p),
             RowKind::Child => Self::style_child(row, p),
             RowKind::Diff => {
                 let tone = match row.sign {
@@ -533,28 +673,38 @@ impl Tui {
                     let digits = row.pre[spaces..].chars().take_while(|c| c.is_ascii_digit()).count();
                     (spaces + digits).min(num_len)
                 };
-                format!("{}{}{}{tone}{}{}{}", p.dim, &row.pre[..num_end], p.reset, &row.pre[num_end..], row.text, p.reset)
+                let bg = match row.sign {
+                    Some('+') => p.add_bg,
+                    Some('-') => p.del_bg,
+                    _ => "",
+                };
+                if bg.is_empty() {
+                    return format!("{}{}{}{tone}{}{}{}", p.dim, &row.pre[..num_end], p.reset, &row.pre[num_end..], row.text, p.reset);
+                }
+                // Claude Code style: tinted rows, a coloured sign, readable syntax-coloured code.
+                let code = super::highlight::generic(&row.text, row.glyph.as_deref().unwrap_or(""), p);
+                let fill = " ".repeat(cols.saturating_sub(visible_length(&row.pre) + visible_length(&row.text)));
+                format!("{}{}{}{bg}{tone}{}{}{code}{fill}{}", p.dim, &row.pre[..num_end], p.reset, &row.pre[num_end..], p.default_fg, p.reset)
             }
             RowKind::DiffMeta => format!("{}{}{}{}", row.pre, if row.text.starts_with("@@") { p.info } else { p.dim }, row.text, p.reset),
             RowKind::Box => style_box_line_with(&row.text, p),
-            RowKind::Hint => format!("{}{}{}", p.dim, row.text, p.reset),
+            RowKind::Hint => format!("{}{}{}{}", p.dim, row.pre, row.text, p.reset),
+            RowKind::Frame => style_frame(row, p),
             RowKind::BannerTitle => {
                 let version = re!(r"^◆ goon (v\S+)").captures(&row.text).map(|c| c[1].to_string()).unwrap_or_default();
                 format!("{}{}{} {}goon{} {}{version}{}", p.brand_bold, glyph::BRAND, p.reset, p.bold, p.reset, p.dim, p.reset)
             }
             RowKind::Banner => {
-                if re!(r"^/help\b").is_match(&row.text) {
-                    let painted = re!(r"(/help|shift\+tab|(?:^|\s)[@$!]) ").replace_all(&row.text, |c: &regex::Captures| format!("{}{}{} ", p.reset, &c[1], p.dim));
-                    let painted = re!(r"(shift\+tab)$").replace_all(&painted, format!("{}${{1}}{}", p.reset, p.dim).as_str());
-                    return format!("{}{}{painted}{}", row.pre, p.dim, p.reset);
+                if row.text.contains(" · ") && re!(r"(^|· )(/help|@|\$|!|shift\+tab) ").is_match(&row.text) {
+                    return format!("{}{}", row.pre, style_tips(&row.text, p));
                 }
-                let painted = re!(r"(^|\s)(model|effort|mode|gateway|workspace|session|branch) ").replace_all(&row.text, format!("${{1}}{}${{2}}{} ", p.dim, p.reset).as_str());
-                format!("{}{painted}", row.pre)
+                let painted = re!(r"^(model|gateway|workspace) ").replace(&row.text, format!("{}${{1}}{} ", p.dim, p.reset).as_str());
+                format!("{}{}", row.pre, paint_facts(&painted, p))
             }
         }
     }
 
-    fn style_cell(row: &Row, p: &Palette) -> String {
+    fn style_cell(row: &Row, cols: usize, p: &Palette) -> String {
         let glyph = row.glyph.clone().unwrap_or_else(|| "•".into());
         let tone = cell_tone(&glyph, p);
         let with_durations = |text: &str, base: &str| {
@@ -567,7 +717,10 @@ impl Tui {
             return format!("{}{}{}{}", row.pre, p.dim, with_durations(&row.text, p.dim), p.reset);
         }
         if glyph == glyph::WORKED {
-            return format!("{}{glyph}{} {}{}{}", p.ok, p.reset, p.dim, row.text, p.reset);
+            // Turn separator: `✓ Worked for 3.1s ──────────`.
+            let fill = cols.saturating_sub(visible_length(&row.pre) + visible_length(&row.text) + 1);
+            let rule = if fill >= 3 { format!(" {}", "─".repeat(fill)) } else { String::new() };
+            return format!("{}{glyph}{} {}{}{rule}{}", p.ok, p.reset, p.dim, row.text, p.reset);
         }
         let (verb, rest) = match re!(r"^(\S+)(.*)$").captures(&row.text) {
             Some(c) => (c[1].to_string(), c[2].to_string()),
@@ -729,7 +882,7 @@ impl Tui {
         } else {
             p.dim
         };
-        vec![seg(format!("ctx {pct}%"), tone)]
+        vec![seg(format!("{}% context left", 100 - pct), tone)]
     }
 
     fn picker_lines(state: &mut PickerState, cols: usize, max_rows: usize, p: &Palette) -> Vec<String> {
@@ -900,71 +1053,133 @@ impl Tui {
         }
 
         if let Some(form) = st.pending.as_ref().and_then(|pending| pending.form.as_ref()) {
+            // Question card (Codex style): anchored above the footer with the transcript still
+            // visible above it, instead of a bare form at the top of an empty screen.
+            let (inner, budget, framed) = Self::form_card_size(columns, rows);
+            let tone = p.brand;
+            let card_row = |content: String| -> String {
+                if framed {
+                    let fill = " ".repeat(inner.saturating_sub(visible_length(&content)));
+                    format!("{tone}│{} {content}{fill} {tone}│{}", p.reset, p.reset)
+                } else {
+                    content
+                }
+            };
+            let card_top = |title: &str| -> String {
+                if framed {
+                    let title = slice_visible(title, inner.saturating_sub(1).max(1));
+                    let dashes = "─".repeat(safe_cols.saturating_sub(3 + visible_length(&title) + 1));
+                    format!("{tone}╭─{}{}{title}{}{tone}{dashes}╮{}", p.reset, p.bold, p.reset, p.reset)
+                } else {
+                    format!("{}{}{}", p.warn, clip(title.trim()), p.reset)
+                }
+            };
+            let card_bottom = || format!("{tone}╰{}╯{}", "─".repeat(safe_cols.saturating_sub(2)), p.reset);
+            let mut card: Vec<String> = vec![];
+            let footer_text: String;
+            let mut cursor_at: Option<(usize, usize)> = None;
             if let Some(selected) = form.confirm {
                 let unanswered = form.questions.iter().filter(|q| !q.committed).count();
                 let noun = if unanswered == 1 { "question" } else { "questions" };
-                let mut lines = wrap_terminal("Submit with unanswered questions?", safe_cols);
-                lines.push(clip(&format!("{unanswered} unanswered {noun}")));
+                card.push(card_top(" Submit with unanswered questions? "));
+                card.push(card_row(format!("{}{}{}", p.dim, slice_visible(&format!("{unanswered} unanswered {noun}"), inner), p.reset)));
                 for (index, label) in ["Proceed", "Go back"].iter().enumerate() {
                     let marker = if index == selected { "›" } else { " " };
-                    lines.push(format!("{}{}{}", if index == selected { p.brand_bold } else { p.dim }, clip(&format!("{marker} {}. {label}", index + 1)), p.reset));
+                    let tone = if index == selected { p.brand_bold } else { p.default_fg };
+                    card.push(card_row(format!("{tone}{}{}", slice_visible(&format!("{marker} {}. {label}", index + 1), inner), p.reset)));
                     let description = if index == 0 { format!("Submit with {unanswered} unanswered {noun}") } else { "Return to the first unanswered question".into() };
-                    lines.push(clip(&description));
+                    card.push(card_row(format!("{}{}{}", p.dim, slice_visible(&format!("     {description}"), inner), p.reset)));
                 }
-                lines.push(clip("Press enter to confirm or esc to go back"));
-                self.flush_screen_lines(st, lines, columns, rows, "\x1b[?25l".into());
-                return;
-            }
-            let question = &form.questions[form.index];
-            let mut lines = vec![format!("{}{}{}", p.warn, clip(&format!("Question {}/{} · {}", form.index + 1, form.questions.len(), question.header)), p.reset)];
-            let (prompt, options, editor_rows, option_room) = Self::form_layout(question, safe_cols, rows);
-            lines.extend(prompt);
-            let mut start = question.selected;
-            let mut used = options[question.selected].len();
-            while start > 0 && used + options[start - 1].len() <= option_room {
-                start -= 1;
-                used += options[start].len();
-            }
-            let mut available = option_room;
-            for (index, option) in options.iter().enumerate().skip(start) {
-                for row in option.iter().take(available) {
-                    lines.push(format!("{}{row}{}", if index == question.selected { p.brand_bold } else { p.dim }, p.reset));
+                if framed {
+                    card.push(card_bottom());
                 }
-                available = available.saturating_sub(option.len());
-                if available == 0 {
-                    break;
+                footer_text = "  Press enter to confirm or esc to go back".into();
+            } else {
+                let question = &form.questions[form.index];
+                card.push(card_top(&format!(" Question {}/{} · {} ", form.index + 1, form.questions.len(), question.header)));
+                let (prompt, options, editor_rows, option_room) = Self::form_layout(question, inner, budget);
+                card.extend(prompt.into_iter().map(|line| card_row(format!("{}{line}{}", p.bold, p.reset))));
+                let mut start = question.selected;
+                let mut used = options[question.selected].len();
+                while start > 0 && used + options[start - 1].len() <= option_room {
+                    start -= 1;
+                    used += options[start].len();
                 }
+                let mut available = option_room;
+                for (index, option) in options.iter().enumerate().skip(start) {
+                    for row in option.iter().take(available) {
+                        card.push(card_row(format!("{}{row}{}", if index == question.selected { p.brand_bold } else { p.default_fg }, p.reset)));
+                    }
+                    available = available.saturating_sub(option.len());
+                    if available == 0 {
+                        break;
+                    }
+                }
+                let notes = question.notes || question.options.is_empty();
+                card.push(card_row(format!("{}{}{}", p.dim, slice_visible(if notes { "Notes · tab options" } else { "tab notes · ↑↓ select · ←→ questions" }, inner), p.reset)));
+                let (editor, row, col) = Self::composer_lines(st, inner.saturating_sub(2).max(1), editor_rows);
+                let editor_start = card.len();
+                for line in editor {
+                    card.push(card_row(format!("{}›{} {line}", if notes { p.brand_bold } else { p.dim }, p.reset)));
+                }
+                if framed {
+                    card.push(card_bottom());
+                }
+                if notes {
+                    cursor_at = Some((editor_start + row, col + 3 + if framed { 2 } else { 0 }));
+                }
+                footer_text = st.status_notice.clone().unwrap_or_else(|| "  enter next/submit · pgup/pgdn questions · esc cancel".into());
             }
-            let notes = question.notes || question.options.is_empty();
-            lines.push(format!("{}{}{}", p.dim, clip(if notes { "Notes · tab options" } else { "tab notes · ↑↓ select · ←→ questions" }), p.reset));
-            let (editor, row, col) = Self::composer_lines(st, safe_cols.saturating_sub(2).max(1), editor_rows);
-            let prompt_start = lines.len() + 1;
-            for line in editor {
-                lines.push(format!("› {line}"));
+            let footer = format!("{}{}{}", p.dim, clip(&footer_text), p.reset);
+            let height = rows.saturating_sub(card.len() + 1);
+            let mut lines: Vec<String> = all[all.len().saturating_sub(height)..].to_vec();
+            while lines.len() < height {
+                lines.push(String::new());
             }
-            lines.push(format!("{}{}{}", p.dim, clip(st.status_notice.as_deref().unwrap_or("enter next/submit · pgup/pgdn questions · esc cancel")), p.reset));
-            let cursor = if notes { format!("\x1b[{};{}H\x1b[?25h", prompt_start + row, col + 3) } else { "\x1b[?25l".into() };
+            let card_start = lines.len();
+            lines.extend(card);
+            lines.push(footer);
+            let cursor = match cursor_at {
+                Some((row, col)) => format!("\x1b[{};{}H\x1b[?25h", card_start + row + 1, col.min(columns)),
+                None => "\x1b[?25l".into(),
+            };
             self.flush_screen_lines(st, lines, columns, rows, cursor);
             return;
         }
 
         if let Some(pending) = st.pending.as_ref().filter(|pending| !pending.choices.is_empty() && !pending.custom) {
-            let count = pending.choices.len().min(rows.saturating_sub(5).max(1));
+            // Claude Code style choice card: a framed list under the request it answers.
+            let framed = safe_cols >= 12;
+            let count = pending.choices.len().min(rows.saturating_sub(if framed { 6 } else { 5 }).max(1));
             let start = (pending.selected + 1).saturating_sub(count);
-            let height = rows.saturating_sub(count + 3).max(1);
+            let height = rows.saturating_sub(count + if framed { 4 } else { 3 }).max(1);
             let mut lines: Vec<String> = all[all.len().saturating_sub(height)..].to_vec();
             while lines.len() < height {
                 lines.push(String::new());
             }
-            lines.push(format!("{}{}{}", p.warn, "─".repeat(safe_cols), p.reset));
+            let tone = if pending.allow_custom { p.brand } else { p.warn };
+            let inner = if framed { safe_cols - 4 } else { safe_cols };
+            if framed {
+                lines.push(format!("{tone}╭{}╮{}", "─".repeat(safe_cols - 2), p.reset));
+            } else {
+                lines.push(format!("{tone}{}{}", "─".repeat(safe_cols), p.reset));
+            }
             for (index, (_, label)) in pending.choices.iter().enumerate().skip(start).take(count) {
                 let selected = index == pending.selected;
                 let marker = if selected { "›" } else { " " };
-                let text = clip(&format!("{marker} {}. {label}", index + 1));
-                lines.push(format!("{}{text}{}", if selected { p.brand_bold } else { p.dim }, p.reset));
+                let text = slice_visible(&format!("{marker} {}. {label}", index + 1), inner);
+                let fill = " ".repeat(inner.saturating_sub(visible_length(&text)));
+                let body = if selected { format!("{}{text}{}", p.brand_bold, p.reset) } else { format!("{}{text}{}", p.default_fg, p.reset) };
+                lines.push(if framed { format!("{tone}│{} {body}{fill} {tone}│{}", p.reset, p.reset) } else { body });
             }
-            lines.push(clip(if pending.allow_custom { "↑↓ select · enter confirm · o other answer · esc cancel" } else { "↑↓ select · enter confirm · esc deny" }));
-            lines.push(String::new());
+            if framed {
+                lines.push(format!("{tone}╰{}╯{}", "─".repeat(safe_cols - 2), p.reset));
+            }
+            let hint = clip(if pending.allow_custom { "  ↑↓ select · enter confirm · o other answer · esc cancel" } else { "  ↑↓ select · enter confirm · esc deny" });
+            lines.push(if color_enabled { format!("{}{hint}{}", p.dim, p.reset) } else { hint });
+            if !framed {
+                lines.push(String::new());
+            }
             self.flush_screen_lines(st, lines, columns, rows, "\x1b[?25l".into());
             return;
         }
@@ -1044,8 +1259,8 @@ impl Tui {
         } else if busy {
             if let Some(notice) = &st.status_notice {
                 let clean_notice = super::text::sanitize_single_line(notice);
-                let full_tail = format!("  {elapsed}   esc to interrupt");
-                let short_tail = format!("  {elapsed}");
+                let full_tail = format!(" ({elapsed} · esc to interrupt)");
+                let short_tail = if elapsed.is_empty() { String::new() } else { format!(" ({elapsed})") };
                 let tail = if 2 + visible_length(&clean_notice) + visible_length(&full_tail) <= safe_cols {
                     full_tail
                 } else if 2 + visible_length(&clean_notice) + visible_length(&short_tail) <= safe_cols {
@@ -1059,32 +1274,44 @@ impl Tui {
                     if color_enabled { format!("{}{indicator}{} {tone}{shown_notice}{}{}{tail}{}", p.brand, p.reset, p.reset, p.dim, p.reset) } else { format!("{indicator} {shown_notice}{tail}") };
                 status_line = clip_line(&raw_status, safe_cols, color_enabled);
             } else {
+                let tool_running = !st.active_tools.is_empty();
+                // A running tool already shows its own timer; the tail then only offers esc.
                 let candidate_tail = if safe_cols >= 48 {
-                    format!("  {elapsed}   esc to interrupt")
-                } else if elapsed.is_empty() {
+                    if tool_running {
+                        " · esc to interrupt".to_string()
+                    } else {
+                        format!(" ({elapsed} · esc to interrupt)")
+                    }
+                } else if elapsed.is_empty() || tool_running {
                     String::new()
                 } else {
-                    format!("  {elapsed}")
+                    format!(" ({elapsed})")
                 };
                 let candidate_avail = safe_cols.saturating_sub(2 + visible_length(&candidate_tail)).max(1);
-                let resolve_working = |avail: usize| -> String {
-                    Self::format_active_tool_status(st, avail, now_ms).unwrap_or_else(|| {
-                        let raw = if st.status == "Running" {
-                            st.reasoning_header.as_deref().map(super::text::sanitize_single_line).filter(|h| !h.is_empty()).unwrap_or_else(|| "Working".to_string())
-                        } else {
-                            super::text::sanitize_single_line(&st.status)
-                        };
-                        slice_visible(&raw, avail)
-                    })
+                let resolve_working = |avail: usize| -> (String, bool) {
+                    match Self::format_active_tool_status(st, avail, now_ms) {
+                        Some(tool) => (tool, false),
+                        None => {
+                            let raw = if st.status == "Running" {
+                                st.reasoning_header.as_deref().map(super::text::sanitize_single_line).filter(|h| !h.is_empty()).unwrap_or_else(|| "Working".to_string())
+                            } else {
+                                super::text::sanitize_single_line(&st.status)
+                            };
+                            let raw = if raw.ends_with(['…', '.']) { raw } else { format!("{raw}…") };
+                            (slice_visible(&raw, avail), true)
+                        }
+                    }
                 };
-                let mut working = resolve_working(candidate_avail);
+                let (mut working, mut thinking) = resolve_working(candidate_avail);
                 let tail = if 2 + visible_length(&working) + visible_length(&candidate_tail) <= safe_cols {
                     candidate_tail
                 } else {
-                    working = resolve_working(safe_cols.saturating_sub(2).max(1));
+                    (working, thinking) = resolve_working(safe_cols.saturating_sub(2).max(1));
                     String::new()
                 };
-                let raw_status = if color_enabled { format!("{}{indicator}{} {working}{}{tail}{}", p.brand, p.reset, p.dim, p.reset) } else { format!("{indicator} {working}{tail}") };
+                // Claude Code / Codex: a breathing star and a soft shimmer across the verb.
+                let painted = if thinking && visible_length(&working) <= 64 { super::highlight::shimmer(&working, st.spin_tick, &p) } else { working.clone() };
+                let raw_status = if color_enabled { format!("{}{indicator}{} {painted}{}{}{tail}{}", p.brand, p.reset, p.reset, p.dim, p.reset) } else { format!("{indicator} {working}{tail}") };
                 status_line = clip_line(&raw_status, safe_cols, color_enabled);
             }
         } else if let Some(notice) = &st.status_notice {
@@ -1106,24 +1333,28 @@ impl Tui {
             status_line = if color_enabled && !text.is_empty() { format!("{}{text}{}", p.dim, p.reset) } else { text };
         }
 
-        let display_mode = match st.mode_label.as_str() {
-            "auto" => "auto-approve".to_string(),
-            "yolo" => "yolo (unrestricted)".to_string(),
-            _ => st.mode_label.clone(),
+        // Mode badge (Claude Code style): quiet in `ask`, loud when approvals are relaxed.
+        let (mode_badge, mode_tone): (String, &'static str) = match st.mode_label.as_str() {
+            "auto" => ("» auto-approve on".into(), p.warn),
+            "yolo" => ("▲ yolo (unrestricted)".into(), p.err),
+            "plan" => ("◇ plan mode".into(), p.brand),
+            "read-only" | "readonly" => ("◌ read-only".into(), p.info),
+            other => (other.to_string(), p.dim),
         };
-        // Auto-approve uses warning tone; unrestricted yolo uses danger/error tone.
-        let mode_tone = if st.mode_label == "yolo" {
-            p.err
-        } else if display_mode == "auto-approve" {
-            p.warn
-        } else if display_mode == "plan" {
-            p.brand
-        } else {
-            p.dim
+        let quiet_mode = matches!(st.mode_label.as_str(), "ask" | "");
+        let model_group: Vec<Seg> = {
+            let effort = st.effort_label.trim();
+            let text = if effort.is_empty() || effort == "default" { model_name.clone() } else { format!("{model_name} · {effort}") };
+            if text.trim().is_empty() {
+                vec![]
+            } else {
+                vec![seg(text, p.dim)]
+            }
         };
 
         if compact_chrome {
-            // Compact layout for narrow/short (<48x12) mobile/split viewports, preserving colors!
+            // Compact layout for narrow/short (<48x12) mobile/split viewports: no frame, the
+            // prompt sits on a tinted band so it still reads as the input area.
             let (slash_matches, slash_sel) = Self::slash_popup(st);
             if status_line.is_empty() {
                 if let Some(cmd) = slash_matches.get(slash_sel) {
@@ -1136,9 +1367,8 @@ impl Tui {
                     }
                 }
             }
-            let status_tone = if busy { p.brand } else { p.dim };
-            let left_compact = vec![seg(display_mode, mode_tone), seg(format!("  {}", st.status), status_tone)];
-            let footer = Self::band(&left_compact, vec![Self::context_group(st, &p), token_group], safe_cols, &p);
+            let left_compact = vec![seg(mode_badge.clone(), mode_tone)];
+            let footer = Self::band(&left_compact, vec![token_group, model_group, Self::context_group(st, &p)], safe_cols, &p);
             let height = rows.saturating_sub(3).max(1);
             st.max_scroll = all.len().saturating_sub(height);
             st.scroll = st.scroll.min(st.max_scroll);
@@ -1150,7 +1380,7 @@ impl Tui {
             }
             let follow = st.scroll > 0 && st.selection.is_none() && st.history_search.is_none() && st.native.is_none();
             status_line = st.follow_control.render(safe_cols, body.len(), follow, &p).unwrap_or(status_line);
-            let label = clip(&st.label);
+            let label = if asking { clip(&st.label) } else { "› ".to_string() };
             let label_cols = visible_length(&label);
             let (before, shown) = Self::slice_input_window(st, safe_cols.saturating_sub(label_cols).max(1));
             let shown_fit = slice_visible(&shown, safe_cols.saturating_sub(label_cols));
@@ -1163,7 +1393,23 @@ impl Tui {
             } else {
                 label
             };
-            let prompt = clip_line(&format!("{label_styled}{shown_fit}"), safe_cols, color_enabled);
+            let content = if st.input.is_empty() && !asking {
+                let hint = slice_visible(if busy { "steer or queue" } else { "Ask goon anything" }, safe_cols.saturating_sub(label_cols));
+                if color_enabled {
+                    format!("{}{hint}{}", p.dim, p.reset)
+                } else {
+                    String::new()
+                }
+            } else {
+                shown_fit
+            };
+            let prompt = clip_line(&format!("{label_styled}{content}"), safe_cols, color_enabled);
+            let prompt = if p.surface.is_empty() || !color_enabled {
+                prompt
+            } else {
+                let fill = " ".repeat(safe_cols.saturating_sub(visible_length(&prompt)));
+                format!("{}{}{fill}{}", p.surface, prompt.replace(p.reset, &format!("{}{}", p.reset, p.surface)), p.reset)
+            };
             let cursor_col = columns.min(label_cols + visible_length(&before) + 1);
             let mut lines = body;
             lines.push(status_line);
@@ -1176,26 +1422,45 @@ impl Tui {
 
         let queue_lines: Vec<String> = st.queued_prompts[st.queued_prompts.len().saturating_sub(3)..]
             .iter()
-            .map(|q| format!("{}{}{}", p.dim, clip(&format!("  queued  {}   alt+↑ edit", q.text.split_whitespace().collect::<Vec<_>>().join(" "))), p.reset))
+            .map(|q| format!("{}{}{}", p.dim, clip(&format!("  ↳ queued  {}   alt+↑ edit", q.text.split_whitespace().collect::<Vec<_>>().join(" "))), p.reset))
             .collect();
-        let prompt_label = if asking { clip(&st.label) } else { "› ".to_string() };
+        // Composer card (Claude Code style): `╭─╮ │ › draft │ ╰─╯`, then one footer line.
+        let inner_cols = safe_cols.saturating_sub(4).max(1);
+        let prompt_label = if asking { slice_visible(&st.label, inner_cols.saturating_sub(1).max(1)) } else { "› ".to_string() };
         let label_cols = visible_length(&prompt_label);
-        let input_cols = safe_cols.saturating_sub(label_cols).max(1);
-        let (editor_lines, editor_cursor_row, editor_cursor_col) = Self::composer_lines(st, input_cols, rows.saturating_sub(7 + queue_lines.len()).clamp(1, 8));
-        let fixed_rows = 1 + queue_lines.len() + 2 + editor_lines.len();
+        let input_cols = inner_cols.saturating_sub(label_cols).max(1);
+        let (editor_lines, editor_cursor_row, editor_cursor_col) = Self::composer_lines(st, input_cols, rows.saturating_sub(8 + queue_lines.len()).clamp(1, 8));
+        let fixed_rows = 1 + queue_lines.len() + 3 + editor_lines.len();
         let mut popup_lines: Vec<String> = vec![];
         let (matches, selected) = Self::slash_popup(st);
         if st.shortcuts_open {
-            let hints = [
-                "Shortcuts · ? or esc to close",
-                "enter send/steer · tab queue · shift+enter newline",
-                "esc interrupt work and subagents · ctrl+c twice quit",
-                "ctrl+r / ctrl+s search history · ↑↓ recall / move",
-                "ctrl+a/e line start/end · alt+b/f move by word",
-                "ctrl+u/k cut line · ctrl+w cut word · ctrl+y paste cut",
-                "ctrl+g external editor · ctrl+t transcript · / commands",
+            let pairs: [(&str, &str); 13] = [
+                ("enter", "send · steer while working"),
+                ("tab", "queue a message while working"),
+                ("shift+enter", "newline (also ctrl+j)"),
+                ("esc", "interrupt · esc esc rewinds the last prompt"),
+                ("shift+tab", "cycle ask → auto → plan → read-only"),
+                ("alt+. / alt+,", "raise / lower reasoning effort"),
+                ("ctrl+r / ctrl+s", "search prompt history · ↑↓ recall"),
+                ("ctrl+a / ctrl+e", "line start / end · alt+b/f by word"),
+                ("ctrl+u/k/w/y", "cut line / to end / word · paste cut"),
+                ("ctrl+g", "edit the draft in $EDITOR"),
+                ("ctrl+t", "full transcript · drag to select, ctrl+o copy"),
+                ("/ @ $ !", "commands · files · skills · shell"),
+                ("ctrl+c ×2", "quit"),
             ];
-            popup_lines.extend(hints.into_iter().take(rows.saturating_sub(fixed_rows + 2)).map(|line| format!("{}{}{}", p.dim, clip(line), p.reset)));
+            let room = rows.saturating_sub(fixed_rows + 2);
+            if room > 0 {
+                popup_lines.push(format!("{}{}{}", p.bold, clip("  Shortcuts · ? or esc to close"), p.reset));
+            }
+            let key_cols = pairs.iter().map(|(k, _)| visible_length(k)).max().unwrap_or(0) + 2;
+            for (key, what) in pairs.into_iter().take(room.saturating_sub(1)) {
+                let plain = clip(&format!("  {key:<key_cols$}{what}"));
+                let split = (2 + key_cols).min(plain.len());
+                let split = (split..=plain.len()).find(|i| plain.is_char_boundary(*i)).unwrap_or(plain.len());
+                let (head, tail) = plain.split_at(split);
+                popup_lines.push(if color_enabled { format!("{}{head}{}{}{tail}{}", p.info, p.reset, p.dim, p.reset) } else { plain.clone() });
+            }
         } else if !matches.is_empty() {
             let room = rows.saturating_sub(fixed_rows + 3).min(8);
             let shown_count = if matches.len() > room { room.saturating_sub(1) } else { matches.len() };
@@ -1208,7 +1473,7 @@ impl Tui {
                 let plain = clip(&format!("{marker}{cmd:<name_cols$}{}", slash_description(cmd)));
                 let name_end = (2 + name_cols).min(plain.len());
                 let (head, tail) = plain.split_at(plain.char_indices().map(|(i, _)| i).chain(std::iter::once(plain.len())).find(|i| *i >= name_end).unwrap_or(plain.len()));
-                popup_lines.push(if is_sel { format!("{}{head}{}{tail}", p.brand_bold, p.reset) } else { format!("{head}{}{tail}{}", p.dim, p.reset) });
+                popup_lines.push(if is_sel { format!("{}{head}{}{}{tail}{}", p.brand_bold, p.reset, p.default_fg, p.reset) } else { format!("{}{head}{}{}{tail}{}", p.info, p.reset, p.dim, p.reset) });
             }
             if matches.len() > shown_count && room > 0 {
                 popup_lines.push(format!("{}{}{}", p.dim, clip(&format!("  {} of {}   ↑↓ select   tab accept", selected + 1, matches.len())), p.reset));
@@ -1240,46 +1505,72 @@ impl Tui {
         let follow = st.scroll > 0 && st.selection.is_none() && st.history_search.is_none() && st.native.is_none();
         status_line = st.follow_control.render(safe_cols, body.len(), follow, &p).unwrap_or(status_line);
 
-        // Composer: a rule (amber while goon waits for an answer), the prompt and a footer.
+        // The frame is amber while goon waits for an answer and sky for a `!` shell command.
         let awaiting = asking && st.pending.is_some();
-        let rule = format!("{}{}{}", if awaiting { p.warn } else { p.dim }, "─".repeat(safe_cols), p.reset);
+        let shell = !asking && current_input.starts_with('!');
+        let border = if awaiting {
+            p.warn
+        } else if shell {
+            p.info
+        } else {
+            p.dim
+        };
+        let width = inner_cols + 4;
+        let top = format!("{border}╭{}╮{}", "─".repeat(width.saturating_sub(2)), p.reset);
+        let bottom = format!("{border}╰{}╯{}", "─".repeat(width.saturating_sub(2)), p.reset);
         let empty = st.input.is_empty() && !asking;
-        let placeholder_text = if busy { "Enter to steer · Tab to queue · Esc to interrupt" } else { "Ask anything   / commands   @ files   $ skills   ! shell" };
-        let placeholder = if empty { wrap_terminal(placeholder_text, input_cols).into_iter().next().unwrap_or_default() } else { String::new() };
-        let label_styled = if asking { format!("{}{}{prompt_label}{}", p.warn, p.bold, p.reset) } else { format!("{}{prompt_label}{}", p.brand_bold, p.reset) };
+        // The longest hint that fits whole; never cut an item in half.
+        let placeholder_options: &[&str] = if busy {
+            &["Enter to steer · Tab to queue · Esc to interrupt", "Enter steer · Tab queue · Esc stop", "Enter steer · Tab queue", "steer or queue"]
+        } else {
+            &["Ask goon anything · / commands · @ files · ! shell", "Ask goon anything · / commands · @ files", "Ask goon anything · / commands", "Ask goon anything", "Ask"]
+        };
+        let placeholder_text = placeholder_options.iter().find(|o| visible_length(o) <= input_cols).copied().unwrap_or("");
+        let placeholder = if empty { placeholder_text.to_string() } else { String::new() };
+        let label_styled = if asking {
+            format!("{}{}{prompt_label}{}", p.warn, p.bold, p.reset)
+        } else if shell {
+            format!("{}{prompt_label}{}", p.info, p.reset)
+        } else {
+            format!("{}{prompt_label}{}", p.brand_bold, p.reset)
+        };
         let prompt_lines: Vec<String> = editor_lines
             .iter()
             .enumerate()
             .map(|(i, line)| {
                 let label = if i == 0 { label_styled.clone() } else { " ".repeat(label_cols) };
                 let content = if empty { format!("{}{placeholder}{}", p.dim, p.reset) } else { line.clone() };
-                format!("{label}{content}")
+                let used = label_cols + if empty { visible_length(&placeholder) } else { visible_length(line) };
+                let fill = " ".repeat(inner_cols.saturating_sub(used));
+                format!("{border}│{} {label}{content}{fill} {border}│{}", p.reset, p.reset)
             })
             .collect();
-        let mut left: Vec<Seg> = vec![seg(display_mode, mode_tone), seg(format!("   {model_name}"), p.dim), seg(format!("   effort {}", st.effort_label), p.dim)];
-        if st.view_mode == "transcript" {
-            left.push(seg("   transcript view", p.dim));
-        }
-        let hint: Vec<Seg> = if awaiting {
-            vec![seg(format!("enter submit   esc {}", st.esc_hint), p.dim)]
+        let mut left: Vec<Seg> = if awaiting {
+            vec![seg(format!("  enter submit · esc {}", st.esc_hint), p.dim)]
+        } else if !quiet_mode {
+            vec![seg(format!("  {mode_badge}"), mode_tone), seg(" · shift+tab to cycle", p.dim)]
         } else if busy {
-            vec![seg("enter steer   tab queue", p.dim)]
+            vec![seg("  enter steer · tab queue", p.dim)]
         } else {
-            vec![seg("ctrl+r history   shift+enter newline", p.dim)]
+            vec![seg("  ? for shortcuts", p.dim)]
         };
+        if st.view_mode == "transcript" {
+            left.push(seg(" · transcript view", p.dim));
+        }
         let place: Vec<Seg> =
             if st.workspace_name.is_empty() { vec![] } else { vec![seg(if st.branch.is_empty() { st.workspace_name.clone() } else { format!("{} ({})", st.workspace_name, st.branch) }, p.dim)] };
-        let footer = Self::band(&left, vec![hint, place, goal_group, todo_group, Self::context_group(st, &p), token_group], safe_cols, &p);
+        let footer = Self::band(&left, vec![place, todo_group, goal_group, token_group, model_group, Self::context_group(st, &p)], safe_cols, &p);
         let mut lines = body;
         lines.push(status_line);
         lines.extend(popup_lines);
         lines.extend(queue_lines);
-        lines.push(rule);
+        lines.push(top);
         let prompt_start = lines.len() + 1;
         lines.extend(prompt_lines);
+        lines.push(bottom);
         lines.push(footer);
         let prompt_row = prompt_start + editor_cursor_row;
-        let cursor_col = safe_cols.min(label_cols + editor_cursor_col + 1);
+        let cursor_col = safe_cols.min(2 + label_cols + editor_cursor_col + 1);
         let cursor = if st.pending.is_some() || !st.input.is_empty() { format!("\x1b[{prompt_row};{cursor_col}H\x1b[?25h") } else { String::new() };
         self.flush_screen_lines(st, lines, columns, rows, cursor);
     }

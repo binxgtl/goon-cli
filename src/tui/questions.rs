@@ -19,6 +19,17 @@ pub(super) struct QuestionForm {
 }
 
 impl Tui {
+    /// The question card's content width, the row budget its layout may use, and whether it is
+    /// framed. Rendering and the "option fully readable" guard must agree on this geometry.
+    pub(super) fn form_card_size(columns: usize, rows: usize) -> (usize, usize, bool) {
+        let safe = columns.saturating_sub(1).max(3);
+        if safe >= 24 && rows >= 10 {
+            (safe - 4, rows - 2, true)
+        } else {
+            (safe, rows, false)
+        }
+    }
+
     pub(super) fn form_layout(question: &FormQuestion, cols: usize, rows: usize) -> (Vec<String>, Vec<Vec<String>>, usize, usize) {
         let prompt = super::text::wrap_terminal(&question.question, cols).into_iter().take(rows.saturating_sub(6).clamp(1, 3)).collect::<Vec<_>>();
         let editor_rows = rows.saturating_sub(prompt.len() + 5).clamp(1, 3);
@@ -213,7 +224,8 @@ impl Tui {
             }
             if question.selected < question.options.len() {
                 let (columns, rows) = self.size();
-                let (_, options, _, room) = Self::form_layout(question, columns.saturating_sub(1).max(3), rows.max(8));
+                let (inner, budget, _) = Self::form_card_size(columns, rows.max(8));
+                let (_, options, _, room) = Self::form_layout(question, inner, budget);
                 if options[question.selected].len() > room {
                     st.set_raw_notice("Expand terminal to read the entire option before submitting");
                     self.schedule(st, 0);

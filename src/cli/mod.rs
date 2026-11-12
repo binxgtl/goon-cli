@@ -92,12 +92,17 @@ pub fn welcome_banner(model: &str, provider: &str, base_url: &str, effort: Optio
         "yolo" => "yolo (unrestricted)",
         other => other,
     };
+    // Plain text on purpose: the TUI frames it as a welcome card at render time, and plain
+    // output (pipes, NO_COLOR) keeps it readable without box drawing.
     [
         format!("◆ goon v{}", crate::version::VERSION),
-        format!("  model {model}   effort {}   mode {mode_label}", effort.unwrap_or("default")),
-        format!("  gateway {host} ({provider})"),
-        format!("  workspace {workspace}   session {}", jsutil::take_chars(session_id, 8)),
-        "  /help commands   @ files   $ skills   ! shell   shift+tab mode".to_string(),
+        match effort.filter(|e| !e.is_empty() && *e != "default") {
+            Some(effort) => format!("  model      {model} · effort {effort} · mode {mode_label}"),
+            None => format!("  model      {model} · mode {mode_label}"),
+        },
+        format!("  gateway    {host} · {provider}"),
+        format!("  workspace  {workspace} · session {}", jsutil::take_chars(session_id, 8)),
+        "  /help commands · @ files · $ skills · ! shell · shift+tab mode".to_string(),
         String::new(),
     ]
     .join("\n")
