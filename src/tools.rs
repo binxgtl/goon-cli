@@ -150,11 +150,85 @@ pub fn sanitize_bash_command(command: &str) -> String {
     re.replace_all(command, "${1}/dev/null").to_string()
 }
 
+fn sanitize_mcp_server_parts(server: &str) -> (String, String) {
+    static NON: OnceLock<Regex> = OnceLock::new();
+    static LEAD: OnceLock<Regex> = OnceLock::new();
+    let non = NON.get_or_init(|| Regex::new(r"[^a-z0-9_]").unwrap());
+    let lead = LEAD.get_or_init(|| Regex::new(r"^[^a-z]+").unwrap());
+    let lower = server.to_lowercase();
+    let clean = non.replace_all(&lower, "_");
+    let full = lead.replace(&clean, "s_").into_owned();
+    let truncated = crate::jsutil::take_chars(&full, 16).to_string();
+    (full, truncated)
+}
+
+fn sanitize_mcp_tool_parts(tool: &str) -> (String, String) {
+    static NON: OnceLock<Regex> = OnceLock::new();
+    let non = NON.get_or_init(|| Regex::new(r"[^a-z0-9_]").unwrap());
+    let full = non.replace_all(&tool.to_lowercase(), "_").into_owned();
+    let truncated = crate::jsutil::take_chars(&full, 28).to_string();
+    (full, truncated)
+}
+
+fn matches_mcp_hashed_prefix(name: &str, prefix: &str) -> bool {
+    let Some(rest) = name.strip_prefix(prefix) else {
+        return false;
+    };
+    let bytes = rest.as_bytes();
+    bytes.len() == 11 && bytes[0] == b'_' && bytes[1..].iter().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn tool_pattern_matches(entry: &str, name: &str) -> bool {
+    if entry == "mcp__*" || entry == "mcp_*" {
+        return name.starts_with("mcp_") && name.len() > 4;
+    }
+    if let Some(rest) = entry.strip_prefix("mcp__") {
+        let Some((server, tool_pat)) = rest.split_once("__") else {
+            return false;
+        };
+        if server.is_empty() || server.contains('*') || tool_pat.is_empty() {
+            return false;
+        }
+        let (full_server, clean_server) = sanitize_mcp_server_parts(server);
+        if tool_pat == "*" {
+            return name.starts_with(&format!("mcp_{clean_server}_"));
+        }
+        if let Some(tool_prefix) = tool_pat.strip_suffix('*') {
+            if tool_prefix.is_empty() || tool_prefix.contains('*') {
+                return false;
+            }
+            let (_, clean_tool) = sanitize_mcp_tool_parts(tool_prefix);
+            return name.starts_with(&format!("mcp_{clean_server}_{clean_tool}"));
+        }
+        if tool_pat.contains('*') {
+            return false;
+        }
+        if name == crate::mcp::mcp_tool_name(server, tool_pat) {
+            return true;
+        }
+        let (full_tool, clean_tool) = sanitize_mcp_tool_parts(tool_pat);
+        if full_server.len() <= 16 && full_tool.len() <= 28 {
+            return matches_mcp_hashed_prefix(name, &format!("mcp_{clean_server}_{clean_tool}"));
+        }
+        return false;
+    }
+    if let Some(prefix) = entry.strip_suffix('*') {
+        return name.starts_with(prefix);
+    }
+    if let Some(after_mcp) = entry.strip_prefix("mcp_") {
+        if after_mcp.split_once('_').is_some_and(|(s, t)| !s.is_empty() && !t.is_empty()) {
+            return matches_mcp_hashed_prefix(name, entry);
+        }
+        return false;
+    }
+    false
+}
+
 pub fn tool_allowed_by_set(allowed: &HashSet<String>, name: &str) -> bool {
     if allowed.contains(name) {
         return true;
     }
-    allowed.iter().any(|entry| entry.strip_suffix('*').map(|prefix| name.starts_with(prefix)).unwrap_or(false))
+    allowed.iter().any(|entry| tool_pattern_matches(entry, name))
 }
 
 pub const PEER_TOOLS: [&str; 4] = ["peer_list", "peer_send", "peer_broadcast", "peer_read"];
@@ -810,7 +884,7 @@ impl ToolRegistry {
 
     pub async fn execute(self: &Arc<Self>, call: &ToolCall, cancel: &CancellationToken) -> Result<ExecuteOutcome> {
         if cancel.is_cancelled() {
-            bail!("This operation was aborted");
+            return Err(crate::harness::Aborted::default().into());
         }
         let canonical = self.resolve_tool_name(&call.tool_name);
         let Some(definition) = self.definition(&canonical) else { bail!("Unknown tool: {}", call.tool_name) };
@@ -863,7 +937,7 @@ impl ToolRegistry {
             g.reset(&call_key);
         }
         if cancel.is_cancelled() {
-            bail!("This operation was aborted");
+            return Err(crate::harness::Aborted::default().into());
         }
         let result = match &definition.exec {
             Some(exec) => exec(input, cancel.clone()).await,
@@ -905,7 +979,21 @@ impl ToolRegistry {
                         .map(|a| a.to_string())
                         .chain([s("query"), target])
                         .collect();
-                let result = run_command("rg", &args, RunOptions { cwd: &self.files.root, cancel, timeout_ms: 30_000, env: None, output_limit_bytes: None, hard_output_bytes: None }).await;
+                let limits = self.policy().map(|p| p.limits.clone());
+                let timeout = limits.as_ref().map(|l| l.default_tool_timeout_ms.min(l.max_tool_timeout_ms)).unwrap_or(30_000).clamp(1_000, 30_000);
+                let result = run_command(
+                    "rg",
+                    &args,
+                    RunOptions {
+                        cwd: &self.files.root,
+                        cancel,
+                        timeout_ms: timeout,
+                        env: None,
+                        output_limit_bytes: limits.as_ref().map(|l| l.max_output_bytes),
+                        hard_output_bytes: limits.as_ref().map(|l| l.hard_output_bytes),
+                    },
+                )
+                .await;
                 match result {
                     Ok(r) => {
                         static HIT: OnceLock<Regex> = OnceLock::new();
@@ -918,10 +1006,11 @@ impl ToolRegistry {
                     }
                     Err(CommandError::NotFound(_)) => {
                         if cancel.is_cancelled() {
-                            bail!("This operation was aborted");
+                            return Err(crate::harness::Aborted::default().into());
                         }
                         self.files.fallback_search(&s("query"), &s("path"), cancel)
                     }
+                    Err(CommandError::Cancelled) => Err(crate::harness::Aborted::default().into()),
                     Err(e) => Err(anyhow!(e.to_string())),
                 }
             }
@@ -1091,7 +1180,10 @@ impl ToolRegistry {
                 if crate::jsutil::is_windows() {
                     let _ = crate::files::unlink_safe(&self.cwd.join("nul"));
                 }
-                let r = result.map_err(|e| anyhow!(e.to_string()))?;
+                let r = result.map_err(|e| match e {
+                    CommandError::Cancelled => crate::harness::Aborted::default().into(),
+                    other => anyhow!(other.to_string()),
+                })?;
                 Ok(format!("Exit code: {}\n{}", r.code, r.output))
             }
             other => bail!("Unknown tool: {other}"),

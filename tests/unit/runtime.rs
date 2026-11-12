@@ -48,6 +48,72 @@ setInterval(() => {}, 1000);
     assert!(!goon::process::process_alive(pid), "cancelled command left grandchild {pid} running");
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn command_cancellation_kills_descendants_that_escape_into_a_new_process_group() {
+    let f = fixture();
+    f.write(
+        "escape_pgrp.py",
+        r#"
+import os, signal, subprocess, time
+child_code = """
+import os, signal, time
+os.setpgrp()
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+with open('escaped.pid', 'w') as fh:
+    fh.write(str(os.getpid()))
+while True:
+    time.sleep(1)
+"""
+subprocess.Popen(['python3', '-c', child_code])
+while True:
+    time.sleep(1)
+"#,
+    );
+    let cancel = token();
+    let c = cancel.clone();
+    let cwd = f.cwd.clone();
+    let running = tokio::spawn(async move {
+        goon::process::run_command(
+            "python3",
+            &["escape_pgrp.py".into()],
+            goon::process::RunOptions { cwd: &cwd, cancel: &c, timeout_ms: 10_000, env: None, output_limit_bytes: None, hard_output_bytes: None },
+        )
+        .await
+    });
+    let escaped_pid = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Ok(raw) = std::fs::read_to_string(f.cwd.join("escaped.pid")) {
+                if let Ok(pid) = raw.trim().parse::<u32>() {
+                    break pid;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("escaped grandchild should write pid");
+    cancel.cancel();
+    let outcome = running.await.unwrap();
+    assert!(matches!(outcome, Err(goon::process::CommandError::Cancelled)), "{outcome:?}");
+    assert!(!goon::process::process_alive(escaped_pid), "descendant in separate process group {escaped_pid} survived cancellation");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn signal_terminated_child_reports_posix_128_plus_signal_exit_code() {
+    let f = fixture();
+    let cancel = token();
+    let res = goon::process::run_command(
+        "python3",
+        &["-c".into(), "import os, signal; os.kill(os.getpid(), signal.SIGTERM)".into()],
+        goon::process::RunOptions { cwd: &f.cwd, cancel: &cancel, timeout_ms: 5_000, env: None, output_limit_bytes: None, hard_output_bytes: None },
+    )
+    .await
+    .unwrap();
+    assert_eq!(res.code, 128 + libc::SIGTERM);
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn unreaped_macos_zombie_is_not_a_live_process_or_lock_owner() {
@@ -303,4 +369,43 @@ async fn transient_500s_are_retried_three_times_and_empty_sessions_are_ignored_o
     std::fs::create_dir_all(f.config.join("goon")).unwrap();
     std::fs::write(f.config.join("goon").join("config.json"), json!({ "model": "gpt-5.4", "runTokenBudget": 120000 }).to_string()).unwrap();
     assert_eq!(config::load_config(&Map::new()).unwrap().run_token_budget, 0, "legacy 120000 runTokenBudget migrates to 0 (unlimited)");
+}
+
+#[test]
+fn child_env_strips_ambient_secrets_preserves_workflow_vars_and_guards_posix_pid_bounds() {
+    for secret in ["OPENAI_API_KEY", "anthropic_api_key", "GITHUB_TOKEN", "AWS_SECRET_ACCESS_KEY", "AWS_ACCESS_KEY_ID", "PGPASSWORD", "MYSQL_PWD", "STRIPE_CLIENT_SECRET", "SLACK_AUTH_TOKEN"] {
+        assert!(process::is_secret_env_name(secret), "{secret} must be recognized as secret");
+    }
+    for benign in ["PATH", "HOME", "PWD", "OLDPWD", "SSH_AUTH_SOCK", "DATABASE_URL", "TERM", "LANG"] {
+        assert!(!process::is_secret_env_name(benign), "{benign} must not be stripped as secret");
+    }
+
+    process::protect_secret_env("custom_gateway_cred");
+    assert!(process::is_secret_env_name("CUSTOM_GATEWAY_CRED"));
+
+    let mut wf_base = std::collections::BTreeMap::new();
+    wf_base.insert("PATH".into(), "/usr/bin".into());
+    wf_base.insert("PWD".into(), "/workspace".into());
+    wf_base.insert("GOON_WF_VAR_TOKEN".into(), "step-input-value".into());
+    wf_base.insert("OPENAI_API_KEY".into(), "sk-should-strip".into());
+    wf_base.insert("GOON_API_KEY".into(), "sk-goon-strip".into());
+    let cleaned = process::child_env(Some(&wf_base));
+    assert_eq!(cleaned.get("PATH").map(String::as_str), Some("/usr/bin"));
+    assert_eq!(cleaned.get("PWD").map(String::as_str), Some("/workspace"));
+    assert_eq!(cleaned.get("GOON_WF_VAR_TOKEN").map(String::as_str), Some("step-input-value"));
+    assert!(!cleaned.contains_key("OPENAI_API_KEY"));
+    assert!(!cleaned.contains_key("GOON_API_KEY"));
+
+    // BUG-02: out-of-range and zero/init PIDs/PGIDs never wrap i32 or signal init/self group.
+    assert!(!process::valid_posix_pid(0));
+    assert!(process::valid_posix_pid(1));
+    assert!(!process::valid_posix_pid(0x8000_0000));
+    assert!(!process::valid_posix_pid(u32::MAX));
+    assert!(!process::valid_posix_pgid(0));
+    assert!(!process::valid_posix_pgid(1));
+    assert!(process::valid_posix_pgid(2));
+    assert!(!process::valid_posix_pgid(0x8000_0000));
+    assert!(!process::process_alive(0));
+    assert!(!process::process_alive(0x8000_0000));
+    assert!(!process::process_alive(u32::MAX));
 }
