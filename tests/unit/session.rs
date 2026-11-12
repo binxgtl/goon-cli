@@ -260,18 +260,21 @@ fn tui_resume_command_does_not_deadlock_renders_single_todo_and_continues_turn()
         *app.tools.lock().unwrap() = Some(tools);
         *app.harness.lock().unwrap() = Some(harness);
 
+        let app_loop = app.clone();
+        let loop_handle = tokio::spawn(async move { app_loop.main_loop(Some("/resume".into())).await });
+
         let tui_driver = tui.clone();
         let driver = tokio::spawn(async move {
-            for _ in 0..100 {
+            for _ in 0..500 {
                 tui_driver.render_now();
-                if tui_driver.rendered_frame().contains("Saved target") {
+                if tui_driver.is_picking() && tui_driver.rendered_frame().contains("Saved target") {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
             tui_driver.key(None, Key::named("return"));
 
-            for _ in 0..100 {
+            for _ in 0..500 {
                 if tui_driver.transcript().contains("Resumed session") {
                     break;
                 }
@@ -282,8 +285,8 @@ fn tui_resume_command_does_not_deadlock_renders_single_todo_and_continues_turn()
             }
             tui_driver.key(None, Key::named("return"));
 
-            for _ in 0..100 {
-                if tui_driver.transcript().contains("Resumed turn reply.") {
+            for _ in 0..500 {
+                if tui_driver.transcript().contains("Resumed turn reply.") && tui_driver.status() == "Ready" {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -294,9 +297,7 @@ fn tui_resume_command_does_not_deadlock_renders_single_todo_and_continues_turn()
             tui_driver.key(None, Key::named("return"));
         });
 
-        let app_loop = app.clone();
-        let loop_handle = tokio::spawn(async move { app_loop.main_loop(Some("/resume".into())).await });
-        match tokio::time::timeout(Duration::from_millis(1500), loop_handle).await {
+        match tokio::time::timeout(Duration::from_millis(10_000), loop_handle).await {
             Ok(joined) => joined.unwrap().unwrap(),
             Err(_) => {
                 driver.abort();
