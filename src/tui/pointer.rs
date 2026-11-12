@@ -58,7 +58,7 @@ pub(super) struct Follow {
 }
 
 impl Follow {
-    pub fn render(&mut self, cols: usize, row: usize, visible: bool) -> Option<String> {
+    pub fn render(&mut self, cols: usize, row: usize, visible: bool, p: &super::text::Palette) -> Option<String> {
         let label = [" ↓ Follow output · Esc ", " ↓ Follow output ", " ↓ Bottom ", " ↓ "].into_iter().find(|label| super::text::visible_length(label) <= cols);
         let Some(label) = label.filter(|_| visible) else {
             *self = Self::default();
@@ -72,7 +72,7 @@ impl Follow {
         }
         self.target = Some(target);
         let hovered = self.pointer.is_some_and(|(col, y)| y == row && col >= start && col < start + width);
-        Some(format!("{}{}{}\x1b[0m", " ".repeat(start), if hovered { "\x1b[7;1m" } else { "\x1b[2m" }, label))
+        Some(format!("{}{}{}{}", " ".repeat(start), if hovered { p.reverse_bold } else { p.dim }, label, p.reset))
     }
 
     /// Returns Some(jump) only when the control consumes this event.
@@ -135,19 +135,21 @@ mod tests {
     fn follow_requires_press_and_release_inside_rendered_target() {
         let mut follow = Follow::default();
         let event = |kind, col| MouseEvent { kind, column: col, row: 5, modifiers: KeyModifiers::NONE };
-        assert!(follow.render(80, 5, true).is_some());
+        let p = crate::tui::Palette::DARK;
+        assert!(follow.render(80, 5, true, &p).is_some());
         assert_eq!(follow.handle(event(MouseEventKind::Down(MouseButton::Left), 40)), Some(false));
         assert_eq!(follow.handle(event(MouseEventKind::Up(MouseButton::Left), 0)), Some(false));
         assert_eq!(follow.handle(event(MouseEventKind::Up(MouseButton::Left), 40)), None);
         follow.handle(event(MouseEventKind::Down(MouseButton::Left), 40));
         assert_eq!(follow.handle(event(MouseEventKind::Up(MouseButton::Left), 40)), Some(true));
         follow.handle(event(MouseEventKind::Down(MouseButton::Left), 40));
-        follow.render(80, 5, false);
+        follow.render(80, 5, false, &p);
         assert_eq!(follow.handle(event(MouseEventKind::Up(MouseButton::Left), 40)), None);
-        follow.render(80, 5, true);
+        follow.render(80, 5, true, &p);
         follow.handle(event(MouseEventKind::Down(MouseButton::Left), 40));
-        follow.render(20, 5, true);
+        follow.render(20, 5, true, &p);
         assert_eq!(follow.handle(event(MouseEventKind::Up(MouseButton::Left), 10)), None, "layout changes invalidate the old press");
-        assert!(follow.render(2, 5, true).is_none());
+        assert!(follow.render(2, 5, true, &p).is_none());
+        assert!(!follow.render(80, 5, true, &crate::tui::Palette::NONE).unwrap().contains("\x1b["));
     }
 }

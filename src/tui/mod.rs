@@ -33,7 +33,77 @@ use text::basename;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
-pub use text::{format_inline_markdown, format_token_count, slice_visible, visible_length, wrap_terminal, Theme};
+pub use text::{detect_env_theme_mode, format_inline_markdown, format_token_count, resolve_theme_mode, slice_visible, visible_length, wrap_terminal, Palette, Theme, ThemeMode};
+
+static PANIC_TERMINAL_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static PANIC_HOOK_INSTALLED: std::sync::Once = std::sync::Once::new();
+
+const PANIC_STATE_RAW: u8 = 0b001;
+const PANIC_STATE_ALT: u8 = 0b010;
+const PANIC_STATE_PASTE: u8 = 0b100;
+
+pub(crate) fn set_panic_terminal_state(active: bool, alt_screen: bool) {
+    use std::sync::atomic::Ordering;
+    let bits = if active { PANIC_STATE_RAW | PANIC_STATE_PASTE | if alt_screen { PANIC_STATE_ALT } else { 0 } } else { 0 };
+    PANIC_TERMINAL_STATE.store(bits, Ordering::SeqCst);
+}
+
+pub(crate) fn mark_raw_mode_enabled(bracketed_paste: bool) {
+    use std::sync::atomic::Ordering;
+    let add = PANIC_STATE_RAW | if bracketed_paste { PANIC_STATE_PASTE } else { 0 };
+    PANIC_TERMINAL_STATE.fetch_or(add, Ordering::SeqCst);
+}
+
+pub(crate) fn mark_raw_mode_disabled(bracketed_paste: bool) {
+    use std::sync::atomic::Ordering;
+    let clear = PANIC_STATE_RAW | if bracketed_paste { PANIC_STATE_PASTE } else { 0 };
+    PANIC_TERMINAL_STATE.fetch_and(!clear, Ordering::SeqCst);
+}
+
+/// Lock-free terminal mode reset writer (testable on arbitrary buffers and safe inside a panic hook).
+pub fn emergency_restore_terminal_to(out: &mut dyn Write, state_bits: u8) {
+    if state_bits == 0 {
+        return;
+    }
+    let _ = out.write_all(b"\x1b[?2026l\x1b[?1002l\x1b[?1004l\x1b[?2004l\x1b[?1007l\x1b[?1006l\x1b[?1000l\x1b[0m\x1b[?25h");
+    if (state_bits & PANIC_STATE_ALT) != 0 {
+        let _ = out.write_all(b"\x1b[?1049l");
+    } else {
+        let _ = out.write_all(b"\r\n");
+    }
+    let _ = out.flush();
+}
+
+/// Restores terminal modes and raw input without locking `Tui` state. Safe to invoke from panic hooks.
+pub fn emergency_restore_terminal() {
+    use std::io::IsTerminal;
+    use std::sync::atomic::Ordering;
+    let bits = PANIC_TERMINAL_STATE.swap(0, Ordering::SeqCst);
+    if bits == 0 {
+        return;
+    }
+    #[cfg(windows)]
+    let _ = windows_console::restore_input_mode();
+    let _ = crossterm::terminal::disable_raw_mode();
+    if std::io::stdout().is_terminal() && !std::io::stderr().is_terminal() {
+        let mut out = std::io::stdout();
+        emergency_restore_terminal_to(&mut out, bits);
+    } else {
+        let mut err = std::io::stderr();
+        emergency_restore_terminal_to(&mut err, bits);
+    }
+}
+
+/// Installs an idempotent process-wide panic hook that restores terminal state before printing panic info.
+pub fn install_panic_hook() {
+    PANIC_HOOK_INSTALLED.call_once(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            emergency_restore_terminal();
+            prev(info);
+        }));
+    });
+}
 
 pub const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 pub const USER_MARK: char = '\u{E000}';
@@ -321,12 +391,20 @@ pub(crate) struct Row {
 pub(crate) struct BodyCache {
     pub cols: usize,
     pub rich: bool,
+    pub theme_mode: text::ThemeMode,
     pub show_reasoning: bool,
     pub source: String,
     pub state: ParseState,
     pub rows: Vec<Row>,
     pub styled: Vec<String>,
     pub source_ends: Vec<usize>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ActiveTool {
+    pub name: String,
+    pub summary: String,
+    pub started_at_ms: i64,
 }
 
 #[derive(Clone)]
@@ -413,6 +491,9 @@ pub(crate) struct State {
     paste_burst: paste_burst::PasteBurst,
     paste_tick_running: bool,
     pub status_notice: Option<String>,
+    notice_gen: u64,
+    pub active_tools: IndexMap<String, ActiveTool>,
+    pub theme_mode: text::ThemeMode,
     pub view_mode: String,
     pub in_transcript_overlay: bool,
     pub workspace_name: String,
@@ -519,13 +600,18 @@ impl Tui {
     }
 
     pub fn start_with_alt_screen(title: &str, cancel: Callback0, alternate: bool) -> Result<Arc<Tui>> {
+        install_panic_hook();
         crossterm::terminal::enable_raw_mode()?;
+        set_panic_terminal_state(true, alternate);
         #[cfg(windows)]
         let _ = windows_console::set_input_record_mode();
         let size: SizeFn = Box::new(|| crossterm::terminal::size().map(|(c, r)| (c as usize, r as usize)).unwrap_or((80, 24)));
         let tui = Tui::with_io_mode(title, cancel, Box::new(std::io::stdout()), size, true, alternate);
         let weak = Arc::downgrade(&tui);
-        std::thread::Builder::new().name("goon-tui-input".into()).spawn(move || input_thread(weak))?;
+        if let Err(err) = std::thread::Builder::new().name("goon-tui-input".into()).spawn(move || input_thread(weak)) {
+            tui.close();
+            return Err(err.into());
+        }
         Ok(tui)
     }
 
@@ -613,6 +699,9 @@ impl Tui {
             paste_burst: paste_burst::PasteBurst::default(),
             paste_tick_running: false,
             status_notice: None,
+            notice_gen: 0,
+            active_tools: IndexMap::new(),
+            theme_mode: if real_terminal { text::detect_env_theme_mode() } else { text::ThemeMode::Dark },
             view_mode: "verbose".into(),
             in_transcript_overlay: false,
             workspace_name: String::new(),
@@ -801,9 +890,7 @@ impl Tui {
                     let mut st = t.state.lock().unwrap();
                     st.timer = false;
                     t.flush_paste_burst_if_due(&mut st, std::time::Instant::now(), cfg!(windows), &mut actions);
-                    if !st.paste_burst.is_active() {
-                        t.render(&mut st);
-                    }
+                    t.render(&mut st);
                 }
                 t.run_actions(actions);
             }
@@ -839,11 +926,13 @@ impl Tui {
             native.reset();
         }
         st.explore_group.clear();
+        st.active_tools.clear();
         st.turn_snapshots.clear();
         st.input_restored_from_revert = false;
         st.esc_primed = None;
         st.esc_gen += 1;
         st.status_notice = None;
+        st.notice_gen = st.notice_gen.wrapping_add(1);
         st.reasoning_buffer.clear();
         st.reasoning_header = None;
         st.reasoning_detail = None;
@@ -869,6 +958,7 @@ impl Tui {
     pub fn rewind_turns(&self, steps: usize) -> bool {
         let mut st = self.state.lock().unwrap();
         self.flush_explore_group(&mut st);
+        st.active_tools.clear();
         st.output_channel = None;
         if steps > 0 && st.turn_snapshots.len() >= steps {
             let target = st.turn_snapshots.len() - steps;
@@ -931,9 +1021,68 @@ impl Tui {
         self.handle_paste(&mut st, text, false);
     }
 
+    pub(crate) fn is_retry_notice(notice: &str) -> bool {
+        notice.starts_with('↻') || notice.contains("retrying (")
+    }
+
+    pub(crate) fn set_notice_locked(&self, st: &mut State, notice: Option<String>) {
+        st.status_notice = notice.filter(|n| !n.is_empty());
+        st.notice_gen = st.notice_gen.wrapping_add(1);
+        let busy = matches!(st.status.as_str(), "Running" | "Connecting MCP" | "Compacting");
+        let is_retry = st.status_notice.as_deref().is_some_and(Self::is_retry_notice);
+        if st.status_notice.is_some() && busy && !is_retry {
+            let gen = st.notice_gen;
+            let me = self.me.clone();
+            self.handle.spawn(async move {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                let Some(t) = me.upgrade() else { return };
+                let mut st = t.state.lock().unwrap();
+                if st.notice_gen == gen && !st.closed {
+                    st.status_notice = None;
+                    t.schedule(&mut st, 0);
+                }
+            });
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expire_busy_notice_for_test(&self) {
+        let mut st = self.state.lock().unwrap();
+        if st.status_notice.as_deref().is_some_and(|n| !Self::is_retry_notice(n)) {
+            st.status_notice = None;
+            st.notice_gen = st.notice_gen.wrapping_add(1);
+            self.schedule(&mut st, 0);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn backdate_active_tool_for_test(&self, id: &str, elapsed_ms: i64) {
+        let mut st = self.state.lock().unwrap();
+        if let Some(tool) = st.active_tools.get_mut(id) {
+            tool.started_at_ms = now() - elapsed_ms;
+        }
+        self.schedule(&mut st, 0);
+    }
+
+    pub fn set_theme_mode(&self, mode: text::ThemeMode) {
+        let mut st = self.state.lock().unwrap();
+        if st.theme_mode != mode {
+            st.theme_mode = mode;
+            st.body_cache = None;
+            st.last_frame_rows.clear();
+            st.needs_full_clear = true;
+            self.schedule(&mut st, 0);
+        }
+    }
+
+    pub fn theme_mode(&self) -> text::ThemeMode {
+        self.state.lock().unwrap().theme_mode
+    }
+
     pub fn set_notice(&self, notice: Option<&str>) {
         let mut st = self.state.lock().unwrap();
-        st.status_notice = notice.map(terminal_text).filter(|n| !n.is_empty() || notice.is_some());
+        let clean = notice.map(terminal_text).filter(|n| !n.is_empty());
+        self.set_notice_locked(&mut st, clean);
         self.schedule(&mut st, 0);
     }
 
@@ -1245,11 +1394,19 @@ impl Tui {
                 }
             }
             "tool_stream" => {
+                if st.status_notice.as_deref().is_some_and(Self::is_retry_notice) {
+                    st.status_notice = None;
+                    st.notice_gen = st.notice_gen.wrapping_add(1);
+                }
                 if !s("preview").is_empty() {
                     st.reasoning_header = Some(format!("Preparing {} · {}", s("name"), crate::jsutil::take_chars(&s("preview"), 90)));
                 }
             }
             "text" | "reasoning" => {
+                if st.status_notice.as_deref().is_some_and(Self::is_retry_notice) {
+                    st.status_notice = None;
+                    st.notice_gen = st.notice_gen.wrapping_add(1);
+                }
                 if kind == "text" {
                     self.flush_explore_group(st);
                 }
@@ -1279,23 +1436,29 @@ impl Tui {
                 self.append_transcript(st, &text, false);
             }
             "tool" => {
+                if st.status_notice.as_deref().is_some_and(Self::is_retry_notice) {
+                    st.status_notice = None;
+                    st.notice_gen = st.notice_gen.wrapping_add(1);
+                }
                 st.output_channel = None;
                 let meta = event.get("meta").cloned();
-                let summary = meta.as_ref().and_then(|m| m.get("summary")).and_then(Value::as_str).filter(|s| !s.is_empty()).map(|s| format!(" {s}")).unwrap_or_default();
+                let raw_summary = meta.as_ref().and_then(|m| m.get("summary")).and_then(Value::as_str).unwrap_or("");
+                let clean_summary = crate::jsutil::slice_chars(&terminal_text(raw_summary).split_whitespace().collect::<Vec<_>>().join(" "), 0, 72).to_string();
                 let state = s("state");
-                st.tool_states.insert(s("id"), format!("{}: {state}", s("name")));
+                let id_raw = s("id");
+                let name = s("name");
+                let tool_key = if id_raw.is_empty() { name.clone() } else { id_raw.clone() };
+                st.tool_states.insert(id_raw, format!("{name}: {state}"));
                 if state == "start" {
-                    let verb = match meta.as_ref().and_then(|m| m.get("kind")).and_then(Value::as_str) {
-                        Some("read") => "Reading".to_string(),
-                        Some("list") => "Listing".into(),
-                        Some("search") => "Searching".into(),
-                        Some("exec") => "Running".into(),
-                        Some("edit") => "Editing".into(),
-                        _ => format!("Calling {}", s("name")),
-                    };
-                    st.reasoning_header = Some(crate::jsutil::slice_chars(&format!("{verb}{summary}"), 0, 72).to_string());
-                } else if let Some(meta) = meta.filter(Value::is_object) {
-                    self.record_completed_tool_cell(st, &s("name"), &state, &meta);
+                    st.active_tools.insert(tool_key, ActiveTool { name: terminal_text(&name), summary: clean_summary, started_at_ms: now() });
+                    if st.reasoning_header.as_deref().is_some_and(|h| h.starts_with("Preparing ")) {
+                        st.reasoning_header = None;
+                    }
+                } else {
+                    st.active_tools.shift_remove(&tool_key);
+                    if let Some(meta) = meta.filter(Value::is_object) {
+                        self.record_completed_tool_cell(st, &name, &state, &meta);
+                    }
                 }
             }
             "todo" => {
@@ -1544,6 +1707,11 @@ impl Tui {
             }
         } else {
             self.flush_explore_group(st);
+            st.active_tools.clear();
+            if st.status_notice.as_deref().is_some_and(Self::is_retry_notice) {
+                st.status_notice = None;
+                st.notice_gen = st.notice_gen.wrapping_add(1);
+            }
             st.turn_started_at = None;
             st.reasoning_buffer.clear();
             st.reasoning_header = None;
@@ -2049,6 +2217,7 @@ impl Tui {
             return;
         }
         st.input_restored_from_revert = false;
+        st.status_notice = None;
         st.scroll = 0;
         // 1. A single existing local image path.
         let unquoted = unquote(cleaned.trim()).to_string();
@@ -3038,6 +3207,7 @@ impl Tui {
             Self::kill_range(st, st.cursor, end);
         } else if key.is("backspace") || (key.ctrl && key.is("h")) {
             st.input_restored_from_revert = false;
+            st.paste_burst.note_backspace(std::time::Instant::now());
             if st.cursor > 0 {
                 match Self::atomic_before(st) {
                     Some(token) => {
@@ -3104,34 +3274,45 @@ impl Tui {
                 self.schedule_paste_burst_check(st);
             }
         }
-        self.schedule(st, 16);
+        self.schedule(st, 0);
+    }
+
+    fn insert_typed_chars_inline(&self, st: &mut State, raw: &str) {
+        if st.esc_primed.is_some() {
+            st.esc_primed = None;
+            st.esc_gen += 1;
+        }
+        if st.status_notice.is_some() {
+            st.status_notice = None;
+        }
+        Self::clear_paste_burst(st);
+        let room = 16_000usize.saturating_sub(st.input.len());
+        if room > 0 {
+            let cleaned = terminal_text(raw).replace('\n', " ");
+            let chars: Vec<char> = cleaned.chars().take(room).collect();
+            if !chars.is_empty() {
+                st.input_restored_from_revert = false;
+                Self::insert_chars(st, &chars);
+                st.scroll = 0;
+                let last = chars.last().copied().unwrap_or(' ');
+                if chars.len() > 1 || "gfpe\"'GFPE".contains(last) {
+                    self.schedule_paste_burst_check(st);
+                }
+            }
+        }
+        self.schedule(st, 0);
     }
 
     fn apply_flush_result(&self, st: &mut State, res: paste_burst::FlushResult, is_windows: bool, actions: &mut Vec<Action>) -> bool {
+        let was_typed_burst = st.paste_burst.take_typed_burst_flag();
         match res {
             paste_burst::FlushResult::None => false,
             paste_burst::FlushResult::Typed(ch) => {
-                if st.esc_primed.is_some() {
-                    st.esc_primed = None;
-                    st.esc_gen += 1;
-                }
-                if st.status_notice.is_some() {
-                    st.status_notice = None;
-                }
-                Self::clear_paste_burst(st);
-                if st.input.len() < 16_000 {
-                    st.input_restored_from_revert = false;
-                    let cleaned = terminal_text(&ch.to_string());
-                    let chars = chars_of(&cleaned);
-                    if !chars.is_empty() {
-                        Self::insert_chars(st, &chars);
-                        st.scroll = 0;
-                        if "gfpe\"'GFPE".contains(ch) {
-                            self.schedule_paste_burst_check(st);
-                        }
-                    }
-                }
-                self.schedule(st, 16);
+                self.insert_typed_chars_inline(st, &ch.to_string());
+                true
+            }
+            paste_burst::FlushResult::Paste(pasted) if was_typed_burst => {
+                self.insert_typed_chars_inline(st, &pasted);
                 true
             }
             paste_burst::FlushResult::Paste(pasted) => {
@@ -3156,7 +3337,8 @@ impl Tui {
                         return true;
                     }
                 }
-                self.handle_paste(st, &pasted, true);
+                let allow_coalesce = pasted.contains(['\r', '\n']) || pasted.chars().count() >= 16;
+                self.handle_paste(st, &pasted, allow_coalesce);
                 true
             }
         }
@@ -3328,6 +3510,9 @@ impl Tui {
                     st.quit_armed = None;
                     let KeyCode::Char(ch) = ev.code else { unreachable!() };
                     match st.paste_burst.on_plain_char(ch, now) {
+                        paste_burst::CharDecision::Passthrough => {
+                            self.insert_typed_chars_inline(&mut st, &ch.to_string());
+                        }
                         paste_burst::CharDecision::RetainFirstChar => {
                             self.ensure_paste_tick(&mut st, is_windows);
                         }
@@ -3341,6 +3526,9 @@ impl Tui {
                     self.apply_flush_result(&mut st, flushed, is_windows, &mut actions);
                     if let Some((text, key)) = key_from_event(&ev) {
                         self.keypress(&mut st, text.as_deref(), &key, &mut actions);
+                    }
+                    if ev.code == KeyCode::Backspace || matches!(ev.code, KeyCode::Char('h' | 'H') if ctrl && !alt && !super_meta) {
+                        st.paste_burst.note_backspace(now);
                     }
                 }
             }
@@ -3377,17 +3565,19 @@ impl Tui {
     }
 
     pub(super) fn restore_terminal(&self) {
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if st.terminal_restored {
             return;
         }
         st.terminal_restored = true;
         if self.real_terminal {
+            set_panic_terminal_state(false, false);
             #[cfg(windows)]
             let _ = windows_console::restore_input_mode();
             let _ = crossterm::terminal::disable_raw_mode();
         }
-        self.write_raw("\x1b[?1002l\x1b[?1004l\x1b[?2004l\x1b[?1007l\x1b[?1006l\x1b[?1000l\x1b[?25h");
+        let sgr_reset = if text::Palette::for_mode(st.theme_mode).is_styled() { "\x1b[0m" } else { "" };
+        self.write_raw(&format!("\x1b[?2026l\x1b[?1002l\x1b[?1004l\x1b[?2004l\x1b[?1007l\x1b[?1006l\x1b[?1000l{sgr_reset}\x1b[?25h"));
         if st.native.is_none() {
             self.write_raw("\x1b[?1049l");
         } else {
@@ -3397,21 +3587,25 @@ impl Tui {
     }
 
     pub fn is_closed(&self) -> bool {
-        self.state.lock().unwrap().closed
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).closed
     }
 }
 
 impl Drop for Tui {
     fn drop(&mut self) {
-        if self.real_terminal && !self.state.lock().map(|s| s.closed).unwrap_or(true) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if self.real_terminal && !st.closed && !st.terminal_restored {
+            st.terminal_restored = true;
+            set_panic_terminal_state(false, false);
             #[cfg(windows)]
             let _ = windows_console::restore_input_mode();
             let _ = crossterm::terminal::disable_raw_mode();
-            self.write_raw("\x1b[?1002l\x1b[?1004l\x1b[?2004l\x1b[?1007l\x1b[?1006l\x1b[?1000l\x1b[?25h");
-            if self.state.lock().unwrap().native.is_none() {
+            let sgr_reset = if text::Palette::for_mode(st.theme_mode).is_styled() { "\x1b[0m" } else { "" };
+            self.write_raw(&format!("\x1b[?2026l\x1b[?1002l\x1b[?1004l\x1b[?2004l\x1b[?1007l\x1b[?1006l\x1b[?1000l{sgr_reset}\x1b[?25h"));
+            if st.native.is_none() {
                 self.write_raw("\x1b[?1049l");
             } else {
-                let finish = self.state.lock().unwrap().native.as_mut().unwrap().finish();
+                let finish = st.native.as_mut().unwrap().finish();
                 self.write_raw(&finish);
             }
         }

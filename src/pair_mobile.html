@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <title>goon · Paired Device</title>
 <style>
   :root {
@@ -30,7 +30,7 @@
   header {
     background: var(--panel);
     border-bottom: 1px solid var(--border);
-    padding: 10px 14px;
+    padding: calc(10px + env(safe-area-inset-top, 0px)) 14px 10px;
     display: flex;
     justify-content: space-between;
     align-items: center;
@@ -110,28 +110,37 @@
   .btn-err { background: var(--err); color: #4c0519; }
   form {
     display: flex;
+    align-items: flex-end;
     gap: 8px;
-    padding: 10px 14px;
+    padding: 10px 14px calc(10px + env(safe-area-inset-bottom, 0px));
     background: var(--panel);
     border-top: 1px solid var(--border);
   }
-  input {
+  textarea#promptInput {
     flex: 1;
     background: var(--bg);
     color: var(--text);
     border: 1px solid var(--border);
     border-radius: 8px;
     padding: 10px 12px;
-    font-size: 14px;
+    font-size: 16px;
+    font-family: inherit;
+    line-height: 1.4;
+    min-height: 42px;
+    max-height: 160px;
+    resize: none;
+    overflow-y: hidden;
     outline: none;
   }
-  input:focus { border-color: var(--brand); }
+  textarea#promptInput:focus { border-color: var(--brand); }
   .send-btn {
     background: var(--brand);
     color: #0f111a;
     border: none;
     border-radius: 8px;
+    height: 42px;
     padding: 0 16px;
+    font-size: 14px;
     font-weight: 700;
     cursor: pointer;
   }
@@ -153,17 +162,38 @@
   </div>
   <div id="log"></div>
   <form id="composer">
-    <input id="promptInput" type="text" placeholder="Send prompt or /command..." autocomplete="off" />
+    <textarea id="promptInput" rows="1" placeholder="Send prompt or /command..." autocomplete="off"></textarea>
     <button class="send-btn" type="submit">Send</button>
   </form>
 <script>
   const params = new URLSearchParams(location.search);
-  const token = params.get('token') || params.get('t') || '';
+  const urlToken = params.get('token') || params.get('t') || '';
+  let storedToken = '';
+  if (urlToken) {
+    try { sessionStorage.setItem('goon_pair_token', urlToken); } catch {}
+    params.delete('token');
+    params.delete('t');
+    const cleanQuery = params.toString();
+    const cleanUrl = (location.pathname || '/') + (cleanQuery ? '?' + cleanQuery : '') + (location.hash || '');
+    try { history.replaceState(null, '', cleanUrl); } catch {}
+  } else {
+    try { storedToken = sessionStorage.getItem('goon_pair_token') || ''; } catch {}
+  }
+  const token = urlToken || storedToken;
   const logEl = document.getElementById('log');
   const metaEl = document.getElementById('meta');
   const statusEl = document.getElementById('statusBadge');
+  const promptEl = document.getElementById('promptInput');
   let lastSeq = 0;
   let sseConnected = false;
+
+  function resizePromptInput() {
+    if (!promptEl) return;
+    promptEl.style.height = 'auto';
+    const next = Math.min(promptEl.scrollHeight || 42, 160);
+    promptEl.style.height = next + 'px';
+    promptEl.style.overflowY = (promptEl.scrollHeight || 0) > 160 ? 'auto' : 'hidden';
+  }
 
   function upsertEntry(entry) {
     if (!entry || !entry.id) return;
@@ -204,7 +234,12 @@
     title.textContent = '▲ Allow ' + msg.tool + '?\n' + (msg.preview || '');
     const actions = document.createElement('div');
     actions.className = 'approval-actions';
-    [['Allow', 'yes', 'btn-ok'], ['Always', 'always', 'btn-info'], ['Deny', 'no', 'btn-err']].forEach(([label, dec, cls]) => {
+    const choices = [['Allow', 'yes', 'btn-ok']];
+    if (msg.canAlways !== false) {
+      choices.push([msg.alwaysLabel || 'Always', 'always', 'btn-info']);
+    }
+    choices.push(['Deny', 'no', 'btn-err']);
+    choices.forEach(([label, dec, cls]) => {
       const b = document.createElement('button');
       b.className = 'btn ' + cls;
       b.textContent = label;
@@ -221,7 +256,7 @@
   }
 
   async function apiPost(path, body) {
-    const res = await fetch(path + '?t=' + encodeURIComponent(token), {
+    const res = await fetch(path, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -235,7 +270,7 @@
   async function pollState(force) {
     if (!force && sseConnected) return;
     try {
-      const res = await fetch('/api/state?t=' + encodeURIComponent(token) + '&since=' + lastSeq, {
+      const res = await fetch('/api/state?since=' + encodeURIComponent(lastSeq), {
         headers: { 'Authorization': 'Bearer ' + token },
         cache: 'no-store',
       });
@@ -284,14 +319,30 @@
     await apiPost('/api/stop', {});
     pollState(true);
   };
-  document.getElementById('composer').onsubmit = async (e) => {
-    e.preventDefault();
-    const input = document.getElementById('promptInput');
-    const text = input.value.trim();
+
+  async function submitPrompt() {
+    if (!promptEl) return;
+    const text = promptEl.value.trim();
     if (!text) return;
-    input.value = '';
+    promptEl.value = '';
+    resizePromptInput();
     await apiPost('/api/prompt', { prompt: text });
     pollState(true);
+  }
+
+  if (promptEl) {
+    promptEl.addEventListener('input', resizePromptInput);
+    promptEl.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && e.keyCode !== 229) {
+        e.preventDefault();
+        submitPrompt();
+      }
+    });
+  }
+
+  document.getElementById('composer').onsubmit = async (e) => {
+    e.preventDefault();
+    await submitPrompt();
   };
 </script>
 </body>

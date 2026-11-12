@@ -1,4 +1,5 @@
 fn main() {
+    goon::tui::install_panic_hook();
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio runtime");
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let code = runtime.block_on(goon::cli::main(argv));

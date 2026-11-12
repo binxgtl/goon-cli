@@ -129,3 +129,180 @@ test('an active goal keeps the CLI going with a continuation turn until update_g
   assert.equal(step, 4, 'Turn 1 (2 model calls) + the automatic continuation turn (2 model calls)');
   assert.equal(sawContinuation, true, 'the continuation turn carries the goal continuation context');
 });
+
+test('pair_mobile.html allows pinch-zoom, uses 16px auto-growing textarea, scrubs ?t= token into sessionStorage, and honors approval flags', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const { resolve } = await import('node:path');
+  const vm = await import('node:vm');
+
+  const html = await readFile(resolve('src/pair_mobile.html'), 'utf8');
+  const viewportMatch = html.match(/<meta\s+name="viewport"\s+content="([^"]+)"/i);
+  assert(viewportMatch, 'viewport meta tag must exist');
+  assert(!viewportMatch[1].includes('user-scalable=no'), 'mobile viewport must not disable pinch-zoom');
+  assert(!viewportMatch[1].includes('maximum-scale=1'), 'mobile viewport must not lock maximum-scale=1');
+  assert(viewportMatch[1].includes('viewport-fit=cover'), 'mobile viewport should support notched safe areas');
+  assert(/<textarea\s+id="promptInput"[^>]*rows="1"/i.test(html), '#promptInput must be a multi-line <textarea rows="1">');
+  assert(/textarea#promptInput\s*\{[^}]*font-size:\s*16px/s.test(html), '#promptInput must have font-size >= 16px to prevent iOS auto-zoom');
+
+  const scriptMatch = html.match(/<script>([\s\S]*?)<\/script>/i);
+  assert(scriptMatch, 'inline script must exist');
+
+  function makeElement(tag, id = '') {
+    const listeners = new Map();
+    return {
+      tagName: tag.toUpperCase(),
+      id,
+      value: '',
+      textContent: '',
+      className: '',
+      dataset: {},
+      style: {},
+      scrollHeight: 48,
+      scrollTop: 0,
+      clientHeight: 400,
+      children: [],
+      classList: { toggle() {} },
+      appendChild(child) {
+        this.children.push(child);
+        return child;
+      },
+      addEventListener(type, fn) {
+        const list = listeners.get(type) || [];
+        list.push(fn);
+        listeners.set(type, list);
+      },
+      dispatch(type, ev) {
+        for (const fn of listeners.get(type) || []) fn(ev);
+      },
+    };
+  }
+
+  function runSandbox(initialSearch, preStored = {}) {
+    const storage = new Map(Object.entries(preStored));
+    const fetches = [];
+    const sseUrls = [];
+    let replacedUrl = null;
+    let sseInstance = null;
+    const byId = new Map([
+      ['log', makeElement('div', 'log')],
+      ['meta', makeElement('div', 'meta')],
+      ['statusBadge', makeElement('div', 'statusBadge')],
+      ['promptInput', makeElement('textarea', 'promptInput')],
+      ['stopBtn', makeElement('button', 'stopBtn')],
+      ['composer', makeElement('form', 'composer')],
+    ]);
+    const sandbox = {
+      URLSearchParams,
+      encodeURIComponent,
+      JSON,
+      Math,
+      Array,
+      location: { search: initialSearch, pathname: '/', hash: '' },
+      sessionStorage: {
+        getItem: k => (storage.has(k) ? storage.get(k) : null),
+        setItem: (k, v) => storage.set(k, String(v)),
+      },
+      history: {
+        replaceState(_state, _title, url) {
+          replacedUrl = url;
+        },
+      },
+      document: {
+        getElementById: id => byId.get(id) || null,
+        createElement: tag => makeElement(tag),
+        querySelectorAll: () => [],
+      },
+      fetch: async (url, opts = {}) => {
+        fetches.push({ url, opts });
+        return { ok: true, json: async () => ({ state: { model: 'm', cwd: '/app', status: 'Ready', mode: 'ask' }, entries: [], pendingApprovals: [] }) };
+      },
+      EventSource: class {
+        constructor(url) {
+          sseUrls.push(url);
+          sseInstance = this;
+        }
+      },
+      setInterval: () => 1,
+    };
+    vm.runInNewContext(scriptMatch[1], sandbox);
+    return { storage, fetches, sseUrls, replacedUrl, byId, getSse: () => sseInstance };
+  }
+
+  const first = runSandbox('?t=pair-tok-999');
+  assert.equal(first.storage.get('goon_pair_token'), 'pair-tok-999');
+  assert.equal(first.replacedUrl, '/', 'token must be scrubbed from address bar via history.replaceState');
+  assert.equal(first.sseUrls[0], '/api/events?t=pair-tok-999');
+  assert.equal(first.fetches[0].url, '/api/state?since=0', 'fetch URL must not leak ?t= query parameter');
+  assert.equal(first.fetches[0].opts.headers.Authorization, 'Bearer pair-tok-999');
+
+  // Reloading after URL scrub recovers token from sessionStorage
+  const reloaded = runSandbox('', { goon_pair_token: 'pair-tok-999' });
+  assert.equal(reloaded.fetches[0].opts.headers.Authorization, 'Bearer pair-tok-999');
+
+  // Shift+Enter and IME composition do not submit; plain Enter submits via Bearer header
+  const promptEl = reloaded.byId.get('promptInput');
+  promptEl.value = 'line 1\nline 2';
+  let prevented = false;
+  promptEl.dispatch('keydown', { key: 'Enter', shiftKey: true, isComposing: false, keyCode: 13, preventDefault() { prevented = true; } });
+  assert.equal(prevented, false, 'Shift+Enter must insert newline without submitting');
+  promptEl.dispatch('keydown', { key: 'Enter', shiftKey: false, isComposing: true, keyCode: 229, preventDefault() { prevented = true; } });
+  assert.equal(prevented, false, 'IME composition Enter must not submit prematurely');
+  promptEl.dispatch('keydown', { key: 'Enter', shiftKey: false, isComposing: false, keyCode: 13, preventDefault() { prevented = true; } });
+  assert.equal(prevented, true, 'plain Enter submits composer');
+  await new Promise(r => setImmediate(r));
+  const promptPost = reloaded.fetches.find(f => f.url === '/api/prompt');
+  assert(promptPost, 'expected POST /api/prompt');
+  assert.equal(promptPost.opts.headers.Authorization, 'Bearer pair-tok-999');
+  assert.equal(JSON.parse(promptPost.opts.body).prompt, 'line 1\nline 2');
+
+  // Approval card respects canAlways: false and custom alwaysLabel
+  const sseMsg = reloaded.getSse();
+  sseMsg.onmessage({ data: JSON.stringify({ type: 'approval', id: 'ap1', tool: 'bash', preview: 'rm -rf build', canAlways: false }) });
+  sseMsg.onmessage({ data: JSON.stringify({ type: 'approval', id: 'ap2', tool: 'bash', preview: 'cargo test', canAlways: true, alwaysLabel: 'Always allow cargo' }) });
+  const cards = reloaded.byId.get('log').children;
+  const labels1 = cards[0].children[1].children.map(b => b.textContent);
+  const labels2 = cards[1].children[1].children.map(b => b.textContent);
+  assert.deepEqual(labels1, ['Allow', 'Deny']);
+  assert.deepEqual(labels2, ['Allow', 'Always allow cargo', 'Deny']);
+});
+
+test('setup wizard accepts preset name and isolates per-provider credentials while NO_COLOR suppresses ANSI escapes', async t => {
+  const { readFile } = await import('node:fs/promises');
+  const { join } = await import('node:path');
+  const f = await fixture(t);
+  const p = await provider(t, (_, response) => sse(response, { text: 'plain ok' }));
+  const [handleCompletion] = p.server.listeners('request');
+  p.server.removeAllListeners('request');
+  p.server.on('request', (request, response) => {
+    if (request.method === 'GET' && request.url === '/v1/models') {
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ data: [{ id: 'openai/gpt-5' }] }));
+    } else {
+      handleCompletion(request, response);
+    }
+  });
+
+  // Piped `goon setup` choosing preset by name ("openrouter") and validating custom effort retry
+  const setupRes = await cli(f, p.url, ['setup'], {
+    input: `not-a-preset\nopenrouter\n${p.url}\nsk-or-e2e-key\n1\nmeduim\nhigh\n`,
+  }).done;
+  assert.equal(setupRes.code, 0, setupRes.stderr + setupRes.stdout);
+  assert(setupRes.stderr.includes('https://openrouter.ai/api/v1'), setupRes.stderr);
+  const savedCfg = JSON.parse(await readFile(join(f.config, 'goon/config.json'), 'utf8'));
+  assert.equal(savedCfg.provider, 'openai-compatible');
+  assert.equal(savedCfg.baseUrl, p.url);
+  assert.equal(savedCfg.keyEnv, 'OPENROUTER_API_KEY');
+  assert.equal(savedCfg.model, 'openai/gpt-5');
+  assert.equal(savedCfg.effort, 'high');
+  const savedCreds = JSON.parse(await readFile(join(f.config, 'goon/credentials.json'), 'utf8'));
+  assert.equal(savedCreds.OPENROUTER_API_KEY, 'sk-or-e2e-key');
+
+  // NO_COLOR=1 one-shot run emits zero SGR escape codes
+  const noColorRes = await cli(f, p.url, ['--provider', 'openai-compatible', '--yes', '--no-mcp', '--no-subagents', '-p', 'ping'], {
+    env: { NO_COLOR: '1' },
+  }).done;
+  assert.equal(noColorRes.code, 0, noColorRes.stderr + noColorRes.stdout);
+  const esc = String.fromCharCode(0x1b);
+  assert(!noColorRes.stdout.includes(`${esc}[`), `NO_COLOR stdout contained CSI: ${JSON.stringify(noColorRes.stdout)}`);
+  assert(!noColorRes.stderr.includes(`${esc}[`), `NO_COLOR stderr contained CSI: ${JSON.stringify(noColorRes.stderr)}`);
+});

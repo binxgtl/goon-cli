@@ -242,7 +242,7 @@ pub(super) struct EditorGuard<'a>(pub(super) &'a Tui);
 impl Drop for EditorGuard<'_> {
     fn drop(&mut self) {
         let tui = self.0;
-        let mut st = tui.state.lock().unwrap();
+        let mut st = tui.state.lock().unwrap_or_else(|e| e.into_inner());
         st.editor_active = false;
         if st.closed {
             drop(st);
@@ -256,6 +256,8 @@ impl Drop for EditorGuard<'_> {
             let _ = crossterm::terminal::disable_raw_mode();
             if let Err(error) = crossterm::terminal::enable_raw_mode() {
                 st.status_notice = Some(format!("Failed to restore raw input: {error}"));
+            } else {
+                super::set_panic_terminal_state(true, st.native.is_none());
             }
             #[cfg(windows)]
             let _ = windows_console::set_input_record_mode();

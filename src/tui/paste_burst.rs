@@ -24,6 +24,9 @@ use std::time::Instant;
 
 const PASTE_ENTER_SUPPRESS_WINDOW: Duration = Duration::from_millis(120);
 const PASTE_BURST_CHAR_INTERVAL: Duration = Duration::from_millis(8);
+const IME_REWRITE_WINDOW: Duration = Duration::from_millis(40);
+const IME_REWRITE_MAX_CHARS: u16 = 16;
+const SINGLE_LINE_BURST_WALL_CAP: Duration = Duration::from_millis(120);
 
 #[cfg(not(windows))]
 const PASTE_BURST_ACTIVE_IDLE_TIMEOUT: Duration = Duration::from_millis(8);
@@ -35,6 +38,11 @@ pub(crate) struct PasteBurst {
     last_plain_char_time: Option<Instant>,
     consecutive_plain_char_burst: u16,
     burst_window_until: Option<Instant>,
+    burst_started_at: Option<Instant>,
+    after_backspace_at: Option<Instant>,
+    ime_rewrite_active: bool,
+    ime_rewrite_chars: u16,
+    last_flush_was_typed_burst: bool,
     buffer: String,
     active: bool,
     pending_first_char: Option<(char, Instant)>,
@@ -42,6 +50,8 @@ pub(crate) struct PasteBurst {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum CharDecision {
+    /// Insert `ch` directly into the composer (`0ms` echo) during a post-`Backspace` IME rewrite.
+    Passthrough,
     /// Append `ch` to the already-active paste buffer.
     BufferAppend,
     /// Hold the first fast character briefly to see whether a burst follows.
@@ -81,6 +91,15 @@ impl PasteBurst {
         Self::active_idle_timeout(is_windows) + Duration::from_millis(1)
     }
 
+    /// Records a `Backspace` / `Ctrl+H` event so subsequent Vietnamese Telex/VNI IME syllable
+    /// rewrites (`Backspace×N` + Unicode/ASCII replacement burst) echo immediately at `0ms`
+    /// without entering the `60ms` Windows `PasteBurst` hold or `120ms` Enter suppression window.
+    pub(crate) fn note_backspace(&mut self, now: Instant) {
+        self.after_backspace_at = Some(now);
+        self.ime_rewrite_active = false;
+        self.ime_rewrite_chars = 0;
+    }
+
     pub(crate) fn next_flush_delay(&self, now: Instant, is_windows: bool) -> Option<Duration> {
         if !self.is_active() {
             return None;
@@ -90,14 +109,38 @@ impl PasteBurst {
             return Some(Duration::from_millis(1));
         };
         let elapsed = now.saturating_duration_since(last);
-        Some(timeout.saturating_sub(elapsed) + Duration::from_millis(1))
+        let idle_delay = timeout.saturating_sub(elapsed) + Duration::from_millis(1);
+        if self.is_active_internal() && !self.buffer.contains(['\r', '\n']) {
+            if let Some(started) = self.burst_started_at {
+                let wall_elapsed = now.saturating_duration_since(started);
+                let wall_delay = SINGLE_LINE_BURST_WALL_CAP.saturating_sub(wall_elapsed).max(Duration::from_millis(1));
+                return Some(idle_delay.min(wall_delay));
+            }
+        }
+        Some(idle_delay)
     }
 
     /// Classifies a text-producing character (`plain`, `Shift`, or Windows `AltGr`).
     /// Applies uniformly to ASCII and Unicode so mixed prefixes like Vietnamese `"Nếu..."` or
-    /// `"Đây..."` never leak their first character inline before buffering starts.
+    /// `"Đây..."` never leak their first character inline before buffering starts, while
+    /// post-`Backspace` IME syllable rewrites (`"tiếng"`, `"đường"`, `"chào"`) pass through at `0ms`.
     pub(crate) fn on_plain_char(&mut self, ch: char, now: Instant) -> CharDecision {
         let char_interval = Self::char_interval();
+
+        if !self.active && self.pending_first_char.is_none() && !matches!(ch, '\r' | '\n') {
+            let within_bs_window = self.after_backspace_at.is_some_and(|bs| now.saturating_duration_since(bs) <= IME_REWRITE_WINDOW);
+            let continuing_ime_burst = self.ime_rewrite_active && self.last_plain_char_time.is_some_and(|prev| now.saturating_duration_since(prev) <= char_interval);
+            if (within_bs_window || continuing_ime_burst) && self.ime_rewrite_chars < IME_REWRITE_MAX_CHARS {
+                self.ime_rewrite_active = true;
+                self.ime_rewrite_chars = self.ime_rewrite_chars.saturating_add(1);
+                self.note_plain_char(now, char_interval);
+                return CharDecision::Passthrough;
+            }
+            self.ime_rewrite_active = false;
+            self.ime_rewrite_chars = 0;
+            self.after_backspace_at = None;
+        }
+
         self.note_plain_char(now, char_interval);
 
         if self.active {
@@ -108,6 +151,7 @@ impl PasteBurst {
         if let Some((held, held_at)) = self.pending_first_char {
             if now.saturating_duration_since(held_at) <= char_interval {
                 self.active = true;
+                self.burst_started_at = Some(held_at);
                 let _ = self.pending_first_char.take();
                 self.buffer.push(held);
                 self.burst_window_until = Some(now + PASTE_ENTER_SUPPRESS_WINDOW);
@@ -130,6 +174,9 @@ impl PasteBurst {
     }
 
     pub(crate) fn append_char_to_buffer(&mut self, ch: char, now: Instant) {
+        if self.burst_started_at.is_none() {
+            self.burst_started_at = Some(now);
+        }
         self.buffer.push(ch);
         self.last_plain_char_time = Some(now);
         self.burst_window_until = Some(now + PASTE_ENTER_SUPPRESS_WINDOW);
@@ -140,8 +187,13 @@ impl PasteBurst {
     /// the burst buffer without auto-submitting.
     pub(crate) fn append_control_char_if_active(&mut self, ch: char, now: Instant) -> bool {
         if self.is_active() {
-            if let Some((held, _)) = self.pending_first_char.take() {
+            if let Some((held, held_at)) = self.pending_first_char.take() {
+                if self.burst_started_at.is_none() {
+                    self.burst_started_at = Some(held_at);
+                }
                 self.buffer.push(held);
+            } else if self.burst_started_at.is_none() {
+                self.burst_started_at = Some(now);
             }
             self.active = true;
             self.buffer.push(ch);
@@ -153,9 +205,27 @@ impl PasteBurst {
         }
     }
 
+    pub(crate) fn take_typed_burst_flag(&mut self) -> bool {
+        std::mem::take(&mut self.last_flush_was_typed_burst)
+    }
+
     pub(crate) fn flush_if_due(&mut self, now: Instant, is_windows: bool) -> FlushResult {
         let timeout = if self.is_active_internal() { Self::active_idle_timeout(is_windows) } else { Self::char_interval() };
         let timed_out = self.last_plain_char_time.is_some_and(|t| now.saturating_duration_since(t) > timeout);
+        if self.is_active_internal() && !self.buffer.contains(['\r', '\n']) {
+            if let Some(started) = self.burst_started_at {
+                let burst_span = self.last_plain_char_time.map(|last| last.saturating_duration_since(started)).unwrap_or_default();
+                let live_cap_hit = !timed_out && now.saturating_duration_since(started) >= SINGLE_LINE_BURST_WALL_CAP;
+                if burst_span >= SINGLE_LINE_BURST_WALL_CAP || live_cap_hit {
+                    self.active = false;
+                    self.burst_started_at = None;
+                    self.burst_window_until = None;
+                    self.last_flush_was_typed_burst = true;
+                    let out = std::mem::take(&mut self.buffer);
+                    return FlushResult::Paste(out);
+                }
+            }
+        }
         if timed_out {
             self.flush_pending()
         } else {
@@ -164,13 +234,14 @@ impl PasteBurst {
     }
 
     pub(crate) fn flush_pending(&mut self) -> FlushResult {
+        self.last_flush_was_typed_burst = false;
         if self.is_active_internal() {
             self.active = false;
+            self.burst_started_at = None;
             let out = std::mem::take(&mut self.buffer);
-            // Short single-line 2-key rollovers / IME commits (e.g. "th", "ươ") should not block
-            // an interactive Enter pressed 70ms later; multi-line or paste-length payloads keep
-            // the 120ms Enter suppression window alive against late trailing CR/LF records.
-            if !out.contains(['\r', '\n']) && out.chars().count() < 16 {
+            // Single-line bursts without newlines never carry ConPTY CR/LF split hazards, so an
+            // interactive Enter pressed right after typing or single-line IME commit must submit!
+            if !out.contains(['\r', '\n']) {
                 self.burst_window_until = None;
             }
             FlushResult::Paste(out)
@@ -202,6 +273,11 @@ impl PasteBurst {
         self.consecutive_plain_char_burst = 0;
         self.last_plain_char_time = None;
         self.burst_window_until = None;
+        self.burst_started_at = None;
+        self.after_backspace_at = None;
+        self.ime_rewrite_active = false;
+        self.ime_rewrite_chars = 0;
+        self.last_flush_was_typed_burst = false;
         self.active = false;
         self.pending_first_char = None;
     }
@@ -210,6 +286,11 @@ impl PasteBurst {
         self.last_plain_char_time = None;
         self.consecutive_plain_char_burst = 0;
         self.burst_window_until = None;
+        self.burst_started_at = None;
+        self.after_backspace_at = None;
+        self.ime_rewrite_active = false;
+        self.ime_rewrite_chars = 0;
+        self.last_flush_was_typed_burst = false;
         self.active = false;
         self.buffer.clear();
         self.pending_first_char = None;
@@ -256,6 +337,7 @@ mod unit_tests {
                     CharDecision::BeginBufferFromPending | CharDecision::BufferAppend => {
                         burst.append_char_to_buffer(c, now);
                     }
+                    CharDecision::Passthrough => panic!("unexpected passthrough without Backspace"),
                 },
             }
             now += Duration::from_millis(1);
@@ -265,5 +347,44 @@ mod unit_tests {
         assert!(burst.newline_should_insert_instead_of_submit(flush_at));
         let after_suppress = now + PASTE_ENTER_SUPPRESS_WINDOW + Duration::from_millis(1);
         assert!(!burst.newline_should_insert_instead_of_submit(after_suppress));
+    }
+
+    #[test]
+    fn vietnamese_telex_post_backspace_rewrite_passes_through_immediately_and_never_suppresses_enter() {
+        let mut burst = PasteBurst::default();
+        let mut now = Instant::now();
+        for _ in 0..3 {
+            let _ = burst.flush_before_modified_input();
+            burst.note_backspace(now);
+            now += Duration::from_millis(1);
+        }
+        for ch in "ếng".chars() {
+            assert_eq!(burst.on_plain_char(ch, now), CharDecision::Passthrough);
+            assert!(!burst.is_active());
+            assert!(!burst.newline_should_insert_instead_of_submit(now));
+            now += Duration::from_millis(1);
+        }
+        assert!(!burst.newline_should_insert_instead_of_submit(now));
+    }
+
+    #[test]
+    fn continuous_windows_single_line_typing_caps_at_120ms_with_typed_burst_flag_and_clears_enter_window() {
+        let mut burst = PasteBurst::default();
+        let t0 = Instant::now();
+        let mut now = t0;
+        assert_eq!(burst.on_plain_char('t', now), CharDecision::RetainFirstChar);
+        now += Duration::from_millis(4);
+        assert_eq!(burst.on_plain_char('h', now), CharDecision::BeginBufferFromPending);
+        burst.append_char_to_buffer('h', now);
+        for ch in ['e', ' ', 'q'] {
+            now += Duration::from_millis(35);
+            assert_eq!(burst.on_plain_char(ch, now), CharDecision::BufferAppend);
+            burst.append_char_to_buffer(ch, now);
+        }
+        now += Duration::from_millis(20);
+        assert_eq!(burst.flush_if_due(now, true), FlushResult::Paste("the q".into()));
+        assert!(burst.take_typed_burst_flag());
+        assert!(!burst.is_active());
+        assert!(!burst.newline_should_insert_instead_of_submit(now));
     }
 }

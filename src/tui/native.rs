@@ -51,7 +51,12 @@ impl NativeViewport {
         lines.drain(..commit_to);
     }
 
+    #[allow(dead_code)]
     pub(super) fn paint(&mut self, lines: &[String], cursor: &str) -> String {
+        self.paint_with(lines, cursor, true)
+    }
+
+    pub(super) fn paint_with(&mut self, lines: &[String], cursor: &str, styled: bool) -> String {
         if !self.geometry_changed && self.pending.is_empty() && self.previous == lines && cursor.is_empty() {
             return String::new();
         }
@@ -70,7 +75,10 @@ impl NativeViewport {
         }
         for line in self.pending.drain(..) {
             output.push_str(&line);
-            output.push_str("\x1b[0m\r\n");
+            if styled {
+                output.push_str("\x1b[0m");
+            }
+            output.push_str("\r\n");
         }
         output.push_str(&lines.iter().map(|line| format!("{line}\x1b[K")).collect::<Vec<_>>().join("\r\n"));
         let last_row = lines.len().saturating_sub(1);
@@ -96,7 +104,12 @@ impl NativeViewport {
 
     /// --no-alt-screen also applies to overlays. Full-height modals move their
     /// origin to row zero; restore a compact viewport against the bottom on exit.
+    #[allow(dead_code)]
     pub(super) fn transition_modal(&mut self, modal: bool, rows: usize, next_rows: usize) -> String {
+        self.transition_modal_with(modal, rows, next_rows, true)
+    }
+
+    pub(super) fn transition_modal_with(&mut self, modal: bool, rows: usize, next_rows: usize, styled: bool) -> String {
         if modal == self.modal {
             if modal {
                 self.modal_rows = rows;
@@ -142,7 +155,10 @@ impl NativeViewport {
         let had_pending = !self.pending.is_empty();
         for line in self.pending.drain(..) {
             output.push_str(&line);
-            output.push_str("\x1b[0m\r\n");
+            if styled {
+                output.push_str("\x1b[0m");
+            }
+            output.push_str("\r\n");
         }
         if had_pending {
             // A watermark means these rows must actually reach scrollback, not

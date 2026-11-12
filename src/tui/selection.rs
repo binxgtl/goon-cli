@@ -689,7 +689,7 @@ impl Tui {
                 st.follow_control = pointer::Follow::default();
             }
         }
-        st.status_notice = Some(status.message("selection"));
+        self.set_notice_locked(&mut st, Some(status.message("selection")));
         self.schedule(&mut st, 0);
     }
 
@@ -705,6 +705,9 @@ impl Tui {
         st.transcript_top_row = top;
         st.transcript_screen_row = screen_row;
         st.transcript_view_rows = body.to_vec();
+        if !super::text::Palette::for_mode(st.theme_mode).is_styled() {
+            return;
+        }
         if let Some(selection) = &st.selection {
             for (index, line) in body.iter_mut().enumerate() {
                 for (start, end) in st.body_layout.columns(top + index, selection) {

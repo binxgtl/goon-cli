@@ -3547,3 +3547,250 @@ async fn clipped_question_options_cannot_be_submitted_until_fully_readable() {
     tty.key("return");
     assert_eq!(task.await.unwrap().unwrap()["q"].len(), 1);
 }
+
+#[tokio::test]
+async fn vietnamese_telex_ime_rewrite_echoes_immediately_and_submits_on_enter_while_multiline_paste_stays_protected() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::time::Instant;
+    let tty = Tty::new(80, 24);
+
+    let ui1 = tty.ui.clone();
+    let ask1 = tokio::spawn(async move { ui1.question("goon> ", None, true, QuestionOpts::default()).await });
+    tokio::time::sleep(Duration::from_millis(5)).await;
+
+    let mut t = Instant::now();
+    // 1. User types "tiee" on Windows, then Vietnamese Telex IME sends Backspace x 2 + "ếng" within 1ms!
+    for ch in ['t', 'i', 'e', 'e'] {
+        tty.ui.handle_crossterm_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), t, true);
+        t += Duration::from_millis(25);
+    }
+    tty.ui.flush_paste_burst_at(t + Duration::from_millis(70), true);
+    t += Duration::from_millis(75);
+    assert_eq!(draft(&tty), "tiee");
+
+    // IME rewrite burst: Backspace x 2 + "ếng" at 1ms intervals
+    for _ in 0..2 {
+        tty.ui.handle_crossterm_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE), t, true);
+        t += Duration::from_millis(1);
+    }
+    for ch in "ếng".chars() {
+        tty.ui.handle_crossterm_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), t, true);
+        t += Duration::from_millis(1);
+    }
+    // Zero-lag assertion: "tiếng" is ALREADY in st.input without waiting 60ms!
+    assert_eq!(draft(&tty), "tiếng");
+
+    // Pressing Enter 5ms later submits immediately instead of inserting a newline!
+    t += Duration::from_millis(5);
+    tty.ui.handle_crossterm_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), t, true);
+    assert_eq!(ask1.await.unwrap().unwrap(), "tiếng");
+
+    // 2. Also verify "chào": type "chao", Backspace x 2 + "ào" + immediate Enter
+    let ui2 = tty.ui.clone();
+    let ask2 = tokio::spawn(async move { ui2.question("goon> ", None, true, QuestionOpts::default()).await });
+    tokio::time::sleep(Duration::from_millis(5)).await;
+
+    for ch in ['c', 'h', 'a', 'o'] {
+        t += Duration::from_millis(20);
+        tty.ui.handle_crossterm_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), t, true);
+    }
+    t += Duration::from_millis(70);
+    tty.ui.flush_paste_burst_at(t, true);
+    for _ in 0..2 {
+        t += Duration::from_millis(1);
+        tty.ui.handle_crossterm_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE), t, true);
+    }
+    for ch in "ào".chars() {
+        t += Duration::from_millis(1);
+        tty.ui.handle_crossterm_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), t, true);
+    }
+    assert_eq!(draft(&tty), "chào");
+    t += Duration::from_millis(5);
+    tty.ui.handle_crossterm_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), t, true);
+    assert_eq!(ask2.await.unwrap().unwrap(), "chào");
+
+    // 3. Unbracketed multi-line paste on Windows STILL coalesces and suppresses trailing Enter within 120ms!
+    let ui3 = tty.ui.clone();
+    let ask3 = tokio::spawn(async move { ui3.question("goon> ", None, true, QuestionOpts::default()).await });
+    tokio::time::sleep(Duration::from_millis(5)).await;
+
+    t += Duration::from_millis(200);
+    for ch in "first line\r\nsecond line\r\nthird line\r\nfourth line".chars() {
+        let code = match ch {
+            '\r' | '\n' => KeyCode::Enter,
+            c => KeyCode::Char(c),
+        };
+        tty.ui.handle_crossterm_key(KeyEvent::new(code, KeyModifiers::NONE), t, true);
+        t += Duration::from_millis(1);
+    }
+    assert!(!ask3.is_finished(), "multi-line paste newlines must never auto-submit");
+    let flush_at = t + Duration::from_millis(65);
+    tty.ui.flush_paste_burst_at(flush_at, true);
+    let composer_after_paste = draft(&tty);
+    assert!(composer_after_paste.contains("[Pasted text #1"), "got {composer_after_paste:?}");
+    ask3.abort();
+}
+
+#[tokio::test]
+async fn status_notice_renders_while_busy_clears_retry_on_stream_and_beats_attachments_when_idle() {
+    let tty = Tty::new(90, 24);
+    tty.ui.set_status("Running");
+    tty.ui.set_notice(Some("↻ HTTP 429 — retrying (1/3) in 2.0s"));
+    let busy_frame = tty.frame();
+    assert!(busy_frame.contains("↻ HTTP 429 — retrying (1/3) in 2.0s"), "busy frame must show retry notice:\n{busy_frame}");
+
+    tty.ui.set_transcript_overlay(true);
+    let overlay_frame = tty.frame();
+    assert!(overlay_frame.contains("↻ HTTP 429"), "transcript overlay must show retry notice:\n{overlay_frame}");
+    tty.ui.set_transcript_overlay(false);
+
+    // Streaming delta clears retry notice automatically
+    tty.ui.event(&serde_json::json!({ "type": "text", "text": "Recovered response" }));
+    let recovered_frame = tty.frame();
+    assert!(!recovered_frame.contains("↻ HTTP 429"), "streaming delta must clear retry notice:\n{recovered_frame}");
+
+    // Non-retry transient notice while busy renders and expires cleanly
+    tty.ui.set_notice(Some("Copied selection"));
+    assert!(tty.frame().contains("Copied selection"));
+    tty.ui.expire_busy_notice_for_test();
+    assert!(!tty.frame().contains("Copied selection"));
+
+    // Idle with attachment + notice: notice wins over "attached ... backspace removes"
+    tty.ui.set_status("Ready");
+    tty.ui.paste("alpha\nbeta\ngamma\ndelta\nepsilon");
+    assert!(tty.frame().contains("attached"));
+    tty.ui.set_notice(Some("Copied last answer"));
+    let idle_notice_frame = tty.frame();
+    assert!(idle_notice_frame.contains("Copied last answer"), "{idle_notice_frame}");
+    assert!(!idle_notice_frame.contains("backspace removes"), "{idle_notice_frame}");
+}
+
+#[tokio::test]
+async fn active_tool_elapsed_timer_renders_running_tool_seconds_and_clears_on_completion() {
+    let tty = Tty::new(96, 24);
+    tty.ui.set_status("Running");
+    tty.ui.event(&serde_json::json!({
+        "type": "tool",
+        "id": "call_bash_1",
+        "name": "bash",
+        "state": "start",
+        "meta": { "kind": "exec", "summary": "cargo test --locked" }
+    }));
+    tty.ui.backdate_active_tool_for_test("call_bash_1", 12_300);
+    let f1 = tty.frame();
+    assert!(f1.contains("Running bash (12s)"), "expected live tool timer in:\n{f1}");
+    assert!(f1.contains("cargo test --locked"), "expected tool summary in:\n{f1}");
+
+    tty.ui.event(&serde_json::json!({
+        "type": "tool",
+        "id": "call_read_2",
+        "name": "read_file",
+        "state": "start",
+        "meta": { "kind": "read", "summary": "src/main.rs" }
+    }));
+    let f2 = tty.frame();
+    assert!(f2.contains("(+1 more)"), "expected concurrent tool count in:\n{f2}");
+
+    tty.ui.event(&serde_json::json!({ "type": "tool", "id": "call_bash_1", "name": "bash", "state": "ok", "meta": { "kind": "exec", "summary": "cargo test --locked" } }));
+    tty.ui.event(&serde_json::json!({ "type": "tool", "id": "call_read_2", "name": "read_file", "state": "ok", "meta": { "kind": "read", "summary": "src/main.rs" } }));
+    assert!(tty.ui.state.lock().unwrap().active_tools.is_empty());
+    let f3 = tty.frame();
+    assert!(!f3.contains("Running bash ("), "{f3}");
+}
+
+#[tokio::test]
+async fn emergency_terminal_restore_resets_dec_modes_and_poisoned_mutex_still_restores() {
+    let mut alt_buf = Vec::new();
+    emergency_restore_terminal_to(&mut alt_buf, 0b111);
+    let alt_seq = String::from_utf8(alt_buf).unwrap();
+    for expected in ["\x1b[?2026l", "\x1b[?2004l", "\x1b[?1004l", "\x1b[?1006l", "\x1b[?1000l", "\x1b[?25h", "\x1b[?1049l"] {
+        assert!(alt_seq.contains(expected), "missing {expected:?} in {alt_seq:?}");
+    }
+
+    let mut inline_buf = Vec::new();
+    emergency_restore_terminal_to(&mut inline_buf, 0b101);
+    let inline_seq = String::from_utf8(inline_buf).unwrap();
+    assert!(inline_seq.contains("\x1b[?2004l") && inline_seq.contains("\x1b[?25h"));
+    assert!(!inline_seq.contains("\x1b[?1049l"), "inline mode must not emit ?1049l");
+
+    let tty = Tty::new(80, 24);
+    let ui_ref = tty.ui.clone();
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _guard = ui_ref.state.lock().unwrap();
+        panic!("simulated render panic while holding state lock");
+    }));
+    assert!(tty.ui.state.is_poisoned());
+    tty.ui.restore_terminal();
+    assert!(!tty.ui.is_closed());
+    let raw_out = tty.written();
+    assert!(raw_out.contains("\x1b[?2004l") && raw_out.contains("\x1b[?1049l"), "poisoned restore must still emit DEC reset sequences");
+}
+
+#[tokio::test]
+async fn theme_modes_no_color_ansi16_and_light_propagate_across_transcript_overlays_and_tables() {
+    let sgr_re = regex::Regex::new(r"\x1b\[[0-9;]*m").unwrap();
+    let tty = Tty::new(84, 24);
+    tty.ui.write(&format!(
+        "╭─ ◆ goon v0.3.16 ─╮\n│  model   claude-sonnet-4-5 │\n╰──────────────────╯\n\n{USER_MARK}Explain `Palette` and **NO_COLOR** with [spec](https://no-color.org)\n\n[answer]\n# Heading\n| Mode | SGR |\n| --- | --- |\n| None | zero |\n\n```rust\nlet x = 42;\n```\n"
+    ));
+    for i in 0..20 {
+        tty.ui.write(&format!("extra line {i}\n"));
+    }
+
+    // 1. ThemeMode::None (NO_COLOR): zero SGR sequences anywhere (normal, scrolled Follow, overlay, picker)
+    tty.ui.set_theme_mode(ThemeMode::None);
+    tty.frame();
+    let normal_none = tty.ui.rendered_frame();
+    assert!(!sgr_re.is_match(&normal_none), "ThemeMode::None leaked SGR in normal view:\n{normal_none:?}");
+
+    tty.ui.state.lock().unwrap().scroll = 5;
+    tty.frame();
+    let scrolled_none = tty.ui.rendered_frame();
+    assert!(scrolled_none.contains("Follow output"));
+    assert!(!sgr_re.is_match(&scrolled_none), "ThemeMode::None leaked SGR in Follow pill:\n{scrolled_none:?}");
+    tty.ui.state.lock().unwrap().scroll = 0;
+
+    tty.ui.set_transcript_overlay(true);
+    tty.frame();
+    let overlay_none = tty.ui.rendered_frame();
+    assert!(!sgr_re.is_match(&overlay_none), "ThemeMode::None leaked SGR in transcript overlay:\n{overlay_none:?}");
+    tty.ui.set_transcript_overlay(false);
+
+    // 2. ThemeMode::Ansi16: standard 16-color SGR present, zero 24-bit `38;2;` RGB sequences
+    tty.ui.set_theme_mode(ThemeMode::Ansi16);
+    tty.frame();
+    let ansi16_frame = tty.ui.rendered_frame();
+    assert!(sgr_re.is_match(&ansi16_frame));
+    assert!(!ansi16_frame.contains("38;2;"), "Ansi16 must never emit 24-bit RGB:\n{ansi16_frame:?}");
+
+    // 3. ThemeMode::Light: emits high-contrast Light palette RGB tokens
+    tty.ui.set_theme_mode(ThemeMode::Light);
+    tty.frame();
+    let light_frame = tty.ui.rendered_frame();
+    assert!(light_frame.contains("38;2;109;40;217m") || light_frame.contains("38;2;87;83;78m"), "Light theme must emit light palette tokens:\n{light_frame:?}");
+    assert!(!light_frame.contains("38;2;167;139;250m"), "Light theme must not emit Dark brand pastel");
+}
+
+#[tokio::test]
+async fn narrow_portrait_viewport_preserves_colors_clips_cleanly_and_shows_inline_slash_hint() {
+    let sgr_re = regex::Regex::new(r"\x1b\[[0-9;]*m").unwrap();
+    let tty = Tty::new(36, 18);
+    tty.ui.set_mode("plan");
+    tty.ui.write("\n[answer]\nShort **styled** answer on a 36-col mobile screen.\n");
+    tty.text("/mo");
+    tty.frame();
+    let raw = tty.ui.rendered_frame();
+    assert!(sgr_re.is_match(&raw), "36-col portrait terminal must preserve ANSI colors when NO_COLOR is unset:\n{raw:?}");
+    for (idx, line) in raw.lines().enumerate() {
+        let vis = visible_length(line);
+        assert!(vis <= 35, "row {idx} exceeded safe_cols=35 (vis={vis}): {:?}", crate::term::strip_vt(line));
+    }
+    let plain = crate::term::strip_vt(&raw);
+    assert!(plain.contains("› /model"), "compact viewport should show inline slash command hint:\n{plain}");
+    assert!(tty.written().contains("\x1b[?25h"), "compact viewport must show cursor while typing");
+
+    tty.ui.set_theme_mode(ThemeMode::None);
+    tty.frame();
+    let raw_no_color = tty.ui.rendered_frame();
+    assert!(!sgr_re.is_match(&raw_no_color), "36-col viewport with ThemeMode::None must emit zero SGR:\n{raw_no_color:?}");
+}

@@ -37,6 +37,207 @@ impl Theme {
     pub const DEL_FG: &'static str = ERR;
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThemeMode {
+    Dark,
+    Light,
+    Ansi16,
+    None,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Palette {
+    pub mode: ThemeMode,
+    pub reset: &'static str,
+    pub dim: &'static str,
+    pub bold: &'static str,
+    pub bold_off: &'static str,
+    pub italic: &'static str,
+    pub underline: &'static str,
+    pub underline_off: &'static str,
+    pub strike: &'static str,
+    pub strike_off: &'static str,
+    pub reverse: &'static str,
+    pub reverse_bold: &'static str,
+    pub default_fg: &'static str,
+    pub brand: &'static str,
+    pub brand_bold: &'static str,
+    pub info: &'static str,
+    pub ok: &'static str,
+    pub err: &'static str,
+    pub warn: &'static str,
+}
+
+impl Palette {
+    pub const DARK: Self = Self {
+        mode: ThemeMode::Dark,
+        reset: RESET,
+        dim: DIM,
+        bold: BOLD,
+        bold_off: "\x1b[22m",
+        italic: "\x1b[3m",
+        underline: "\x1b[4m",
+        underline_off: "\x1b[24m",
+        strike: "\x1b[9m",
+        strike_off: "\x1b[29m",
+        reverse: "\x1b[7m",
+        reverse_bold: "\x1b[7;1m",
+        default_fg: DEFAULT_FG,
+        brand: BRAND,
+        brand_bold: BRAND_BOLD,
+        info: INFO,
+        ok: OK,
+        err: ERR,
+        warn: WARN,
+    };
+
+    /// High-contrast WCAG AA (>= 4.5:1 on `#FFFFFF` and `#FDF6E3` Solarized Light) semantic tokens.
+    pub const LIGHT: Self = Self {
+        mode: ThemeMode::Light,
+        reset: RESET,
+        dim: "\x1b[38;2;87;83;78m",
+        bold: BOLD,
+        bold_off: "\x1b[22m",
+        italic: "\x1b[3m",
+        underline: "\x1b[4m",
+        underline_off: "\x1b[24m",
+        strike: "\x1b[9m",
+        strike_off: "\x1b[29m",
+        reverse: "\x1b[7m",
+        reverse_bold: "\x1b[7;1m",
+        default_fg: DEFAULT_FG,
+        brand: "\x1b[38;2;109;40;217m",
+        brand_bold: "\x1b[1m\x1b[38;2;109;40;217m",
+        info: "\x1b[38;2;3;105;161m",
+        ok: "\x1b[38;2;21;128;61m",
+        err: "\x1b[38;2;185;28;28m",
+        warn: "\x1b[38;2;180;83;9m",
+    };
+
+    /// Standard 16-color SGR palette (`31`..`36` + `1`/`2`) without `38;2;R;G;B` sequences.
+    pub const ANSI16: Self = Self {
+        mode: ThemeMode::Ansi16,
+        reset: RESET,
+        dim: DIM,
+        bold: BOLD,
+        bold_off: "\x1b[22m",
+        italic: "\x1b[3m",
+        underline: "\x1b[4m",
+        underline_off: "\x1b[24m",
+        strike: "\x1b[9m",
+        strike_off: "\x1b[29m",
+        reverse: "\x1b[7m",
+        reverse_bold: "\x1b[7;1m",
+        default_fg: DEFAULT_FG,
+        brand: "\x1b[35m",
+        brand_bold: "\x1b[1;35m",
+        info: "\x1b[36m",
+        ok: "\x1b[32m",
+        err: "\x1b[31m",
+        warn: "\x1b[33m",
+    };
+
+    /// Pure plain-text palette (`NO_COLOR`, `CLICOLOR=0`, `FORCE_COLOR=0`, `TERM=dumb`, `GOON_THEME=none`).
+    pub const NONE: Self = Self {
+        mode: ThemeMode::None,
+        reset: "",
+        dim: "",
+        bold: "",
+        bold_off: "",
+        italic: "",
+        underline: "",
+        underline_off: "",
+        strike: "",
+        strike_off: "",
+        reverse: "",
+        reverse_bold: "",
+        default_fg: "",
+        brand: "",
+        brand_bold: "",
+        info: "",
+        ok: "",
+        err: "",
+        warn: "",
+    };
+
+    pub const fn for_mode(mode: ThemeMode) -> Self {
+        match mode {
+            ThemeMode::Dark => Self::DARK,
+            ThemeMode::Light => Self::LIGHT,
+            ThemeMode::Ansi16 => Self::ANSI16,
+            ThemeMode::None => Self::NONE,
+        }
+    }
+
+    pub const fn is_styled(&self) -> bool {
+        !matches!(self.mode, ThemeMode::None)
+    }
+}
+
+/// Resolves terminal color/theme capability from standard environment variables (`NO_COLOR`,
+/// `FORCE_COLOR`, `CLICOLOR`, `TERM`, `COLORTERM`, `COLORFGBG`, `GOON_THEME`).
+pub fn resolve_theme_mode(get_env: impl Fn(&str) -> Option<String>) -> ThemeMode {
+    let goon_theme = get_env("GOON_THEME").unwrap_or_default().trim().to_ascii_lowercase();
+    if matches!(goon_theme.as_str(), "none" | "mono" | "off" | "no-color" | "nocolor") {
+        return ThemeMode::None;
+    }
+    if get_env("NO_COLOR").is_some_and(|v| !v.is_empty()) {
+        return ThemeMode::None;
+    }
+    let force_raw = get_env("FORCE_COLOR").unwrap_or_default().trim().to_ascii_lowercase();
+    if matches!(force_raw.as_str(), "0" | "false") {
+        return ThemeMode::None;
+    }
+    let forced_ansi16 = force_raw == "1";
+    let forced = forced_ansi16 || matches!(force_raw.as_str(), "2" | "3" | "true");
+
+    if !forced {
+        let clicolor_force = get_env("CLICOLOR_FORCE").unwrap_or_default();
+        let clicolor_forced = !clicolor_force.trim().is_empty() && clicolor_force.trim() != "0";
+        if !clicolor_forced && get_env("CLICOLOR").is_some_and(|v| v.trim() == "0") {
+            return ThemeMode::None;
+        }
+        if get_env("TERM").is_some_and(|t| t.trim().eq_ignore_ascii_case("dumb")) {
+            return ThemeMode::None;
+        }
+    }
+
+    match goon_theme.as_str() {
+        "ansi" | "ansi16" | "16" => return ThemeMode::Ansi16,
+        "light" => return if forced_ansi16 { ThemeMode::Ansi16 } else { ThemeMode::Light },
+        "dark" => return if forced_ansi16 { ThemeMode::Ansi16 } else { ThemeMode::Dark },
+        _ => {}
+    }
+
+    if forced_ansi16 {
+        return ThemeMode::Ansi16;
+    }
+
+    let colorterm = get_env("COLORTERM").unwrap_or_default().to_ascii_lowercase();
+    let has_truecolor_hint = colorterm.contains("truecolor") || colorterm.contains("24bit");
+    let term = get_env("TERM").unwrap_or_default().trim().to_ascii_lowercase();
+    let is_legacy_16 = matches!(term.as_str(), "linux" | "ansi" | "vt100" | "vt102" | "vt220" | "cons25" | "rxvt" | "eterm-color") || term.ends_with("-16color");
+    if !has_truecolor_hint && !forced && is_legacy_16 {
+        return ThemeMode::Ansi16;
+    }
+
+    if let Some(fgbg) = get_env("COLORFGBG") {
+        if let Some(bg_part) = fgbg.rsplit(';').next() {
+            if let Ok(bg) = bg_part.trim().parse::<u8>() {
+                if matches!(bg, 7 | 15 | 230 | 231 | 249..=255) {
+                    return ThemeMode::Light;
+                }
+            }
+        }
+    }
+
+    ThemeMode::Dark
+}
+
+pub fn detect_env_theme_mode() -> ThemeMode {
+    resolve_theme_mode(|k| std::env::var(k).ok())
+}
+
 /// Width of a standalone code point. Layout must measure complete graphemes instead.
 pub fn width(c: char) -> usize {
     UnicodeWidthChar::width(c).unwrap_or(0)
@@ -80,6 +281,14 @@ pub fn slice_visible(text: &str, max_cols: usize) -> String {
         used += w;
     }
     out
+}
+
+/// Clips a line to `cols` visible columns, omitting trailing SGR reset when styling is disabled.
+pub fn clip_line(line: &str, cols: usize, styled: bool) -> String {
+    if !styled {
+        return slice_visible(&strip_vt(line), cols);
+    }
+    slice_ansi_line(line, cols)
 }
 
 /// Clips a line containing SGR sequences to `cols` visible columns, keeping the styles.
@@ -132,14 +341,26 @@ pub fn pad_end_visible(text: &str, cols: usize) -> String {
     format!("{sliced}{}", " ".repeat(cols.saturating_sub(vis)))
 }
 
+/// Palette-aware inline Markdown (**bold**, `code`, [label](url), ~~strike~~) and attachment pills.
+pub fn format_inline_markdown_with(raw: &str, base: &str, p: &Palette) -> String {
+    if !p.is_styled() {
+        let mut out = re!(r"`([^`\n]+)`").replace_all(raw, "${1}").to_string();
+        out = re!(r"\[([^\]]+)\]\(([^)]+)\)").replace_all(&out, "${1} (${2})").to_string();
+        out = re!(r"\*\*([^*]+)\*\*").replace_all(&out, "${1}").to_string();
+        out = re!(r"~~([^~]+)~~").replace_all(&out, "${1}").to_string();
+        return out;
+    }
+    let mut out = re!(r"(\[(?:Image #\d+|Pasted text #\d+)[^\]]*\])").replace_all(raw, format!("{}${{1}}{base}", p.brand_bold).as_str()).to_string();
+    out = re!(r"`([^`\n]+)`").replace_all(&out, format!("{}${{1}}{base}", p.info).as_str()).to_string();
+    out = re!(r"\[([^\]]+)\]\(([^)]+)\)").replace_all(&out, format!("{}{}${{1}}{}{} (${{2}}){base}", p.underline, p.info, p.underline_off, p.dim).as_str()).to_string();
+    out = re!(r"\*\*([^*]+)\*\*").replace_all(&out, format!("{}${{1}}{}{base}", p.bold, p.bold_off).as_str()).to_string();
+    out = re!(r"~~([^~]+)~~").replace_all(&out, format!("{}${{1}}{}{base}", p.strike, p.strike_off).as_str()).to_string();
+    out
+}
+
 /// Inline Markdown (**bold**, `code`, [label](url), ~~strike~~) and attachment pills → ANSI.
 pub fn format_inline_markdown(raw: &str, base: &str) -> String {
-    let mut out = re!(r"(\[(?:Image #\d+|Pasted text #\d+)[^\]]*\])").replace_all(raw, format!("{BRAND_BOLD}${{1}}{base}").as_str()).to_string();
-    out = re!(r"`([^`\n]+)`").replace_all(&out, format!("{INFO}${{1}}{base}").as_str()).to_string();
-    out = re!(r"\[([^\]]+)\]\(([^)]+)\)").replace_all(&out, format!("\x1b[4m{INFO}${{1}}\x1b[24m{DIM} (${{2}}){base}").as_str()).to_string();
-    out = re!(r"\*\*([^*]+)\*\*").replace_all(&out, format!("\x1b[1m${{1}}\x1b[22m{base}").as_str()).to_string();
-    out = re!(r"~~([^~]+)~~").replace_all(&out, format!("\x1b[9m${{1}}\x1b[29m{base}").as_str()).to_string();
-    out
+    format_inline_markdown_with(raw, base, &Palette::DARK)
 }
 
 pub fn format_inline_markdown_default(raw: &str) -> String {
@@ -190,11 +411,18 @@ pub(super) fn wrap_ranges(clean: &str, first: usize, cont: usize, words: bool) -
     out
 }
 
-/// Slice styled text by bytes in its plain projection, replaying prior SGR state.
-pub(super) fn styled_range(text: &str, range: std::ops::Range<usize>) -> String {
+/// Palette-aware slice of styled text by bytes in its plain projection, replaying prior SGR state.
+pub(super) fn styled_range_with(text: &str, range: std::ops::Range<usize>, p: &Palette) -> String {
+    if !p.is_styled() {
+        let plain = strip_vt(text);
+        let start = range.start.min(plain.len());
+        let end = range.end.min(plain.len()).max(start);
+        return plain[start..end].to_string();
+    }
     let mut output = String::new();
     let mut offset = 0;
     let mut last = 0;
+    let mut saw_sgr = false;
     for sgr in re!(r"\x1b\[[0-9;]*m").find_iter(text) {
         let part = &text[last..sgr.start()];
         let start = range.start.saturating_sub(offset).min(part.len());
@@ -204,10 +432,13 @@ pub(super) fn styled_range(text: &str, range: std::ops::Range<usize>) -> String 
         }
         offset += part.len();
         if offset >= range.end {
-            output.push_str(RESET);
+            if saw_sgr {
+                output.push_str(p.reset);
+            }
             return output;
         }
         output.push_str(sgr.as_str());
+        saw_sgr = true;
         last = sgr.end();
     }
     let part = &text[last..];
@@ -216,8 +447,16 @@ pub(super) fn styled_range(text: &str, range: std::ops::Range<usize>) -> String 
     if start < end {
         output.push_str(&part[start..end]);
     }
-    output.push_str(RESET);
+    if saw_sgr {
+        output.push_str(p.reset);
+    }
     output
+}
+
+#[allow(dead_code)]
+/// Slice styled text by bytes in its plain projection, replaying prior SGR state.
+pub(super) fn styled_range(text: &str, range: std::ops::Range<usize>) -> String {
+    styled_range_with(text, range, &Palette::DARK)
 }
 
 pub fn format_token_count(n: f64) -> String {
@@ -228,7 +467,7 @@ pub fn format_token_count(n: f64) -> String {
     }
     let trim = |s: String| s.strip_suffix(".0").map(str::to_string).unwrap_or(s);
     if n < 1_000_000.0 {
-        return format!("{}k", trim(crate::jsutil::to_fixed(n / 1000.0, if n < 10_000.0 { 1 } else { 0 })));
+        return format!("{}k", trim(crate::jsutil::to_fixed(n / 1000.0, if n < 10_00.0 * 10.0 { 1 } else { 0 })));
     }
     format!("{}M", trim(crate::jsutil::to_fixed(n / 1_000_000.0, 1)))
 }
@@ -338,31 +577,39 @@ pub fn format_compact_diff(diff: &str, max_lines: usize) -> Vec<String> {
     out
 }
 
-/// Paints welcome-banner / panel box rows: faint frame, brand mark, faint labels, bright values.
-pub fn style_box_line(line: &str) -> String {
+/// Palette-aware welcome-banner / panel box rows.
+pub fn style_box_line_with(line: &str, p: &Palette) -> String {
+    if !p.is_styled() {
+        return line.to_string();
+    }
     if line.starts_with('╭') || line.starts_with('╰') {
-        let inner = re!(r"[^─╭╮╰╯]+").replace_all(line, format!("{RESET}{BRAND_BOLD}${{0}}{RESET}{DIM}").as_str());
-        return format!("{DIM}{inner}{RESET}");
+        let inner = re!(r"[^─╭╮╰╯]+").replace_all(line, format!("{}{}${{0}}{}{}", p.reset, p.brand_bold, p.reset, p.dim).as_str());
+        return format!("{}{inner}{}", p.dim, p.reset);
     }
     let Some(m) = re!(r"^│(.*?)(│?)$").captures(line) else { return line.to_string() };
     let content = m.get(1).map(|x| x.as_str()).unwrap_or("");
-    let close = if m.get(2).map(|x| !x.as_str().is_empty()).unwrap_or(false) { format!("{DIM}│{RESET}") } else { String::new() };
+    let close = if m.get(2).map(|x| !x.as_str().is_empty()).unwrap_or(false) { format!("{}│{}", p.dim, p.reset) } else { String::new() };
     let styled = if let Some(t) = re!(r"^(\s*)(◆ goon)(\s+)(v\S+)(\s+)(.*?)(\s*)$").captures(content) {
-        format!("{}{BRAND_BOLD}{}{RESET}{}{DIM}{}{RESET}{}{DIM}{}{RESET}{}", &t[1], &t[2], &t[3], &t[4], &t[5], &t[6], &t[7])
+        format!("{}{}{}{}{}{}{}{}{}{}{}{}{}", &t[1], p.brand_bold, &t[2], p.reset, &t[3], p.dim, &t[4], p.reset, &t[5], p.dim, &t[6], p.reset, &t[7])
     } else if let Some(f) = re!(r"^(\s{2,4})([a-z]+)(\s{2,})(.*)$").captures(content) {
-        format!("{}{DIM}{}{RESET}{}{DEFAULT_FG}{}{RESET}", &f[1], &f[2], &f[3], &f[4])
+        format!("{}{}{}{}{}{}{}{}", &f[1], p.dim, &f[2], p.reset, &f[3], p.default_fg, &f[4], p.reset)
     } else {
         let tokens = re!(r"(/help|shift\+tab|[@$!] )").replace_all(content, |c: &regex::Captures| {
             let tok = &c[1];
             if tok.ends_with(' ') && tok.len() == 2 {
-                format!("{RESET}{INFO}{}{RESET}{DIM} ", &tok[..1])
+                format!("{}{}{}{}{} ", p.reset, p.info, &tok[..1], p.reset, p.dim)
             } else {
-                format!("{RESET}{INFO}{tok}{RESET}{DIM}")
+                format!("{}{}{tok}{}{}", p.reset, p.info, p.reset, p.dim)
             }
         });
-        format!("{DIM}{tokens}{RESET}")
+        format!("{}{tokens}{}", p.dim, p.reset)
     };
-    format!("{DIM}│{RESET}{styled}{close}")
+    format!("{}│{}{styled}{close}", p.dim, p.reset)
+}
+
+/// Paints welcome-banner / panel box rows: faint frame, brand mark, faint labels, bright values.
+pub fn style_box_line(line: &str) -> String {
+    style_box_line_with(line, &Palette::DARK)
 }
 
 pub fn basename(path: &str) -> String {
@@ -372,6 +619,79 @@ pub fn basename(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn env_from(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: std::collections::HashMap<String, String> = pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        move |k: &str| map.get(k).cloned()
+    }
+
+    fn parse_rgb(sgr: &str) -> (u8, u8, u8) {
+        let c = re!(r"38;2;(\d+);(\d+);(\d+)m").captures(sgr).expect("24-bit RGB SGR");
+        (c[1].parse().unwrap(), c[2].parse().unwrap(), c[3].parse().unwrap())
+    }
+
+    fn rel_luminance((r, g, b): (u8, u8, u8)) -> f64 {
+        let chan = |v: u8| {
+            let s = v as f64 / 255.0;
+            if s <= 0.03928 {
+                s / 12.92
+            } else {
+                ((s + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * chan(r) + 0.7152 * chan(g) + 0.0722 * chan(b)
+    }
+
+    fn contrast_ratio(a: (u8, u8, u8), b: (u8, u8, u8)) -> f64 {
+        let (la, lb) = (rel_luminance(a), rel_luminance(b));
+        let (lighter, darker) = if la >= lb { (la, lb) } else { (lb, la) };
+        (lighter + 0.05) / (darker + 0.05)
+    }
+
+    #[test]
+    fn theme_mode_precedence_respects_no_color_force_color_term_and_colorfgbg() {
+        assert_eq!(resolve_theme_mode(env_from(&[("NO_COLOR", "1"), ("COLORTERM", "truecolor"), ("FORCE_COLOR", "3")])), ThemeMode::None);
+        assert_eq!(resolve_theme_mode(env_from(&[("NO_COLOR", ""), ("TERM", "xterm-256color")])), ThemeMode::Dark);
+        assert_eq!(resolve_theme_mode(env_from(&[("CLICOLOR", "0"), ("TERM", "xterm-256color")])), ThemeMode::None);
+        assert_eq!(resolve_theme_mode(env_from(&[("CLICOLOR", "0"), ("CLICOLOR_FORCE", "1"), ("TERM", "xterm-256color")])), ThemeMode::Dark);
+        assert_eq!(resolve_theme_mode(env_from(&[("FORCE_COLOR", "0"), ("TERM", "xterm-256color")])), ThemeMode::None);
+        assert_eq!(resolve_theme_mode(env_from(&[("FORCE_COLOR", "1"), ("TERM", "xterm-256color")])), ThemeMode::Ansi16);
+        assert_eq!(resolve_theme_mode(env_from(&[("TERM", "dumb")])), ThemeMode::None);
+        assert_eq!(resolve_theme_mode(env_from(&[("TERM", "dumb"), ("FORCE_COLOR", "2")])), ThemeMode::Dark);
+        assert_eq!(resolve_theme_mode(env_from(&[("TERM", "linux")])), ThemeMode::Ansi16);
+        assert_eq!(resolve_theme_mode(env_from(&[("TERM", "vt100")])), ThemeMode::Ansi16);
+        assert_eq!(resolve_theme_mode(env_from(&[("TERM", "xterm-16color")])), ThemeMode::Ansi16);
+        assert_eq!(resolve_theme_mode(env_from(&[("TERM", "linux"), ("COLORTERM", "truecolor")])), ThemeMode::Dark);
+        for capable in ["", "xterm", "xterm-256color", "screen", "tmux", "tmux-256color"] {
+            assert_eq!(resolve_theme_mode(env_from(&[("TERM", capable)])), ThemeMode::Dark, "{capable:?}");
+        }
+        assert_eq!(resolve_theme_mode(env_from(&[("COLORFGBG", "0;15")])), ThemeMode::Light);
+        assert_eq!(resolve_theme_mode(env_from(&[("COLORFGBG", "12;default;7")])), ThemeMode::Light);
+        assert_eq!(resolve_theme_mode(env_from(&[("COLORFGBG", "15;0")])), ThemeMode::Dark);
+        assert_eq!(resolve_theme_mode(env_from(&[("COLORFGBG", "15;234")])), ThemeMode::Dark);
+        assert_eq!(resolve_theme_mode(env_from(&[("COLORFGBG", "0;15"), ("GOON_THEME", "dark")])), ThemeMode::Dark);
+        assert_eq!(resolve_theme_mode(env_from(&[("GOON_THEME", "light")])), ThemeMode::Light);
+        assert_eq!(resolve_theme_mode(env_from(&[("GOON_THEME", "ansi16")])), ThemeMode::Ansi16);
+        assert_eq!(resolve_theme_mode(env_from(&[("GOON_THEME", "none")])), ThemeMode::None);
+    }
+
+    #[test]
+    fn light_palette_meets_wcag_aa_contrast_and_ansi16_none_avoid_disallowed_sgr() {
+        for bg in [(255, 255, 255), (253, 246, 227)] {
+            for (name, token) in
+                [("dim", Palette::LIGHT.dim), ("brand", Palette::LIGHT.brand), ("info", Palette::LIGHT.info), ("ok", Palette::LIGHT.ok), ("err", Palette::LIGHT.err), ("warn", Palette::LIGHT.warn)]
+            {
+                let ratio = contrast_ratio(parse_rgb(token), bg);
+                assert!(ratio >= 4.5, "{name} on {bg:?} had contrast {ratio:.2} < 4.5");
+            }
+        }
+        for token in [Palette::ANSI16.brand, Palette::ANSI16.brand_bold, Palette::ANSI16.info, Palette::ANSI16.ok, Palette::ANSI16.err, Palette::ANSI16.warn] {
+            assert!(!token.contains("38;2;"), "Ansi16 must not emit 24-bit RGB: {token:?}");
+        }
+        let plain_md = format_inline_markdown_with("**bold** `code` [x](https://e.co) ~~old~~ [Image #1]", "", &Palette::NONE);
+        assert!(!plain_md.contains("\x1b["), "{plain_md:?}");
+        assert_eq!(plain_md, "bold code x (https://e.co) old [Image #1]");
+    }
 
     #[test]
     fn emoji_and_combining_graphemes_are_measured_wrapped_and_clipped_atomically() {

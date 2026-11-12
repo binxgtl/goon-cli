@@ -45,6 +45,9 @@ impl Tui {
             } else {
                 self.write_raw("\x1b[?1049l");
             }
+            if self.real_terminal {
+                super::set_panic_terminal_state(false, false);
+            }
         }
         let mut guard = ResumeGuard { tui: self, error: None };
         let result = if self.real_terminal { crossterm::terminal::disable_raw_mode().and_then(|()| stop()) } else { stop() };
@@ -60,13 +63,14 @@ struct ResumeGuard<'a> {
 impl Drop for ResumeGuard<'_> {
     fn drop(&mut self) {
         let tui = self.tui;
-        let mut st = tui.state.lock().unwrap();
+        let mut st = tui.state.lock().unwrap_or_else(|e| e.into_inner());
         if st.closed {
             // Modes/screen were already yielded. The shell may have written or
             // moved its cursor since then; a second native.finish() would touch
             // output that is no longer ours. Only restore the raw-mode cache.
             if tui.real_terminal {
                 let _ = crossterm::terminal::disable_raw_mode();
+                super::set_panic_terminal_state(false, false);
             }
             st.input_yielded = false;
             st.terminal_restored = true;
@@ -77,6 +81,8 @@ impl Drop for ResumeGuard<'_> {
             let _ = crossterm::terminal::disable_raw_mode();
             if let Err(error) = crossterm::terminal::enable_raw_mode() {
                 self.error = Some(error);
+            } else {
+                super::set_panic_terminal_state(true, st.native.is_none());
             }
             unsafe {
                 libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH);
