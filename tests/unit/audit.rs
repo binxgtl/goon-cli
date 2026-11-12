@@ -182,6 +182,46 @@ fn bash_prefix_approvals_only_cover_simple_commands() {
 }
 
 #[test]
+fn bash_prefix_approvals_reject_flag_collapsing_launcher_flags_and_risky_extra_args() {
+    for cmd in ["npm --silent test", "npm --prefix sub test", "yarn --cwd sub test", "cargo --locked test", "npm run --silent build", "python3.12 -c pass", "fd pattern", "ash -c ls", "nsenter ls"] {
+        assert_eq!(prefix(cmd), None, "{cmd}");
+    }
+
+    let make_set: BTreeSet<String> = ["make".to_string(), "make test".to_string(), "npx tsc".to_string()].into_iter().collect();
+    assert!(approved("make", &make_set));
+    assert!(approved("make test", &make_set));
+    assert!(approved("npx tsc", &make_set));
+    for cmd in ["make deploy", "make test -f evil.mk", "make test SHELL=/bin/sh", "npx tsc --package=evil"] {
+        assert!(!approved(cmd, &make_set), "{cmd}");
+    }
+
+    let rg_set: BTreeSet<String> = [prefix("rg foo").unwrap()].into_iter().collect();
+    assert!(approved("rg foo src", &rg_set));
+    assert!(!approved("rg foo --pre=sh", &rg_set));
+    assert!(!approved("rg foo --pre sh", &rg_set));
+
+    let sed_set: BTreeSet<String> = [prefix("sed s/a/b/").unwrap()].into_iter().collect();
+    assert!(approved("sed s/a/b/ file.txt", &sed_set));
+    assert!(!approved("sed s/a/b/ -i file.txt", &sed_set));
+    assert!(!approved("sed s/a/b/e file.txt", &sed_set));
+
+    let node_set: BTreeSet<String> = [prefix("node app.js").unwrap()].into_iter().collect();
+    assert!(approved("node app.js --watch", &node_set));
+    for cmd in ["node app.js --import ./evil.mjs", "node app.js -r ./evil.cjs", "node app.js --env-file=.env", "node app.js -e process.exit(1)"] {
+        assert!(!approved(cmd, &node_set), "{cmd}");
+    }
+
+    let awk_set: BTreeSet<String> = [prefix("awk 1").unwrap()].into_iter().collect();
+    assert!(approved("awk 1 file.txt", &awk_set));
+    assert!(!approved("awk 1 cmd=evil file.txt", &awk_set));
+
+    let tar_set: BTreeSet<String> = [prefix("tar xzf archive.tgz").unwrap()].into_iter().collect();
+    assert!(approved("tar xzf other.tgz", &tar_set));
+    assert!(!approved("tar xzf archive.tgz --checkpoint-action=exec=sh", &tar_set));
+    assert!(!approved("tar xzf archive.tgz -P", &tar_set));
+}
+
+#[test]
 fn images_cost_a_flat_estimate_and_legacy_sessions_are_repaired() {
     use base64::Engine;
     let big = vec![7u8; 400_000];

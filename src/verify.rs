@@ -292,6 +292,13 @@ fn npm_invocation(root: &Path, args: &[&str]) -> (String, Vec<String>) {
             return (node_executable(), std::iter::once(execpath).chain(args).collect());
         }
     }
+    if crate::process::which("npm").is_some() {
+        if cfg!(windows) {
+            let comspec = std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".into());
+            return (comspec, ["/d", "/s", "/c", "npm"].iter().map(|s| s.to_string()).chain(args).collect());
+        }
+        return ("npm".into(), args);
+    }
     let local = root.join("node_modules/npm/bin/npm-cli.js");
     if local.exists() {
         return (node_executable(), std::iter::once(local.to_string_lossy().to_string()).chain(args).collect());
@@ -310,15 +317,36 @@ fn package_script(root: &Path, name: &str) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
-fn npm_command(root: &Path, stage: &str, script: &str) -> VerifyCommand {
-    let (command, args) = npm_invocation(root, &["run", script]);
-    VerifyCommand { stage: stage.into(), command, args, display: format!("npm run {script}") }
+fn package_script_hooks(root: &Path, name: &str) -> Vec<(String, String)> {
+    let Ok(text) = std::fs::read_to_string(root.join("package.json")) else { return vec![] };
+    let Ok(parsed) = serde_json::from_str::<Value>(&text) else { return vec![] };
+    let Some(scripts) = parsed.get("scripts").and_then(Value::as_object) else { return vec![] };
+    let mut out = vec![];
+    for key in [format!("pre{name}"), name.to_string(), format!("post{name}")] {
+        if let Some(body) = scripts.get(&key).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) {
+            out.push((key, body.to_string()));
+        }
+    }
+    out
 }
 
-fn local_command(tool: (String, Vec<String>), logical: &str, args: &[String], stage: &str) -> VerifyCommand {
+fn npm_command(root: &Path, stage: &str, script: &str) -> VerifyCommand {
+    let (command, args) = npm_invocation(root, &["run", script]);
+    let local_npm = root.join("node_modules/npm/bin/npm-cli.js");
+    let runner_label = if args.first().is_some_and(|a| Path::new(a) == local_npm) { format!("node {} run {script}", args[0]) } else { format!("npm run {script}") };
+    let hooks = package_script_hooks(root, script);
+    let display = match hooks.as_slice() {
+        [] => runner_label,
+        [(k, body)] if k == script => format!("{runner_label} ({body})"),
+        _ => format!("{runner_label} ({})", hooks.iter().map(|(k, v)| format!("{k}: {v}")).collect::<Vec<_>>().join("; ")),
+    };
+    VerifyCommand { stage: stage.into(), command, args, display }
+}
+
+fn local_command(tool: (String, Vec<String>), _logical: &str, args: &[String], stage: &str) -> VerifyCommand {
     let mut all = tool.1;
     all.extend(args.iter().cloned());
-    let display = std::iter::once(logical.to_string()).chain(args.iter().cloned()).collect::<Vec<_>>().join(" ");
+    let display = std::iter::once("node".to_string()).chain(all.iter().cloned()).collect::<Vec<_>>().join(" ");
     VerifyCommand { stage: stage.into(), command: tool.0, args: all, display }
 }
 
@@ -338,17 +366,15 @@ fn node_commands(root: &Path, files: &[String], policy: &VerifyPolicy) -> Vec<Ve
             out.push(npm_command(root, "format", "format:check"));
         } else if let Some(prettier) = resolve_local_tool(root, "prettier") {
             if !files.is_empty() {
-                let mut args = s(&["--check"]);
-                args.extend(files.iter().cloned());
-                out.push(local_command(prettier, "prettier", &args, "format"));
+                out.push(local_command(prettier, "prettier", &with_files(&["--check", "--"], files), "format"));
             }
         }
         if package_script(root, "lint").is_some() {
             out.push(npm_command(root, "lint", "lint"));
         } else if let (Some(eslint), false) = (resolve_local_tool(root, "eslint"), files.is_empty()) {
-            out.push(local_command(eslint, "eslint", files, "lint"));
+            out.push(local_command(eslint, "eslint", &with_files(&["--"], files), "lint"));
         } else if let (Some(oxlint), false) = (resolve_local_tool(root, "oxlint"), files.is_empty()) {
-            out.push(local_command(oxlint, "oxlint", files, "lint"));
+            out.push(local_command(oxlint, "oxlint", &with_files(&["--"], files), "lint"));
         }
     }
     if policy.require_typecheck {
@@ -387,11 +413,11 @@ fn with_files(base: &[&str], files: &[String]) -> Vec<String> {
 fn python_commands(files: &[String], policy: &VerifyPolicy) -> Vec<VerifyCommand> {
     let mut out = vec![];
     if policy.require_lint && !files.is_empty() {
-        out.push(bare_command("black", &with_files(&["--check"], files), "format"));
-        out.push(bare_command("ruff", &with_files(&["check"], files), "lint"));
+        out.push(bare_command("black", &with_files(&["--check", "--"], files), "format"));
+        out.push(bare_command("ruff", &with_files(&["check", "--"], files), "lint"));
     }
     if policy.require_typecheck && !files.is_empty() {
-        out.push(bare_command("mypy", files, "typecheck"));
+        out.push(bare_command("mypy", &with_files(&["--"], files), "typecheck"));
     }
     if policy.require_tests {
         out.push(bare_command("pytest", &[], "test"));
@@ -402,7 +428,7 @@ fn python_commands(files: &[String], policy: &VerifyPolicy) -> Vec<VerifyCommand
 fn rust_commands(files: &[String], policy: &VerifyPolicy) -> Vec<VerifyCommand> {
     let mut out = vec![];
     if policy.require_lint && !files.is_empty() {
-        out.push(bare_command("rustfmt", &with_files(&["--check"], files), "format"));
+        out.push(bare_command("rustfmt", &with_files(&["--check", "--"], files), "format"));
         out.push(bare_command("cargo", &s(&["clippy", "--offline"]), "lint"));
     }
     if policy.require_typecheck {
@@ -418,7 +444,7 @@ fn rust_commands(files: &[String], policy: &VerifyPolicy) -> Vec<VerifyCommand> 
 fn go_commands(files: &[String], policy: &VerifyPolicy) -> Vec<VerifyCommand> {
     let mut out = vec![];
     if policy.require_lint && !files.is_empty() {
-        out.push(bare_command("gofmt", &with_files(&["-l"], files), "format"));
+        out.push(bare_command("gofmt", &with_files(&["-l", "--"], files), "format"));
     }
     if policy.require_lint {
         out.push(bare_command("go", &s(&["vet", "./..."]), "lint"));
@@ -489,14 +515,99 @@ pub struct VerifyPlanAssessment {
     pub denied: Option<String>,
 }
 
-/// Verification commands are shell commands too: they get the same critical-risk and network
-/// policy gates as the bash tool, and their risk is passed to the approval callback.
+fn extract_npm_script_from_args(args: &[String]) -> Option<String> {
+    let first = args.first()?.as_str();
+    if first == "run" || first == "run-script" {
+        return args.get(1).filter(|s| !s.starts_with('-')).cloned();
+    }
+    if first == "test" || first == "t" {
+        return Some("test".into());
+    }
+    None
+}
+
+fn referenced_npm_script(command: &VerifyCommand) -> Option<String> {
+    let base = crate::risk::base_name(&command.command);
+    if base == "npm" {
+        return extract_npm_script_from_args(&command.args);
+    }
+    if (base == "node" || base == "nodejs") && !command.args.is_empty() {
+        let first_norm = command.args[0].replace('\\', "/");
+        if first_norm.ends_with("/npm-cli.js") || first_norm == "npm-cli.js" {
+            return extract_npm_script_from_args(&command.args[1..]);
+        }
+    }
+    if base == "cmd" && command.args.len() >= 5 && command.args[3].eq_ignore_ascii_case("npm") {
+        return extract_npm_script_from_args(&command.args[4..]);
+    }
+    if base == "bash" && command.args.len() == 2 && command.args[0] == "-c" {
+        let tokens = crate::risk::tokenize(&command.args[1]);
+        if tokens.first().is_some_and(|t| crate::risk::base_name(t) == "npm") {
+            return extract_npm_script_from_args(&tokens[1..]);
+        }
+    }
+    None
+}
+
+fn is_workspace_node_modules_path(raw: &str, projects: &[VerifyProject], system_npm_execpath: Option<&Path>) -> bool {
+    let path = Path::new(raw);
+    if let Some(sys) = system_npm_execpath {
+        if path == sys {
+            return false;
+        }
+    }
+    let norm = raw.replace('\\', "/");
+    if norm.starts_with("node_modules/") || norm.starts_with("./node_modules/") {
+        return true;
+    }
+    for project in projects {
+        if path.starts_with(project.root.join("node_modules")) {
+            return true;
+        }
+    }
+    projects.is_empty() && path.components().any(|c| c.as_os_str() == "node_modules")
+}
+
+fn uses_workspace_node_modules(command: &VerifyCommand, projects: &[VerifyProject]) -> bool {
+    let sys_exec = std::env::var("npm_execpath").ok().map(PathBuf::from);
+    let sys_ref = sys_exec.as_deref();
+    is_workspace_node_modules_path(&command.command, projects, sys_ref) || command.args.iter().take_while(|a| a.as_str() != "--").any(|a| is_workspace_node_modules_path(a, projects, sys_ref))
+}
+
 pub fn assess_verify_plan(plan: &VerifyPlan, policy: Option<&ExecutionPolicy>) -> VerifyPlanAssessment {
     let unrestricted = policy.map(|p| p.is_unrestricted()).unwrap_or(false);
     let mut risk = RiskClass::Low;
     for command in &plan.commands {
         let line = verify_command_line(command);
-        let command_risk = classify_bash_risk(&line);
+        let mut command_risk = classify_bash_risk(&line);
+        if uses_workspace_node_modules(command, &plan.projects) {
+            command_risk = command_risk.max(RiskClass::Medium);
+        }
+        if let Some(script_name) = referenced_npm_script(command) {
+            for project in &plan.projects {
+                if !project.root.join("package.json").exists() {
+                    continue;
+                }
+                command_risk = command_risk.max(RiskClass::Medium);
+                for (_, hook_body) in package_script_hooks(&project.root, &script_name) {
+                    let hook_risk = classify_bash_risk(&hook_body);
+                    command_risk = command_risk.max(hook_risk);
+                    if hook_risk == RiskClass::Critical && !unrestricted {
+                        return VerifyPlanAssessment { risk: RiskClass::Critical, denied: Some(format!("verification command is critical risk and cannot run: {}", command.display)) };
+                    }
+                    if !unrestricted {
+                        if let Some(policy) = policy {
+                            if !is_network_allowed_for_command(policy, &hook_body) {
+                                return VerifyPlanAssessment {
+                                    risk: risk.max(command_risk),
+                                    denied: Some(format!("verification command needs network access blocked by the execution policy: {}", command.display)),
+                                };
+                            }
+                        }
+                    }
+                }
+            }
+        }
         risk = risk.max(command_risk);
         if command_risk == RiskClass::Critical && !unrestricted {
             return VerifyPlanAssessment { risk: RiskClass::Critical, denied: Some(format!("verification command is critical risk and cannot run: {}", command.display)) };
@@ -905,7 +1016,7 @@ mod tests {
         let policy = VerifyPolicy { require_tests: true, require_lint: true, ..VerifyPolicy::default() };
         let plan = plan_verification(dir.path(), &["a.ts".into()], &config, &policy);
         let displays: Vec<&str> = plan.commands.iter().map(|c| c.display.as_str()).collect();
-        assert_eq!(displays, vec!["npm run lint", "npm run test"]);
+        assert_eq!(displays, vec!["npm run lint (oxlint)", "npm run test (node --test)"]);
         let configured = VerifyConfig { commands: vec!["!curl https://x.test".into()], ..VerifyConfig::default() };
         let plan = plan_verification(dir.path(), &[], &configured, &configured.policy);
         let denied = assess_verify_plan(&plan, Some(&ExecutionPolicy::with_mode(crate::policy::NetworkMode::Deny, &[])));

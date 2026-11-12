@@ -289,3 +289,108 @@ async fn workflow_shell_high_risk_passes_high_to_the_callback() {
     assert_eq!(*received.lock().unwrap(), Some(RiskClass::High));
     assert_eq!(result.status, "failed");
 }
+
+#[test]
+fn parameter_expansion_and_posix_subshell_escapes_are_critical() {
+    for cmd in [
+        "echo ${x:-$(id)}",
+        "echo \"${x:-$(id)}\"",
+        "echo \"${x:-`id`}\"",
+        "echo \"${x:-'$(id)'}\"",
+        "echo ${x:-<(id)}",
+        "echo ${x@P}",
+        "echo \"${x@P}\"",
+        "echo ${ id; }",
+        "echo ${| id; }",
+        "echo $((echo hi); (rm -rf /))",
+        "echo $((1 + 2); id)",
+        "echo $(( $(id) ))",
+        "echo $(( `id` ))",
+        "echo $'\\''; rm -rf /",
+        "echo $\"$(id)\"",
+        "echo $\"`id`\"",
+    ] {
+        assert_eq!(r(cmd), "critical", "{cmd}");
+    }
+    for cmd in ["echo '${x:-$(id)}'", "echo \"${x:-literal}\"", "echo $(( (1 + 2) * (3 + 4) ))", "echo $'\\''", "echo $\"hello;world\""] {
+        assert_eq!(r(cmd), "low", "{cmd}");
+    }
+}
+
+#[test]
+fn gnu_rm_abbreviations_shell_inline_flags_env_s_and_git_exec_flags_are_classified() {
+    for cmd in [
+        "rm --r --f /",
+        "rm --rec --for ~",
+        "rm --no-preserve /",
+        "rm -rf -- /",
+        "bash -lc \"id\"",
+        "sh -ic \"id\"",
+        "zsh -lic \"id\"",
+        "dash -c\"id\"",
+        "fish --command=\"id\"",
+        "ash -c \"id\"",
+        "pwsh -enc AAA",
+        "pwsh -ec AAA",
+        "powershell -EncodedCommand AAA",
+        "cmd /k dir",
+        "cmd /c\"whoami\"",
+        "env -S\"rm -rf /\"",
+        "env -iS \"rm -rf /\"",
+        "env -S \"rm -rf\" /",
+        "stdbuf -o L rm -rf /",
+    ] {
+        assert_eq!(r(cmd), "critical", "{cmd}");
+    }
+    for cmd in [
+        "git -c core.sshCommand=evil status",
+        "git -ccore.pager=evil log",
+        "git --config-env=core.pager=EVIL log",
+        "git --exec-path=/tmp status",
+        "git status --upload-pack=evil",
+        "git clone -u ./pwn https://github.com/a/b",
+    ] {
+        assert_eq!(r(cmd), "high", "{cmd}");
+    }
+}
+
+#[test]
+fn dev_tcp_redirections_expanded_network_clis_and_defense_in_depth_tool_flags() {
+    for cmd in [
+        "cat < /dev/tcp/1.2.3.4/80",
+        "exec 3<>/dev/tcp/example.com/443",
+        "echo hi > /dev/udp/1.1.1.1/53",
+        "echo hi >\"/dev/tcp/1.2.3.4/80\"",
+        "gh pr list",
+        "aws s3 ls",
+        "gcloud auth list",
+        "az account show",
+        "dig example.com",
+        "ping -c 1 1.1.1.1",
+        "rclone ls remote:bucket",
+        "websocat ws://example.com",
+        "grpcurl example.com:443 list",
+        "openssl s_client -connect example.com:443",
+        "nerdctl run alpine",
+        "helm install x y",
+        "iptables -L",
+        "node --test --import ./evil.mjs",
+        "node --require=./evil.cjs test.js",
+        "node -e\"process.exit(0)\"",
+        "python3.12 -c \"import os\"",
+        "python3 -m http.server",
+        "python3 -m pip install x",
+        "rg --pre=sh pattern",
+        "tar -xf a.tar --checkpoint-action=exec=sh",
+        "tar -xPf a.tar",
+        "fd -x rm",
+        "find . -fprint /tmp/out",
+        "make -f evil.mk test",
+        "make SHELL=/bin/sh test",
+    ] {
+        assert_eq!(r(cmd), "high", "{cmd}");
+    }
+    assert_eq!(r("echo \"/dev/tcp/1.2.3.4/80\""), "low");
+    assert_eq!(r("echo \"/dev/tcp/1.2.3.4/80\" > out.txt"), "medium");
+    assert_eq!(r("openssl rand -hex 16"), "medium");
+}

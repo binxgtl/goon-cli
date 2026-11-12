@@ -311,15 +311,55 @@ pub fn parse_workflow_args(raw: &str, defaults: Option<&IndexMap<String, String>
 
 fn shell_quote_context(prefix: &str) -> u8 {
     let chars: Vec<char> = prefix.chars().collect();
-    let mut state = 0u8; // 0 none, 1 single, 2 double
+    let mut stack: Vec<u8> = vec![];
+    let mut state = 0u8;
     let mut i = 0;
     while i < chars.len() {
         let ch = chars[i];
         match state {
             0 => {
                 if ch == '\\' {
+                    if i + 1 >= chars.len() {
+                        return 4;
+                    }
+                    i += 2;
+                    continue;
+                }
+                if ch == '#' && (i == 0 || matches!(chars[i - 1], ' ' | '\t' | '\n' | '\r' | ';' | '&' | '|' | '(' | ')')) {
+                    while i < chars.len() && chars[i] != '\n' {
+                        i += 1;
+                    }
+                    continue;
+                }
+                if ch == '$' && chars.get(i + 1) == Some(&'\'') {
+                    state = 3;
+                    i += 2;
+                    continue;
+                }
+                if ch == '$' && chars.get(i + 1) == Some(&'"') {
+                    state = 2;
+                    i += 2;
+                    continue;
+                }
+                if ch == '$' && chars.get(i + 1) == Some(&'(') && chars.get(i + 2) != Some(&'(') {
+                    stack.push(0);
+                    state = 0;
+                    i += 2;
+                    continue;
+                }
+                if ch == '(' && !stack.is_empty() {
+                    stack.push(0);
                     i += 1;
-                } else if ch == '\'' {
+                    continue;
+                }
+                if ch == ')' {
+                    if let Some(prev) = stack.pop() {
+                        state = prev;
+                    }
+                    i += 1;
+                    continue;
+                }
+                if ch == '\'' {
                     state = 1;
                 } else if ch == '"' {
                     state = 2;
@@ -330,10 +370,31 @@ fn shell_quote_context(prefix: &str) -> u8 {
                     state = 0;
                 }
             }
+            3 => {
+                if ch == '\\' {
+                    if i + 1 < chars.len() {
+                        i += 2;
+                        continue;
+                    }
+                } else if ch == '\'' {
+                    state = 0;
+                }
+            }
             _ => {
                 if ch == '\\' {
-                    i += 1;
-                } else if ch == '"' {
+                    if i + 1 >= chars.len() {
+                        return 5;
+                    }
+                    i += 2;
+                    continue;
+                }
+                if ch == '$' && chars.get(i + 1) == Some(&'(') && chars.get(i + 2) != Some(&'(') {
+                    stack.push(2);
+                    state = 0;
+                    i += 2;
+                    continue;
+                }
+                if ch == '"' {
                     state = 0;
                 }
             }
@@ -356,6 +417,18 @@ pub fn shell_escape(value: &str, context: u8) -> String {
             }
             out
         }
+        3 => {
+            let mut out = String::new();
+            for c in value.chars() {
+                if matches!(c, '\\' | '\'') {
+                    out.push('\\');
+                }
+                out.push(c);
+            }
+            out
+        }
+        4 => format!("\\'{}'", value.replace('\'', "'\\''")),
+        5 => format!("\\{}", shell_escape(value, 2)),
         _ => format!("'{}'", value.replace('\'', "'\\''")),
     }
 }
@@ -368,7 +441,6 @@ pub struct InterpContext<'a> {
     pub step_outputs: &'a IndexMap<String, String>,
 }
 
-/// Replaces matches of `re` (ASCII `\b` already encoded), computing each value from the source.
 fn replace_each(src: &str, re: &Regex, mut f: impl FnMut(&regex::Captures, usize, &str) -> String) -> String {
     let mut out = String::new();
     let mut last = 0;
@@ -383,52 +455,70 @@ fn replace_each(src: &str, re: &Regex, mut f: impl FnMut(&regex::Captures, usize
 }
 
 pub fn interpolate_workflow_template(template: &str, ctx: &InterpContext, shell: bool) -> String {
-    static STEPS: OnceLock<Regex> = OnceLock::new();
-    static INPUT: OnceLock<Regex> = OnceLock::new();
-    static PREV: OnceLock<Regex> = OnceLock::new();
-    static NUM_BRACE: OnceLock<Regex> = OnceLock::new();
-    static NAME_BRACE: OnceLock<Regex> = OnceLock::new();
-    static NUM: OnceLock<Regex> = OnceLock::new();
-    static NAME: OnceLock<Regex> = OnceLock::new();
-    let steps_re = STEPS.get_or_init(|| Regex::new(r"\{\{\s*steps\.([A-Za-z0-9_-]+)\.output\s*\}\}").unwrap());
-    let input_re = INPUT.get_or_init(|| Regex::new(r"\{\{\s*input\s*\}\}|\$input(?-u:\b)").unwrap());
-    let prev_re = PREV.get_or_init(|| Regex::new(r"\{\{\s*prev\s*\}\}|\$prev(?-u:\b)").unwrap());
-    let num_brace = NUM_BRACE.get_or_init(|| Regex::new(r"\{\{\s*([0-9]+)\s*\}\}").unwrap());
-    let name_brace = NAME_BRACE.get_or_init(|| Regex::new(r"\{\{\s*([A-Za-z_][A-Za-z0-9_-]*)\s*\}\}").unwrap());
-    let num_re = NUM.get_or_init(|| Regex::new(r"\{\{\s*([0-9]+)\s*\}\}|\$([0-9]+)(?-u:\b)").unwrap());
-    let name_re = NAME.get_or_init(|| Regex::new(r"\{\{\s*([A-Za-z_][A-Za-z0-9_-]*)\s*\}\}|\$([A-Za-z_][A-Za-z0-9_-]*)(?-u:\b)").unwrap());
-    let fmt = |val: &str, offset: usize, src: &str| if shell { shell_escape(val, shell_quote_context(&src[..offset])) } else { val.to_string() };
-    let mut out = replace_each(template, steps_re, |c, o, s| fmt(ctx.step_outputs.get(&c[1]).map(String::as_str).unwrap_or(""), o, s));
-    out = replace_each(&out, input_re, |_, o, s| fmt(ctx.input, o, s));
-    out = replace_each(&out, prev_re, |_, o, s| fmt(ctx.prev_output, o, s));
+    static SHELL_RE: OnceLock<Regex> = OnceLock::new();
+    static TEXT_RE: OnceLock<Regex> = OnceLock::new();
     if shell {
-        out = replace_each(&out, num_brace, |c, o, s| {
-            let idx = c[1].parse::<usize>().unwrap_or(0);
-            fmt(idx.checked_sub(1).and_then(|i| ctx.positional.get(i)).map(String::as_str).unwrap_or(""), o, s)
+        let re = SHELL_RE.get_or_init(|| {
+            Regex::new(
+                r"\{\{\s*steps\.([A-Za-z0-9_-]+)\.output\s*\}\}|\{\{\s*(input)\s*\}\}|\$(input)(?-u:\b)|\{\{\s*(prev)\s*\}\}|\$(prev)(?-u:\b)|\{\{\s*([0-9]+)\s*\}\}|\{\{\s*([A-Za-z_][A-Za-z0-9_-]*)\s*\}\}",
+            )
+            .unwrap()
         });
-        out = replace_each(&out, name_brace, |c, o, s| {
-            let key = &c[1];
-            if let Some(v) = ctx.named.get(key) {
-                return fmt(v, o, s);
+        return replace_each(template, re, |c, offset, src| {
+            let fmt = |val: &str| shell_escape(val, shell_quote_context(&src[..offset]));
+            if let Some(step_id) = c.get(1) {
+                return fmt(ctx.step_outputs.get(step_id.as_str()).map(String::as_str).unwrap_or(""));
             }
-            if let Some(v) = ctx.step_outputs.get(key) {
-                return fmt(v, o, s);
+            if c.get(2).is_some() || c.get(3).is_some() {
+                return fmt(ctx.input);
+            }
+            if c.get(4).is_some() || c.get(5).is_some() {
+                return fmt(ctx.prev_output);
+            }
+            if let Some(num) = c.get(6) {
+                let idx = num.as_str().parse::<usize>().unwrap_or(0);
+                return fmt(idx.checked_sub(1).and_then(|i| ctx.positional.get(i)).map(String::as_str).unwrap_or(""));
+            }
+            if let Some(name) = c.get(7) {
+                let key = name.as_str();
+                if let Some(v) = ctx.named.get(key) {
+                    return fmt(v);
+                }
+                if let Some(v) = ctx.step_outputs.get(key) {
+                    return fmt(v);
+                }
             }
             c[0].to_string()
         });
-        return out;
     }
-    out = replace_each(&out, num_re, |c, _, _| {
-        let idx = c.get(1).or(c.get(2)).map(|m| m.as_str().parse::<usize>().unwrap_or(0)).unwrap_or(0);
-        idx.checked_sub(1).and_then(|i| ctx.positional.get(i)).cloned().unwrap_or_default()
+    let re = TEXT_RE.get_or_init(|| {
+        Regex::new(
+            r"\{\{\s*steps\.([A-Za-z0-9_-]+)\.output\s*\}\}|\{\{\s*(input)\s*\}\}|\$(input)(?-u:\b)|\{\{\s*(prev)\s*\}\}|\$(prev)(?-u:\b)|\{\{\s*([0-9]+)\s*\}\}|\$([0-9]+)(?-u:\b)|\{\{\s*([A-Za-z_][A-Za-z0-9_-]*)\s*\}\}|\$([A-Za-z_][A-Za-z0-9_-]*)(?-u:\b)",
+        )
+        .unwrap()
     });
-    replace_each(&out, name_re, |c, _, _| {
-        let key = c.get(1).or(c.get(2)).map(|m| m.as_str()).unwrap_or("");
-        if let Some(v) = ctx.named.get(key) {
-            return v.clone();
+    replace_each(template, re, |c, _, _| {
+        if let Some(step_id) = c.get(1) {
+            return ctx.step_outputs.get(step_id.as_str()).cloned().unwrap_or_default();
         }
-        if let Some(v) = ctx.step_outputs.get(key) {
-            return v.clone();
+        if c.get(2).is_some() || c.get(3).is_some() {
+            return ctx.input.to_string();
+        }
+        if c.get(4).is_some() || c.get(5).is_some() {
+            return ctx.prev_output.to_string();
+        }
+        if let Some(num) = c.get(6).or_else(|| c.get(7)) {
+            let idx = num.as_str().parse::<usize>().unwrap_or(0);
+            return idx.checked_sub(1).and_then(|i| ctx.positional.get(i)).cloned().unwrap_or_default();
+        }
+        if let Some(name) = c.get(8).or_else(|| c.get(9)) {
+            let key = name.as_str();
+            if let Some(v) = ctx.named.get(key) {
+                return v.clone();
+            }
+            if let Some(v) = ctx.step_outputs.get(key) {
+                return v.clone();
+            }
         }
         c[0].to_string()
     })
@@ -631,25 +721,69 @@ fn parse_workflow_json(raw: &Value) -> Result<(Option<String>, Option<String>, O
     Ok((name, description, inputs, out))
 }
 
+const MAX_WORKFLOW_BYTES: u64 = 256 * 1024;
+
+fn read_contained_workflow_file(full: &Path, root_canon: &Path) -> Option<String> {
+    let lmeta = std::fs::symlink_metadata(full).ok()?;
+    if lmeta.file_type().is_symlink() || !lmeta.file_type().is_file() || lmeta.len() > MAX_WORKFLOW_BYTES {
+        return None;
+    }
+    let full_canon = std::fs::canonicalize(full).ok()?;
+    if !full_canon.starts_with(root_canon) {
+        return None;
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = opts.open(full).ok()?;
+    let fmeta = file.metadata().ok()?;
+    if !fmeta.file_type().is_file() || fmeta.len() > MAX_WORKFLOW_BYTES {
+        return None;
+    }
+    use std::io::Read;
+    let mut buf = Vec::with_capacity((fmeta.len() as usize).min(MAX_WORKFLOW_BYTES as usize));
+    file.take(MAX_WORKFLOW_BYTES + 1).read_to_end(&mut buf).ok()?;
+    if buf.len() as u64 > MAX_WORKFLOW_BYTES {
+        return None;
+    }
+    String::from_utf8(buf).ok()
+}
+
 pub fn discover_workflows(cwd: &Path) -> Vec<WorkflowDefinition> {
-    let roots: [(PathBuf, &'static str); 3] = [(cwd.join(".goon").join("workflows"), "workspace"), (cwd.join(".agents").join("workflows"), "workspace"), (config_dir().join("workflows"), "user")];
+    let workspace_canon = std::fs::canonicalize(cwd).ok();
+    let user_workflows_dir = config_dir().join("workflows");
+    let roots: [(PathBuf, Option<PathBuf>, &'static str); 3] = [
+        (cwd.join(".goon").join("workflows"), workspace_canon.clone(), "workspace"),
+        (cwd.join(".agents").join("workflows"), workspace_canon, "workspace"),
+        (user_workflows_dir.clone(), std::fs::canonicalize(&user_workflows_dir).ok(), "user"),
+    ];
     let mut seen = std::collections::HashSet::new();
     let mut out = vec![];
-    for (dir, scope) in roots {
+    for (dir, boundary_canon, scope) in roots {
+        let Ok(lmeta) = std::fs::symlink_metadata(&dir) else { continue };
+        if lmeta.file_type().is_symlink() || !lmeta.file_type().is_dir() {
+            continue;
+        }
+        let Ok(dir_canon) = std::fs::canonicalize(&dir) else { continue };
+        if let Some(boundary) = &boundary_canon {
+            if !dir_canon.starts_with(boundary) {
+                continue;
+            }
+        }
         let Ok(entries) = std::fs::read_dir(&dir) else { continue };
         let mut entries: Vec<_> = entries.flatten().collect();
         entries.sort_by(|a, b| crate::jsutil::locale_cmp(&a.file_name().to_string_lossy(), &b.file_name().to_string_lossy()));
         for entry in entries {
             let file_name = entry.file_name().to_string_lossy().to_string();
-            if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) || !(file_name.ends_with(".json") || file_name.ends_with(".md")) {
+            if !(file_name.ends_with(".json") || file_name.ends_with(".md")) {
                 continue;
             }
             let full = dir.join(&file_name);
-            let Ok(meta) = std::fs::metadata(&full) else { continue };
-            if meta.len() > 256 * 1024 {
-                continue;
-            }
-            let Ok(raw) = std::fs::read_to_string(&full) else { continue };
+            let Some(raw) = read_contained_workflow_file(&full, &dir_canon) else { continue };
             let def = if file_name.ends_with(".json") {
                 let Ok(value) = serde_json::from_str::<Value>(&raw) else { continue };
                 let Ok((name, description, inputs, steps)) = parse_workflow_json(&value) else { continue };
@@ -730,6 +864,10 @@ pub fn remove_custom_workflow(cwd: &Path, name: &str) -> Result<PathBuf> {
     let Some(found) = all.into_iter().find(|w| w.name.to_lowercase() == name.trim().to_lowercase()) else { bail!("Workflow \"{name}\" not found.") };
     match (&found.path, found.scope) {
         (Some(p), s) if s != "builtin" => {
+            let meta = std::fs::symlink_metadata(p)?;
+            if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+                bail!("Refusing to delete non-regular workflow file: {}", p.display());
+            }
             std::fs::remove_file(p)?;
             Ok(p.clone())
         }
@@ -860,15 +998,16 @@ pub async fn execute_workflow(workflow: &WorkflowDefinition, raw_args: &str, hoo
                         return Err(WorkflowApprovalError(format!("Permission denied by the user for shell command: {cmd}")).into());
                     }
                     progress(&format!("  $ {cmd}\n"));
+                    let clean_env = |v: &str| v.replace('\0', "");
                     let mut env: std::collections::BTreeMap<String, String> = std::env::vars().collect();
-                    env.insert("GOON_WF_INPUT".into(), parsed.full_input.clone());
-                    env.insert("GOON_WF_PREV".into(), prev.clone());
+                    env.insert("GOON_WF_INPUT".into(), clean_env(&parsed.full_input));
+                    env.insert("GOON_WF_PREV".into(), clean_env(&prev));
                     for (idx, p) in parsed.positional.iter().enumerate() {
-                        env.insert(format!("GOON_WF_ARG_{}", idx + 1), p.clone());
+                        env.insert(format!("GOON_WF_ARG_{}", idx + 1), clean_env(p));
                     }
                     for (k, v) in &parsed.named {
                         let key: String = k.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' }).collect::<String>().to_uppercase();
-                        env.insert(format!("GOON_WF_VAR_{key}"), v.clone());
+                        env.insert(format!("GOON_WF_VAR_{key}"), clean_env(v));
                     }
                     let limits = hooks.policy.as_ref().map(|p| p.limits.clone());
                     let timeout = limits
@@ -890,7 +1029,10 @@ pub async fn execute_workflow(workflow: &WorkflowDefinition, raw_args: &str, hoo
                         },
                     )
                     .await
-                    .map_err(|e| anyhow!(e.to_string()))?;
+                    .map_err(|e| match e {
+                        crate::process::CommandError::Cancelled => crate::harness::Aborted::default().into(),
+                        other => anyhow!(other.to_string()),
+                    })?;
                     let out = limit_text(format!("Exit code: {}\n{}", res.code, res.output).trim(), 12_000);
                     if res.code != 0 && step.bool("continueOnError") != Some(true) {
                         bail!("Command exited with code {}:\n{}", res.code, take_chars(&res.output, 1000));
@@ -956,6 +1098,9 @@ pub async fn execute_workflow(workflow: &WorkflowDefinition, raw_args: &str, hoo
                 results.push(WorkflowStepResult { id: step.id().into(), title, kind: step.kind().into(), status: "completed", output: out, duration_ms: duration });
             }
             Err(error) => {
+                if hooks.cancel.is_cancelled() || crate::harness::is_aborted(&error) {
+                    return Err(crate::harness::Aborted::default().into());
+                }
                 let msg = error.to_string();
                 results.push(WorkflowStepResult { id: step.id().into(), title: title.clone(), kind: step.kind().into(), status: "failed", output: msg.clone(), duration_ms: duration });
                 if step.bool("continueOnError") != Some(true) {

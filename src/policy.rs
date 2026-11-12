@@ -99,6 +99,54 @@ fn unknown_network() -> NetworkAssessment {
 }
 
 const NETWORK_CLIENTS: &[&str] = &["curl", "wget", "ssh", "scp", "sftp", "rsync", "nc", "ncat", "netcat", "ftp", "telnet", "socat", "tnftp", "lftp"];
+const OPAQUE_NETWORK_COMMANDS: &[&str] = &[
+    "fetch",
+    "aria2c",
+    "axel",
+    "http",
+    "https",
+    "httpie",
+    "xh",
+    "xhs",
+    "curlie",
+    "websocat",
+    "wscat",
+    "grpcurl",
+    "ab",
+    "hey",
+    "wrk",
+    "ssh-keyscan",
+    "rclone",
+    "s3cmd",
+    "ngrok",
+    "cloudflared",
+    "tailscale",
+    "gh",
+    "glab",
+    "aws",
+    "gcloud",
+    "gsutil",
+    "az",
+    "kubectl",
+    "helm",
+    "docker",
+    "podman",
+    "nerdctl",
+    "dig",
+    "nslookup",
+    "host",
+    "drill",
+    "resolvectl",
+    "whois",
+    "ping",
+    "ping6",
+    "fping",
+    "traceroute",
+    "traceroute6",
+    "tracepath",
+    "mtr",
+    "nmap",
+];
 const PACKAGE_MANAGERS: &[&str] = &["npm", "pnpm", "yarn", "bun", "pip", "pip3", "uv", "poetry", "cargo", "go", "gem", "composer", "apt", "apt-get", "pkg", "brew", "dnf", "pacman", "apk", "yum"];
 const PACKAGE_NETWORK_SUBCOMMANDS: &[&str] = &[
     "install",
@@ -230,14 +278,34 @@ const WGET_VALUE_FLAGS: &[&str] = &[
     "--method",
     "--body-data",
     "--body-file",
+    "--config",
 ];
 const SSH_VALUE_FLAGS: &[&str] = &["-p", "-i", "-l", "-o", "-F", "-J", "-L", "-R", "-D", "-W", "-b", "-c", "-E", "-I", "-m", "-O", "-Q", "-S", "-w", "-e", "-B"];
 const COPY_VALUE_FLAGS: &[&str] = &["-e", "--rsh", "-i", "--identity-file", "-P", "-p", "-o", "-F", "-S", "-l"];
 const NETCAT_VALUE_FLAGS: &[&str] = &["-p", "-s", "-w", "-i", "-x", "-X", "-c", "-q", "-T", "-O", "-m", "-I", "-e"];
 const FTP_VALUE_FLAGS: &[&str] = &["-p", "-P", "-u", "-w", "-o", "-N", "-t", "-r", "-g"];
 const GIT_VALUE_FLAGS: &[&str] = &["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix"];
-const GIT_SUB_VALUE_FLAGS: &[&str] =
-    &["--depth", "--branch", "-b", "--origin", "-o", "--config", "--reference", "--separate-git-dir", "--jobs", "-j", "--filter", "--shallow-since", "--shallow-exclude", "--repo", "--server-option"];
+const GIT_SUB_VALUE_FLAGS: &[&str] = &[
+    "-c",
+    "--config",
+    "-u",
+    "--upload-pack",
+    "--receive-pack",
+    "--depth",
+    "--branch",
+    "-b",
+    "--origin",
+    "-o",
+    "--reference",
+    "--separate-git-dir",
+    "--jobs",
+    "-j",
+    "--filter",
+    "--shallow-since",
+    "--shallow-exclude",
+    "--repo",
+    "--server-option",
+];
 const PACKAGE_VALUE_FLAGS: &[&str] = &[
     "--prefix",
     "--registry",
@@ -267,20 +335,41 @@ const PACKAGE_VALUE_FLAGS: &[&str] = &[
     "--source",
     "--build-dir",
 ];
-const CURL_REDIRECT_FLAGS: &[&str] =
-    &["-x", "--proxy", "--preproxy", "--socks4", "--socks4a", "--socks5", "--socks5-hostname", "--resolve", "--connect-to", "--unix-socket", "--abstract-unix-socket", "--doh-url", "-K", "--config"];
-const WGET_REDIRECT_FLAGS: &[&str] = &["-e", "--execute"];
+const CURL_REDIRECT_FLAGS: &[&str] = &[
+    "-x",
+    "--proxy",
+    "--proxy1.0",
+    "--preproxy",
+    "--socks4",
+    "--socks4a",
+    "--socks5",
+    "--socks5-hostname",
+    "--resolve",
+    "--connect-to",
+    "--unix-socket",
+    "--abstract-unix-socket",
+    "--doh-url",
+    "--ipfs-gateway",
+    "-K",
+    "--config",
+];
+const CURL_SHORT_VALUE_CHARS: &[char] = &['o', 'H', 'd', 'X', 'u', 'A', 'e', 'b', 'c', 'F', 'T', 'm', 'r', 'w', 'E', 'C', 'D', 'P', 'Q', 'Y', 'y', 'z'];
+const WGET_REDIRECT_FLAGS: &[&str] = &["-e", "--execute", "-i", "--input-file", "-B", "--base", "--config"];
+const WGET_SHORT_VALUE_CHARS: &[char] = &['O', 'P', 'o', 'U', 'T', 'w', 't', 'Q', 'a', 'D', 'H', 'Y', 'l', 'A', 'R'];
 const SSH_REDIRECT_FLAGS: &[&str] = &["-o", "-J", "-L", "-R", "-D", "-W", "-F", "-w"];
+const SSH_SHORT_VALUE_CHARS: &[char] = &['p', 'i', 'l', 'b', 'c', 'E', 'e', 'I', 'm', 'O', 'Q', 'S', 'B'];
 const COPY_REDIRECT_FLAGS: &[&str] = &["-o", "-F", "-J", "-S"];
+const COPY_SHORT_VALUE_CHARS: &[char] = &['P', 'i', 'c', 'l', 'b', 'D', 'R', 's'];
 const RSYNC_REDIRECT_FLAGS: &[&str] = &["-e", "--rsh", "--rsync-path"];
 const NETCAT_REDIRECT_FLAGS: &[&str] = &["-x", "--proxy", "-e", "--exec", "-c", "--sh-exec"];
+const NETCAT_SHORT_VALUE_CHARS: &[char] = &['p', 's', 'w', 'i', 'q', 'X', 'T', 'O', 'm', 'I'];
 
 fn is_flag(token: &str) -> bool {
     token.starts_with('-') && token != "-"
 }
 
 fn has_flag(tokens: &[String], flags: &[&str]) -> bool {
-    tokens.iter().any(|token| {
+    tokens.iter().take_while(|t| *t != "--").any(|token| {
         if !is_flag(token) {
             return false;
         }
@@ -292,8 +381,24 @@ fn has_flag(tokens: &[String], flags: &[&str]) -> bool {
     })
 }
 
-fn has_attached_short_flag(tokens: &[String], short: &str) -> bool {
-    tokens.iter().any(|t| t.len() > short.len() && t.starts_with(short))
+fn has_short_flag_in_cluster(tokens: &[String], redirect_chars: &[char], value_chars: &[char]) -> bool {
+    for token in tokens {
+        if token == "--" {
+            break;
+        }
+        if !token.starts_with('-') || token.starts_with("--") || token.len() <= 1 {
+            continue;
+        }
+        for ch in token[1..].chars() {
+            if redirect_chars.contains(&ch) {
+                return true;
+            }
+            if value_chars.contains(&ch) {
+                break;
+            }
+        }
+    }
+    false
 }
 
 fn git_has_redirect(rest: &[String]) -> bool {
@@ -403,14 +508,25 @@ fn positionals(tokens: &[String], value_flags: &[&str]) -> Vec<String> {
     out
 }
 
-fn inline_values(tokens: &[String], names: &[&str]) -> Vec<String> {
-    tokens
-        .iter()
-        .filter_map(|t| {
-            let eq = t.find('=')?;
-            (eq > 0 && names.contains(&&t[..eq])).then(|| t[eq + 1..].to_string())
-        })
-        .collect()
+fn flag_values(tokens: &[String], names: &[&str]) -> Vec<String> {
+    let mut out = vec![];
+    let mut i = 0;
+    while i < tokens.len() {
+        let t = &tokens[i];
+        if t == "--" {
+            break;
+        }
+        if let Some(eq) = t.find('=') {
+            if eq > 0 && names.contains(&&t[..eq]) {
+                out.push(t[eq + 1..].to_string());
+            }
+        } else if names.contains(&t.as_str()) {
+            out.push(tokens.get(i + 1).cloned().unwrap_or_default());
+            i += 1;
+        }
+        i += 1;
+    }
+    out
 }
 
 fn trim_path(value: &str) -> &str {
@@ -508,6 +624,148 @@ fn package_subcommand(rest: &[String]) -> Option<String> {
     None
 }
 
+const SAFE_PYTHON_MODULES: &[&str] = &[
+    "pytest",
+    "unittest",
+    "mypy",
+    "ruff",
+    "black",
+    "flake8",
+    "isort",
+    "pylint",
+    "pyflakes",
+    "coverage",
+    "doctest",
+    "py_compile",
+    "compileall",
+    "json.tool",
+    "ast",
+    "dis",
+    "timeit",
+    "tokenize",
+    "tabnanny",
+    "venv",
+    "zipfile",
+    "tarfile",
+    "base64",
+    "calendar",
+];
+
+fn authority_has_unverified_expansion(token: &str) -> bool {
+    let rest = match token.find("://") {
+        Some(idx) => &token[idx + 3..],
+        None => token,
+    };
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..end];
+    authority.chars().any(|c| matches!(c, '$' | '{' | '}' | ' ' | '\t'))
+}
+
+fn assess_scripting_runtime(cmd: &str, rest: &[String]) -> Option<NetworkAssessment> {
+    let pre_dd: Vec<&String> = rest.iter().take_while(|t| *t != "--").collect();
+    let post_dd_nonempty = rest.iter().skip_while(|t| *t != "--").nth(1).is_some();
+    if cmd == "node" || cmd == "nodejs" {
+        if crate::risk::node_has_inline_or_loader(rest) || pre_dd.iter().any(|t| t.as_str() == "-") {
+            return Some(unknown_network());
+        }
+        if pre_dd.iter().any(|t| matches!(t.as_str(), "--version" | "-v" | "--help" | "-h")) {
+            return Some(NO_NETWORK);
+        }
+        if pre_dd.iter().any(|t| t.as_str() == "--test" || t.starts_with("--test=") || t.as_str() == "--check" || t.as_str() == "-c") {
+            return Some(NO_NETWORK);
+        }
+        let pos = positionals(rest, &["-C", "--conditions", "--env-file", "--env-file-if-exists", "--watch-path", "--test-name-pattern", "--test-reporter", "--test-reporter-destination"]);
+        return Some(if !pos.is_empty() || post_dd_nonempty { NO_NETWORK } else { unknown_network() });
+    }
+    if cmd == "deno" {
+        let Some(sub) = pre_dd.iter().find(|t| !is_flag(t)).map(|s| s.to_ascii_lowercase()) else {
+            return Some(if pre_dd.iter().any(|t| matches!(t.as_str(), "-V" | "--version" | "-h" | "--help")) { NO_NETWORK } else { unknown_network() });
+        };
+        if matches!(sub.as_str(), "fmt" | "lint" | "check" | "doc" | "types" | "completions" | "help" | "--version" | "-V") {
+            return Some(NO_NETWORK);
+        }
+        return Some(unknown_network());
+    }
+    if cmd == "bun" {
+        if pre_dd.iter().any(|t| t.as_str() == "-e" || t.as_str() == "--eval" || t.starts_with("--eval=") || (!t.starts_with("--") && t.starts_with("-e")) || t.as_str() == "-") {
+            return Some(unknown_network());
+        }
+        if pre_dd.iter().any(|t| matches!(t.as_str(), "-v" | "--version" | "-h" | "--help")) {
+            return Some(NO_NETWORK);
+        }
+        if let Some(first) = pre_dd.iter().find(|t| !is_flag(t)).map(|s| s.to_ascii_lowercase()) {
+            if matches!(first.as_str(), "test" | "build" | "pm") {
+                return Some(NO_NETWORK);
+            }
+            if matches!(first.as_str(), "x" | "install" | "i" | "add" | "update" | "upgrade" | "outdated" | "publish" | "init" | "create" | "repl") {
+                return Some(unknown_network());
+            }
+            if first == "run" {
+                let run_idx = rest.iter().position(|t| t.eq_ignore_ascii_case("run")).unwrap_or(0);
+                let target = rest[run_idx + 1..].iter().find(|t| !is_flag(t));
+                return Some(if target.is_some() { NO_NETWORK } else { unknown_network() });
+            }
+            return Some(NO_NETWORK);
+        }
+        return Some(unknown_network());
+    }
+    if crate::risk::is_python_cmd(cmd) {
+        let mut i = 0;
+        let mut has_script = post_dd_nonempty;
+        while i < pre_dd.len() {
+            let t = pre_dd[i];
+            if t == "-c" || (!t.starts_with("--") && (t.starts_with("-c") || (t.starts_with('-') && t[1..].chars().take_while(|c| c.is_ascii_alphabetic()).any(|c| c == 'c')))) || t == "-" {
+                return Some(unknown_network());
+            }
+            if t == "-m" || (!t.starts_with("--") && t.starts_with("-m") && t.len() > 2) {
+                let module = if t == "-m" { pre_dd.get(i + 1).map(|s| s.to_ascii_lowercase()).unwrap_or_default() } else { t[2..].to_ascii_lowercase() };
+                return Some(if SAFE_PYTHON_MODULES.contains(&module.as_str()) { NO_NETWORK } else { unknown_network() });
+            }
+            if t == "-W" || t == "-X" || t == "--check-hash-based-pycs" {
+                i += 2;
+                continue;
+            }
+            if !is_flag(t) {
+                has_script = true;
+            }
+            i += 1;
+        }
+        if pre_dd.iter().any(|t| matches!(t.as_str(), "-V" | "--version" | "-h" | "--help")) {
+            return Some(NO_NETWORK);
+        }
+        return Some(if has_script { NO_NETWORK } else { unknown_network() });
+    }
+    if matches!(cmd, "perl" | "ruby" | "php" | "lua" | "luajit" | "rscript" | "tclsh" | "osascript") {
+        let inline_or_server = match cmd {
+            "perl" => pre_dd.iter().any(|t| {
+                t.as_str() == "-e"
+                    || t.as_str() == "-E"
+                    || (!t.starts_with("--")
+                        && (t.starts_with("-e") || t.starts_with("-E") || (t.starts_with('-') && t[1..].chars().take_while(|c| c.is_ascii_alphabetic()).any(|c| c == 'e' || c == 'E'))))
+            }),
+            "ruby" => pre_dd.iter().any(|t| {
+                t.as_str() == "-e"
+                    || t.as_str() == "-r"
+                    || (!t.starts_with("--") && (t.starts_with("-e") || t.starts_with("-r") || (t.starts_with('-') && t[1..].chars().take_while(|c| c.is_ascii_alphabetic()).any(|c| c == 'e'))))
+            }),
+            "php" => pre_dd.iter().any(|t| matches!(t.as_str(), "-r" | "-B" | "-R" | "-F" | "-E" | "-S" | "--server" | "-a") || (!t.starts_with("--") && (t.starts_with("-r") || t.starts_with("-S")))),
+            "lua" | "luajit" => pre_dd.iter().any(|t| matches!(t.as_str(), "-e" | "-l" | "-i") || (!t.starts_with("--") && (t.starts_with("-e") || t.starts_with("-l")))),
+            "rscript" | "osascript" => pre_dd.iter().any(|t| t.as_str() == "-e" || (!t.starts_with("--") && t.starts_with("-e"))),
+            "tclsh" => pre_dd.iter().any(|t| t.as_str() == "-c" || (!t.starts_with("--") && t.starts_with("-c"))),
+            _ => false,
+        };
+        if inline_or_server || pre_dd.iter().any(|t| t.as_str() == "-") {
+            return Some(unknown_network());
+        }
+        if pre_dd.iter().any(|t| matches!(t.as_str(), "-v" | "-V" | "--version" | "-h" | "--help" | "-c" | "-l")) {
+            return Some(NO_NETWORK);
+        }
+        let has_script = post_dd_nonempty || pre_dd.iter().any(|t| !is_flag(t));
+        return Some(if has_script { NO_NETWORK } else { unknown_network() });
+    }
+    None
+}
+
 fn analyze_segment(tokens: &[String], depth: usize) -> NetworkAssessment {
     let (peeled, _) = peel_wrappers(tokens);
     if peeled.is_empty() {
@@ -515,7 +773,13 @@ fn analyze_segment(tokens: &[String], depth: usize) -> NetworkAssessment {
     }
     let cmd = base_name(&peeled[0]);
     let rest: Vec<String> = peeled[1..].to_vec();
-    if (cmd == "busybox" || cmd == "toybox") && !rest.is_empty() && depth < 5 {
+    if cmd == "busybox" || cmd == "toybox" {
+        if rest.is_empty() {
+            return NO_NETWORK;
+        }
+        if depth >= 5 {
+            return unknown_network();
+        }
         return analyze_segment(&rest, depth + 1);
     }
     if is_generic_runner(&cmd) {
@@ -532,6 +796,55 @@ fn analyze_segment(tokens: &[String], depth: usize) -> NetworkAssessment {
         }
         return NO_NETWORK;
     }
+    if cmd == "eval" {
+        if depth >= 4 {
+            return unknown_network();
+        }
+        let joined = rest.join(" ");
+        return if assess_nested(&joined, depth + 1).network { unknown_network() } else { NO_NETWORK };
+    }
+    if cmd == "pwsh" || cmd == "powershell" {
+        return unknown_network();
+    }
+    if ["bash", "sh", "zsh", "fish", "dash", "ksh", "mksh", "tcsh", "csh", "ash", "cmd"].contains(&cmd.as_str()) {
+        if crate::risk::is_shell_inline_exec(&cmd, &rest) {
+            if depth >= 4 {
+                return unknown_network();
+            }
+            for token in &rest {
+                if !token.starts_with('-') && !(cmd == "cmd" && (token.to_ascii_lowercase().starts_with("/c") || token.to_ascii_lowercase().starts_with("/k"))) {
+                    if assess_nested(token, depth + 1).network {
+                        return unknown_network();
+                    }
+                } else if token.starts_with("-c") && !token.starts_with("--") && token.len() > 2 {
+                    if assess_nested(&token[2..], depth + 1).network {
+                        return unknown_network();
+                    }
+                } else if cmd == "fish" {
+                    if let Some(script) = token.strip_prefix("--command=") {
+                        if assess_nested(script, depth + 1).network {
+                            return unknown_network();
+                        }
+                    }
+                }
+            }
+        }
+        return NO_NETWORK;
+    }
+    if OPAQUE_NETWORK_COMMANDS.contains(&cmd.as_str()) {
+        return unknown_network();
+    }
+    if cmd == "openssl" {
+        if let Some(sub) = rest.iter().find(|t| !is_flag(t)) {
+            if matches!(sub.to_ascii_lowercase().as_str(), "s_client" | "s_server" | "ocsp" | "s_time") {
+                return unknown_network();
+            }
+        }
+        return NO_NETWORK;
+    }
+    if let Some(runtime_assessment) = assess_scripting_runtime(&cmd, &rest) {
+        return runtime_assessment;
+    }
     if NETWORK_PACKAGE_RUNNERS.contains(&cmd.as_str()) {
         return unknown_network();
     }
@@ -545,47 +858,110 @@ fn analyze_segment(tokens: &[String], depth: usize) -> NetworkAssessment {
     if cmd == "git" {
         let (sub, args) = git_subcommand(&rest);
         let Some(sub) = sub else { return NO_NETWORK };
+        if sub == "remote" {
+            let pos = positionals(&args, &["-t", "-m"]);
+            let rsub = pos.first().map(|s| s.to_ascii_lowercase()).unwrap_or_default();
+            let has_fetch = args.iter().take_while(|t| *t != "--").any(|t| t == "-f" || t == "--fetch");
+            let has_no_query = args.iter().take_while(|t| *t != "--").any(|t| t == "-n");
+            if rsub == "add" && has_fetch {
+                let mut hosts = vec![];
+                if let Some(url_tok) = pos.get(2) {
+                    add_host(&mut hosts, host_from_token(url_tok, false));
+                }
+                let unknown = hosts.is_empty() || git_has_redirect(&rest);
+                return NetworkAssessment { network: true, hosts, unknown };
+            }
+            if rsub == "update" || rsub == "prune" || (rsub == "show" && !has_no_query) {
+                return unknown_network();
+            }
+            return NO_NETWORK;
+        }
         if !NETWORK_GIT_SUBCOMMANDS.contains(&sub.as_str()) {
             return NO_NETWORK;
         }
-        let mut hosts = vec![];
-        for token in positionals(&args, GIT_SUB_VALUE_FLAGS).into_iter().chain(inline_values(&args, &["--remote", "--upload-pack", "--receive-pack"])) {
-            add_host(&mut hosts, host_from_token(&token, false));
+        if sub == "submodule" {
+            return unknown_network();
         }
-        let unknown = hosts.is_empty() || git_has_redirect(&rest);
+        let mut hosts = vec![];
+        let pos = positionals(&args, GIT_SUB_VALUE_FLAGS);
+        if sub == "archive" {
+            for token in flag_values(&args, &["--remote"]) {
+                add_host(&mut hosts, host_from_token(&token, false));
+            }
+        } else if sub == "request-pull" {
+            if let Some(url_tok) = pos.get(1) {
+                add_host(&mut hosts, host_from_token(url_tok, false));
+            }
+        } else {
+            if let Some(remote_tok) = pos.first() {
+                add_host(&mut hosts, host_from_token(remote_tok, false));
+            }
+            for repo_tok in flag_values(&args, &["--repo"]) {
+                add_host(&mut hosts, host_from_token(&repo_tok, false));
+            }
+        }
+        let multi_or_upload = args.iter().take_while(|t| *t != "--").any(|t| {
+            t == "--all"
+                || t == "--multiple"
+                || t.starts_with("--upload-pack")
+                || t.starts_with("--receive-pack")
+                || ((sub == "clone" || sub == "fetch" || sub == "ls-remote") && !t.starts_with("--") && t.starts_with("-u"))
+        });
+        let unknown = hosts.is_empty() || git_has_redirect(&rest) || multi_or_upload;
         return NetworkAssessment { network: true, hosts, unknown };
     }
     if NETWORK_CLIENTS.contains(&cmd.as_str()) {
         let mut hosts = vec![];
         if cmd == "curl" || cmd == "wget" {
             let (value_flags, redirect_flags) = if cmd == "curl" { (CURL_VALUE_FLAGS, CURL_REDIRECT_FLAGS) } else { (WGET_VALUE_FLAGS, WGET_REDIRECT_FLAGS) };
-            for token in positionals(&rest, value_flags).into_iter().chain(inline_values(&rest, &["--url"])) {
-                add_host(&mut hosts, host_from_token(&token, true));
+            let mut unverified_target = false;
+            let extra_urls = if cmd == "curl" { flag_values(&rest, &["--url"]) } else { vec![] };
+            for token in positionals(&rest, value_flags).into_iter().chain(extra_urls) {
+                if authority_has_unverified_expansion(&token) {
+                    unverified_target = true;
+                    continue;
+                }
+                match host_from_token(&token, true) {
+                    Some(h) => add_host(&mut hosts, Some(h)),
+                    None => unverified_target = true,
+                }
             }
-            let redirect = has_flag(&rest, redirect_flags) || (cmd == "curl" && has_attached_short_flag(&rest, "-x")) || (cmd == "wget" && has_attached_short_flag(&rest, "-e"));
-            let unknown = hosts.is_empty() || redirect;
+            let short_cluster_redirect =
+                if cmd == "curl" { has_short_flag_in_cluster(&rest, &['x', 'K'], CURL_SHORT_VALUE_CHARS) } else { has_short_flag_in_cluster(&rest, &['e', 'i', 'B'], WGET_SHORT_VALUE_CHARS) };
+            let redirect = has_flag(&rest, redirect_flags) || short_cluster_redirect;
+            let unknown = hosts.is_empty() || redirect || unverified_target;
             return NetworkAssessment { network: true, hosts, unknown };
         }
         if cmd == "ssh" {
             let args = positionals(&rest, SSH_VALUE_FLAGS);
-            add_host(&mut hosts, host_from_token(args.first().map(String::as_str).unwrap_or(""), true));
-            let redirect = has_flag(&rest, SSH_REDIRECT_FLAGS) || has_attached_short_flag(&rest, "-o");
+            if let Some(target) = args.first() {
+                if !authority_has_unverified_expansion(target) {
+                    add_host(&mut hosts, host_from_token(target, true));
+                }
+            }
+            let redirect = has_flag(&rest, SSH_REDIRECT_FLAGS) || has_short_flag_in_cluster(&rest, &['o', 'J', 'L', 'R', 'D', 'W', 'F', 'w'], SSH_SHORT_VALUE_CHARS);
             let unknown = hosts.is_empty() || redirect;
             return NetworkAssessment { network: true, hosts, unknown };
         }
         if cmd == "scp" || cmd == "sftp" || cmd == "rsync" {
+            let mut unverified_target = false;
             for token in positionals(&rest, COPY_VALUE_FLAGS) {
+                if authority_has_unverified_expansion(&token) && (cmd == "sftp" || token.contains(':')) {
+                    unverified_target = true;
+                    continue;
+                }
                 add_host(&mut hosts, host_from_token(&token, cmd == "sftp"));
             }
             let redirect = if cmd == "rsync" {
-                has_flag(&rest, RSYNC_REDIRECT_FLAGS) || has_attached_short_flag(&rest, "-e")
+                has_flag(&rest, RSYNC_REDIRECT_FLAGS) || has_short_flag_in_cluster(&rest, &['e'], &[])
             } else {
-                has_flag(&rest, COPY_REDIRECT_FLAGS) || has_attached_short_flag(&rest, "-o")
+                has_flag(&rest, COPY_REDIRECT_FLAGS) || has_short_flag_in_cluster(&rest, &['o', 'F', 'J', 'S'], COPY_SHORT_VALUE_CHARS)
             };
-            if hosts.is_empty() && !redirect {
+            if hosts.is_empty() && !redirect && !unverified_target {
                 return NO_NETWORK;
             }
-            return NetworkAssessment { network: true, hosts, unknown: redirect };
+            let unknown = hosts.is_empty() || redirect || unverified_target;
+            return NetworkAssessment { network: true, hosts, unknown };
         }
         if cmd == "socat" {
             let mut redirect = false;
@@ -601,7 +977,11 @@ fn analyze_segment(tokens: &[String], depth: usize) -> NetworkAssessment {
                 }
                 let upper = token.to_uppercase();
                 if let Some(c) = address_re.captures(&upper) {
-                    add_host(&mut hosts, normalize_network_host(&c[1]));
+                    if authority_has_unverified_expansion(&c[1]) {
+                        redirect = true;
+                    } else {
+                        add_host(&mut hosts, normalize_network_host(&c[1]));
+                    }
                 }
             }
             let unknown = hosts.is_empty() || redirect;
@@ -609,8 +989,12 @@ fn analyze_segment(tokens: &[String], depth: usize) -> NetworkAssessment {
         }
         let netcat = cmd == "nc" || cmd == "ncat" || cmd == "netcat";
         let args = positionals(&rest, if netcat { NETCAT_VALUE_FLAGS } else { FTP_VALUE_FLAGS });
-        add_host(&mut hosts, host_from_token(args.first().map(String::as_str).unwrap_or(""), true));
-        let redirect = netcat && (has_flag(&rest, NETCAT_REDIRECT_FLAGS) || has_attached_short_flag(&rest, "-x"));
+        if let Some(target) = args.first() {
+            if !authority_has_unverified_expansion(target) {
+                add_host(&mut hosts, host_from_token(target, true));
+            }
+        }
+        let redirect = netcat && (has_flag(&rest, NETCAT_REDIRECT_FLAGS) || has_short_flag_in_cluster(&rest, &['x', 'e', 'c'], NETCAT_SHORT_VALUE_CHARS));
         let unknown = hosts.is_empty() || redirect;
         return NetworkAssessment { network: true, hosts, unknown };
     }
@@ -628,10 +1012,14 @@ fn assess_nested(input: &str, depth: usize) -> NetworkAssessment {
     }
     let scan = scan_shell(input);
     let mut hosts: Vec<String> = vec![];
-    let mut network = false;
-    let mut unknown = false;
+    let mut network = scan.critical_escape;
+    let mut unknown = scan.critical_escape;
     for segment in &scan.segments {
         let tokens = tokenize(segment);
+        if crate::risk::has_dev_net_redirection(segment, &tokens) {
+            network = true;
+            unknown = true;
+        }
         if tokens.is_empty() {
             continue;
         }

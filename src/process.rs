@@ -184,10 +184,61 @@ fn kill_group(pid: u32, signal: i32) {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn for_each_session_proc(sid: u32, mut f: impl FnMut(u32, u32)) {
+    let self_pid = std::process::id();
+    let Ok(entries) = std::fs::read_dir("/proc") else { return };
+    for entry in entries.flatten() {
+        let Ok(name) = entry.file_name().into_string() else { continue };
+        let Ok(entry_pid) = name.parse::<u32>() else { continue };
+        if entry_pid == 0 || entry_pid == self_pid {
+            continue;
+        }
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{entry_pid}/stat")) else { continue };
+        let Some((_, after_comm)) = stat.rsplit_once(") ") else { continue };
+        let mut fields = after_comm.split_whitespace();
+        let Some(state) = fields.next() else { continue };
+        if matches!(state.as_bytes().first(), Some(b'Z' | b'X')) {
+            continue;
+        }
+        let _ppid = fields.next();
+        let Some(pgrp) = fields.next().and_then(|s| s.parse::<u32>().ok()) else { continue };
+        let Some(proc_sid) = fields.next().and_then(|s| s.parse::<u32>().ok()) else { continue };
+        if proc_sid == sid || pgrp == sid {
+            f(entry_pid, pgrp);
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn kill_session_procs(sid: u32, signal: i32) {
+    for_each_session_proc(sid, |entry_pid, pgrp| unsafe {
+        if pgrp != sid && pgrp > 1 {
+            let _ = libc::kill(-(pgrp as i32), signal);
+        }
+        let _ = libc::kill(entry_pid as i32, signal);
+    });
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn group_or_session_alive(sid: u32) -> bool {
+    let mut alive = false;
+    for_each_session_proc(sid, |_, _| {
+        alive = true;
+    });
+    alive
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+fn kill_session_procs(_sid: u32, _signal: i32) {}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+fn group_or_session_alive(pid: u32) -> bool {
+    unsafe { libc::kill(-(pid as i32), 0) == 0 }
+}
+
 #[cfg(windows)]
 async fn kill_tree(pid: u32) {
-    // Wait before killing the root ourselves: taskkill /T discovers descendants through
-    // that root. Fire-and-forget races root exit and can leave grandchildren alive.
     let mut command = tokio::process::Command::new("taskkill");
     command.args(["/pid", &pid.to_string(), "/T", "/F"]).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).kill_on_drop(true);
     if let Ok(mut killer) = command.spawn() {
@@ -195,8 +246,6 @@ async fn kill_tree(pid: u32) {
     }
 }
 
-/// Runs a command with a timeout, cancellation and bounded head/tail output capture. The child gets
-/// its own process group (POSIX) so cancellation reaches grandchildren too.
 pub async fn run_command(command: &str, args: &[String], options: RunOptions<'_>) -> std::result::Result<CommandResult, CommandError> {
     if options.cancel.is_cancelled() {
         return Err(CommandError::Cancelled);
@@ -215,8 +264,13 @@ pub async fn run_command(command: &str, args: &[String], options: RunOptions<'_>
         .envs(child_env(options.env.as_ref()))
         .kill_on_drop(true);
     #[cfg(unix)]
-    {
-        cmd.process_group(0);
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 && libc::setpgid(0, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
     }
     #[cfg(windows)]
     {
@@ -294,21 +348,24 @@ pub async fn run_command(command: &str, args: &[String], options: RunOptions<'_>
         }
     };
     if let Some(error) = terminal {
+        rx.close();
         #[cfg(unix)]
         {
             if pid > 0 {
                 kill_group(pid, libc::SIGTERM);
+                kill_session_procs(pid, libc::SIGTERM);
                 let waited = tokio::time::timeout(Duration::from_millis(500), child.wait()).await;
                 if waited.is_err() {
                     kill_group(pid, libc::SIGKILL);
+                    kill_session_procs(pid, libc::SIGKILL);
                     let _ = child.wait().await;
                 }
-                // Grandchildren holding the pipes open must not outlive the cancelled command.
                 kill_group(pid, libc::SIGKILL);
-                // Sending SIGKILL is not a completion barrier: a descendant may not yet have
-                // been scheduled to exit when the direct child has already been reaped.
+                kill_session_procs(pid, libc::SIGKILL);
                 let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
-                while unsafe { libc::kill(-(pid as i32), 0) } == 0 && tokio::time::Instant::now() < deadline {
+                while group_or_session_alive(pid) && tokio::time::Instant::now() < deadline {
+                    kill_group(pid, libc::SIGKILL);
+                    kill_session_procs(pid, libc::SIGKILL);
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             }
@@ -322,6 +379,8 @@ pub async fn run_command(command: &str, args: &[String], options: RunOptions<'_>
         }
         out_task.abort();
         err_task.abort();
+        let _ = out_task.await;
+        let _ = err_task.await;
         return Err(error);
     }
     let _ = out_task.await;
@@ -329,7 +388,24 @@ pub async fn run_command(command: &str, args: &[String], options: RunOptions<'_>
     while let Ok(chunk) = rx.try_recv() {
         capture.push(&chunk);
     }
-    let code = status.and_then(|s| s.code()).unwrap_or(1);
+    let code = match status {
+        Some(s) => {
+            if let Some(c) = s.code() {
+                c
+            } else {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt;
+                    s.signal().map(|sig| 128 + sig).unwrap_or(1)
+                }
+                #[cfg(not(unix))]
+                {
+                    1
+                }
+            }
+        }
+        None => 1,
+    };
     Ok(CommandResult { code, output: capture.render(output_limit), truncated: capture.bytes > output_limit })
 }
 

@@ -48,6 +48,72 @@ setInterval(() => {}, 1000);
     assert!(!goon::process::process_alive(pid), "cancelled command left grandchild {pid} running");
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn command_cancellation_kills_descendants_that_escape_into_a_new_process_group() {
+    let f = fixture();
+    f.write(
+        "escape_pgrp.py",
+        r#"
+import os, signal, subprocess, time
+child_code = """
+import os, signal, time
+os.setpgrp()
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+with open('escaped.pid', 'w') as fh:
+    fh.write(str(os.getpid()))
+while True:
+    time.sleep(1)
+"""
+subprocess.Popen(['python3', '-c', child_code])
+while True:
+    time.sleep(1)
+"#,
+    );
+    let cancel = token();
+    let c = cancel.clone();
+    let cwd = f.cwd.clone();
+    let running = tokio::spawn(async move {
+        goon::process::run_command(
+            "python3",
+            &["escape_pgrp.py".into()],
+            goon::process::RunOptions { cwd: &cwd, cancel: &c, timeout_ms: 10_000, env: None, output_limit_bytes: None, hard_output_bytes: None },
+        )
+        .await
+    });
+    let escaped_pid = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Ok(raw) = std::fs::read_to_string(f.cwd.join("escaped.pid")) {
+                if let Ok(pid) = raw.trim().parse::<u32>() {
+                    break pid;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("escaped grandchild should write pid");
+    cancel.cancel();
+    let outcome = running.await.unwrap();
+    assert!(matches!(outcome, Err(goon::process::CommandError::Cancelled)), "{outcome:?}");
+    assert!(!goon::process::process_alive(escaped_pid), "descendant in separate process group {escaped_pid} survived cancellation");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn signal_terminated_child_reports_posix_128_plus_signal_exit_code() {
+    let f = fixture();
+    let cancel = token();
+    let res = goon::process::run_command(
+        "python3",
+        &["-c".into(), "import os, signal; os.kill(os.getpid(), signal.SIGTERM)".into()],
+        goon::process::RunOptions { cwd: &f.cwd, cancel: &cancel, timeout_ms: 5_000, env: None, output_limit_bytes: None, hard_output_bytes: None },
+    )
+    .await
+    .unwrap();
+    assert_eq!(res.code, 128 + libc::SIGTERM);
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn unreaped_macos_zombie_is_not_a_live_process_or_lock_owner() {

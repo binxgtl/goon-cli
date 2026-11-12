@@ -810,7 +810,7 @@ impl ToolRegistry {
 
     pub async fn execute(self: &Arc<Self>, call: &ToolCall, cancel: &CancellationToken) -> Result<ExecuteOutcome> {
         if cancel.is_cancelled() {
-            bail!("This operation was aborted");
+            return Err(crate::harness::Aborted::default().into());
         }
         let canonical = self.resolve_tool_name(&call.tool_name);
         let Some(definition) = self.definition(&canonical) else { bail!("Unknown tool: {}", call.tool_name) };
@@ -863,7 +863,7 @@ impl ToolRegistry {
             g.reset(&call_key);
         }
         if cancel.is_cancelled() {
-            bail!("This operation was aborted");
+            return Err(crate::harness::Aborted::default().into());
         }
         let result = match &definition.exec {
             Some(exec) => exec(input, cancel.clone()).await,
@@ -905,7 +905,21 @@ impl ToolRegistry {
                         .map(|a| a.to_string())
                         .chain([s("query"), target])
                         .collect();
-                let result = run_command("rg", &args, RunOptions { cwd: &self.files.root, cancel, timeout_ms: 30_000, env: None, output_limit_bytes: None, hard_output_bytes: None }).await;
+                let limits = self.policy().map(|p| p.limits.clone());
+                let timeout = limits.as_ref().map(|l| l.default_tool_timeout_ms.min(l.max_tool_timeout_ms)).unwrap_or(30_000).clamp(1_000, 30_000);
+                let result = run_command(
+                    "rg",
+                    &args,
+                    RunOptions {
+                        cwd: &self.files.root,
+                        cancel,
+                        timeout_ms: timeout,
+                        env: None,
+                        output_limit_bytes: limits.as_ref().map(|l| l.max_output_bytes),
+                        hard_output_bytes: limits.as_ref().map(|l| l.hard_output_bytes),
+                    },
+                )
+                .await;
                 match result {
                     Ok(r) => {
                         static HIT: OnceLock<Regex> = OnceLock::new();
@@ -918,10 +932,11 @@ impl ToolRegistry {
                     }
                     Err(CommandError::NotFound(_)) => {
                         if cancel.is_cancelled() {
-                            bail!("This operation was aborted");
+                            return Err(crate::harness::Aborted::default().into());
                         }
                         self.files.fallback_search(&s("query"), &s("path"), cancel)
                     }
+                    Err(CommandError::Cancelled) => Err(crate::harness::Aborted::default().into()),
                     Err(e) => Err(anyhow!(e.to_string())),
                 }
             }
@@ -1091,7 +1106,10 @@ impl ToolRegistry {
                 if crate::jsutil::is_windows() {
                     let _ = crate::files::unlink_safe(&self.cwd.join("nul"));
                 }
-                let r = result.map_err(|e| anyhow!(e.to_string()))?;
+                let r = result.map_err(|e| match e {
+                    CommandError::Cancelled => crate::harness::Aborted::default().into(),
+                    other => anyhow!(other.to_string()),
+                })?;
                 Ok(format!("Exit code: {}\n{}", r.code, r.output))
             }
             other => bail!("Unknown tool: {other}"),

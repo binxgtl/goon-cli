@@ -85,3 +85,26 @@ test('resuming a session by ID or with `goon resume` from another folder switche
   assert.equal(plain.code, 0, plain.stderr);
   assert.equal(JSON.parse(plain.stdout.split('\n')[0]).id, id);
 });
+
+test('default network-deny policy blocks inline runtime sockets and forge CLIs end-to-end', async t => {
+  const f = await fixture(t);
+  const sentinel = join(f.cwd, 'ran-net-bypass.txt');
+  for (const command of [
+    `python3 -c "open('${sentinel.replaceAll('\\', '/')}', 'w').write('1')"`,
+    'gh api user',
+  ]) {
+    const p = await provider(t, (_body, response) =>
+      sse(response, { calls: [{ id: 'b1', name: 'bash', input: { command } }] }),
+    );
+    // Do NOT pass --yes or --allow-net: default NetworkMode::Deny must reject before execution and exit 2.
+    const result = await cli(f, p.url, ['--json', '-p', 'probe network policy']).done;
+    assert.equal(result.code, 2, result.stderr + result.stdout);
+    const events = result.stdout.trim().split('\n').map(line => JSON.parse(line));
+    const errTool = events.find(e => e.type === 'tool' && e.state === 'error');
+    assert(errTool, `expected tool error event for ${command}`);
+    assert.match((errTool.meta?.outputPreview ?? []).join('\n'), /network access is disabled/i);
+    const done = events.find(e => e.type === 'done');
+    assert.equal(done?.denied, true);
+  }
+  await assert.rejects(stat(sentinel), 'blocked inline python command must never execute');
+});
