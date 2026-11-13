@@ -80,7 +80,10 @@ async fn run_tasks_is_the_public_spawn_path_and_pins_allowed_tools_in_the_child_
     let tools = registry(&f.cwd, tools::approve_all(), false);
     let subs = subagents::Subagents::new(rt, st, tools, harness::noop_emit());
     let allowed: HashSet<String> = ["read_file", "list_files", "search"].iter().map(|s| s.to_string()).collect();
-    let out = subs.run_tasks(vec!["inspect".into()], subagents::RunTasksOptions { read_only: false, cancel: token(), budget: None, allowed_tools: Some(allowed), role: None }).await.unwrap();
+    let out = subs
+        .run_tasks(vec!["inspect".into()], subagents::RunTasksOptions { model: None, effort: None, read_only: false, cancel: token(), budget: None, allowed_tools: Some(allowed), role: None })
+        .await
+        .unwrap();
     assert_match(&out, "child report");
     assert_eq!(*child_tools.lock().unwrap(), vec!["list_files", "read_file", "search"]);
 }
@@ -390,7 +393,10 @@ async fn run_dag_applies_max_cost_to_the_shared_budget_and_the_child_stops_at_th
         let (r, sb) = (r.clone(), sb.clone());
         Box::pin(async move {
             let out = sb
-                .run_tasks(vec!["inspect".into()], subagents::RunTasksOptions { read_only: true, cancel: req.cancel.clone(), budget: Some(req.budget.clone()), allowed_tools: None, role: None })
+                .run_tasks(
+                    vec!["inspect".into()],
+                    subagents::RunTasksOptions { model: None, effort: None, read_only: true, cancel: req.cancel.clone(), budget: Some(req.budget.clone()), allowed_tools: None, role: None },
+                )
                 .await?;
             *r.lock().unwrap() = out.clone();
             Ok(out)

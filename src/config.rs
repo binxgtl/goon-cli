@@ -92,6 +92,10 @@ pub struct Config {
     pub embedder_provider: String,
     pub embedder_model: Option<String>,
     pub embedder_base_url: Option<String>,
+    /// Default model for subagents (spawn_agent / delegate_*); a per-call `model` still wins.
+    pub subagent_model: Option<String>,
+    /// Default reasoning effort for subagents; a per-call `reasoning_effort` still wins.
+    pub subagent_effort: Option<String>,
 }
 
 impl Default for Config {
@@ -371,6 +375,8 @@ const CONFIG_KEYS: &[&str] = &[
     "embedderProvider",
     "embedderModel",
     "embedderBaseUrl",
+    "subagentModel",
+    "subagentEffort",
 ];
 
 /// `configSchema.parse(value)`.
@@ -428,7 +434,7 @@ pub fn parse_config(value: &Value) -> Result<Config> {
     };
     let inline_reasoning = get_enum(map, "inlineReasoning", &["leading-think", "off"], Some("leading-think"), &mut issues).unwrap();
     let show_reasoning = get_bool(map, "showReasoning", false, &mut issues);
-    let approval_mode = get_enum(map, "approvalMode", &["ask", "auto", "yolo", "plan", "readonly"], None, &mut issues).map(|m| if m == "yolo" { "auto".to_string() } else { m });
+    let approval_mode = get_enum(map, "approvalMode", &["ask", "auto", "yolo", "plan", "readonly"], None, &mut issues);
     let allow_net = get_bool(map, "allowNet", false, &mut issues);
     let allow_net_hosts = get_string_array(map, "allowNetHosts", &mut issues);
     let view_mode = get_enum(map, "viewMode", &["normal", "verbose", "transcript"], None, &mut issues);
@@ -473,6 +479,12 @@ pub fn parse_config(value: &Value) -> Result<Config> {
             issues.push("embedderBaseUrl", "Invalid URL");
         }
     }
+    let subagent_model = match get_string(map, "subagentModel", &mut issues) {
+        Some(m) if m.trim().is_empty() => None,
+        Some(m) => Some(m.trim().to_string()),
+        None => None,
+    };
+    let subagent_effort = get_enum(map, "subagentEffort", &EFFORT_LEVELS, None, &mut issues);
     if !issues.0.is_empty() {
         bail!("Invalid config:\n  {}", issues.0.join("\n  "));
     }
@@ -517,6 +529,8 @@ pub fn parse_config(value: &Value) -> Result<Config> {
         embedder_provider,
         embedder_model,
         embedder_base_url,
+        subagent_model,
+        subagent_effort,
     })
 }
 
@@ -600,6 +614,12 @@ impl Config {
         }
         if let Some(v) = &self.embedder_base_url {
             m.insert("embedderBaseUrl".into(), json!(v));
+        }
+        if let Some(v) = &self.subagent_model {
+            m.insert("subagentModel".into(), json!(v));
+        }
+        if let Some(v) = &self.subagent_effort {
+            m.insert("subagentEffort".into(), json!(v));
         }
         Value::Object(m)
     }
@@ -807,7 +827,7 @@ pub fn load_config(overrides: &Map<String, Value>) -> Result<Config> {
     };
     let validated = parse_config(&stored)?;
     let mut env = Map::new();
-    let env_keys: [(&str, &str); 16] = [
+    let env_keys: [(&str, &str); 18] = [
         ("provider", "GOON_PROVIDER"),
         ("baseUrl", "GOON_BASE_URL"),
         ("model", "GOON_MODEL"),
@@ -824,6 +844,8 @@ pub fn load_config(overrides: &Map<String, Value>) -> Result<Config> {
         ("embedderProvider", "GOON_EMBEDDER_PROVIDER"),
         ("embedderModel", "GOON_EMBEDDER_MODEL"),
         ("embedderBaseUrl", "GOON_EMBEDDER_BASE_URL"),
+        ("subagentModel", "GOON_SUBAGENT_MODEL"),
+        ("subagentEffort", "GOON_SUBAGENT_EFFORT"),
     ];
     let numeric = ["contextWindow", "maxOutputTokens", "timeoutMs", "runTokenBudget", "maxCostUsd", "maxTimeMs", "mouseScrollSpeed"];
     for (key, name) in env_keys {

@@ -112,3 +112,20 @@ async fn project_instructions_walk_from_the_git_root_and_compact_now_strips_anal
     assert_eq!(res.tokens, 55);
     assert_eq!(st.session.lock().unwrap().messages[0]["content"], "Earlier session summary (historical data):\nClean checkpoint summary.");
 }
+
+#[test]
+fn system_prompt_points_at_goons_own_files_and_yolo_drops_the_cautions() {
+    let f = fixture();
+    let _env = fixture_env(&f);
+    let rt = runtime(&f.cwd, &f.data, "http://127.0.0.1:9", json!({}));
+    let ask = goon::context::system_prompt(&rt, false, false, false, None, None).unwrap();
+    let mcp = goon::mcp::mcp_config_path();
+    assert!(ask.contains(&mcp.display().to_string()), "{ask}");
+    assert!(ask.contains(&goon::config::config_path().display().to_string()));
+    assert!(ask.contains("/mcp reload") && ask.contains("subagentModel"));
+    assert!(!ask.contains("YOLO MODE"));
+    let yolo = goon::context::system_prompt(&rt, false, false, true, None, None).unwrap();
+    assert!(yolo.contains("YOLO MODE") && yolo.contains("do not ask for confirmation"), "{yolo}");
+    // Read-only / plan sessions never get the unrestricted guidance.
+    assert!(!goon::context::system_prompt(&rt, true, false, true, None, None).unwrap().contains("YOLO MODE"));
+}

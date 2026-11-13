@@ -110,7 +110,7 @@ goon sessions
 ```
 
 Mặc định ở chế độ `ask` (yêu cầu chấp thuận khi sửa/ghi file hoặc chạy shell).
-Không có TTY thì những yêu cầu này bị từ chối trừ khi truyền `--yes` (chế độ `auto` — tự duyệt sửa file trong workspace và lệnh rủi ro thấp/vừa) hoặc `--yolo` (không giới hạn mạng/ngoài workspace, vẫn chặn lệnh `critical`). `--read-only` (hoặc `--readonly`) loại bỏ các công cụ ghi/sửa/bash khỏi bộ tool.
+Không có TTY thì những yêu cầu này bị từ chối trừ khi truyền `--yes` (chế độ `auto` — tự duyệt sửa file trong workspace và lệnh rủi ro thấp/vừa) hoặc `--yolo` (không giới hạn gì cả: mọi tool, lệnh — kể cả `critical` —, đường dẫn và host đều chạy không hỏi). `--read-only` (hoặc `--readonly`) loại bỏ các công cụ ghi/sửa/bash khỏi bộ tool.
 Mã thoát: `0` thành công, `1` lỗi, `2` từ chối quyền, `130` Ctrl+C, `143` SIGTERM.
 
 ## Giao diện TUI, Phím tắt & Slash Commands
@@ -259,7 +259,7 @@ Khi model đang suy nghĩ hoặc chạy tool:
 ### Danh sách Slash Commands tiêu biểu
 
 - `/auto [on|off]`: Bật/tắt chế độ **Auto-Approve** trong workspace (tự động duyệt thao tác rủi ro thấp/vừa; vẫn hỏi với lệnh rủi ro cao và giữ chính sách mạng).
-- `/yolo [on|off]`: Bật/tắt chế độ **YOLO (Unrestricted)** cho phiên hiện tại (tự động duyệt cả rủi ro cao, mạng và ngoài workspace; vẫn chặn `critical`).
+- `/yolo [on|off]`: Bật/tắt chế độ **YOLO (Unrestricted)** cho phiên hiện tại (tự động duyệt mọi thứ, kể cả lệnh `critical`, mạng và ngoài workspace; có thể đặt `"approvalMode": "yolo"` trong config để luôn bật).
 - `/mode [ask|auto|yolo|plan|readonly]`: Xem hoặc đổi chế độ quyền thực thi.
 - `/view [normal|verbose]`: Đổi chế độ hiển thị suy nghĩ (`normal` ẩn khối `Thinking` cho gọn; `verbose` hiện đầy đủ toàn bộ quá trình suy luận).
 - `/transcript`: Bật/tắt chế độ xem Transcript toàn màn hình (giống `Ctrl+T`).
@@ -410,6 +410,19 @@ Xem [docs/MCP.md](docs/MCP.md) để biết chi tiết cấu hình stdio, biến
 - **Uỷ thác theo lô (`delegate_task` & `delegate_edit`)**:
   - `delegate_task`: chia tối đa 4 việc đọc/review độc lập, tối đa 2 agent chạy đồng thời.
   - `delegate_edit`: chia tối đa 4 việc sửa file, chạy tuần tự; tôn trọng chế độ duyệt quyền (`ask` hoặc `auto`/`--yes`) của phiên cha.
+- **Model mặc định cho subagent**: đặt trong `~/.config/goon/config.json` để mọi subagent tự dùng model
+  này mà không cần dặn agent (agent vẫn có thể truyền `model` / `reasoning_effort` riêng khi bạn yêu cầu,
+  giá trị đó sẽ được ưu tiên). Không đặt thì subagent dùng model của phiên chính.
+
+  ```json
+  {
+    "model": "glm-5.3",
+    "subagentModel": "glm-5.3-flash",
+    "subagentEffort": "low"
+  }
+  ```
+
+  Hoặc qua biến môi trường `GOON_SUBAGENT_MODEL`, `GOON_SUBAGENT_EFFORT`.
 
 ```bash
 goon --read-only -p 'Dùng spawn_agent hoặc delegate_task để khảo sát cấu trúc repo và tìm rủi ro trong test'
@@ -595,6 +608,9 @@ goon --no-subagents -p 'Đọc repo và làm trực tiếp'
 - Event logs: `SESSION_UUID.events.jsonl` (+ `.seq`) trong cùng thư mục khi bật `--event-log`.
 - Archives: `SESSION_UUID.compact-N.json` trong cùng thư mục session.
 - Ưu tiên: cờ CLI > biến `GOON_*` > config người dùng > mặc định.
+- Agent được báo sẵn các đường dẫn trên (config, `mcp.json`, skills, prompts, memories, sessions, file
+  binary) trong system prompt, nên chỉ cần nói "cài MCP X" hay "đổi model mặc định" là nó tự sửa đúng file.
+- `"approvalMode": "yolo"` trong config giữ YOLO bật cho mọi lần chạy (bật bằng `/yolo` thì chỉ áp dụng cho phiên đó).
 
 Các biến môi trường hỗ trợ: `GOON_PROVIDER`, `GOON_BASE_URL`, `GOON_MODEL`, `GOON_EFFORT`,
 `GOON_KEY_ENV`, `GOON_API_KEY`, `GOON_CONTEXT_WINDOW`, `GOON_MAX_OUTPUT_TOKENS`,

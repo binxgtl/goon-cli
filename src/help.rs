@@ -28,7 +28,7 @@ Options:
   -r, --resume [ID|latest]   Resume a saved session (opens picker when omitted)
       --pair                 Start Cloudflared tunnel + QR device pairing on launch
   -y, --yes                  Auto-approve workspace edits & low/medium-risk shell commands
-      --yolo                 Unrestricted mode (high-risk shell, network & outside-workspace; dangerous)
+      --yolo                 Unrestricted mode: every tool/command runs without asking (incl. critical)
       --plan                 Start in read-only planning mode until exit_plan_mode
       --read-only, --readonly  Read tools and research agents; no writes or shell
       --allow-net            Allow outbound network (bash/MCP) for this run (default: deny)

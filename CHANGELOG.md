@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.4.1
+
+- **YOLO is truly unrestricted.** Critical-classified commands are no longer blocked in `yolo`
+  (`--yolo`, `/yolo`, shift+tab): every tool, command, path and host runs without asking, and the
+  system prompt tells the model to carry out the request without confirmation prompts or watered-down
+  variants. `"approvalMode": "yolo"` in `config.json` is now honoured (it used to be silently downgraded
+  to `auto`); toggling `/yolo` inside a session still only lasts for that session. Other modes are
+  unchanged (`ask`/`auto` still deny Critical), and paired remote devices still cannot switch a host
+  into `auto`/`yolo`.
+- **Default subagent model.** New config keys `subagentModel` and `subagentEffort` (env
+  `GOON_SUBAGENT_MODEL`, `GOON_SUBAGENT_EFFORT`) set the model/effort for `spawn_agent`,
+  `delegate_task` and `delegate_edit` children. A per-call `model` / `reasoning_effort` still wins;
+  `delegate_task` / `delegate_edit` gained both parameters. Unset → the session model, as before.
+- **Goon knows where it lives.** The system prompt lists goon's own files (config.json, mcp.json with
+  its format, credentials, skills, prompts, memories, sessions, the binary), so "install MCP server X"
+  or "change my default model" edits the right file and ends with a `/mcp reload` hint.
+
 ## 0.4.0
 
 ### Redesigned terminal UI (Claude Code / Codex inspired)

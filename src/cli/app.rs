@@ -783,7 +783,7 @@ impl App {
         }
         let label = match next {
             "auto" => "auto-approve (workspace Low/Medium tools — High/Critical & network still gated)".to_string(),
-            "yolo" => "yolo (unrestricted session — High-risk, outside-workspace & network enabled; Critical still blocked)".to_string(),
+            "yolo" => "yolo (unrestricted — every tool, command, path and host runs without asking)".to_string(),
             _ => next.to_string(),
         };
         self.notice(&format!("Mode: {label}"));
@@ -1366,7 +1366,7 @@ pub async fn run_session(values: Parsed, mut config: Config, policy: ExecutionPo
         config.approval_mode.clone().unwrap_or_else(|| "ask".into())
     };
     policy.set_unrestricted(mode == "yolo");
-    let pre_plan_mode = if yolo_flag {
+    let pre_plan_mode = if yolo_flag || mode == "yolo" {
         "yolo"
     } else if yes_flag || config.approval_mode.as_deref() == Some("auto") {
         "auto"

@@ -451,6 +451,23 @@
       "maxLength": 16000
      },
      "description": "List of independent task prompts (1 to 4 tasks) to run in isolated sub-agents."
+    },
+    "model": {
+     "description": "Optional model for these sub-agents. Defaults to `subagentModel` from goon's config.json (else the session model); set this only when the user asks for a specific model.",
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 128
+    },
+    "reasoning_effort": {
+     "description": "Optional reasoning effort for these sub-agents. Defaults to `subagentEffort` from config.json.",
+     "type": "string",
+     "enum": [
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max"
+     ]
     }
    },
    "required": [
@@ -476,6 +493,23 @@
       "maxLength": 16000
      },
      "description": "List of independent task prompts (1 to 4 tasks) to run in isolated sub-agents."
+    },
+    "model": {
+     "description": "Optional model for these sub-agents. Defaults to `subagentModel` from goon's config.json (else the session model); set this only when the user asks for a specific model.",
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 128
+    },
+    "reasoning_effort": {
+     "description": "Optional reasoning effort for these sub-agents. Defaults to `subagentEffort` from config.json.",
+     "type": "string",
+     "enum": [
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max"
+     ]
     }
    },
    "required": [
@@ -519,13 +553,13 @@
      "type": "boolean"
     },
     "model": {
-     "description": "Optional model override for this sub-agent.",
+     "description": "Optional model for this sub-agent. Defaults to `subagentModel` from goon's config.json (else the session model); set this only when the user asks for a specific model.",
      "type": "string",
      "minLength": 1,
      "maxLength": 128
     },
     "reasoning_effort": {
-     "description": "Optional reasoning effort override for this sub-agent.",
+     "description": "Optional reasoning effort for this sub-agent. Defaults to `subagentEffort` from config.json.",
      "type": "string",
      "enum": [
       "low",

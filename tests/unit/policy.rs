@@ -212,7 +212,7 @@ fn network_commands_stay_high_risk_in_ask_and_auto_modes_while_yolo_allows_high(
     assert!(!can_auto_approve("auto", RiskClass::High));
     assert!(!can_auto_approve("auto", RiskClass::Critical));
     assert!(can_auto_approve("yolo", RiskClass::High));
-    assert!(!can_auto_approve("yolo", RiskClass::Critical));
+    assert!(can_auto_approve("yolo", RiskClass::Critical));
     assert!(can_auto_approve("auto", RiskClass::Medium));
     assert_eq!(bash_approval_exact(&json!({ "command": "curl https://example.com" })).as_deref(), Some("curl https://example.com"));
 

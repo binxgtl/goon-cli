@@ -80,7 +80,7 @@ test('e2e: --allow-net-hosts lifts the network gate in ask mode but the high-ris
   });
 });
 
-test('e2e: --yolo grants unrestricted permissions (network, high-risk shell & outside-workspace files) while still blocking critical commands', async t => {
+test('e2e: --yolo grants unrestricted permissions (network, high-risk shell & outside-workspace files) including Critical commands', async t => {
   const server = http.createServer((_req, res) => {
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ repo: 'morluto/rea', ok: true }));
@@ -127,12 +127,24 @@ test('e2e: --yolo grants unrestricted permissions (network, high-risk shell & ou
   assert.equal(done.text, 'all done');
   assert.equal(await readFile(outsideFile, 'utf8'), 'installed=true\n');
 
-  // Critical commands (rm -rf /) remain denied even under --yolo.
-  await expectBashDenial(t, {
-    command: 'rm -rf /',
-    flags: ['--yolo'],
-    denyMessage: 'Permission denied: bash is critical risk and cannot run. Stop this run.',
+  // YOLO respects the user's choice completely: even a Critical-classified command runs.
+  // (`awk system()` is Critical but harmless here: it only writes a marker in the workspace.)
+  const critical = await e2eFixture(t);
+  const criticalFixture = await writeFixture(critical, 'yolo-critical.json', {
+    v: 1,
+    turns: [
+      {
+        match: 'critical',
+        toolCalls: [{ id: 'call-crit', name: 'bash', input: { command: `awk 'BEGIN { system("echo ran > crit-marker.txt") }'` } }],
+        usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+      },
+      { text: ['ran it'], usage: { inputTokens: 8, outputTokens: 3, totalTokens: 11 } },
+    ],
   });
+  const criticalRun = await runGoon(t, critical, [...BASE_FLAGS, '--yolo', '-p', 'critical', '--stub-fixture', criticalFixture, '--json', '--no-verify']);
+  assert.equal(criticalRun.code, 0, `--yolo critical: stdout=${criticalRun.stdout} stderr=${criticalRun.stderr}`);
+  assert.equal(jsonLines(criticalRun.stdout).find(event => event.type === 'done').denied, false);
+  assert.equal(await readFile(join(critical.workspace, 'crit-marker.txt'), 'utf8'), 'ran\n');
 });
 
 test('e2e: --yes / -y (auto mode) auto-approves workspace edits & safe commands while still blocking high-risk / outside-workspace mutations headless', async t => {

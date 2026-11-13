@@ -59,6 +59,12 @@ pub const CODEX_AGENT_NICKNAMES: [&str; 33] = [
 ];
 
 /// Child progress is a control channel: text/reasoning and per-request diagnostics stay internal.
+/// Optional `model` / `reasoning_effort` a delegate_* call asks for.
+fn model_choice(input: &Value) -> (Option<String>, Option<String>) {
+    let s = |k: &str| input.get(k).and_then(Value::as_str).map(str::to_string);
+    (s("model"), s("reasoning_effort"))
+}
+
 pub fn is_child_progress_event(event: &Value) -> bool {
     !matches!(event.get("type").and_then(Value::as_str), Some("text" | "reasoning" | "tool_stream" | "context_budget" | "memory_indexed" | "memory_retrieved" | "memory_error"))
 }
@@ -164,6 +170,9 @@ pub struct RunTasksOptions {
     pub budget: Option<SharedBudget>,
     pub allowed_tools: Option<HashSet<String>>,
     pub role: Option<String>,
+    /// Per-call model / effort chosen by the calling agent (falls back to `subagentModel` / `subagentEffort`).
+    pub model: Option<String>,
+    pub effort: Option<String>,
 }
 
 pub struct Subagents {
@@ -222,6 +231,20 @@ impl Subagents {
 
     fn arc(&self) -> Arc<Subagents> {
         self.me.lock().unwrap().upgrade().expect("subagents alive")
+    }
+
+    /// Runtime config for a child agent. `subagentModel` / `subagentEffort` from config.json are the
+    /// defaults; an explicit per-call `model` / `reasoning_effort` (the calling agent's choice) wins.
+    pub fn child_config(&self, model: Option<String>, effort: Option<String>) -> RuntimeConfig {
+        let mut child = (*self.config).clone();
+        let pick = |explicit: Option<String>, default: &Option<String>| explicit.map(|v| v.trim().to_string()).filter(|v| !v.is_empty()).or_else(|| default.clone());
+        if let Some(model) = pick(model, &self.config.subagent_model) {
+            child.model = model;
+        }
+        if let Some(effort) = pick(effort, &self.config.subagent_effort) {
+            child.config.effort = Some(effort);
+        }
+        child
     }
 
     pub fn subagents_root(&self) -> PathBuf {
@@ -295,7 +318,8 @@ impl Subagents {
                 Some(sync_exec(weak.clone(), |me, input, cancel| {
                     Box::pin(async move {
                         let tasks = string_list(&input, "tasks");
-                        me.run_tasks(tasks, RunTasksOptions { read_only: true, cancel, budget: None, allowed_tools: None, role: Some("explorer".into()) }).await
+                        let (model, effort) = model_choice(&input);
+                        me.run_tasks(tasks, RunTasksOptions { read_only: true, cancel, budget: None, allowed_tools: None, role: Some("explorer".into()), model, effort }).await
                     })
                 })),
             ),
@@ -307,7 +331,8 @@ impl Subagents {
                 Some(sync_exec(weak.clone(), |me, input, cancel| {
                     Box::pin(async move {
                         let tasks = string_list(&input, "tasks");
-                        me.run_tasks(tasks, RunTasksOptions { read_only: false, cancel, budget: None, allowed_tools: None, role: Some("worker".into()) }).await
+                        let (model, effort) = model_choice(&input);
+                        me.run_tasks(tasks, RunTasksOptions { read_only: false, cancel, budget: None, allowed_tools: None, role: Some("worker".into()), model, effort }).await
                     })
                 })),
             ),
@@ -449,14 +474,7 @@ impl Subagents {
         if !child_read_only && self.registry.read_only() {
             bail!("Writable subagents unavailable in read-only mode. Use agent_type=\"explorer\".");
         }
-        let mut child_config = (*self.config).clone();
-        if let Some(m) = s("model") {
-            child_config.model = m;
-        }
-        if let Some(e) = s("reasoning_effort") {
-            child_config.config.effort = Some(e);
-        }
-        let child_config = Arc::new(child_config);
+        let child_config = Arc::new(self.child_config(s("model"), s("reasoning_effort")));
         let nickname = self.allocate_nickname(s("nickname").as_deref());
         let message = s("message").unwrap_or_default();
         let store = SessionStore::open(&self.subagents_root(), SessionRoute::from_runtime(&child_config), None, None)?;
@@ -975,6 +993,7 @@ impl Subagents {
         let next = Arc::new(Mutex::new(0usize));
         let denied = Arc::new(Mutex::new(false));
         let workers = if opts.read_only { 2.min(tasks.len()) } else { 1 };
+        let child_config = Arc::new(self.child_config(opts.model.clone(), opts.effort.clone()));
         let worker = || async {
             loop {
                 if opts.cancel.is_cancelled() || *denied.lock().unwrap() {
@@ -988,7 +1007,7 @@ impl Subagents {
                     *n += 1;
                     *n - 1
                 };
-                let outcome = self.child(&tasks[index], opts.read_only, &opts.cancel, &budget, opts.role.as_deref(), Some(allowed.clone())).await;
+                let outcome = self.child(&tasks[index], opts.read_only, &opts.cancel, &budget, opts.role.as_deref(), Some(allowed.clone()), child_config.clone()).await;
                 let text = match outcome {
                     Ok(report) => report,
                     Err(error) => {
@@ -1012,7 +1031,17 @@ impl Subagents {
         Ok(limit_text(&joined, 32_000))
     }
 
-    async fn child(&self, task: &str, read_only: bool, cancel: &CancellationToken, budget: &SharedBudget, role: Option<&str>, allowed: Option<HashSet<String>>) -> Result<String> {
+    #[allow(clippy::too_many_arguments)]
+    async fn child(
+        &self,
+        task: &str,
+        read_only: bool,
+        cancel: &CancellationToken,
+        budget: &SharedBudget,
+        role: Option<&str>,
+        allowed: Option<HashSet<String>>,
+        config: Arc<RuntimeConfig>,
+    ) -> Result<String> {
         let role = role.map(str::to_string).unwrap_or_else(|| if read_only { "explorer".into() } else { "worker".into() });
         self.acquire(cancel, 2).await?;
         let denied = Arc::new(Mutex::new(false));
@@ -1024,24 +1053,18 @@ impl Subagents {
                     bail!("Shared run token budget reached.");
                 }
             }
-            let st = Arc::new(SessionStore::open(&self.subagents_root(), SessionRoute::from_runtime(&self.config), None, None)?);
+            let st = Arc::new(SessionStore::open(&self.subagents_root(), SessionRoute::from_runtime(&config), None, None)?);
             store = Some(st.clone());
             let id = st.id();
             let nickname = self.allocate_nickname(None);
             self.metadata.lock().unwrap().insert(id.clone(), (nickname, role.clone(), task.to_string()));
             (self.emit)(json!({ "type": "subagent", "id": id, "task": task, "state": "start" }));
-            let tools = ToolRegistry::new(&self.config.cwd, self.child_approve(denied.clone()), read_only || self.registry.read_only(), allowed);
+            let tools = ToolRegistry::new(&config.cwd, self.child_approve(denied.clone()), read_only || self.registry.read_only(), allowed);
             tools.update_flags(|f| f.unrestricted = self.registry.unrestricted());
             tools.set_policy(self.registry.policy());
             tools.set_cost_ledger(self.registry.cost_ledger());
-            let harness = Harness::new(
-                self.config.clone(),
-                st.clone(),
-                tools,
-                self.child_emit(id.clone(), denied.clone(), cancel.clone()),
-                None,
-                HarnessDeps { verify_enabled: Some(false), ..Default::default() },
-            )?;
+            let harness =
+                Harness::new(config.clone(), st.clone(), tools, self.child_emit(id.clone(), denied.clone(), cancel.clone()), None, HarnessDeps { verify_enabled: Some(false), ..Default::default() })?;
             harness.set_untrusted_prompts(true);
             let before = st.session.lock().unwrap().cost();
             let run = harness.run(&build_role_prompt(&role, task), cancel, Some(budget.clone())).await;
@@ -1051,7 +1074,7 @@ impl Subagents {
                 return Err(PermissionDenied("Permission denied in a subagent. Stop this run.".into()).into());
             }
             let messages = st.session.lock().unwrap().messages.clone();
-            let answer = last_assistant_answer(&messages, &self.config.inline_reasoning);
+            let answer = last_assistant_answer(&messages, &config.inline_reasoning);
             Ok(format!("Session {id}\nTask: {task}\n{}", limit_text(&answer, 12_000)))
         }
         .await;

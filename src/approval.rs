@@ -404,7 +404,7 @@ pub fn bash_approval_prefix(input: &Value) -> Option<String> {
 pub fn can_auto_approve(mode: &str, risk: RiskClass) -> bool {
     match mode {
         "auto" => matches!(risk, RiskClass::Low | RiskClass::Medium),
-        "yolo" => risk != RiskClass::Critical,
+        "yolo" => true,
         _ => false,
     }
 }
@@ -504,7 +504,7 @@ mod tests {
         assert!(!can_auto_approve("auto", RiskClass::High));
         assert!(!can_auto_approve("auto", RiskClass::Critical));
         assert!(can_auto_approve("yolo", RiskClass::High));
-        assert!(!can_auto_approve("yolo", RiskClass::Critical));
+        assert!(can_auto_approve("yolo", RiskClass::Critical));
         assert!(!can_auto_approve("ask", RiskClass::Low));
     }
 }

@@ -203,13 +203,13 @@ fn exact_allowlist_normalizes_and_rejects_shell_metacharacters() {
 }
 
 #[test]
-fn can_auto_approve_grants_low_medium_in_auto_and_high_in_yolo_while_denying_critical() {
+fn can_auto_approve_grants_low_medium_in_auto_and_everything_in_yolo() {
     assert!(!approval::can_auto_approve("auto", RiskClass::High));
     assert!(!approval::can_auto_approve("auto", RiskClass::Critical));
     assert!(approval::can_auto_approve("auto", RiskClass::Medium));
     assert!(approval::can_auto_approve("auto", RiskClass::Low));
     assert!(approval::can_auto_approve("yolo", RiskClass::High));
-    assert!(!approval::can_auto_approve("yolo", RiskClass::Critical));
+    assert!(approval::can_auto_approve("yolo", RiskClass::Critical));
     assert!(!approval::can_auto_approve("ask", RiskClass::Low));
     assert!(!approval::can_auto_approve("plan", RiskClass::Low));
     assert!(!approval::can_auto_approve("readonly", RiskClass::Low));

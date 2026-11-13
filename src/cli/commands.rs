@@ -438,6 +438,8 @@ impl App {
                             budget: Some(req.budget),
                             allowed_tools: Some(req.allowed_tools.into_iter().collect::<HashSet<_>>()),
                             role: Some(req.todo.role.clone()),
+                            model: None,
+                            effort: None,
                         },
                     )
                     .await

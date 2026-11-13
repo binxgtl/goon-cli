@@ -636,7 +636,7 @@ impl Harness {
         repair_interrupted(&mut history);
         let expanded = expand_file_mentions(question, &self.tools.files, &MentionOptions { model: Some(&self.config.model), ..Default::default() });
         history.push(json!({ "role": "user", "content": format!("[Ephemeral Side Question (/btw) — answer concisely without modifying session state]:\n{}", expanded.expanded_prompt) }));
-        let sys = system_prompt(&self.config, true, false, goal.as_ref(), None)?;
+        let sys = system_prompt(&self.config, true, false, false, goal.as_ref(), None)?;
         let request = ModelRequest {
             system: Some(format!("{sys}\n\nYou are answering an ephemeral side question (/btw). Do not call tools; answer directly and concisely from the conversation context and your knowledge.")),
             messages: with_reasoning_replay(&history, self.model.provider(), self.config.effort.as_deref()),
@@ -1228,7 +1228,7 @@ impl Harness {
             }
             let goal = self.store.session.lock().unwrap().goal.clone();
             let flags = self.tools.flags();
-            let system = system_prompt(&self.config, flags.read_only, flags.plan_mode, goal.as_ref(), Some(&mut prompt_cache))?;
+            let system = system_prompt(&self.config, flags.read_only, flags.plan_mode, self.tools.is_unrestricted(), goal.as_ref(), Some(&mut prompt_cache))?;
             let allocation = allocate_context_budget(&budget_config, &system);
             let memory_context = self.retrieve_memory(&expanded.expanded_prompt, allocation.files).await;
             let old_count = self.store.session.lock().unwrap().compactions;

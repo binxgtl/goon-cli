@@ -688,7 +688,7 @@ async fn parent_cancel_stops_synchronous_delegates_before_queued_tasks_start() {
         agents
             .run_tasks(
                 vec!["first".into(), "second".into(), "must not start".into()],
-                goon::subagents::RunTasksOptions { read_only: true, cancel: c, budget: None, allowed_tools: None, role: Some("explorer".into()) },
+                goon::subagents::RunTasksOptions { model: None, effort: None, read_only: true, cancel: c, budget: None, allowed_tools: None, role: Some("explorer".into()) },
             )
             .await
     });
@@ -704,4 +704,35 @@ async fn parent_cancel_stops_synchronous_delegates_before_queued_tasks_start() {
     assert!(harness::is_aborted(&result.unwrap_err()));
     assert_eq!(started.load(Ordering::SeqCst), 2);
     assert_eq!(locks_in(&h.child_dir()), 0);
+}
+
+#[tokio::test]
+async fn subagents_default_to_the_configured_model_but_a_per_call_model_still_wins() {
+    for (call_input, expected) in [(json!({ "tasks": ["Look around"] }), "child-default"), (json!({ "tasks": ["Look around"], "model": "custom-x", "reasoning_effort": "low" }), "custom-x")] {
+        let f = fixture();
+        let seen = Arc::new(Mutex::new(vec![]));
+        let seen_in = seen.clone();
+        let input = call_input.clone();
+        let p = provider(move |body, _| {
+            if is_child(body) {
+                seen_in.lock().unwrap().push(body["model"].as_str().unwrap_or("").to_string());
+                return text("child report");
+            }
+            if has_tool_results(body) {
+                return text("parent done");
+            }
+            calls(vec![tc("delegate", "delegate_task", input.clone())])
+        })
+        .await;
+        let (approve, _) = recording(|_| true);
+        let h = parent(&f, &p.url, approve, json!({ "subagentModel": "child-default", "subagentEffort": "high" }));
+        assert_eq!(h.rt.config.subagent_model.as_deref(), Some("child-default"));
+        h.run("delegate please").await.unwrap();
+        assert_eq!(*seen.lock().unwrap(), vec![expected.to_string()], "{call_input}");
+        let child = h.subagents.child_config(None, None);
+        assert_eq!((child.model.as_str(), child.config.effort.as_deref()), ("child-default", Some("high")));
+        let explicit = h.subagents.child_config(Some("custom-y".into()), Some("max".into()));
+        assert_eq!((explicit.model.as_str(), explicit.config.effort.as_deref()), ("custom-y", Some("max")));
+        assert_eq!(h.rt.model, "test-model", "the parent keeps its own model");
+    }
 }

@@ -972,7 +972,8 @@ impl ToolRegistry {
         let risk = self.risk_of(&canonical, Some(&input));
         let call_key = tool_approval_signature(&canonical, &normalized);
         let unrestricted = self.is_unrestricted();
-        if risk == RiskClass::Critical {
+        // YOLO is the user's explicit choice of an unrestricted session: nothing is gated, Critical included.
+        if risk == RiskClass::Critical && !unrestricted {
             return Ok(self.deny(&call_key, format!("Permission denied: {canonical} is critical risk and cannot run. Stop this run.")).await);
         }
         if !unrestricted {
