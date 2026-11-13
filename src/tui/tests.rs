@@ -68,6 +68,7 @@ async fn selection_arrow_keys_move_endpoint_and_reveal_it_without_touching_compo
     tty.ui.set_status("Running");
     tty.frame();
     let mut st = tty.ui.state.lock().unwrap();
+    st.ensure_body_layout();
     let mut selected = selection::Selection::new(selection::Point { line: 0, offset: 0 }, &st.transcript, &st.body_layout);
     selected.end = selection::Point { line: 0, offset: 1 };
     st.selection = Some(selected);
@@ -169,6 +170,7 @@ async fn windows_copy_shortcuts_decode_without_altgr_becoming_copy() {
     tty.ui.set_input("draft", false);
     tty.frame();
     let mut st = tty.ui.state.lock().unwrap();
+    st.ensure_body_layout();
     let mut selected = selection::Selection::new(selection::Point { line: 0, offset: 0 }, &st.transcript, &st.body_layout);
     selected.end = selection::Point { line: 0, offset: 8 };
     st.selection = Some(selected);
@@ -208,6 +210,7 @@ async fn selection_copy_acknowledgment_preserves_retry_and_rejects_stale_results
     tty.frame();
     let install = || {
         let mut st = tty.ui.state.lock().unwrap();
+        st.ensure_body_layout();
         let mut selected = selection::Selection::new(selection::Point { line: 0, offset: 0 }, &st.transcript, &st.body_layout);
         selected.end = selection::Point { line: 0, offset: 8 };
         st.selection = Some(selected);
@@ -257,6 +260,7 @@ async fn selection_copy_ack_cannot_undo_scrolling_even_after_returning_to_the_sa
             tty.frame();
             let request = {
                 let mut st = tty.ui.state.lock().unwrap();
+                st.ensure_body_layout();
                 let mut selected = selection::Selection::new(selection::Point { line: 0, offset: 0 }, &st.transcript, &st.body_layout);
                 selected.end = selection::Point { line: 0, offset: 8 };
                 st.selection = Some(selected);
@@ -290,6 +294,7 @@ async fn selection_copy_ack_cannot_undo_home_or_unchanged_endpoint_reveal() {
         tty.frame();
         let (request, scroll) = {
             let mut st = tty.ui.state.lock().unwrap();
+            st.ensure_body_layout();
             let mut selected = selection::Selection::new(selection::Point { line: 0, offset: 8 }, &st.transcript, &st.body_layout);
             selected.end = selection::Point { line: 0, offset: 0 };
             st.selection = Some(selected);
@@ -316,6 +321,7 @@ async fn selection_copy_ack_survives_noop_scroll_but_not_actual_resize() {
         tty.frame();
         let request = {
             let mut st = tty.ui.state.lock().unwrap();
+            st.ensure_body_layout();
             let mut selected = selection::Selection::new(selection::Point { line: 0, offset: 0 }, &st.transcript, &st.body_layout);
             selected.end = selection::Point { line: 0, offset: 8 };
             st.selection = Some(selected);
@@ -340,6 +346,7 @@ async fn enter_and_control_copy_capture_selection_without_submitting_draft_or_ca
     tty.ui.set_status("Running");
     tty.frame();
     let mut st = tty.ui.state.lock().unwrap();
+    st.ensure_body_layout();
     let mut selected = selection::Selection::new(selection::Point { line: 0, offset: 0 }, &st.transcript, &st.body_layout);
     selected.end = selection::Point { line: 0, offset: 8 };
     st.selection = Some(selected);
@@ -372,6 +379,7 @@ async fn clipboard_ack_does_not_follow_behind_a_new_modal_prompt() {
     tty.frame();
     let request = {
         let mut st = tty.ui.state.lock().unwrap();
+        st.ensure_body_layout();
         let mut selected = selection::Selection::new(selection::Point { line: 0, offset: 0 }, &st.transcript, &st.body_layout);
         selected.end = selection::Point { line: 0, offset: 8 };
         st.selection = Some(selected);
@@ -591,6 +599,7 @@ async fn transcript_presentation_changes_never_reinterpret_stale_selection_rows(
     tty.frame();
     {
         let mut st = tty.ui.state.lock().unwrap();
+        st.ensure_body_layout();
         st.selection = Some(selection::Selection::new(selection::Point { line: 0, offset: 0 }, &st.transcript, &st.body_layout));
         st.selection_dragging = true;
     }
@@ -599,6 +608,7 @@ async fn transcript_presentation_changes_never_reinterpret_stale_selection_rows(
     tty.frame();
     {
         let mut st = tty.ui.state.lock().unwrap();
+        st.ensure_body_layout();
         st.selection = Some(selection::Selection::new(selection::Point { line: 0, offset: 0 }, &st.transcript, &st.body_layout));
     }
     tty.ui.key(None, modified("t", true, false, false));
@@ -1006,6 +1016,7 @@ async fn incremental_rendering_is_identical_to_a_full_re_render() {
         }
         let cols = tty.size.lock().unwrap().0 - 1;
         let mut st = tty.ui.state.lock().unwrap();
+        st.ensure_body_layout();
         let incremental = tty.ui.render_styled_body_lines(&mut st, cols, true);
         let incremental_ends = st.body_source_ends.clone();
         let incremental_logical = st.body_layout.text.clone();
@@ -1247,7 +1258,8 @@ async fn welcome_banner_is_plain_text_framed_as_a_card_and_view_mode_toggles_thi
             let width = visible_length(&lines[top]);
             assert!(lines[top..=bottom].iter().all(|l| visible_length(l) == width), "card edges align:\n{frame}");
             // The card is decoration: selecting across it copies nothing from the frame.
-            let st = tty.ui.state.lock().unwrap();
+            let mut st = tty.ui.state.lock().unwrap();
+            st.ensure_body_layout();
             assert!(st.body_layout.text.iter().all(|t| !t.contains('│') && !t.contains('╭')));
         } else {
             assert!(frame.contains("model gpt-5.4"), "narrow banner collapses label padding:\n{frame}");
@@ -1558,6 +1570,7 @@ async fn adaptive_table_full_copy_and_native_source_boundaries_survive_layout_ch
         tty.ui.write(source);
         tty.frame();
         let mut st = tty.ui.state.lock().unwrap();
+        st.ensure_body_layout();
         let first = st.body_layout.text.iter().position(|line| line.contains("│ Task ")).unwrap();
         let last = st.body_layout.text.iter().position(|line| line.contains("Finish implementation")).unwrap();
         let mut selected = selection::Selection::new(selection::Point { line: first, offset: 0 }, &st.transcript, &st.body_layout);
@@ -1584,7 +1597,8 @@ async fn whole_table_copy_preserves_markdown_structure_alignment_and_empty_cells
         tty.ui.write("[answer]\n| A | B |\n|:---|---:|\n| left | right |\n|  |  |\n");
         tty.frame();
         let request = {
-            let st = tty.ui.state.lock().unwrap();
+            let mut st = tty.ui.state.lock().unwrap();
+            st.ensure_body_layout();
             let first = st.body_layout.text.iter().position(|line| line.contains("│ A")).unwrap();
             let last = st.body_layout.text.iter().rposition(|line| line.contains('│')).unwrap();
             let mut selected = selection::Selection::new(selection::Point { line: first, offset: 0 }, &st.transcript, &st.body_layout);
@@ -1602,6 +1616,7 @@ async fn table_copy_only_serializes_selected_cell_fragments_and_survives_reflow(
     tty.frame();
     let install = |first: &str, from: usize, last: &str, to: usize| {
         let mut st = tty.ui.state.lock().unwrap();
+        st.ensure_body_layout();
         let line = st.body_layout.text.iter().position(|line| line.contains(first)).unwrap();
         let offset = st.body_layout.text[line].find(first).unwrap() + from;
         let mut selected = selection::Selection::new(selection::Point { line, offset }, &st.transcript, &st.body_layout);
@@ -1629,7 +1644,8 @@ async fn table_copy_keeps_literal_cells_plain_and_mixed_code_cells_formatted() {
     tty.ui.write("[answer]\nBefore\n\n| `a\\|b` | B |\n|---|---|\n| **literal │ divider** | value |\n");
     tty.frame();
     let request = |start_text: &str, start_offset: usize, end_text: &str, end_offset: usize| {
-        let st = tty.ui.state.lock().unwrap();
+        let mut st = tty.ui.state.lock().unwrap();
+        st.ensure_body_layout();
         let line = st.body_layout.text.iter().position(|line| line.contains(start_text)).unwrap();
         let offset = st.body_layout.text[line].find(start_text).unwrap() + start_offset;
         let mut selected = selection::Selection::new(selection::Point { line, offset }, &st.transcript, &st.body_layout);
@@ -1642,7 +1658,8 @@ async fn table_copy_keeps_literal_cells_plain_and_mixed_code_cells_formatted() {
     assert_eq!(request("Before", 0, "a|b", 3), "Before\n\n`a|b`");
     assert_eq!(request("literal │ divider", 0, "literal │ divider", "literal │ divider".len()), "**literal │ divider**");
     let separator = {
-        let st = tty.ui.state.lock().unwrap();
+        let mut st = tty.ui.state.lock().unwrap();
+        st.ensure_body_layout();
         let line = st.body_layout.text.iter().position(|line| line.contains('├')).unwrap();
         st.body_layout.text[line].to_string()
     };
@@ -1655,7 +1672,8 @@ async fn table_copy_keeps_separate_tables_and_fenced_pipe_text_separate() {
     tty.ui.write("[answer]\nBefore\n\n| A | B |\n|---|---|\n| one | two |\n\n```text\n| literal | code |\n```\n\n| C | D |\n|---|---|\n| three | four |\n\nAfter\n");
     tty.frame();
     let request = {
-        let st = tty.ui.state.lock().unwrap();
+        let mut st = tty.ui.state.lock().unwrap();
+        st.ensure_body_layout();
         let first = st.body_layout.text.iter().position(|line| line.contains("Before")).unwrap();
         let last = st.body_layout.text.iter().position(|line| line.contains("After")).unwrap();
         let mut selected = selection::Selection::new(selection::Point { line: first, offset: 0 }, &st.transcript, &st.body_layout);
@@ -3063,6 +3081,7 @@ async fn pointer_hit_testing_refreshes_scroll_and_snaps_wide_glyph_carets() {
 
     {
         let mut st = tty.ui.state.lock().unwrap();
+        st.ensure_body_layout();
         st.selection = Some(selection::Selection::new(selection::Point { line: 0, offset: 0 }, &st.transcript, &st.body_layout));
         st.selection_dragging = true;
     }
@@ -3071,6 +3090,7 @@ async fn pointer_hit_testing_refreshes_scroll_and_snaps_wide_glyph_carets() {
     assert!(!tty.ui.state.lock().unwrap().selection_dragging, "aborted resize gesture cannot remain armed");
     {
         let mut st = tty.ui.state.lock().unwrap();
+        st.ensure_body_layout();
         st.selection = Some(selection::Selection::new(selection::Point { line: 0, offset: 0 }, &st.transcript, &st.body_layout));
         st.selection_dragging = true;
     }

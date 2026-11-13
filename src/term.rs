@@ -36,6 +36,11 @@ fn ansi_re() -> &'static Regex {
 
 /// `stripVTControlCharacters`: removes complete escape sequences only.
 pub fn strip_vt(value: &str) -> std::borrow::Cow<'_, str> {
+    // Fast path: most strings (plain text, single graphemes) carry no escape at all, and the
+    // regex scan dominated render profiles when called per grapheme.
+    if !value.contains(['\x1b', '\u{9b}']) {
+        return std::borrow::Cow::Borrowed(value);
+    }
     ansi_re().replace_all(value, "")
 }
 

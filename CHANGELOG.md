@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.4.2
+
+Streaming performance (measured on Linux, 120×40, a 1,500-line answer streamed over ~20 s):
+goon CPU 24% → 4%, bytes written to the terminal 244 KiB/s → 14 KiB/s (≈17× less for the
+terminal to parse and draw — the main cost on CPU-rendered terminals).
+
+- **Scroll instead of repaint.** When the body only moved up, the alternate-screen renderer
+  scrolls that region (DECSTBM + line feeds) and paints just the new rows, instead of rewriting
+  every visible row each frame.
+- **~30 fps while streaming.** Chunks arriving within one 33 ms frame share a paint (was 16 ms).
+- **No more O(n²) transcript growth.** Streamed text is appended in place instead of rebuilding
+  the whole transcript string per chunk.
+- **Body cache without copies.** The incremental renderer reuses its cached rows/lines in place
+  instead of cloning the whole body (and the transcript) every frame.
+- **Lazy selection geometry.** The row → text layout used for mouse/keyboard selection is built
+  only when a selection or click needs it, not on every streamed frame.
+- **Fast paths for width/escape stripping.** `visible_length` / `strip_vt` skip the regex for
+  plain text; the regex ran once per grapheme during layout and dominated profiles.
+
 ## 0.4.1
 
 - **YOLO is truly unrestricted.** Critical-classified commands are no longer blocked in `yolo`

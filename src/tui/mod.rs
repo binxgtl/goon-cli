@@ -398,6 +398,20 @@ pub(crate) struct Row {
     origin: Option<selection::Origin>,
 }
 
+impl State {
+    /// Selection geometry (row → logical text) is only needed for mouse/keyboard selection, so it
+    /// is built lazily from the last rendered body instead of on every streamed frame.
+    pub(crate) fn ensure_body_layout(&mut self) {
+        if !self.body_layout_dirty {
+            return;
+        }
+        if let Some(cache) = &self.body_cache {
+            self.body_layout = selection::Layout::from_rows(&cache.rows, &cache.styled, cache.rich);
+        }
+        self.body_layout_dirty = false;
+    }
+}
+
 pub(crate) struct BodyCache {
     pub cols: usize,
     pub rich: bool,
@@ -405,6 +419,8 @@ pub(crate) struct BodyCache {
     pub show_reasoning: bool,
     pub source: String,
     pub state: ParseState,
+    /// Rows/lines of the whole last frame; only the first `checkpoint_rows` are reusable.
+    pub checkpoint_rows: usize,
     pub rows: Vec<Row>,
     pub styled: Vec<String>,
     pub source_ends: Vec<usize>,
@@ -515,6 +531,8 @@ pub(crate) struct State {
     pub body_cache: Option<BodyCache>,
     body_source_ends: Vec<usize>,
     body_layout: selection::Layout,
+    /// The body changed since `body_layout` was built; rebuilt on demand (selection, mouse).
+    body_layout_dirty: bool,
     native: Option<native::NativeViewport>,
     native_resize_cursor: Option<(usize, usize, usize)>,
     editor_requested: bool,
@@ -737,6 +755,7 @@ impl Tui {
             body_cache: None,
             body_source_ends: vec![],
             body_layout: selection::Layout::default(),
+            body_layout_dirty: false,
             native: (!alternate).then(native::NativeViewport::default),
             native_resize_cursor: None,
             editor_requested: false,
@@ -1280,8 +1299,10 @@ impl Tui {
 
     fn append_transcript(&self, st: &mut State, text: &str, force_bottom: bool) {
         let was_at_bottom = st.scroll == 0;
-        let mut next = format!("{}{}", st.transcript, terminal_text(text));
-        if next.len() > TRANSCRIPT_MAX_CHARS {
+        // Append in place: rebuilding the whole transcript per streamed chunk was O(n²).
+        st.transcript.push_str(&terminal_text(text));
+        if st.transcript.len() > TRANSCRIPT_MAX_CHARS {
+            let next = std::mem::take(&mut st.transcript);
             // Trim in large steps and only at a block boundary: cutting inside a code fence used
             // to render the rest of the session as code.
             let mut from = next.len() - TRANSCRIPT_KEEP_CHARS;
@@ -1299,13 +1320,13 @@ impl Tui {
                 native.trim_source_prefix(cut);
             }
             // A selection owns its immutable revision, including trimmed history.
-            next = next[cut..].to_string();
+            st.transcript = next[cut..].to_string();
         }
-        st.transcript = next;
         if force_bottom || was_at_bottom {
             st.scroll = 0;
         }
-        self.schedule(st, 16);
+        // ~30 fps while streaming: chunks arriving inside one frame budget share a paint.
+        self.schedule(st, 33);
     }
 
     /// A `[normal]` marker closes any open reasoning/answer block (renders as nothing).
@@ -2477,6 +2498,7 @@ impl Tui {
         // Scroll, streaming output and popup layout may have changed since the
         // last paint. Hit-test the frame we are about to show, never stale rows.
         self.render(&mut st);
+        st.ensure_body_layout();
         if let Some(jump) = st.follow_control.handle(event) {
             if jump {
                 st.selection = None;
@@ -2837,6 +2859,7 @@ impl Tui {
             && Self::slash_popup(st).0.is_empty()
         {
             self.render(st); // Refresh wrapped row geometry before moving the logical endpoint.
+            st.ensure_body_layout();
             if let Some(mut selection) = st.selection.take() {
                 if let Some(row) = selection.move_endpoint(&st.body_layout, &key.name) {
                     let height = st.transcript_view_rows.len().max(1);

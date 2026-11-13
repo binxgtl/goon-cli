@@ -294,6 +294,10 @@ pub fn wrap_terminal(text: &str, columns: usize) -> Vec<String> {
 }
 
 pub fn visible_length(text: &str) -> usize {
+    // Fast path: printable ASCII is one column per byte.
+    if text.bytes().all(|b| (0x20..0x7f).contains(&b)) {
+        return text.len();
+    }
     UnicodeWidthStr::width(strip_vt(text).as_ref())
 }
 

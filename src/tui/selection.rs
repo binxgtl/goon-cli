@@ -710,6 +710,9 @@ impl Tui {
         if !super::text::Palette::for_mode(st.theme_mode).is_styled() {
             return;
         }
+        if st.selection.is_some() {
+            st.ensure_body_layout();
+        }
         if let Some(selection) = &st.selection {
             for (index, line) in body.iter_mut().enumerate() {
                 for (start, end) in st.body_layout.columns(top + index, selection) {

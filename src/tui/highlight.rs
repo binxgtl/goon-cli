@@ -316,3 +316,22 @@ mod tests {
         assert_eq!(shimmer("Working", 3, &Palette::ANSI16), "Working");
     }
 }
+
+#[cfg(test)]
+mod width_fast_path_tests {
+    use super::super::text::visible_length;
+    use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn ascii_fast_path_matches_unicode_width_for_every_ascii_byte() {
+        for b in 0u8..128 {
+            let s = format!("ab{}cd", b as char);
+            if b == 0x1b {
+                continue;
+            }
+            assert_eq!(visible_length(&s), UnicodeWidthStr::width(s.as_str()), "byte {b:#x}");
+        }
+        assert_eq!(visible_length("\x1b[1mbold\x1b[0m"), 4);
+        assert_eq!(visible_length("tiếng Việt 漢字"), UnicodeWidthStr::width("tiếng Việt 漢字"));
+    }
+}

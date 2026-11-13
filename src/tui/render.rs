@@ -182,7 +182,11 @@ impl Tui {
         let p = Palette::for_mode(st.theme_mode);
         let styled_mode = rich && p.is_styled();
         let show_reasoning = st.view_mode != "normal" || st.in_transcript_overlay;
-        let transcript = st.selection.as_ref().map(|s| s.source.to_string()).unwrap_or_else(|| st.transcript.clone());
+        // Borrow the live transcript for the parse instead of copying it every frame; a selection
+        // renders its own frozen revision.
+        let selection_source = st.selection.as_ref().map(|s| s.source.to_string());
+        let live = selection_source.is_none();
+        let transcript: String = selection_source.unwrap_or_else(|| std::mem::take(&mut st.transcript));
         let reuse = st
             .body_cache
             .as_ref()
@@ -195,12 +199,20 @@ impl Tui {
                     && transcript.starts_with(&c.source)
             })
             .unwrap_or(false);
+        // The cache owns the rows/styled lines of the previous frame; reuse them in place (truncated
+        // back to the checkpoint) instead of cloning the whole body every frame.
         let cache = if reuse { st.body_cache.take() } else { None };
         let mut state = cache.as_ref().map(|c| c.state).unwrap_or_default();
-        let mut rows: Vec<Row> = cache.as_ref().map(|c| c.rows.clone()).unwrap_or_default();
-        let base_styled: Vec<String> = cache.as_ref().map(|c| c.styled.clone()).unwrap_or_default();
-        let base_len = cache.as_ref().map(|c| c.source.len()).unwrap_or(0);
-        let mut source_ends = cache.as_ref().map(|c| c.source_ends.clone()).unwrap_or_default();
+        let (mut cached_source, mut rows, base_styled, mut source_ends, cached) = match cache {
+            Some(mut c) => {
+                c.rows.truncate(c.checkpoint_rows);
+                c.styled.truncate(c.checkpoint_rows);
+                c.source_ends.truncate(c.checkpoint_rows);
+                (c.source, c.rows, c.styled, c.source_ends, c.checkpoint_rows)
+            }
+            None => (String::new(), vec![], vec![], vec![], 0),
+        };
+        let base_len = cached_source.len();
         let mut source_offset = base_len;
         let mut previous_source_end = base_len;
         let raw_lines: Vec<&str> = transcript[base_len..].split('\n').collect();
@@ -575,28 +587,24 @@ impl Tui {
             push_markdown(&mut rows, raw_line.trim_end(), "", None, RowKind::Normal, line_index);
         }
 
-        let cached = cache.as_ref().map(|c| c.rows.len()).unwrap_or(0);
         source_ends.resize(rows.len(), previous_source_end);
-        let mut styled: Vec<String> = base_styled[..cached.min(base_styled.len())].to_vec();
+        let mut styled = base_styled;
+        styled.truncate(cached);
         for row in &rows[cached..] {
             styled.push(clip_line(&if styled_mode { Self::style_row(row, cols, &p) } else { plain_row(row, cols) }, cols, styled_mode));
         }
         // Remember everything before the checkpoint line for the next frame.
         let consumed: usize = raw_lines[..checkpoint].iter().map(|l| l.len() + 1).sum();
-        st.body_cache = Some(BodyCache {
-            cols,
-            rich: styled_mode,
-            theme_mode: st.theme_mode,
-            show_reasoning,
-            source: transcript[..base_len + consumed].to_string(),
-            state: checkpoint_state,
-            rows: rows[..checkpoint_rows].to_vec(),
-            styled: styled[..checkpoint_rows].to_vec(),
-            source_ends: source_ends[..checkpoint_rows].to_vec(),
-        });
-        st.body_source_ends = source_ends;
-        st.body_layout = super::selection::Layout::from_rows(&rows, &styled, styled_mode);
-        styled
+        cached_source.push_str(&transcript[base_len..base_len + consumed]);
+        st.body_layout_dirty = true;
+        st.body_source_ends.clone_from(&source_ends);
+        let out = styled.clone();
+        st.body_cache =
+            Some(BodyCache { cols, rich: styled_mode, theme_mode: st.theme_mode, show_reasoning, source: cached_source, state: checkpoint_state, checkpoint_rows, rows, styled, source_ends });
+        if live {
+            st.transcript = transcript;
+        }
+        out
     }
 
     fn style_row(row: &Row, cols: usize, p: &Palette) -> String {
@@ -816,6 +824,18 @@ impl Tui {
         }
         let reset_prefix = if styled { "\x1b[0m" } else { "" };
         let mut patches = String::new();
+        // Streaming output usually just moves the body up a few rows. Let the terminal scroll
+        // that region (DECSTBM + SU) and repaint only the rows that are new, instead of
+        // rewriting every visible row each frame: far less output for the terminal to parse
+        // and draw, which is what CPU-rendered terminals struggle with.
+        if let Some((region, shift)) = scroll_shift(&st.last_frame_rows, &lines) {
+            // Line feeds at the region's bottom margin: the most widely supported way to scroll.
+            patches.push_str(&format!("\x1b[0m\x1b[1;{region}r\x1b[{region};1H{}\x1b[r", "\n".repeat(shift)));
+            st.last_frame_rows[..region].rotate_left(shift);
+            for row in &mut st.last_frame_rows[region - shift..region] {
+                row.clear();
+            }
+        }
         for (i, line) in lines.iter().enumerate() {
             if *line != st.last_frame_rows[i] {
                 patches.push_str(&format!("\x1b[{};1H{reset_prefix}{line}\x1b[K", i + 1));
@@ -1004,6 +1024,9 @@ impl Tui {
         }
         st.last_body_total_lines = all.len();
         if columns != st.last_cols || rows != st.last_rows {
+            if st.selection.is_some() {
+                st.ensure_body_layout();
+            }
             // Keep the selected endpoint in view instead of reinterpreting the
             // old row offset after rewrap. Body-height clamping happens below.
             if let Some(row) = st.selection.as_ref().and_then(|s| st.body_layout.row_for(s.end)) {
@@ -1631,5 +1654,48 @@ mod table_tests {
         assert!(!table_separator("| : | -- |"), "a colon alone is content, not a delimiter cell");
         assert!(!table_separator("| | -- |"), "empty delimiter cell is invalid");
         assert!(!table_separator(r"| --\|-- | -- |"), "literal pipes cannot join delimiter columns");
+    }
+}
+
+/// Detects a frame whose top region is the previous frame's top region moved up by `shift` rows.
+/// Returns `(region_rows, shift)` when scrolling saves a meaningful amount of repainting.
+fn scroll_shift(previous: &[String], next: &[String]) -> Option<(usize, usize)> {
+    let height = previous.len().min(next.len());
+    if height < 8 {
+        return None;
+    }
+    let mut best: Option<(usize, usize)> = None;
+    for shift in 1..=(height / 2).min(24) {
+        // Rows that survive the scroll: next[i] == previous[i + shift], counted from the top.
+        let kept = (0..height - shift).take_while(|&i| next[i] == previous[i + shift]).count();
+        // Only worth it when most of the region moves, and the row already in place doesn't.
+        if kept >= 6 && kept * 2 >= height - shift && kept > best.map_or(0, |(region, s)| region - s) && next[0] != previous[0] {
+            best = Some((kept + shift, shift));
+        }
+    }
+    best
+}
+
+#[cfg(test)]
+mod scroll_tests {
+    use super::scroll_shift;
+
+    fn frame(lines: &[&str]) -> Vec<String> {
+        lines.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn detects_a_body_that_moved_up_and_leaves_static_frames_alone() {
+        let body: Vec<String> = (0..30).map(|i| format!("line {i}")).collect();
+        let mut prev = body[0..20].to_vec();
+        prev.extend(frame(&["status", "╭──╮", "│ › │", "╰──╯", "footer"]));
+        let mut next = body[3..23].to_vec();
+        next.extend(frame(&["status 2", "╭──╮", "│ › │", "╰──╯", "footer"]));
+        assert_eq!(scroll_shift(&prev, &next), Some((20, 3)));
+        assert_eq!(scroll_shift(&prev, &prev), None, "nothing moved");
+        let mut edited = prev.clone();
+        edited[5] = "changed".into();
+        assert_eq!(scroll_shift(&prev, &edited), None, "an in-place edit is a patch, not a scroll");
+        assert_eq!(scroll_shift(&prev[..5], &next[..5]), None, "tiny screens repaint");
     }
 }
