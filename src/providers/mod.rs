@@ -23,6 +23,10 @@ pub fn http_client() -> &'static reqwest::Client {
             .connect_timeout(Duration::from_secs(30))
             .redirect(reqwest::redirect::Policy::none())
             .user_agent(format!("goon-cli/{}", crate::version::VERSION))
+            .gzip(true)
+            .zstd(true)
+            .brotli(true)
+            .deflate(true)
             .build()
             .expect("http client")
     })
@@ -351,7 +355,7 @@ mod tests {
         assert_eq!(parser.finish(), vec![SseEvent { event: None, data: "tail".into() }]);
     }
 
-    async fn read_http_headers(socket: &mut tokio::net::TcpStream) {
+    async fn read_http_headers(socket: &mut tokio::net::TcpStream) -> String {
         let mut buf = vec![0u8; 4096];
         let mut seen = Vec::new();
         loop {
@@ -360,10 +364,11 @@ mod tests {
                 Ok(n) => n,
             };
             seen.extend_from_slice(&buf[..n]);
-            if seen.windows(4).any(|w| w == b"\r\n\r\n") {
-                break;
+            if let Some(pos) = seen.windows(4).position(|w| w == b"\r\n\r\n") {
+                return String::from_utf8_lossy(&seen[..pos]).to_ascii_lowercase();
             }
         }
+        String::from_utf8_lossy(&seen).to_ascii_lowercase()
     }
 
     #[tokio::test]
@@ -434,5 +439,70 @@ mod tests {
         assert!(err.aborted);
         assert!(!err.retryable);
         cancel_server.abort();
+    }
+
+    async fn serve_compressed_once(content_type: &'static str, encoding: &'static str, payload: &'static [u8]) -> (std::net::SocketAddr, tokio::task::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let req_headers = read_http_headers(&mut socket).await;
+            let head = format!("HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Encoding: {encoding}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", payload.len());
+            socket.write_all(head.as_bytes()).await.unwrap();
+            socket.write_all(payload).await.unwrap();
+            socket.flush().await.unwrap();
+            req_headers
+        });
+        (addr, handle)
+    }
+
+    fn assert_accepts_encodings(req_headers: &str) {
+        let line = req_headers.lines().find(|l| l.starts_with("accept-encoding:")).unwrap_or("");
+        for enc in ["gzip", "zstd", "br", "deflate"] {
+            assert!(line.contains(enc), "expected Accept-Encoding to include {enc}, got headers:\n{req_headers}");
+        }
+    }
+
+    #[tokio::test]
+    async fn post_sse_and_post_json_advertise_and_decompress_gzip_and_zstd() {
+        const SSE_GZIP: &[u8] = &[
+            31, 139, 8, 0, 0, 0, 0, 0, 0, 10, 75, 73, 44, 73, 180, 82, 168, 86, 202, 207, 86, 178, 50, 172, 229, 226, 74, 1, 243, 163, 93, 252, 253, 92, 99, 185, 184, 0, 85, 68, 144, 214, 30, 0, 0, 0,
+        ];
+        const SSE_ZSTD: &[u8] = &[
+            40, 181, 47, 253, 32, 35, 25, 1, 0, 100, 97, 116, 97, 58, 32, 123, 34, 122, 115, 116, 100, 34, 58, 116, 114, 117, 101, 125, 10, 10, 100, 97, 116, 97, 58, 32, 91, 68, 79, 78, 69, 93, 10,
+            10,
+        ];
+        const SSE_BR: &[u8] = &[11, 16, 128, 100, 97, 116, 97, 58, 32, 123, 34, 98, 114, 34, 58, 116, 114, 117, 101, 125, 10, 10, 100, 97, 116, 97, 58, 32, 91, 68, 79, 78, 69, 93, 10, 10, 3];
+        const SSE_DEFLATE: &[u8] = &[
+            120, 156, 75, 73, 44, 73, 180, 82, 168, 86, 74, 73, 77, 203, 73, 44, 73, 85, 178, 42, 41, 42, 77, 173, 229, 226, 74, 1, 139, 71, 187, 248, 251, 185, 198, 114, 113, 1, 0, 251, 198, 11, 250,
+        ];
+        const JSON_GZIP: &[u8] = &[
+            31, 139, 8, 0, 0, 0, 0, 0, 0, 10, 171, 86, 74, 206, 207, 45, 40, 74, 45, 46, 78, 77, 81, 178, 82, 74, 175, 202, 44, 80, 210, 81, 202, 207, 86, 178, 42, 41, 42, 77, 173, 5, 0, 207, 200,
+            83, 84, 31, 0, 0, 0,
+        ];
+        const JSON_ZSTD: &[u8] =
+            &[40, 181, 47, 253, 32, 31, 249, 0, 0, 123, 34, 99, 111, 109, 112, 114, 101, 115, 115, 101, 100, 34, 58, 34, 122, 115, 116, 100, 34, 44, 34, 111, 107, 34, 58, 116, 114, 117, 101, 125];
+
+        for (encoding, payload, first_data) in
+            [("gzip", SSE_GZIP, "{\"ok\":1}"), ("zstd", SSE_ZSTD, "{\"zstd\":true}"), ("br", SSE_BR, "{\"br\":true}"), ("deflate", SSE_DEFLATE, "{\"deflate\":true}")]
+        {
+            let (addr, server) = serve_compressed_once("text/event-stream", encoding, payload).await;
+            let mut rx = post_sse(&format!("http://{addr}/v1/chat/completions"), &[], &json!({}), CancellationToken::new(), Duration::from_secs(5)).await.unwrap();
+            let mut received = Vec::new();
+            while let Some(item) = rx.recv().await {
+                received.push(item.unwrap().data);
+            }
+            let req_headers = server.await.unwrap();
+            assert_accepts_encodings(&req_headers);
+            assert_eq!(received, vec![first_data, "[DONE]"]);
+        }
+
+        for (encoding, payload) in [("gzip", JSON_GZIP), ("zstd", JSON_ZSTD)] {
+            let (addr, server) = serve_compressed_once("application/json", encoding, payload).await;
+            let parsed = post_json(&format!("http://{addr}/v1/chat/completions"), &[], &json!({}), CancellationToken::new(), Duration::from_secs(5)).await.unwrap();
+            let req_headers = server.await.unwrap();
+            assert_accepts_encodings(&req_headers);
+            assert_eq!(parsed, json!({ "compressed": encoding, "ok": true }));
+        }
     }
 }
