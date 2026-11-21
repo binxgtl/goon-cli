@@ -553,12 +553,18 @@ impl Drop for SignalGuard {
 }
 
 pub fn on_signals(handler: std::sync::Arc<dyn Fn(&'static str) + Send + Sync>) -> SignalGuard {
+    #[cfg(unix)]
+    let unix_signals = {
+        use tokio::signal::unix::{signal, SignalKind};
+        match (signal(SignalKind::interrupt()), signal(SignalKind::terminate())) {
+            (Ok(int), Ok(term)) => Some((int, term, signal(SignalKind::hangup()).ok())),
+            _ => None,
+        }
+    };
     let task = tokio::spawn(async move {
         #[cfg(unix)]
         {
-            use tokio::signal::unix::{signal, SignalKind};
-            let (Ok(mut int), Ok(mut term)) = (signal(SignalKind::interrupt()), signal(SignalKind::terminate())) else { return };
-            let mut hup = signal(SignalKind::hangup()).ok();
+            let Some((mut int, mut term, mut hup)) = unix_signals else { return };
             loop {
                 tokio::select! {
                     _ = int.recv() => handler("SIGINT"),

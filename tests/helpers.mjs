@@ -50,7 +50,7 @@ export function cli(f, url, args = [], options = {}) {
   });
   const origKill = child.kill.bind(child);
   child.kill = (sig = 'SIGTERM') => {
-    if (process.platform === 'win32' && (sig === 'SIGINT' || sig === 'SIGTERM') && child.connected) {
+    if ((sig === 'SIGINT' || sig === 'SIGTERM') && child.connected) {
       try {
         child.send({ type: 'goon:signal', signal: sig });
         return true;
@@ -63,7 +63,12 @@ export function cli(f, url, args = [], options = {}) {
   let stdout = '', stderr = '';
   child.stdout.on('data', chunk => { stdout += chunk; });
   child.stderr.on('data', chunk => { stderr += chunk; });
-  const timeout = setTimeout(() => origKill('SIGKILL'), 15_000);
+  const timeout = setTimeout(() => {
+    if (child.connected) {
+      try { child.send({ type: 'goon:signal', signal: 'SIGKILL' }); } catch { /* ignore */ }
+    }
+    setTimeout(() => origKill('SIGKILL'), 250).unref();
+  }, 15_000);
   const done = new Promise((resolve, reject) => {
     child.once('error', reject);
     child.once('close', (code, signal) => { clearTimeout(timeout); resolve({ code, signal, stdout, stderr }); });

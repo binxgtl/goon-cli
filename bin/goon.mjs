@@ -22,21 +22,19 @@ try {
 const isWindows = process.platform === 'win32';
 const env = { ...process.env, GOON_WRAPPER_NODE: process.version };
 
-// Windows has no SIGTERM and Ctrl+C reaches the whole console, so relayed signals (IPC from a
-// parent, e.g. the test harness) travel over a loopback control socket the binary connects to.
-let control;
+// Windows has no SIGTERM and Ctrl+C reaches the whole console; on all platforms, relayed signals
+// (IPC from a parent such as the test harness) travel over a buffered loopback control socket so
+// signals sent before the child attaches its OS handler are never lost.
 let controlSocket;
 const pendingSignals = [];
-if (isWindows) {
-  control = createServer(socket => {
-    controlSocket = socket;
-    socket.on('error', () => {});
-    for (const sig of pendingSignals.splice(0)) socket.write(`${sig}\n`);
-  });
-  control.unref();
-  await new Promise(resolve => control.listen(0, '127.0.0.1', resolve));
-  env.GOON_CONTROL_PORT = String(control.address().port);
-}
+const control = createServer(socket => {
+  controlSocket = socket;
+  socket.on('error', () => {});
+  for (const sig of pendingSignals.splice(0)) socket.write(`${sig}\n`);
+});
+control.unref();
+await new Promise(resolve => control.listen(0, '127.0.0.1', resolve));
+env.GOON_CONTROL_PORT = String(control.address().port);
 
 const child = spawn(binary, process.argv.slice(2), { stdio: 'inherit', env, windowsHide: false });
 
@@ -56,11 +54,15 @@ process.on('SIGINT', () => { if (!process.stdin.isTTY || isWindows) relay('SIGIN
 process.on('SIGTERM', () => relay('SIGTERM'));
 if (!isWindows) process.on('SIGHUP', () => relay('SIGHUP'));
 process.on('message', message => {
-  if (message && typeof message === 'object' && message.type === 'goon:signal' && (message.signal === 'SIGINT' || message.signal === 'SIGTERM')) {
-    if (isWindows) {
+  if (message && typeof message === 'object' && message.type === 'goon:signal') {
+    if (message.signal === 'SIGKILL') {
+      try { child.kill('SIGKILL'); } catch { /* already gone */ }
+      return;
+    }
+    if (message.signal === 'SIGINT' || message.signal === 'SIGTERM') {
       if (controlSocket) controlSocket.write(`${message.signal}\n`);
       else pendingSignals.push(message.signal);
-    } else relay(message.signal);
+    }
   }
 });
 
